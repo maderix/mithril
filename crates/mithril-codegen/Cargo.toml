@@ -1,0 +1,13 @@
+[package]
+name = "mithril-codegen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mithril-core = { path = "../mithril-core" }
+mithril-front = { path = "../mithril-front" }
+mithril-net = { path = "../mithril-net" }
+
+[dev-dependencies]
+mithril-rt = { path = "../mithril-rt" }
+mithril-reassoc = { path = "../mithril-reassoc" }
