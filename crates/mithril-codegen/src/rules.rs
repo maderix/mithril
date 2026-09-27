@@ -21,13 +21,15 @@
 
 use crate::seq::Ex;
 use crate::{cnt_expr, free_vars, has_call, merge_max, Cnt};
-use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
+use mithril_front::core::{Core, CoreModule};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
 #[derive(Clone)]
 pub(crate) struct Seg {
     pub id: u16,
+    /// Owning function (for var typing); u32::MAX = none (forwarding seg).
+    pub fid: u32,
     pub slots: Vec<u32>,
     pub env: Vec<u32>,
     pub body: Core,
@@ -39,10 +41,10 @@ pub(crate) struct SegQ {
 }
 
 impl SegQ {
-    pub(crate) fn add(&mut self, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
+    pub(crate) fn add(&mut self, fid: u32, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
         let id = self.next;
         self.next += 1;
-        self.q.push(Seg { id, slots, env, body });
+        self.q.push(Seg { id, fid, slots, env, body });
         id
     }
 }
@@ -160,6 +162,9 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
             Box::new(norm_pure(a, c, lets)),
             Box::new(norm_pure(b, c, lets)),
         ),
+        Core::Reuse(v, k, args) => {
+            Core::Reuse(*v, *k, args.iter().map(|a| norm_pure(a, c, lets)).collect())
+        }
         Core::Ctor(k, args) => {
             Core::Ctor(*k, args.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
@@ -174,56 +179,20 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
 // ---- fork detection (shared by counting and emission) ----
 
 /// `Let(x, Call g, Let(y, Call h, bo2))` with `h`'s args independent of `x`.
-pub(crate) fn fork_parts<'e>(x: &u32, bo: &'e Core) -> Option<(&'e u32, &'e u32, &'e Vec<Core>, &'e Core)> {
-    if let Core::Let(y, r2, bo2) = bo {
-        if let Core::Call(h, hargs) = r2.as_ref() {
-            if !hargs.iter().any(|a| free_vars(a).contains(x)) {
-                return Some((y, h, hargs, bo2));
-            }
-        }
-    }
-    None
-}
-
 // ---- use counting for the rule form (mirrors rtail's structure) ----
 
 pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) {
     match e {
-        Core::Let(x, r, bo) => {
-            if !has_call(r) {
+        Core::Let(_, r, bo) => {
+            // A call dives inline (continuation runs here) or suspends
+            // (continuation moves into a record taking exactly its uses):
+            // both paths consume the same counts.
+            if has_call(r) {
+                cnt_rule(r, m);
+            } else {
                 cnt_expr(r, m);
-                return cnt_rule(bo, m);
             }
-            match r.as_ref() {
-                Core::Call(_, gargs) => {
-                    if let Some((y, _h, hargs, bo2)) = fork_parts(x, bo) {
-                        let mut env = free_vars(bo2);
-                        env.remove(x);
-                        env.remove(y);
-                        for v in env {
-                            *m.entry(v).or_insert(0) += 1;
-                        }
-                        gargs.iter().for_each(|a| cnt_expr(a, m));
-                        hargs.iter().for_each(|a| cnt_expr(a, m));
-                    } else {
-                        let mut env = free_vars(bo);
-                        env.remove(x);
-                        for v in env {
-                            *m.entry(v).or_insert(0) += 1;
-                        }
-                        gargs.iter().for_each(|a| cnt_expr(a, m));
-                    }
-                }
-                Core::If(..) | Core::Match(..) => {
-                    let mut env = free_vars(bo);
-                    env.remove(x);
-                    for v in env {
-                        *m.entry(v).or_insert(0) += 1;
-                    }
-                    cnt_rule(r, m);
-                }
-                _ => unreachable!("codegen bug: non-normalized let RHS carrying a call"),
-            }
+            cnt_rule(bo, m);
         }
         Core::If(c, t, f) => {
             cnt_expr(c, m);
@@ -254,14 +223,17 @@ pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) {
 
 /// Allocate a waiting record for segment `rule` with the given spilled
 /// environment; returns the record temp name.
-pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str, b: &mut String) -> String {
+pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str, body: &Core, b: &mut String) -> String {
     let chn = ex.fresh();
     if env.is_empty() {
         b.push_str(&format!("let {chn}: u64 = 0;\n"));
     } else {
+        // the record's one reference stands for every use `body` makes
+        let mut uses = Cnt::new();
+        cnt_rule(body, &mut uses);
         b.push_str(&format!("let mut {chn}: u64 = 0;\n"));
         for v in env.iter().rev() {
-            let ev = ex.use_var(*v, true, b);
+            let ev = ex.use_var_n(*v, uses.get(v).copied().unwrap_or(1), b);
             b.push_str(&format!("{chn} = ctx.alloc({ev}, {chn}) as u64 + 1;\n"));
         }
     }
@@ -270,11 +242,6 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str
         "let {rn} = ctx.alloc_rec({rule}u16, {pend}, {chn} as u32, 0, {par});\n"
     ));
     rn
-}
-
-pub(crate) fn emit_spawn(ex: &mut Ex, g: u32, args: &[Core], par: &str, b: &mut String) {
-    let es: Vec<String> = args.iter().map(|a| ex.val(a, true, b)).collect();
-    b.push_str(&format!("spawn_call(ctx, {}u16, &[{}], {});\n", 1 + g, es.join(", "), par));
 }
 
 /// Emit `e` (normalized) in rule-form tail position, delivering to `par`.
@@ -292,31 +259,48 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
             }
             match r.as_ref() {
                 Core::Call(g, gargs) => {
-                    // Pair fork: two adjacent independent calls share a record.
-                    if let Some((y, h, hargs, bo2)) = fork_parts(x, bo) {
-                        let mut env: BTreeSet<u32> = free_vars(bo2);
-                        env.remove(x);
-                        env.remove(y);
-                        let env: Vec<u32> = env.into_iter().collect();
-                        let sid = sq.add(vec![*x, *y], env.clone(), bo2.clone());
-                        let rn = emit_rec(ex, &env, sid, 2, par, b);
-                        emit_spawn(ex, *g, gargs, &format!("(({rn} as u64) << 3)"), b);
-                        emit_spawn(ex, *h, hargs, &format!("((({rn} as u64) << 3) | 1)"), b);
-                        return;
+                    // Dive inline; the continuation runs right here when the
+                    // callee finishes within fuel. On suspension the frame
+                    // splits like the dive form's capture: the independent
+                    // suffix P runs now (inline, delivering to the join's
+                    // second slot), the dependent rest J waits in a record.
+                    let es: Vec<String> = gargs.iter().map(|a| ex.val(a, true, b)).collect();
+                    let saved = ex.rem.clone();
+                    b.push_str(&format!("match ctx.dive({g}u16, &[NONE, {}]) {{\nDiveResult::Done(v) => {{\n", es.join(", ")));
+                    if ex.rem.get(x).copied().unwrap_or(0) == 0 {
+                        b.push_str("free_val(ctx, v);\n");
+                    } else {
+                        b.push_str(&format!("let v{x} = v;\n"));
                     }
-                    let mut env = free_vars(bo);
-                    env.remove(x);
-                    let env: Vec<u32> = env.into_iter().collect();
-                    let sid = sq.add(vec![*x], env.clone(), (**bo).clone());
-                    let rn = emit_rec(ex, &env, sid, 1, par, b);
-                    emit_spawn(ex, *g, gargs, &format!("(({rn} as u64) << 3)"), b);
+                    rtail(ex, bo, par, b, sq);
+                    b.push_str("}\nDiveResult::Suspended(rec) => {\n");
+                    ex.rem = saved.clone();
+                    if let Some((p_body, live, j_body)) = crate::seq::split_frame(*x, bo) {
+                        let mut env: BTreeSet<u32> = free_vars(&j_body);
+                        env.remove(x);
+                        env.remove(&live);
+                        let env: Vec<u32> = env.into_iter().collect();
+                        let sid = sq.add(ex.self_fid, vec![*x, live], env.clone(), j_body.clone());
+                        let rn = emit_rec(ex, &env, sid, 2, par, &j_body, b);
+                        b.push_str(&format!("ctx.set_parent(rec, ({rn} as u64) << 3);\n"));
+                        rtail(ex, &p_body, &format!("((({rn} as u64) << 3) | 1)"), b, sq);
+                    } else {
+                        let mut env = free_vars(bo);
+                        env.remove(x);
+                        let env: Vec<u32> = env.into_iter().collect();
+                        let sid = sq.add(ex.self_fid, vec![*x], env.clone(), (**bo).clone());
+                        let rn = emit_rec(ex, &env, sid, 1, par, bo, b);
+                        b.push_str(&format!("ctx.set_parent(rec, ({rn} as u64) << 3);\n"));
+                    }
+                    ex.rem = saved;
+                    b.push_str("}\n}\n");
                 }
                 Core::If(..) | Core::Match(..) => {
                     let mut env = free_vars(bo);
                     env.remove(x);
                     let env: Vec<u32> = env.into_iter().collect();
-                    let sid = sq.add(vec![*x], env.clone(), (**bo).clone());
-                    let rn = emit_rec(ex, &env, sid, 1, par, b);
+                    let sid = sq.add(ex.self_fid, vec![*x], env.clone(), (**bo).clone());
+                    let rn = emit_rec(ex, &env, sid, 1, par, bo, b);
                     let p2 = format!("(({rn} as u64) << 3)");
                     rtail(ex, r, &p2, b, sq);
                 }
@@ -337,22 +321,33 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
         Core::Match(s, arms) => {
             let (sv, hold) = ex.scrutinee(s, b);
             let saved = ex.rem.clone();
-            b.push_str(&format!("match con_tag({sv}) {{\n"));
-            for (cid, binders, body) in arms {
-                if *cid == UNREACHABLE_CTOR {
-                    continue;
-                }
+            let (open, plan, close) = crate::seq::plan_arms(&sv, arms, ex.unbox);
+            b.push_str(&open);
+            for (i, pre, suf) in plan {
+                let (cid, binders, body) = &arms[i];
                 ex.rem = saved.clone();
-                b.push_str(&format!("{cid} => {{\n"));
-                ex.bind_fields(&sv, hold, binders, b);
+                b.push_str(&pre);
+                if ex.unbox.contains_key(cid) {
+                    if let Some(bv) = binders.first() {
+                        if ex.rem.get(bv).copied().unwrap_or(0) > 0 {
+                            b.push_str(&format!("let v{bv} = num(as_i({sv}));\n"));
+                        }
+                    }
+                } else {
+                    ex.bind_fields(&sv, hold, *cid, binders, None, b);
+                }
                 rtail(ex, body, par, b, sq);
-                b.push_str("}\n");
+                b.push_str(&suf);
             }
             ex.rem = saved;
-            b.push_str("_ => { mith_unreachable(); }\n}\n");
+            b.push_str(&format!("{close}\n"));
         }
         Core::Call(g, args) => {
-            emit_spawn(ex, *g, args, par, b);
+            let es: Vec<String> = args.iter().map(|a| ex.val(a, true, b)).collect();
+            b.push_str(&format!(
+                "match ctx.dive({g}u16, &[{par}, {}]) {{\nDiveResult::Done(v) => ctx.deliver({par}, v),\nDiveResult::Suspended(_) => {{}}\n}}\n",
+                es.join(", ")
+            ));
         }
         other => {
             let v = ex.val(other, true, b);
@@ -369,14 +364,18 @@ pub(crate) fn expand_fn(
     body: &Core,
     bor: &[Vec<bool>],
     sq: &mut SegQ,
+    unbox: &std::collections::HashMap<u32, u8>,
+    tys: &crate::ty::Types,
+    iret: &[bool],
+    shared: &std::cell::RefCell<crate::seq::Shared>,
 ) -> String {
     let ar = m.fns[fid as usize].arity;
     let params: String = (0..ar).map(|i| format!(", v{i}: u64")).collect();
     let mut s = format!("fn x_{fid}(ctx: &mut Wctx, parent: u64{params}) {{\n");
     let mut rem = Cnt::new();
     cnt_rule(body, &mut rem);
-    let ints = crate::seq::numeric_vars(body, crate::float_free(m));
-    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, 0);
+    let ints = crate::ints_of(tys, fid as usize);
+    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, 0, unbox, iret, tys, shared);
     let mut bb = String::new();
     for i in 0..ar as u32 {
         if ex.rem.get(&i).copied().unwrap_or(0) == 0 {
@@ -392,13 +391,15 @@ pub(crate) fn expand_fn(
 /// A continuation segment: fires when its record fills; slots arrive in
 /// `e.a` / `e.b` (owned), the spilled environment is read back off the cell
 /// chain (owned; the chain cells are freed as they are read).
-pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ) -> String {
+pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &std::collections::HashMap<u32, u8>, tys: &crate::ty::Types, iret: &[bool], shared: &std::cell::RefCell<crate::seq::Shared>) -> String {
     let _ = m;
-    let mut s = format!("fn sg_{}(ctx: &mut Wctx, e: Redex) {{\n", seg.id);
+    let mut s = format!("// segment of fn {} slots {:?} env {:?}\nfn sg_{}(ctx: &mut Wctx, e: Redex) {{\n", seg.fid, seg.slots, seg.env, seg.id);
     s.push_str("let inf = ctx.rec(e.aux as u32);\nlet parent = inf.parent;\n");
     let mut rem = Cnt::new();
     cnt_rule(&seg.body, &mut rem);
-    s.push_str(&format!("let v{} = e.a;\n", seg.slots[0]));
+    if !seg.slots.is_empty() {
+        s.push_str(&format!("let v{} = e.a;\n", seg.slots[0]));
+    }
     if seg.slots.len() > 1 {
         s.push_str(&format!("let v{} = e.b;\n", seg.slots[1]));
     }
@@ -416,8 +417,12 @@ pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut 
             s.push_str(&format!("free_val(ctx, v{sv});\n"));
         }
     }
-    let ints = crate::seq::numeric_vars(&seg.body, crate::float_free(m));
-    let mut ex = Ex::new(false, u32::MAX, false, rem, HashSet::new(), bor, ints, None, 0);
+    let ints = if seg.fid == u32::MAX {
+        HashSet::new()
+    } else {
+        crate::ints_of(tys, seg.fid as usize)
+    };
+    let mut ex = Ex::new(false, seg.fid, false, rem, HashSet::new(), bor, ints, None, 0, unbox, iret, tys, shared);
     let mut bb = String::new();
     rtail(&mut ex, &seg.body, "parent", &mut bb, sq);
     s.push_str(&bb);

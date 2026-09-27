@@ -353,7 +353,7 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
         }
         Core::Let(v, r, b) => NExpr::Let(*v, Box::new(lower(r, prog)), Box::new(lower(b, prog))),
         Core::Call(f, args) => NExpr::Call(*f as u16, args.iter().map(|a| lower(a, prog)).collect()),
-        Core::Ctor(cid, args) => NExpr::Ctor(ctag_of(*cid), args.iter().map(|a| lower(a, prog)).collect()),
+        Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => NExpr::Ctor(ctag_of(*cid), args.iter().map(|a| lower(a, prog)).collect()),
         Core::Tuple(items) => NExpr::Tuple(items.iter().map(|a| lower(a, prog)).collect()),
         Core::Match(s, arms) => {
             let scrut = lower(s, prog);
@@ -406,7 +406,7 @@ fn fv(c: &Core, out: &mut BTreeSet<u32>) {
             inner.remove(v);
             out.extend(inner);
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
             for a in args {
                 fv(a, out);
             }
@@ -468,7 +468,7 @@ fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), D
             bound.insert(*v);
             check_bound(b, bound, fname)
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
             for a in args {
                 check_bound(a, bound, fname)?;
             }

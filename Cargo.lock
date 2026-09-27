@@ -3,12 +3,45 @@
 version = 4
 
 [[package]]
+name = "mithril-cli"
+version = "0.1.0"
+dependencies = [
+ "mithril-codegen",
+ "mithril-core",
+ "mithril-front",
+ "mithril-gpu",
+ "mithril-net",
+ "mithril-reassoc",
+ "mithril-rt",
+]
+
+[[package]]
+name = "mithril-codegen"
+version = "0.1.0"
+dependencies = [
+ "mithril-core",
+ "mithril-front",
+ "mithril-net",
+ "mithril-reassoc",
+ "mithril-rt",
+]
+
+[[package]]
 name = "mithril-core"
 version = "0.1.0"
 
 [[package]]
 name = "mithril-front"
 version = "0.1.0"
+
+[[package]]
+name = "mithril-gpu"
+version = "0.1.0"
+dependencies = [
+ "mithril-core",
+ "mithril-front",
+ "mithril-rt",
+]
 
 [[package]]
 name = "mithril-net"

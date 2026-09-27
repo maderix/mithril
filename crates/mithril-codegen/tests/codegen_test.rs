@@ -128,6 +128,9 @@ fn peak_cells(stderr: &str) -> usize {
         .lines()
         .find_map(|l| l.strip_prefix("peak_cells="))
         .unwrap_or_else(|| panic!("no peak_cells line in stderr: {stderr:?}"))
+        .split_whitespace()
+        .next()
+        .unwrap()
         .parse()
         .expect("bad peak_cells value")
 }

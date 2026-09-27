@@ -1,40 +1,52 @@
 #!/usr/bin/env python3
 """Mithril benchmark harness.
 
-For every benchmark ported under bench/ports/<name>.py this runs:
+For every benchmark ported under bench/ports/<name>.py this runs three CPU
+lanes (plus an optional GPU lane):
 
-  * the C twin  (bench/ports/<name>.c, compiled with `gcc -O2`, if present)
-  * `mithril run bench/ports/<name>.py --threads 1`   (SEQ)
-  * `mithril run bench/ports/<name>.py --threads 16`  (PAR16)
-  * `mithril run bench/ports/<name>.py --threads 16 --gpu`
-    (GPU, only when the environment sets MITHRIL_GPU=1)
+  * C      : the C twin bench/ports/<name>.c, compiled with `gcc -O2 -lm`
+  * SEQ    : the Mithril program at `--threads 1`
+  * PAR16  : the Mithril program at `--threads 16`
+  * GPU    : `mithril run bench/ports/<name>.py --threads 16 --gpu`
+             (only when MITHRIL_GPU=1 and --skip-gpu is not given)
 
-Each lane is executed N=3 times and the minimum wall time is kept.
-EVERY run's stdout must equal the checksum recorded in bench/expected.txt;
-any mismatch marks the row FAILED and the harness exits nonzero at the end.
+The Mithril program is compiled ONCE per benchmark with
+`mithril build bench/ports/<name>.py -o <tmp>/<name>` (identical pipeline to
+`mithril run`, which is build + exec); the build time is recorded in the
+notes and excluded from the lane times. The SEQ/PAR16 lanes then execute the
+built binary with `--threads N`, exactly as `mithril run --threads N` does.
 
-Results land in bench/results.md as a table
+Timing: each lane is timed as wall clock. `--n N` fixes the number of runs
+per lane; by default it is adaptive: 3 runs if the first run finished in
+under 60 s, otherwise 1. The minimum wall time is kept.
 
-  name | C | SEQ | PAR16 | GPU | SEQ/C | PAR/C | GPU/C
+Timeouts: `--timeout SECS` (default 1200) per run. A run exceeding it is
+killed (whole process group) and the lane is recorded as DNF.
 
-with optional reference columns (B2-SEQ | B2-PAR | B2-GPU) imported from
-bench/reference.csv (columns: name,seq,par,gpu) when that file exists.
+Environment for Mithril lanes: MITHRIL_STATS is removed and the default
+arena sizes are used. If a run dies with "arena exhausted", the lane is
+retried once with MITHRIL_NODES=1<<32 MITHRIL_RECS=1<<28 and the retry is
+noted in the results.
 
-The mithril binary is built once at harness start via
-`cargo build --release -p mithril-cli` and used from target/release/mithril.
+EVERY completed run's stdout must equal the checksum in bench/expected.txt;
+a mismatch or crash marks the row FAILED (the harness continues, and exits
+nonzero at the end).
+
+Outputs: bench/results.md (table + machine info + git HEAD + notes) and
+bench/results.json (raw per-lane data). Both are rewritten after every
+benchmark so a partial run leaves partial results.
 
 Usage:
-  python3 bench/harness.py [--dry-run] [-n RUNS] [--timeout SECS]
-                           [--only NAME [NAME ...]]
-
-  --dry-run   lists what would run and validates expected.txt coverage
-              without building or executing anything.
+  python3 bench/harness.py [--dry-run] [--n RUNS] [--timeout SECS]
+                           [--skip-gpu] [--only NAME [NAME ...]]
 """
 
 import argparse
-import csv
+import json
 import os
+import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,13 +56,18 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(BENCH_DIR)
 PORTS_DIR = os.path.join(BENCH_DIR, "ports")
 EXPECTED_TXT = os.path.join(BENCH_DIR, "expected.txt")
-reference_CSV = os.path.join(BENCH_DIR, "reference.csv")
 RESULTS_MD = os.path.join(BENCH_DIR, "results.md")
-MITHRIL_BIN = os.path.join(REPO_ROOT, "target", "release", "mithril")
+RESULTS_JSON = os.path.join(BENCH_DIR, "results.json")
+TARGET_DIR = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO_ROOT, "target")
+MITHRIL_BIN = os.path.join(TARGET_DIR, "release", "mithril")
 
-N_RUNS_DEFAULT = 3
 PAR_THREADS = 16
+ADAPTIVE_CUTOFF = 60.0     # seconds: first run under this -> 3 runs, else 1
+ADAPTIVE_MANY = 3
+BIG_ARENAS = {"MITHRIL_NODES": "1<<32", "MITHRIL_RECS": "1<<28"}
 
+
+# ----------------------------------------------------------------- inputs
 
 def load_expected(path):
     """Parse expected.txt: `<name> <checksum>` per line, `#` comments allowed."""
@@ -87,63 +104,183 @@ def discover():
     return ports, c_twins
 
 
-def load_reference(path):
-    """Parse optional reference.csv (name,seq,par,gpu). Returns {name: (seq,par,gpu)}."""
-    table = {}
-    if not os.path.isfile(path):
-        return table
-    with open(path, newline="") as fh:
-        for row in csv.reader(fh):
-            if not row or row[0].strip().startswith("#"):
-                continue
-            cells = [c.strip() for c in row]
-            if cells[0].lower() == "name":  # header row
-                continue
-            name = cells[0]
-            vals = []
-            for cell in cells[1:4] + [""] * (4 - len(cells)):
-                try:
-                    vals.append(float(cell))
-                except ValueError:
-                    vals.append(None)
-            table[name] = tuple(vals[:3])
-    return table
-
+# -------------------------------------------------------------- execution
 
 def run_once(cmd, timeout, env=None):
-    """Run cmd once; return (wall_seconds, stdout_stripped, ok_exit)."""
+    """Run cmd once in its own process group.
+
+    Returns dict(wall, stdout, stderr, rc, timeout). On timeout the whole
+    process group is SIGKILLed.
+    """
     t0 = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=REPO_ROOT, env=env, start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=REPO_ROOT, env=env,
-        )
+        out, err = proc.communicate(timeout=timeout)
+        timed_out = False
     except subprocess.TimeoutExpired:
-        return time.perf_counter() - t0, "<timeout after %gs>" % timeout, False
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = proc.communicate()
+        timed_out = True
     wall = time.perf_counter() - t0
-    return wall, proc.stdout.strip(), proc.returncode == 0
+    return {"wall": wall, "stdout": (out or "").strip(), "stderr": err or "",
+            "rc": proc.returncode, "timeout": timed_out}
 
 
-def run_lane(label, cmd, expected, n_runs, timeout, env=None):
-    """Run one lane N times; return (min_wall or None, list of error strings)."""
-    best, errors = None, []
-    for i in range(n_runs):
-        wall, out, ok = run_once(cmd, timeout, env=env)
-        if not ok:
-            errors.append("%s run %d/%d: nonzero exit or timeout (stdout=%r)"
-                          % (label, i + 1, n_runs, out[:200]))
-            return None, errors
-        if out != expected:
-            errors.append("%s run %d/%d: checksum mismatch: got %r, want %r"
-                          % (label, i + 1, n_runs, out[:200], expected))
-            return None, errors
-        if best is None or wall < best:
-            best = wall
-    return best, errors
+def mithril_env(big_arenas=False):
+    env = dict(os.environ)
+    env.pop("MITHRIL_STATS", None)
+    for k in BIG_ARENAS:
+        env.pop(k, None)
+    if big_arenas:
+        env.update(BIG_ARENAS)
+    return env
 
+
+def run_lane(label, cmd, expected, n_fixed, timeout, env=None, arena_retry=False):
+    """Run one lane; return a lane record dict.
+
+    status: "ok" | "DNF" | "FAILED".  time: min wall of ok runs.
+    """
+    rec = {"label": label, "cmd": cmd, "status": "ok", "time": None,
+           "runs": [], "notes": [], "error": None}
+    big = False
+    i = 0
+    n_target = n_fixed if n_fixed else 1
+    while i < n_target:
+        r = run_once(cmd, timeout, env=mithril_env(big) if env == "mithril" else env)
+        print("[harness]     %s run %d: %.3fs rc=%s%s" % (
+            label, i + 1, r["wall"], r["rc"], " TIMEOUT" if r["timeout"] else ""),
+            flush=True)
+        if r["timeout"]:
+            rec["status"] = "DNF"
+            rec["error"] = "timeout after %gs (run %d)" % (timeout, i + 1)
+            rec["time"] = None
+            return rec
+        if r["rc"] != 0:
+            if arena_retry and not big and "arena exhausted" in r["stderr"]:
+                big = True
+                rec["notes"].append("arena exhausted at defaults; retried with "
+                                    "MITHRIL_NODES=1<<32 MITHRIL_RECS=1<<28")
+                print("[harness]     %s: arena exhausted -> retry with big arenas"
+                      % label, flush=True)
+                continue  # retry the same run index
+            rec["status"] = "FAILED"
+            tail = r["stderr"].strip().splitlines()[-3:]
+            rec["error"] = "exit %s (run %d); stdout=%r; stderr tail=%r" % (
+                r["rc"], i + 1, r["stdout"][:200], " | ".join(tail)[:400])
+            rec["time"] = None
+            return rec
+        if r["stdout"] != expected:
+            rec["status"] = "FAILED"
+            rec["error"] = "checksum mismatch (run %d): expected %s, got %r" % (
+                i + 1, expected, r["stdout"][:200])
+            rec["time"] = None
+            return rec
+        rec["runs"].append(r["wall"])
+        if rec["time"] is None or r["wall"] < rec["time"]:
+            rec["time"] = r["wall"]
+        if i == 0 and not n_fixed:
+            n_target = ADAPTIVE_MANY if r["wall"] < ADAPTIVE_CUTOFF else 1
+        i += 1
+    return rec
+
+
+def build_mithril_cli():
+    print("[harness] building mithril: cargo build --release -p mithril-cli "
+          "(CARGO_TARGET_DIR=%s)" % TARGET_DIR, flush=True)
+    proc = subprocess.run(["cargo", "build", "--release", "-p", "mithril-cli"],
+                          cwd=REPO_ROOT)
+    if proc.returncode != 0:
+        sys.exit("[harness] cargo build failed (exit %d)" % proc.returncode)
+    if not os.path.isfile(MITHRIL_BIN):
+        sys.exit("[harness] mithril binary not found at %s" % MITHRIL_BIN)
+
+
+def compile_c(name, out_dir):
+    """gcc -O2 the C twin; return (binary or None, error)."""
+    src = os.path.join(PORTS_DIR, name + ".c")
+    binary = os.path.join(out_dir, name + ".c.bin")
+    proc = subprocess.run(["gcc", "-O2", "-o", binary, src, "-lm"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None, "gcc -O2 failed: %s" % proc.stderr.strip()[:400]
+    return binary, None
+
+
+def compile_mithril(name, out_dir, timeout):
+    """`mithril build` the port; return (binary or None, seconds, error)."""
+    port = os.path.join(PORTS_DIR, name + ".py")
+    binary = os.path.join(out_dir, name + ".mithril.bin")
+    r = run_once([MITHRIL_BIN, "build", port, "-o", binary], timeout,
+                 env=mithril_env())
+    if r["timeout"]:
+        return None, r["wall"], "mithril build timed out after %gs" % timeout
+    if r["rc"] != 0:
+        return None, r["wall"], "mithril build failed: %s" % r["stderr"].strip()[-400:]
+    return binary, r["wall"], None
+
+
+# ------------------------------------------------------------ machine info
+
+def _cmd_out(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              cwd=REPO_ROOT).stdout.strip()
+    except OSError:
+        return "?"
+
+
+def machine_info():
+    cpu = "?"
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    ram = "?"
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal"):
+                    ram = "%.1f GiB" % (int(line.split()[1]) / 1048576.0)
+                    break
+    except OSError:
+        pass
+    return {
+        "cpu": cpu,
+        "logical_cpus": os.cpu_count(),
+        "ram": ram,
+        "kernel": platform.release(),
+        "rustc": _cmd_out(["rustc", "-V"]),
+        "gcc": _cmd_out(["gcc", "--version"]).splitlines()[0] if _cmd_out(["gcc", "--version"]) else "?",
+        "git_head": _cmd_out(["git", "rev-parse", "HEAD"]),
+        "git_branch": _cmd_out(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+    }
+
+
+# ----------------------------------------------------------------- output
 
 def fmt_time(secs):
     return "%.3fs" % secs if secs is not None else "-"
+
+
+def fmt_lane(lane):
+    if lane is None:
+        return "-"
+    if lane["status"] == "DNF":
+        return "DNF"
+    if lane["status"] == "FAILED":
+        return "FAILED"
+    return fmt_time(lane["time"])
 
 
 def fmt_ratio(num, den):
@@ -152,220 +289,180 @@ def fmt_ratio(num, den):
     return "%.2fx" % (num / den)
 
 
-def build_mithril():
-    print("[harness] building mithril: cargo build --release -p mithril-cli")
-    proc = subprocess.run(
-        ["cargo", "build", "--release", "-p", "mithril-cli"],
-        cwd=REPO_ROOT,
-    )
-    if proc.returncode != 0:
-        sys.exit("[harness] cargo build failed (exit %d)" % proc.returncode)
-    if not os.path.isfile(MITHRIL_BIN):
-        sys.exit("[harness] mithril binary not found at %s" % MITHRIL_BIN)
+def lane_time(lane):
+    return lane["time"] if lane and lane["status"] == "ok" else None
 
 
-def compile_c(name, out_dir):
-    """gcc -O2 the C twin; return binary path or None on failure."""
-    src = os.path.join(PORTS_DIR, name + ".c")
-    binary = os.path.join(out_dir, name)
-    proc = subprocess.run(
-        ["gcc", "-O2", "-o", binary, src, "-lm"],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        print("[harness] gcc failed for %s:\n%s" % (name, proc.stderr), file=sys.stderr)
-        return None
-    return binary
-
-
-def dry_run(ports, c_twins, expected, gpu_enabled, n_runs):
-    print("[dry-run] bench dir : %s" % BENCH_DIR)
-    print("[dry-run] mithril   : %s (built via `cargo build --release -p mithril-cli`)"
-          % MITHRIL_BIN)
-    print("[dry-run] runs/lane : %d (min wall-time kept)" % n_runs)
-    print("[dry-run] GPU lane  : %s (MITHRIL_GPU=%s)"
-          % ("ENABLED" if gpu_enabled else "disabled",
-             os.environ.get("MITHRIL_GPU", "<unset>")))
-    print()
+def write_results(rows, meta, args):
+    lines = [
+        "# Mithril benchmark results (CPU, BIG size)",
+        "",
+        "- Git HEAD: `%s` (branch `%s`)" % (meta["git_head"], meta["git_branch"]),
+        "- CPU: %s (%s logical CPUs)" % (meta["cpu"], meta["logical_cpus"]),
+        "- RAM: %s; kernel %s" % (meta["ram"], meta["kernel"]),
+        "- rustc: %s" % meta["rustc"],
+        "- gcc: %s" % meta["gcc"],
+        "- Date: %s" % meta["date"],
+        "",
+        "Lanes: `C` = C twin `gcc -O2`; `SEQ` = Mithril program at `--threads 1`; "
+        "`PAR16` = `--threads %d`. Mithril programs are built once with "
+        "`mithril build` (the same pipeline `mithril run` uses; build time in "
+        "notes, excluded from lane times). Times are wall-clock minimum of "
+        "%s runs per lane. Per-run timeout %gs -> `DNF`. Ratios are "
+        "Mithril / C (lower is better). Every completed run's stdout was "
+        "checked against `bench/expected.txt`; `FAILED` = wrong checksum or crash. "
+        "Mithril env: MITHRIL_STATS unset, default arenas "
+        "(retry with MITHRIL_NODES=1<<32 MITHRIL_RECS=1<<28 on `arena exhausted`, noted)."
+        % (PAR_THREADS,
+           ("%d" % args.n) if args.n else
+           "adaptive (%d if first run < %gs, else 1)" % (ADAPTIVE_MANY, ADAPTIVE_CUTOFF),
+           args.timeout),
+        "",
+        "| name | C | SEQ | PAR16 | SEQ/C | PAR16/C | DNF / notes |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        c, s, p = row["lanes"].get("C"), row["lanes"].get("SEQ"), row["lanes"].get("PAR16")
+        failed = any(l and l["status"] == "FAILED" for l in (c, s, p)) or row["build_error"]
+        notes = list(row["notes"])
+        for l in (c, s, p):
+            if l is None:
+                continue
+            if l["status"] == "DNF":
+                notes.append("%s DNF (>%gs)" % (l["label"], args.timeout))
+            for n in l["notes"]:
+                notes.append("%s: %s" % (l["label"], n))
+            if l["status"] == "ok":
+                notes.append("%s n=%d" % (l["label"], len(l["runs"])))
+        cells = [
+            row["name"] + (" **FAILED**" if failed else ""),
+            fmt_lane(c), fmt_lane(s), fmt_lane(p),
+            fmt_ratio(lane_time(s), lane_time(c)), fmt_ratio(lane_time(p), lane_time(c)),
+            "; ".join(notes) or "",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
 
     problems = []
-    if not expected:
-        problems.append("expected.txt is missing or empty")
+    for row in rows:
+        if row["build_error"]:
+            problems.append("- `%s` build: %s" % (row["name"], row["build_error"]))
+        for label in ("C", "SEQ", "PAR16"):
+            l = row["lanes"].get(label)
+            if l and l["status"] in ("FAILED", "DNF"):
+                problems.append("- `%s` %s %s: %s" % (row["name"], label, l["status"], l["error"]))
+    if problems:
+        lines += ["", "## Failures / DNFs", ""] + problems
+    lines.append("")
+    with open(RESULTS_MD, "w") as fh:
+        fh.write("\n".join(lines))
+    with open(RESULTS_JSON, "w") as fh:
+        json.dump({"meta": meta, "timeout": args.timeout, "n": args.n, "rows": rows},
+                  fh, indent=1)
 
-    if not ports:
-        print("[dry-run] no ports found in bench/ports/*.py yet (Task 11 lands them);")
-        print("[dry-run] nothing would run. Coverage of already-present artifacts:")
+
+# ------------------------------------------------------------------- main
+
+def dry_run(ports, c_twins, expected, args):
+    print("[dry-run] mithril   : %s" % MITHRIL_BIN)
+    print("[dry-run] runs/lane : %s" % (args.n or "adaptive"))
+    print("[dry-run] timeout   : %gs" % args.timeout)
+    problems = []
     for name in ports:
         exp = expected.get(name)
         if exp is None:
             problems.append("port %s.py has no entry in expected.txt" % name)
-        print("[dry-run] %-14s expected=%s" % (name, exp or "MISSING"))
-        if name in c_twins:
-            print("            C     : gcc -O2 ports/%s.c && ./%s   x%d" % (name, name, n_runs))
-        else:
-            print("            C     : (no %s.c — column will be '-')" % name)
-        print("            SEQ   : %s run bench/ports/%s.py --threads 1   x%d"
-              % (MITHRIL_BIN, name, n_runs))
-        print("            PAR16 : %s run bench/ports/%s.py --threads %d   x%d"
-              % (MITHRIL_BIN, name, PAR_THREADS, n_runs))
-        if gpu_enabled:
-            print("            GPU   : %s run bench/ports/%s.py --threads %d --gpu   x%d"
-                  % (MITHRIL_BIN, name, PAR_THREADS, n_runs))
-
-    # Coverage report over everything present, ports or not.
-    for name in c_twins:
-        if name not in expected:
-            problems.append("C twin %s.c has no entry in expected.txt" % name)
-    pending = sorted(set(expected) - set(ports))
-    covered_c = sorted(set(expected) & set(c_twins))
-    print()
-    print("[dry-run] expected.txt entries : %d" % len(expected))
-    print("[dry-run] ports (*.py)         : %d" % len(ports))
-    print("[dry-run] C twins (*.c)        : %d (%d with expected checksums)"
-          % (len(c_twins), len(covered_c)))
-    if pending:
-        print("[dry-run] expected entries awaiting a .py port: %s" % " ".join(pending))
-    if os.path.isfile(reference_CSV):
-        print("[dry-run] reference.csv present — reference columns would be imported")
-    else:
-        print("[dry-run] reference.csv absent — reference columns omitted")
-
-    if problems:
-        print()
-        for p in problems:
-            print("[dry-run] ERROR: %s" % p)
-        return 1
-    print("[dry-run] coverage OK")
-    return 0
+        print("[dry-run] %-14s expected=%s C=%s" % (name, exp or "MISSING",
+                                                    "yes" if name in c_twins else "no"))
+    for p in problems:
+        print("[dry-run] ERROR: %s" % p)
+    return 1 if problems or not expected else 0
 
 
 def main():
     ap = argparse.ArgumentParser(description="Mithril benchmark harness")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="list what would run and validate expected.txt coverage")
-    ap.add_argument("-n", "--runs", type=int, default=N_RUNS_DEFAULT,
-                    help="runs per lane, min wall-time kept (default %d)" % N_RUNS_DEFAULT)
-    ap.add_argument("--timeout", type=float, default=900.0,
-                    help="per-run timeout in seconds (default 900)")
-    ap.add_argument("--only", nargs="+", metavar="NAME",
-                    help="restrict to these benchmark names")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--n", "-n", type=int, default=None,
+                    help="runs per lane (default adaptive: 3 if first run < 60s else 1)")
+    ap.add_argument("--timeout", type=float, default=1200.0,
+                    help="per-run timeout in seconds; exceeding it records DNF (default 1200)")
+    ap.add_argument("--skip-gpu", action="store_true", help="never run the GPU lane")
+    ap.add_argument("--no-build", action="store_true",
+                    help="skip `cargo build` of mithril-cli (use existing binary)")
+    ap.add_argument("--only", nargs="+", metavar="NAME")
     args = ap.parse_args()
 
     expected = load_expected(EXPECTED_TXT)
     ports, c_twins = discover()
     if args.only:
         unknown = sorted(set(args.only) - set(ports))
-        if unknown and not args.dry_run:
+        if unknown:
             sys.exit("--only names have no port: %s" % " ".join(unknown))
-        ports = [p for p in ports if p in set(args.only)]
-    gpu_enabled = os.environ.get("MITHRIL_GPU") == "1"
+        ports = [p for p in args.only]
+    gpu_enabled = os.environ.get("MITHRIL_GPU") == "1" and not args.skip_gpu
 
     if args.dry_run:
-        sys.exit(dry_run(ports, c_twins, expected, gpu_enabled, args.runs))
-
-    if not ports:
-        sys.exit("[harness] no benchmarks found under %s (need <name>.py)" % PORTS_DIR)
+        sys.exit(dry_run(ports, c_twins, expected, args))
     missing = [p for p in ports if p not in expected]
     if missing:
         sys.exit("[harness] expected.txt is missing entries for: %s" % " ".join(missing))
 
-    build_mithril()
-    reference = load_reference(reference_CSV)
-    have_reference = bool(reference)
+    if not args.no_build:
+        build_mithril_cli()
+    meta = machine_info()
+    meta["date"] = time.strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    rows = []          # (name, c, seq, par, gpu, failed, errors)
-    any_failed = False
+    rows = []
     tmpdir = tempfile.mkdtemp(prefix="mithril-bench-")
     try:
         for name in ports:
             exp = expected[name]
-            port = os.path.join(PORTS_DIR, name + ".py")
-            errors = []
-            print("[harness] === %s (expect %s) ===" % (name, exp))
+            print("[harness] === %s (expect %s) ===" % (name, exp), flush=True)
+            row = {"name": name, "expected": exp, "lanes": {}, "notes": [],
+                   "build_error": None, "build_time": None}
 
-            c_time = None
             if name in c_twins:
-                binary = compile_c(name, tmpdir)
-                if binary is None:
-                    errors.append("C: gcc -O2 failed to compile")
+                binary, err = compile_c(name, tmpdir)
+                if err:
+                    row["lanes"]["C"] = {"label": "C", "status": "FAILED", "time": None,
+                                         "runs": [], "notes": [], "error": err, "cmd": []}
                 else:
-                    c_time, errs = run_lane("C", [binary], exp, args.runs, args.timeout)
-                    errors += errs
-            print("[harness]   C     : %s" % fmt_time(c_time))
+                    row["lanes"]["C"] = run_lane("C", [binary], exp, args.n, args.timeout)
+            print("[harness]   C     : %s" % fmt_lane(row["lanes"].get("C")), flush=True)
 
-            seq_time, errs = run_lane(
-                "SEQ", [MITHRIL_BIN, "run", port, "--threads", "1"],
-                exp, args.runs, args.timeout)
-            errors += errs
-            print("[harness]   SEQ   : %s" % fmt_time(seq_time))
-
-            par_time, errs = run_lane(
-                "PAR16", [MITHRIL_BIN, "run", port, "--threads", str(PAR_THREADS)],
-                exp, args.runs, args.timeout)
-            errors += errs
-            print("[harness]   PAR16 : %s" % fmt_time(par_time))
-
-            gpu_time = None
-            if gpu_enabled:
-                gpu_time, errs = run_lane(
-                    "GPU",
-                    [MITHRIL_BIN, "run", port, "--threads", str(PAR_THREADS), "--gpu"],
-                    exp, args.runs, args.timeout)
-                errors += errs
-                print("[harness]   GPU   : %s" % fmt_time(gpu_time))
-
-            failed = bool(errors)
-            if failed:
-                any_failed = True
-                for e in errors:
-                    print("[harness]   FAILED %s: %s" % (name, e), file=sys.stderr)
-            rows.append((name, c_time, seq_time, par_time, gpu_time, failed, errors))
+            mbin, btime, berr = compile_mithril(name, tmpdir, args.timeout)
+            row["build_time"] = btime
+            if berr:
+                row["build_error"] = berr
+                print("[harness]   BUILD FAILED: %s" % berr, flush=True)
+            else:
+                row["notes"].append("build %.1fs" % btime)
+                for label, threads in (("SEQ", 1), ("PAR16", PAR_THREADS)):
+                    row["lanes"][label] = run_lane(
+                        label, [mbin, "--threads", str(threads)], exp, args.n,
+                        args.timeout, env="mithril", arena_retry=True)
+                    print("[harness]   %-6s: %s" % (label, fmt_lane(row["lanes"][label])),
+                          flush=True)
+                if gpu_enabled:
+                    port = os.path.join(PORTS_DIR, name + ".py")
+                    row["lanes"]["GPU"] = run_lane(
+                        "GPU", [MITHRIL_BIN, "run", port, "--threads", str(PAR_THREADS),
+                                "--gpu"], exp, args.n, args.timeout, env="mithril")
+            for l in row["lanes"].values():
+                if l["status"] != "ok":
+                    print("[harness]   %s %s: %s" % (l["label"], l["status"], l["error"]),
+                          file=sys.stderr, flush=True)
+            rows.append(row)
+            write_results(rows, meta, args)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    write_results(rows, reference, have_reference, gpu_enabled, args.runs)
+    write_results(rows, meta, args)
     print("[harness] wrote %s" % RESULTS_MD)
-    if any_failed:
+    bad = any(r["build_error"] or any(l["status"] == "FAILED" for l in r["lanes"].values())
+              for r in rows)
+    if bad:
         print("[harness] FAILURES present — see results.md", file=sys.stderr)
         sys.exit(1)
-
-
-def write_results(rows, reference, have_reference, gpu_enabled, n_runs):
-    header = ["name", "C", "SEQ", "PAR16", "GPU", "SEQ/C", "PAR/C", "GPU/C"]
-    if have_reference:
-        header += ["B2-SEQ", "B2-PAR", "B2-GPU"]
-    lines = [
-        "# Mithril benchmark results",
-        "",
-        "Wall-clock minimum of %d runs per lane. `SEQ` = `mithril run --threads 1`, "
-        "`PAR16` = `--threads %d`, `GPU` = `--gpu`%s. Ratios are mithril-time / C-time "
-        "(lower is better). Every run's stdout was checked against `expected.txt`; "
-        "a FAILED row means at least one lane printed the wrong checksum or crashed."
-        % (n_runs, PAR_THREADS,
-           "" if gpu_enabled else " (disabled: MITHRIL_GPU!=1)"),
-        "",
-        "| " + " | ".join(header) + " |",
-        "|" + "|".join(["---"] * len(header)) + "|",
-    ]
-    for name, c, seq, par, gpu, failed, errors in rows:
-        cells = [
-            name + (" **FAILED**" if failed else ""),
-            fmt_time(c), fmt_time(seq), fmt_time(par), fmt_time(gpu),
-            fmt_ratio(seq, c), fmt_ratio(par, c), fmt_ratio(gpu, c),
-        ]
-        if have_reference:
-            b2 = reference.get(name, (None, None, None))
-            cells += [fmt_time(v) for v in b2]
-        lines.append("| " + " | ".join(cells) + " |")
-    failed_rows = [(n, errs) for n, _, _, _, _, f, errs in rows if f]
-    if failed_rows:
-        lines += ["", "## Failures", ""]
-        for name, errs in failed_rows:
-            for e in errs:
-                lines.append("- `%s`: %s" % (name, e))
-    lines.append("")
-    with open(RESULTS_MD, "w") as fh:
-        fh.write("\n".join(lines))
 
 
 if __name__ == "__main__":

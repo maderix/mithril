@@ -27,6 +27,11 @@ pub enum Core {
     Ctor(CtorId, Vec<Core>),
     /// Binders are var indices, in field order.
     Match(Box<Core>, Vec<(CtorId, Vec<u32>, Core)>),
+    /// Static reuse rewrite: build ctor `c` from `args` in the cell of the
+    /// value bound to var `v`, which the enclosing match consumed (last use).
+    /// Semantically identical to `Ctor(c, args)`; the rewrite guarantees `v`
+    /// is dead here and its cell has the same arity.
+    Reuse(u32, CtorId, Vec<Core>),
     Tuple(Vec<Core>),
     Proj(Box<Core>, usize),
 }
@@ -181,7 +186,7 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
             let vals: Vec<Val> = args.iter().map(|a| eval(m, env, a)).collect();
             eval_core(m, *fid, &vals)
         }
-        Core::Ctor(cid, args) => {
+        Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => {
             if *cid == UNREACHABLE_CTOR {
                 panic!("eval_core: non-exhaustive match reached at runtime");
             }

@@ -1,0 +1,16 @@
+{
+ "meta": {
+  "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor",
+  "logical_cpus": 16,
+  "ram": "62.0 GiB",
+  "kernel": "6.17.4-76061704-generic",
+  "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
+  "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0",
+  "git_head": "620e689455b1779c1abc631f1870857bc24eda24",
+  "git_branch": "mithril-v1",
+  "date": "2026-09-27 20:18:36 IST"
+ },
+ "timeout": 300.0,
+ "n": 1,
+ "rows": []
+}

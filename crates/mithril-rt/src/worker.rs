@@ -1,10 +1,21 @@
 //! Per-worker context: chunked bump + free-list allocation of cells and
 //! records, record delivery, and thread-local spawn buffers that the
-//! coordinator merges into the global buckets after every wave.
+//! scheduler publishes to the worker's deque after every fire.
 
 use crate::alloc::Arena;
 use crate::{DiveResult, Program, Redex};
+
+/// Bound on records fired inline from `deliver` (each level may nest a
+/// fuel-bounded dive under it).
+const MAX_INLINE: u32 = 64;
 use std::sync::atomic::Ordering;
+
+/// A schedulable entry: a spawned redex or an activated record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Item {
+    Redex(u16, Redex),
+    Rec(u16, u32),
+}
 
 /// Static payload of a waiting record, readable while its rule fires.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,6 +48,8 @@ pub struct Wctx<'e> {
     pub(crate) live: i64,
     pub(crate) live_peak: i64,
     pub(crate) rewrites: u64,
+    /// Nesting of records fired inline from `deliver` (see `MAX_INLINE`).
+    inline_depth: u32,
 }
 
 impl<'e> Wctx<'e> {
@@ -57,6 +70,7 @@ impl<'e> Wctx<'e> {
             live: 0,
             live_peak: 0,
             rewrites: 0,
+            inline_depth: 0,
         }
     }
 
@@ -117,6 +131,12 @@ impl<'e> Wctx<'e> {
         self.ar.rc_dec(i)
     }
 
+    /// Reset a reused cell's refcount to one (reuse of a unique cell).
+    #[inline(always)]
+    pub fn rc_set1(&self, i: u32) {
+        self.ar.rc_set1(i)
+    }
+
     /// True when the caller's reference is the only one.
     #[inline(always)]
     pub fn rc_unique(&self, i: u32) -> bool {
@@ -144,7 +164,6 @@ impl<'e> Wctx<'e> {
 
     /// Allocate a waiting record that fires `rule` after `pend` deliveries.
     pub fn alloc_rec(&mut self, rule: u16, pend: u32, d: u32, s: u32, parent: u64) -> u32 {
-        assert!(pend >= 1, "alloc_rec: pend must be >= 1");
         assert!((rule as usize) < self.out.len(), "alloc_rec: rule {rule} out of range");
         let i = match self.rfree.pop() {
             Some(i) => i,
@@ -197,9 +216,28 @@ impl<'e> Wctx<'e> {
         r.args[(parent & 7) as usize].store(val, Ordering::Release);
         if r.pend.fetch_sub(1, Ordering::AcqRel) == 1 {
             let rule = r.rule.load(Ordering::Relaxed) as u16;
-            self.mark(rule);
-            self.out_recs[rule as usize].push(ri);
+            // The last child fires the record right here: a chain of
+            // nested joins then completes in one wave instead of one hop
+            // per wave. Depth-bounded so a long chain cannot overrun the
+            // stack; beyond it the record waits for the next wave.
+            if self.inline_depth < MAX_INLINE {
+                self.inline_depth += 1;
+                self.fire_rec(rule, ri);
+                self.inline_depth -= 1;
+            } else {
+                self.mark(rule);
+                self.out_recs[rule as usize].push(ri);
+            }
         }
+    }
+
+    /// Queue record `ri` (allocated with pend 0: a task with no inputs) to
+    /// fire in a later wave.
+    #[inline]
+    pub fn ready_rec(&mut self, ri: u32) {
+        let rule = self.ar.recs[ri as usize].rule.load(Ordering::Relaxed) as u16;
+        self.mark(rule);
+        self.out_recs[rule as usize].push(ri);
     }
 
     // ---- redexes ----
@@ -250,13 +288,23 @@ impl<'e> Wctx<'e> {
         self.rfree.push(ri);
     }
 
-    /// Move this worker's output buffers into the global buckets.
-    pub(crate) fn merge_into(&mut self, redexes: &mut [Vec<Redex>], recs: &mut [Vec<u32>]) {
+    /// Fire one scheduled entry.
+    #[inline]
+    pub(crate) fn fire_item(&mut self, it: Item) {
+        match it {
+            Item::Redex(rule, e) => self.fire_redex(rule, e),
+            Item::Rec(rule, ri) => self.fire_rec(rule, ri),
+        }
+    }
+
+    /// Move this worker's spawn buffers onto `q` (rule order within the
+    /// buffers preserved).
+    pub(crate) fn take_spawned(&mut self, q: &mut std::collections::VecDeque<Item>) {
         for rule in self.dirty.drain(..) {
             let k = rule as usize;
             self.marked[k] = false;
-            redexes[k].append(&mut self.out[k]);
-            recs[k].append(&mut self.out_recs[k]);
+            q.extend(self.out[k].drain(..).map(|e| Item::Redex(rule, e)));
+            q.extend(self.out_recs[k].drain(..).map(|ri| Item::Rec(rule, ri)));
         }
     }
 }

@@ -63,7 +63,7 @@ fn bare_uses(e: &Core, t: u32) -> usize {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => bare_uses(a, t) + bare_uses(b, t),
         Core::If(c, x, y) => bare_uses(c, t) + bare_uses(x, t) + bare_uses(y, t),
         Core::Let(_, r, b) => bare_uses(r, t) + bare_uses(b, t),
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
             args.iter().map(|a| bare_uses(a, t)).sum()
         }
         Core::Match(s, arms) => {
@@ -226,7 +226,7 @@ fn proj_shape(e: &Core, p: u32, bare: &mut bool, max: &mut i64) {
             proj_shape(r, p, bare, max);
             proj_shape(b, p, bare, max);
         }
-        Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) => {
+        Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) => {
             for x in a {
                 proj_shape(x, p, bare, max);
             }
@@ -554,7 +554,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
                     bargs.push(format!("a{p}_{i}"));
                 }
                 if !bor[fid as usize][p] {
-                    unpack.push_str(&format!("free_spine(ctx, v{p});\n"));
+                    unpack.push_str(&format!("free_val(ctx, v{p});\n"));
                 }
             }
         }

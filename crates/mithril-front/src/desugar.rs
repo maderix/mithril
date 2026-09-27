@@ -339,8 +339,12 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
             check_cond(cond, scope)?;
             let ccond = compile_expr(cond, scope, t)?;
             let arms = [(Vec::<String>::new(), then.as_slice()), (Vec::new(), els.as_slice())];
-            let (cores, _binders) = compile_dispatch_arms(&arms, rest, scope, t, g, k)?;
-            Ok(Core::If(Box::new(ccond), Box::new(cores[0].clone()), Box::new(cores[1].clone())))
+            let (cores, _binders, join) = compile_dispatch_arms(&arms, rest, scope, t, g, k)?;
+            let producer = Core::If(Box::new(ccond), Box::new(cores[0].clone()), Box::new(cores[1].clone()));
+            match join {
+                Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
+                None => Ok(producer),
+            }
         }
         Stmt::While(cond, body) => {
             let (call, mutated) = compile_while(cond, body, scope, t, g)?;
@@ -352,6 +356,26 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
         }
         Stmt::Match(scrut, cases) => compile_match(scrut, cases, rest, scope, t, g, k),
     }
+}
+
+/// Bind an if/match join's result: a bare value for one name, a tuple
+/// otherwise (see `compile_dispatch_arms`).
+fn bind_join_and_continue(
+    producer: Core,
+    names: &[String],
+    rest: &[Stmt],
+    scope: &mut Scope,
+    t: &Tables,
+    g: &mut Gen,
+    k: &Cont,
+) -> Result<Core, Diag> {
+    if names.len() == 1 {
+        let idx = scope.fresh(&names[0]);
+        scope.bool_vars.remove(&names[0]);
+        let core = compile_block(rest, scope, t, g, k)?;
+        return Ok(Core::Let(idx, Box::new(producer), Box::new(core)));
+    }
+    bind_and_continue(producer, names, rest, scope, t, g, k)
 }
 
 /// Bind a `Tuple` producer's result into fresh indices for `names` (in
@@ -391,6 +415,14 @@ fn bind_and_continue(
 /// with fallthrough arms — e.g. naive `fib`'s `if n < 2: return n` — work
 /// for free) at the cost of some code-size duplication for `if`/`match`
 /// statements where more than one arm falls through.
+/// Returns the arm cores, their binder indices, and — when the arms are
+/// compiled as a *join* — the names whose values every arm yields as a
+/// tuple (the caller then binds them once and continues with `rest`).
+///
+/// Join form applies when no arm returns anywhere and every name any arm
+/// assigns already exists in the enclosing scope: `rest` is then compiled
+/// exactly once instead of once per arm (the SSA-style merge), which
+/// keeps code size linear. Otherwise each fall-through arm inlines `rest`.
 fn compile_dispatch_arms(
     arms: &[(Vec<String>, &[Stmt])],
     rest: &[Stmt],
@@ -398,13 +430,32 @@ fn compile_dispatch_arms(
     t: &Tables,
     g: &mut Gen,
     k: &Cont,
-) -> Result<(Vec<Core>, Vec<Vec<u32>>), Diag> {
+) -> Result<(Vec<Core>, Vec<Vec<u32>>, Option<Vec<String>>), Diag> {
+    let mut assigned = BTreeSet::new();
+    for (_, body) in arms {
+        assigned.extend(assigned_names(body));
+    }
+    let joinable = !rest.is_empty()
+        && arms.iter().all(|(binds, body)| {
+            !contains_return(body) && binds.iter().all(|b| !assigned.contains(b))
+        })
+        && assigned.iter().all(|n| scope.vars.contains_key(n));
+    let mutated: Vec<String> = assigned.into_iter().collect();
     let mut cores = Vec::new();
     let mut binder_idxs = Vec::new();
     for (binds, body) in arms {
         let mut s = scope.clone();
         let idxs: Vec<u32> = binds.iter().map(|n| s.fresh(n)).collect();
-        let core = if always_returns(body) {
+        let core = if joinable {
+            let m = mutated.clone();
+            compile_block(body, &mut s, t, g, &move |sc: &Scope, _g2: &mut Gen| {
+                Ok(if m.len() == 1 {
+                    Core::Var(sc.vars[&m[0]])
+                } else {
+                    Core::Tuple(m.iter().map(|n| Core::Var(sc.vars[n])).collect())
+                })
+            })?
+        } else if always_returns(body) {
             compile_block(body, &mut s, t, g, &unreachable_tail)?
         } else {
             compile_block(body, &mut s, t, g, &|sc: &Scope, g2: &mut Gen| compile_block(rest, &mut sc.clone(), t, g2, k))?
@@ -412,7 +463,7 @@ fn compile_dispatch_arms(
         cores.push(core);
         binder_idxs.push(idxs);
     }
-    Ok((cores, binder_idxs))
+    Ok((cores, binder_idxs, if joinable { Some(mutated) } else { None }))
 }
 
 fn compile_match(
@@ -433,8 +484,8 @@ fn compile_match(
         check_exhaustive(cases, t)?;
     }
     let arm_specs: Vec<(Vec<String>, &[Stmt])> = cases.iter().map(|(p, b)| (p.binds.clone(), b.as_slice())).collect();
-    let (cores, binder_idxs) = compile_dispatch_arms(&arm_specs, rest, scope, t, g, k)?;
-    if is_int {
+    let (cores, binder_idxs, join) = compile_dispatch_arms(&arm_specs, rest, scope, t, g, k)?;
+    let producer = if is_int {
         let scrut_idx = scope.fresh_anon();
         let mut chain = Core::Ctor(UNREACHABLE_CTOR, vec![]);
         for ((p, _), core) in cases.iter().zip(cores.iter()).rev() {
@@ -445,14 +496,18 @@ fn compile_match(
                 Box::new(chain),
             );
         }
-        Ok(Core::Let(scrut_idx, Box::new(cscrut), Box::new(chain)))
+        Core::Let(scrut_idx, Box::new(cscrut), Box::new(chain))
     } else {
         let mut arms = Vec::new();
         for (i, (p, _)) in cases.iter().enumerate() {
             let &(cid, _) = t.ctor_table.get(&p.ctor).ok_or_else(|| Diag::new(0, format!("unknown constructor: {}", p.ctor)))?;
             arms.push((cid, binder_idxs[i].clone(), cores[i].clone()));
         }
-        Ok(Core::Match(Box::new(cscrut), arms))
+        Core::Match(Box::new(cscrut), arms)
+    };
+    match join {
+        Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
+        None => Ok(producer),
     }
 }
 
@@ -649,7 +704,7 @@ fn walk_tail(fid: FnId, c: &Core, is_tail: bool, ok: &mut bool) {
                 *ok = false;
             }
         }
-        Core::Ctor(_, args) | Core::Tuple(args) => {
+        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
             for a in args {
                 walk_tail(fid, a, false, ok);
             }

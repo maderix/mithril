@@ -37,9 +37,11 @@
 //! after `Let`; the arena is sized for it). Records are engine-recycled.
 
 mod fold;
+mod rewrite;
 mod rules;
 mod scalar;
 mod seq;
+mod ty;
 
 use mithril_core::net::Net;
 use mithril_front::core::{Core, CoreModule, Val};
@@ -68,7 +70,7 @@ pub(crate) fn float_free(m: &CoreModule) -> bool {
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_flo(a) || has_flo(b),
             Core::If(c, t, f) => has_flo(c) || has_flo(t) || has_flo(f),
             Core::Let(_, r, b) => has_flo(r) || has_flo(b),
-            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) => a.iter().any(has_flo),
+            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) => a.iter().any(has_flo),
             Core::Match(s, arms) => has_flo(s) || arms.iter().any(|(_, _, b)| has_flo(b)),
             Core::Proj(b, _) => has_flo(b),
         }
@@ -76,8 +78,109 @@ pub(crate) fn float_free(m: &CoreModule) -> bool {
     !m.fns.iter().any(|f| has_flo(&f.body))
 }
 
+/// Unary constructors whose field is a proven-i56 at EVERY construction
+/// site are unboxed: the value rides in the port (tag = TU_BASE + slot, the
+/// i56 in the payload), so building/matching/freeing them costs no cell.
+/// Returns ctor id -> unbox slot. General, type-shape-driven; a single
+/// non-int construction site disqualifies the ctor everywhere.
+pub(crate) fn unboxed_ctors(
+    m: &CoreModule,
+    tys: &ty::Types,
+) -> std::collections::HashMap<u32, u8> {
+    let mut slot = 0u8;
+    let mut out = std::collections::HashMap::new();
+    for c in 0..m.ctors.len() as u32 {
+        if m.ctors[c as usize].1 == 1 && tys.field[c as usize][0] == ty::Ty::Int {
+            assert!(slot < 200, "too many unboxed ctor tags");
+            out.insert(c, slot);
+            slot += 1;
+        }
+    }
+    out
+}
+/// Vars (params + locals) of `fid` proven Int by inference.
+pub(crate) fn ints_of(tys: &ty::Types, fid: usize) -> std::collections::HashSet<u32> {
+    tys.locals[fid]
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == ty::Ty::Int)
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
 /// Emit a complete `main.rs` for the module (see module docs).
+/// Alpha-rename every binder (Let, match field) of every function to a
+/// unique id, so one var id means one value everywhere in the body (the
+/// desugarer reuses ids across match arms). Parameters keep 0..arity.
+fn uniquify(m: &CoreModule) -> CoreModule {
+    fn go(e: &Core, env: &mut std::collections::HashMap<u32, u32>, next: &mut u32) -> Core {
+        match e {
+            Core::Var(i) => Core::Var(*env.get(i).unwrap_or(i)),
+            Core::Num(_) | Core::Flo(_) => e.clone(),
+            Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
+            Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
+            Core::If(c, t, f) => Core::If(Box::new(go(c, env, next)), Box::new(go(t, env, next)), Box::new(go(f, env, next))),
+            Core::Let(x, r, b) => {
+                let r2 = go(r, env, next);
+                let nx = *next;
+                *next += 1;
+                let saved = env.insert(*x, nx);
+                let b2 = go(b, env, next);
+                match saved {
+                    Some(v) => env.insert(*x, v),
+                    None => env.remove(x),
+                };
+                Core::Let(nx, Box::new(r2), Box::new(b2))
+            }
+            Core::Call(g, a) => Core::Call(*g, a.iter().map(|x| go(x, env, next)).collect()),
+            Core::Ctor(c, a) => Core::Ctor(*c, a.iter().map(|x| go(x, env, next)).collect()),
+            Core::Reuse(v, c, a) => Core::Reuse(*env.get(v).unwrap_or(v), *c, a.iter().map(|x| go(x, env, next)).collect()),
+            Core::Tuple(a) => Core::Tuple(a.iter().map(|x| go(x, env, next)).collect()),
+            Core::Proj(b, i) => Core::Proj(Box::new(go(b, env, next)), *i),
+            Core::Match(sc, arms) => {
+                let sc2 = go(sc, env, next);
+                let arms2 = arms
+                    .iter()
+                    .map(|(c, bs, body)| {
+                        let mut saved = Vec::new();
+                        let nbs: Vec<u32> = bs
+                            .iter()
+                            .map(|b| {
+                                let nb = *next;
+                                *next += 1;
+                                saved.push((*b, env.insert(*b, nb)));
+                                nb
+                            })
+                            .collect();
+                        let body2 = go(body, env, next);
+                        for (b, old) in saved.into_iter().rev() {
+                            match old {
+                                Some(v) => env.insert(b, v),
+                                None => env.remove(&b),
+                            };
+                        }
+                        (*c, nbs, body2)
+                    })
+                    .collect();
+                Core::Match(Box::new(sc2), arms2)
+            }
+        }
+    }
+    let mut out = m.clone();
+    for f in out.fns.iter_mut() {
+        let mut env = std::collections::HashMap::new();
+        let mut next = f.arity as u32;
+        f.body = go(&f.body, &mut env, &mut next);
+    }
+    out
+}
+
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
+    let m_i = rewrite::inline_leaves(m);
+    let m_u = uniquify(&m_i);
+    // records_to_tuples (rewrite.rs) is parked: without native multi-value
+    // returns in the dive form it only trades ctor cells for tuple chains.
+    let m = &m_u;
     // Const path: the compile-time reducer already finished the program.
     if net.redexes.is_empty() {
         if let Some(v) = mithril_net::readback(net, mithril_net::root_port()) {
@@ -101,7 +204,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     let mut sq = rules::SegQ { next, q: Vec::new() };
     // forwarding segment: fuel-out at a dive entry spawns the pending call
     // against a record of this rule, which just passes the value upward
-    let fwd = sq.add(vec![0], vec![], Core::Var(0));
+    let fwd = sq.add(u32::MAX, vec![0], vec![], Core::Var(0));
 
     // Normalize every body first, then infer per-parameter borrow modes
     // (read-only params are lent, not consumed; see `borrows`).
@@ -116,15 +219,40 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     let (bor, bsets) = borrows(m, &bodies);
 
     let scal = scalar::classify(m);
+    let tys = ty::infer(m);
+    let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
+    let unbox = unboxed_ctors(m, &tys);
+    // static reuse rewrite: consumed same-arity cells are rebuilt in place
+    let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
+    let shared = std::cell::RefCell::new(seq::Shared::default());
+    // fold splits deep-share the fold's extra args (see fold.rs)
+    for (fid, pf) in folds.iter().enumerate() {
+        if let Some(pf) = pf {
+            for i in 2..m.fns[fid].arity {
+                if i == pf.acc {
+                    continue;
+                }
+                let mut sh = shared.borrow_mut();
+                match tys.params[fid][i] {
+                    ty::Ty::Adt(c) => {
+                        sh.classes.insert(c);
+                    }
+                    ty::Ty::Tup(_) => sh.tuples = true,
+                    ty::Ty::Dyn => sh.poison = true,
+                    _ => {}
+                }
+            }
+        }
+    }
     let mut fns_code = String::new();
     for fid in 0..nf {
         if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
         } else {
-            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd));
+            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
         }
-        fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq));
+        fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
         if let Some(pf) = &folds[fid] {
             fns_code.push_str(&fold::join_fn(fid as u32, pf));
@@ -135,7 +263,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq));
+        fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared));
     }
 
     let n_rules = sq.next as usize;
@@ -152,9 +280,15 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             fire_arms.push_str(&format!("            {} => jn_{}(ctx, e),\n", join_rule[fid], fid));
         }
     }
+    // rules whose firing may run a dive: CALL entries and segments with calls
+    let mut diving: Vec<usize> = (1..=nf).collect();
     for seg in &sq.q {
         fire_arms.push_str(&format!("            {} => sg_{}(ctx, e),\n", seg.id, seg.id));
+        if has_call(&seg.body) {
+            diving.push(seg.id as usize);
+        }
     }
+    let diving: String = diving.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
     let mut dive_arms = String::new();
     for fid in 0..nf {
         let ar = m.fns[fid].arity;
@@ -164,6 +298,55 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
 
     let mut out = String::with_capacity(fns_code.len() + 8192);
     out.push_str(PRELUDE);
+    // slot -> original ctor id, for printing unboxed constructor values
+    {
+        let mut cids = vec![0u32; unbox.len()];
+        for (cid, slot) in &unbox {
+            cids[*slot as usize] = *cid;
+        }
+        out.push_str(&format!(
+            "const UNBOX_CID: [u32; {}] = [{}];\n",
+            cids.len(),
+            cids.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // static linearity: close the shared set over field types; every ctor
+    // of an unshared class is linear (refcount never read or written)
+    {
+        let mut sh = shared.borrow_mut();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let classes: Vec<u32> = sh.classes.iter().copied().collect();
+            for c in 0..m.ctors.len() {
+                if !classes.contains(&tys.class_of[c]) {
+                    continue;
+                }
+                for ft in &tys.field[c] {
+                    match *ft {
+                        ty::Ty::Adt(d) => changed |= sh.classes.insert(d),
+                        ty::Ty::Tup(_) => {
+                            if !sh.tuples {
+                                sh.tuples = true;
+                                changed = true;
+                            }
+                        }
+                        ty::Ty::Dyn => sh.poison = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let lin: Vec<bool> = (0..m.ctors.len())
+            .map(|c| !sh.poison && !sh.classes.contains(&tys.class_of[c]))
+            .collect();
+        out.push_str(&format!(
+            "const LIN: [bool; {}] = [{}];\nconst LIN_TUP: bool = {};\n",
+            lin.len(),
+            lin.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", "),
+            !sh.poison && !sh.tuples
+        ));
+    }
     out.push_str(&fns_code);
     out.push_str(&format!(
         "struct Pg {{ fuel: u32 }}
@@ -171,8 +354,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
 impl Program for Pg {{
     fn n_rules(&self) -> usize {{ {n_rules} }}
     fn rule_cost(&self, rule: u16) -> u32 {{
-        // A CALL entry may burn a whole dive budget; joins/segments are tiny.
-        if (1..={nf}).contains(&(rule as usize)) {{ self.fuel }} else {{ 8 }}
+        // An entry that may dive can burn a whole budget; pure joins are tiny.
+        const DIVING: &[usize] = &[{diving}];
+        if DIVING.contains(&(rule as usize)) {{ self.fuel }} else {{ 8 }}
     }}
     fn fire(&self, rule: u16, e: Redex, ctx: &mut Wctx) {{
         match rule {{
@@ -189,8 +373,11 @@ impl Program for Pg {{
         match r {{
             Ok(v) => DiveResult::Done(v),
             Err(rec) => {{
-                ctx.set_parent(rec, parent);
-                DiveResult::Suspended
+                if parent == NONE {{
+                    return DiveResult::Suspended(rec as u32);
+                }}
+                ctx.set_parent(rec as u32, parent);
+                DiveResult::Suspended(NO_REC)
             }}
         }}
     }}
@@ -236,7 +423,7 @@ fn call_fn(
         done_frees.push_str(&format!("free_val(ctx, v{i});\n"));
     }
     s.push_str(&format!(
-        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => {{\nctx.deliver(parent, v);\n{done_frees}}}\nDiveResult::Suspended => {{}}\n}}\n}}\n\n"
+        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => {{\nctx.deliver(parent, v);\n{done_frees}}}\nDiveResult::Suspended(_) => {{}}\n}}\n}}\n\n"
     ));
     s
 }
@@ -250,7 +437,7 @@ pub(crate) fn has_call(e: &Core) -> bool {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
         Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
         Core::Let(_, r, b) => has_call(r) || has_call(b),
-        Core::Ctor(_, xs) | Core::Tuple(xs) => xs.iter().any(has_call),
+        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
     }
@@ -275,7 +462,7 @@ pub(crate) fn max_var(e: &Core) -> u32 {
                 go(r, m);
                 go(b, m);
             }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => {
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
                 xs.iter().for_each(|x| go(x, m))
             }
             Core::Match(s, arms) => {
@@ -319,7 +506,7 @@ pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
                 go(b, bound, out);
                 bound.pop();
             }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => {
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
                 for x in xs {
                     go(x, bound, out);
                 }
@@ -364,7 +551,7 @@ pub(crate) fn cnt_expr(e: &Core, m: &mut Cnt) {
             cnt_expr(r, m);
             cnt_expr(b, m);
         }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => {
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
             xs.iter().for_each(|x| cnt_expr(x, m))
         }
         Core::Match(s, arms) => {
@@ -438,28 +625,14 @@ pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
 // optimistically (everything borrowed).
 
 fn borrows(m: &CoreModule, bodies: &[Core]) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
-    let nf = m.fns.len();
-    let mut bor: Vec<Vec<bool>> = m.fns.iter().map(|f| vec![f.arity <= 60; f.arity]).collect();
-    for _ in 0..32 {
-        let mut changed = false;
-        for f in 0..nf {
-            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor);
-            for (i, b) in bor[f].iter_mut().enumerate() {
-                if *b && esc & (1u64 << i) != 0 {
-                    *b = false;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let bsets = (0..nf).map(|f| derive_set(&bodies[f], &bor[f])).collect();
+    // Reference counting made sharing O(1), so the borrowed/owned split (and
+    // the deep copies it forced at suspension boundaries) is gone: every
+    // parameter is owned, shared reads are increfs.
+    let _ = bodies;
+    let bor = m.fns.iter().map(|f| vec![false; f.arity]).collect();
+    let bsets = m.fns.iter().map(|_| std::collections::HashSet::new()).collect();
     (bor, bsets)
 }
-
-/// Bitmask of borrowed-candidate params whose derived values escape.
 fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -> u64 {
     use std::collections::HashMap;
     if arity > 60 {
@@ -498,7 +671,7 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                 walk(r, mask, esc, bor);
                 walk(b, mask, esc, bor);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) => {
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
                 for x in xs {
                     *esc |= var_mask(x, mask);
                     walk(x, mask, esc, bor);
@@ -556,7 +729,7 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
                 walk(r, s);
                 walk(b, s);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) => {
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) | Core::Reuse(_, _, xs) => {
                 xs.iter().for_each(|x| walk(x, s))
             }
             Core::Match(sc, arms) => {
@@ -582,11 +755,11 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
 
 const PRELUDE: &str = r#"// GENERATED by mithril-codegen. Do not edit.
 #![allow(unused, unused_mut, unreachable_code, unreachable_patterns, non_snake_case, clippy::all)]
-use mithril_rt::{DiveResult, Engine, Program, Redex, Wctx, ROOT};
+use mithril_rt::{DiveResult, Engine, Program, Redex, Wctx, NO_REC, ROOT};
 
 /// Dive result: Ok(value) | Err(rec) = suspended; the residue is spawned
 /// behind a record chain whose root `rec` still needs its parent set.
-type R = Result<u64, u32>;
+type R = Result<u64, u64>;
 
 /// "No destination" sentinel for nested dives (they unwind on fuel-out).
 const NONE: u64 = u64::MAX;
@@ -596,6 +769,11 @@ const T_FLO: u64 = 3;
 const T_CON: u64 = 4;
 
 #[inline] fn tag(p: u64) -> u64 { p >> 56 }
+// unboxed unary ctors: tag = TU + slot, i56 value in the payload
+const TU: u64 = 16;
+#[inline] fn ic(slot: u64, v: i64) -> u64 { ((TU + slot) << 56) | ((v as u64) & M56) }
+/// match dispatch key: boxed ctors -> ctor tag, unboxed -> 0x1000 + slot
+#[inline] fn mtag(p: u64) -> u32 { let t = tag(p); if t >= TU { 0x1000 + (t - TU) as u32 } else { con_tag(p) as u32 } }
 #[inline] fn num(v: i64) -> u64 { (T_NUM << 56) | ((v as u64) & M56) }
 #[inline] fn as_i(p: u64) -> i64 { ((p << 8) as i64) >> 8 }
 #[inline] fn wrap56(v: i64) -> i64 { ((v as u64) << 8) as i64 >> 8 }
@@ -616,22 +794,25 @@ fn mk_con(ctx: &mut Wctx, k: u16, fs: &[u64]) -> u64 {
     let n = fs.len();
     if n == 0 { return con(0, k, 0); }
     if n <= 2 {
-        let a = ctx.alloc(fs[0], if n == 2 { fs[1] } else { 0 });
+        let a = calloc(ctx, k, fs[0], if n == 2 { fs[1] } else { 0 });
         return con(a, k, n as u8);
     }
-    let a = ctx.alloc(fs[n - 2], fs[n - 1]);
+    let a = calloc(ctx, k, fs[n - 2], fs[n - 1]);
     let mut chain = con(a, k, 2);
     let mut i = n - 2;
     while i > 0 {
         i -= 1;
-        let a = ctx.alloc(fs[i], chain);
+        let a = calloc(ctx, k, fs[i], chain);
         chain = con(a, k, (n - i).min(15) as u8);
     }
     chain
 }
 
-#[inline] fn mk_con1(ctx: &mut Wctx, k: u16, f0: u64) -> u64 { let a = ctx.alloc(f0, 0); con(a, k, 1) }
-#[inline] fn mk_con2(ctx: &mut Wctx, k: u16, f0: u64, f1: u64) -> u64 { let a = ctx.alloc(f0, f1); con(a, k, 2) }
+/// Constructor k is statically linear (see LIN): never shared, no rc.
+#[inline(always)] fn lin(k: u16) -> bool { if k == 0xFFF { LIN_TUP } else { LIN[k as usize] } }
+#[inline(always)] fn calloc(ctx: &mut Wctx, k: u16, a: u64, b: u64) -> u32 { if lin(k) { ctx.alloc_lin(a, b) } else { ctx.alloc(a, b) } }
+#[inline(always)] fn mk_con1(ctx: &mut Wctx, k: u16, f0: u64) -> u64 { let a = calloc(ctx, k, f0, 0); con(a, k, 1) }
+#[inline(always)] fn mk_con2(ctx: &mut Wctx, k: u16, f0: u64, f1: u64) -> u64 { let a = calloc(ctx, k, f0, f1); con(a, k, 2) }
 
 /// Field `i` of a constructor value (walks the >2-arity chain).
 fn field(ctx: &Wctx, p: u64, i: usize) -> u64 {
@@ -659,60 +840,142 @@ fn py_mod(a: i64, b: i64) -> i64 {
     if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
 }
 
-/// Deep-copy a value (used for non-last uses of shared owned values and
-/// escaping reads of borrowed values). Immediates copy for free.
+/// Consume an arity<=2 constructor: move both fields out. Unique owner
+/// moves raw and frees the cell; shared increfs the fields and decrefs the
+/// root. (Chained arity>2 ctors take the generic dup+free path instead.)
+#[inline(always)]
+fn consume2(ctx: &mut Wctx, p: u64) -> (u64, u64) {
+    let a = con_addr(p);
+    let c = ctx.cell(a);
+    if lin(con_tag(p)) || ctx.rc_unique(a) {
+        ctx.free(a);
+        (c[0], c[1])
+    } else {
+        let f0 = dup_val(ctx, c[0]);
+        let f1 = dup_val(ctx, c[1]);
+        let _ = ctx.rc_dec(a);
+        (f0, f1)
+    }
+}
+
+/// consume2 with the constructor statically known (the match arm's ctor):
+/// `lin(k)` constant-folds, so linear types move with zero rc traffic.
+#[inline(always)]
+fn consume2k(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64) {
+    let a = con_addr(p);
+    let c = ctx.cell(a);
+    if lin(k) || ctx.rc_unique(a) {
+        ctx.free(a);
+        (c[0], c[1])
+    } else {
+        let f0 = dup_val(ctx, c[0]);
+        let f1 = dup_val(ctx, c[1]);
+        let _ = ctx.rc_dec(a);
+        (f0, f1)
+    }
+}
+
+/// Consume with a reuse token: moves the fields out and, when the caller
+/// held the only reference (always, for linear types), hands the cell back
+/// as a token instead of freeing it (NOTOK otherwise).
+const NOTOK: u32 = u32::MAX;
+#[inline(always)]
+fn consume2r(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64, u32) {
+    let a = con_addr(p);
+    let c = ctx.cell(a);
+    if lin(k) || ctx.rc_unique(a) {
+        (c[0], c[1], a)
+    } else {
+        let f0 = dup_val(ctx, c[0]);
+        let f1 = dup_val(ctx, c[1]);
+        let _ = ctx.rc_dec(a);
+        (f0, f1, NOTOK)
+    }
+}
+
+/// Build a 2-field ctor in a reuse token's cell (or allocate).
+#[inline(always)]
+fn mk_con2r(ctx: &mut Wctx, tok: u32, k: u16, f0: u64, f1: u64) -> u64 {
+    if tok == NOTOK {
+        return mk_con2(ctx, k, f0, f1);
+    }
+    ctx.set(tok, 0, f0);
+    ctx.set(tok, 1, f1);
+    if !lin(k) {
+        ctx.rc_set1(tok);
+    }
+    con(tok, k, 2)
+}
+
+/// Release an unused reuse token.
+#[inline(always)]
+fn tok_free(ctx: &mut Wctx, tok: u32) {
+    if tok != NOTOK {
+        ctx.free(tok);
+    }
+}
+
+/// Share a value: O(1) refcount bump on the root cell (immediates copy
+/// for free; a >2-arity chain is owned by its first cell).
+#[inline(always)]
 fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
     match tag(p) {
+        t if t >= TU => p,
         T_FLO => {
-            let bits = ctx.cell((p & M56) as u32)[0];
-            let a = ctx.alloc(bits, 0);
-                (T_FLO << 56) | a as u64
+            ctx.rc_inc((p & M56) as u32);
+            p
         }
         T_CON => {
-            if con_ar(p) == 0 {
-                return p;
+            if con_ar(p) > 0 {
+                debug_assert!(!lin(con_tag(p)), "share of a statically linear value");
+                ctx.rc_inc(con_addr(p));
             }
-            let k = con_tag(p);
-            let mut fs: Vec<u64> = Vec::new();
-            let mut q = p;
-            loop {
-                let ar = con_ar(q) as usize;
-                let c = ctx.cell(con_addr(q));
-                if ar > 2 {
-                    fs.push(c[0]);
-                    q = c[1];
-                } else {
-                    for s in 0..ar {
-                        fs.push(c[s]);
-                    }
-                    break;
-                }
-            }
-            for f in fs.iter_mut() {
-                *f = dup_val(ctx, *f);
-            }
-            mk_con(ctx, k, &fs)
+            p
         }
         _ => p,
     }
 }
 
-/// Deep-free a dead value (deferred).
+/// Drop a reference; the last one tears the value down (frees the chain
+/// cells and drops every field).
+/// Drop a reference (immediates return at once; the teardown is out of line
+/// so hot paths stay small).
+#[inline(always)]
 fn free_val(ctx: &mut Wctx, p: u64) {
+    let t = tag(p);
+    if t != T_CON && t != T_FLO {
+        return;
+    }
+    free_val_slow(ctx, p);
+}
+
+#[inline(never)]
+fn free_val_slow(ctx: &mut Wctx, p: u64) {
     match tag(p) {
-        T_FLO => ctx.free((p & M56) as u32),
+        t if t >= TU => {}
+        T_FLO => {
+            let a = (p & M56) as u32;
+            if ctx.rc_dec(a) {
+                ctx.free(a);
+            }
+        }
         T_CON => {
+            if con_ar(p) == 0 {
+                return;
+            }
+            let root = con_addr(p);
+            if !lin(con_tag(p)) && !ctx.rc_dec(root) {
+                return;
+            }
+            // last reference: free the chain, dropping each field
             let mut q = p;
             loop {
                 let ar = con_ar(q) as usize;
-                if ar == 0 {
-                    return;
-                }
                 let ca = con_addr(q);
                 let c = ctx.cell(ca);
                 ctx.free(ca);
                 if ar > 2 {
-                    free_val(ctx, c[0]);
+                    free_val_slow(ctx, c[0]);
                     q = c[1];
                 } else {
                     for s in 0..ar {
@@ -725,72 +988,6 @@ fn free_val(ctx: &mut Wctx, p: u64) {
         _ => {}
     }
 }
-
-/// Free only a constructor's spine cells (fields were moved out).
-fn free_spine(ctx: &mut Wctx, p: u64) {
-    if tag(p) != T_CON {
-        if tag(p) == T_FLO {
-            ctx.free((p & M56) as u32);
-        }
-        return;
-    }
-    let mut q = p;
-    loop {
-        let ar = con_ar(q) as usize;
-        if ar == 0 {
-            return;
-        }
-        let ca = con_addr(q);
-        if ar > 2 {
-            let c = ctx.cell(ca);
-            ctx.free(ca);
-            q = c[1];
-        } else {
-            ctx.free(ca);
-            return;
-        }
-    }
-}
-
-/// Consume a tuple/ctor: return field `i`, deep-free the other fields and
-/// the spine.
-fn take_field(ctx: &mut Wctx, p: u64, i: usize) -> u64 {
-    if tag(p) != T_CON || con_ar(p) == 0 {
-        panic!("projection on a non-constructor value");
-    }
-    let mut out = 0u64;
-    let mut q = p;
-    let mut idx = 0usize;
-    loop {
-        let ar = con_ar(q) as usize;
-        let ca = con_addr(q);
-        let c = ctx.cell(ca);
-        ctx.free(ca);
-        if ar > 2 {
-            if idx == i {
-                out = c[0];
-            } else {
-                free_val(ctx, c[0]);
-            }
-            idx += 1;
-            q = c[1];
-        } else {
-            for (s, cv) in c.iter().enumerate().take(ar) {
-                if idx == i {
-                    out = *cv;
-                } else {
-                    free_val(ctx, *cv);
-                }
-                idx += 1;
-                let _ = s;
-            }
-            return out;
-        }
-    }
-}
-
-/// `own` bits 0/1: the respective operand is owned and dies here (its box
-/// is freed on the float path; a borrowed read stays live).
 fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     if tag(a) == T_NUM && tag(b) == T_NUM {
         let (x, y) = (as_i(a), as_i(b));
@@ -809,8 +1006,8 @@ fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
         }));
     }
     let (x, y) = (flo_val(ctx, a), flo_val(ctx, b));
-    if own & 1 != 0 { ctx.free((a & M56) as u32); }
-    if own & 2 != 0 { ctx.free((b & M56) as u32); }
+    if own & 1 != 0 { free_val(ctx, a); }
+    if own & 2 != 0 { free_val(ctx, b); }
     let v = match op { 0 => x + y, 1 => x - y, 2 => x * y, 3 => x / y, _ => panic!("op not defined on floats") };
     flo(ctx, v)
 }
@@ -819,8 +1016,8 @@ fn cmp(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     let o = if tag(a) == T_NUM && tag(b) == T_NUM {
         as_i(a).partial_cmp(&as_i(b))
     } else {
-        if own & 1 != 0 { ctx.free((a & M56) as u32); }
-        if own & 2 != 0 { ctx.free((b & M56) as u32); }
+        if own & 1 != 0 { free_val(ctx, a); }
+        if own & 2 != 0 { free_val(ctx, b); }
         flo_val(ctx, a).partial_cmp(&flo_val(ctx, b))
     };
     let o = o.expect("incomparable values (NaN?)");
@@ -888,6 +1085,7 @@ fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
 /// Post-run readback + printing of the delivered root value.
 fn show(eng: &Engine, p: u64) -> String {
     match tag(p) {
+        t if t >= TU => format!("C{}({})", UNBOX_CID[(t - TU) as usize], as_i(p)),
         T_NUM => as_i(p).to_string(),
         T_FLO => format!("{:?}", f64::from_bits(eng.cell((p & M56) as u32)[0])),
         T_CON => {
@@ -923,7 +1121,7 @@ fn main() {
     // `--threads N` / `--fuel N` flag forms are accepted too.
     let a: Vec<String> = std::env::args().skip(1).collect();
     let mut threads: usize = 1;
-    let mut fuel: i64 = 4096;
+    let mut fuel: i64 = -1;
     let mut pos: Vec<&str> = Vec::new();
     let mut it = a.iter();
     while let Some(w) = it.next() {
@@ -935,12 +1133,29 @@ fn main() {
     }
     if let Some(p) = pos.first() { if let Ok(v) = p.parse() { threads = v; } }
     if let Some(p) = pos.get(1) { if let Ok(v) = p.parse() { fuel = v; } }
-    let pg = Pg { fuel: fuel.clamp(1, u32::MAX as i64) as u32 };
-    let mut eng = Engine::new(threads, fuel);
-    let root = eng.run(&pg, Redex { a: 0, b: 0, aux: ROOT });
-    println!("{}", show(&eng, root));
-    if std::env::var_os("MITHRIL_STATS").is_some() {
-        eprintln!("peak_cells={}", eng.stats().peak_cells);
+    // Suspension exposes work to other workers. With one worker it only
+    // bounds dive depth, so suspend rarely; the dive runs on a thread with a
+    // large reserved stack so that bound stays safe.
+    if fuel < 0 {
+        // one worker: nothing to hand work to, so never suspend (the runner
+        // thread's 1 GiB stack bounds the recursion instead)
+        fuel = if threads <= 1 { 1 << 40 } else { 16384 };
+    }
+    let h = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            let pg = Pg { fuel: fuel.clamp(1, u32::MAX as i64) as u32 };
+            let mut eng = Engine::new(threads, fuel);
+            let root = eng.run(&pg, Redex { a: 0, b: 0, aux: ROOT });
+            println!("{}", show(&eng, root));
+            if std::env::var_os("MITHRIL_STATS").is_some() {
+                let st = eng.stats();
+                eprintln!("peak_cells={} live_peak={} pool_fired={} rewrites={}", st.peak_cells, st.live_peak, st.pool_fired, st.rewrites);
+            }
+        })
+        .expect("spawn main runner");
+    if h.join().is_err() {
+        std::process::exit(101);
     }
 }
 "#;

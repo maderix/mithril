@@ -64,9 +64,14 @@ pub struct Redex {
 pub enum DiveResult {
     /// Finished within fuel; carries the result (a Port raw in generated code).
     Done(u64),
-    /// Fuel ran out; the dive has already queued its residue.
-    Suspended,
+    /// Fuel ran out; the dive has already queued its residue. Carries the
+    /// root record still awaiting a parent when the dive was started with
+    /// no destination (`NO_REC` when the residue already has one).
+    Suspended(u32),
 }
+
+/// `DiveResult::Suspended` payload: the residue already has its destination.
+pub const NO_REC: u32 = u32::MAX;
 
 /// A compiled program: numbered rules plus fuel-bounded sequential forms.
 pub trait Program: Sync {
@@ -85,8 +90,8 @@ pub struct Stats {
     /// Cell-arena footprint: distinct cell slots handed out during the run
     /// (free-list reuse keeps this near the live high-water mark).
     pub peak_cells: usize,
-    /// Waves drained across the worker pool rather than on the coordinator.
-    pub parallel_waves: usize,
+    /// `fire` calls executed by pool workers (0 for single-threaded runs).
+    pub pool_fired: u64,
     /// Total `fire` calls (spawned redexes plus activated records).
     pub rewrites: u64,
 }
