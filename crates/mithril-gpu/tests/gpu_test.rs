@@ -190,6 +190,7 @@ fn engine_source_is_program_independent() {
     assert!(ENGINE_CU.contains("PROG_NRULES"));
     assert!(ENGINE_CU.contains("__global__ void k_fire"));
     assert!(ENGINE_CU.contains("__global__ void k_boot"));
+    assert!(ENGINE_CU.contains("__global__ void k_pump"), "sequential-tail pump kernel");
     // the spike leak fix: overflow ring + checked bump + abort flag
     assert!(ENGINE_CU.contains("ovf"));
     assert!(ENGINE_CU.contains("g_abort(AB_ARENA)"));
@@ -273,6 +274,38 @@ fn gpu_tree_sum_ctors_and_match_end_to_end() {
     let boot = Redex { a: num_port(10), b: 0, aux: 0 };
     let got = compile_and_run(&src, boot, &cache_dir()).expect("gpu run failed");
     assert_eq!(got, num_port(1 << 10), "tsum(build(10)) counts 1024 leaves");
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (mutates MITHRIL_GPU_WAVES; run --test-threads=1)"]
+fn gpu_sequential_tail_is_pumped_not_wave_limited() {
+    if !gpu_on() {
+        return;
+    }
+    // A 50,000-deep strict dependence chain used to cost >=100k host waves;
+    // the device-side pump must finish it far under this wave budget.
+    let src = emit_cuda(&sum_module());
+    let boot = Redex { a: num_port(50_000), b: 0, aux: 0 };
+    std::env::set_var("MITHRIL_GPU_WAVES", "4000");
+    let got = compile_and_run(&src, boot, &cache_dir());
+    std::env::remove_var("MITHRIL_GPU_WAVES");
+    assert_eq!(got, Ok(num_port(50_000i64 * 50_001 / 2)), "sum(50000) under a tight wave budget");
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (mutates MITHRIL_GPU_NODES; run --test-threads=1)"]
+fn gpu_oversized_nodes_request_is_capped_not_oom() {
+    if !gpu_on() {
+        return;
+    }
+    // 2^30 cells = 16 GiB of nodes: unallocatable next to the other buffers
+    // on a 24 GB card. The runner must cap to free VRAM and still run.
+    let src = emit_cuda(&trivial_module());
+    let boot = Redex { a: num_port(20), b: 0, aux: 0 };
+    std::env::set_var("MITHRIL_GPU_NODES", "1073741824");
+    let got = compile_and_run(&src, boot, &cache_dir());
+    std::env::remove_var("MITHRIL_GPU_NODES");
+    assert_eq!(got, Ok(num_port(47)), "capped arena must still produce the result");
 }
 
 #[test]

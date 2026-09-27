@@ -52,6 +52,8 @@ struct Dev {
   int *ovftop;
   u64 *ebuf;   // PROG_NRULES buckets of bcap 3-word entries
   u32 *blen;   // PROG_NRULES append counters (host drains by prefix)
+  u32 *bdone;  // PROG_NRULES drained prefixes (shared with the host; a
+               // fully drained bucket is recycled to 0 between waves)
   u64 *result; // [0] = delivered flag, [1] = ROOT value
   u32 *abortf;
   u32 ncap, rcap, bcap, ovfcap, chunksz, nrules;
@@ -294,4 +296,47 @@ extern "C" __global__ void k_fire(u32 rule, u32 start, u32 count) {
     return; // poisoned: stop generating work
   const u64 *e = &G.ebuf[((u64)rule * G.bcap + start + i) * 3];
   prog_fire(rule, e[0], e[1], e[2]);
+}
+
+// Sequential-tail pump: when total pending work is tiny, one host wave per
+// rewrite (sync + memcpy + launch) dominates, so the host launches this
+// single-thread kernel instead. It drains entries one by one for up to
+// max_steps rewrites, recycling fully drained buckets, and hands back to
+// the parallel loop as soon as the frontier widens again.
+extern "C" __global__ void k_pump(u32 max_steps) {
+  u32 r0 = 0; // round-robin start (chains hop between few rules)
+  for (u32 s = 0; s < max_steps; s++) {
+    if (*G.abortf >= AB_ARENA)
+      return;
+    if ((s & 255u) == 255u) {
+      u64 tot = 0;
+      for (u32 r = 0; r < G.nrules; r++) {
+        u32 len = G.blen[r] > G.bcap ? G.bcap : G.blen[r];
+        tot += len - G.bdone[r];
+      }
+      if (tot > 1024)
+        return; // wide again: let the host drain it in parallel
+    }
+    u32 rule = G.nrules;
+    for (u32 k = 0; k < G.nrules; k++) {
+      u32 r = (r0 + k) % G.nrules;
+      u32 len = G.blen[r] > G.bcap ? G.bcap : G.blen[r];
+      u32 d = G.bdone[r];
+      if (d >= len) {
+        if (len && d >= G.blen[r]) { // fully drained: recycle the bucket
+          G.blen[r] = 0;
+          G.bdone[r] = 0;
+        }
+        continue;
+      }
+      rule = r;
+      break;
+    }
+    if (rule == G.nrules)
+      return; // quiescent
+    r0 = rule;
+    u32 i = G.bdone[rule]++;
+    const u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
+    prog_fire(rule, e[0], e[1], e[2]);
+  }
 }
