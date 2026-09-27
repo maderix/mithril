@@ -21,9 +21,10 @@ pub struct Wctx<'e> {
     prog: &'e dyn Program,
     fuel: i64,
     cfree: Vec<u32>,
-    cchunk: (u32, u32),
+    /// Current bump chunk `[lo, hi)` (u64: `hi` may be 2^32).
+    cchunk: (u64, u64),
     rfree: Vec<u32>,
-    rchunk: (u32, u32),
+    rchunk: (u64, u64),
     /// Spawned redexes / activated records per rule, since the last merge.
     out: Vec<Vec<Redex>>,
     out_recs: Vec<Vec<u32>>,
@@ -67,7 +68,8 @@ impl<'e> Wctx<'e> {
                 }
                 self.issued += 1;
                 self.cchunk.0 += 1;
-                self.cchunk.0 - 1
+                // chunks lie below the capacity, which is <= 2^32
+                (self.cchunk.0 - 1) as u32
             }
         };
         self.ar.set(i, 0, a);
@@ -104,7 +106,7 @@ impl<'e> Wctx<'e> {
                     self.rchunk = self.ar.claim_recs();
                 }
                 self.rchunk.0 += 1;
-                self.rchunk.0 - 1
+                (self.rchunk.0 - 1) as u32
             }
         };
         let r = &self.ar.recs[i as usize];

@@ -31,10 +31,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Engine with capacities from `MITHRIL_NODES` / `MITHRIL_RECS`.
+    /// Engine with capacities from `MITHRIL_NODES` (default 2^26 cells) /
+    /// `MITHRIL_RECS` (default 2^27 records). Both are reservations that
+    /// commit memory only as chunks are used; max 2^32 each (u32 indices).
     pub fn new(threads: usize, fuel: i64) -> Engine {
         let cells = cap_from_env("MITHRIL_NODES", 1 << 26);
-        let recs = cap_from_env("MITHRIL_RECS", 1 << 24);
+        let recs = cap_from_env("MITHRIL_RECS", 1 << 27);
         Engine::with_capacity(threads, fuel, cells, recs)
     }
 

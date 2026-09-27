@@ -34,8 +34,10 @@
 //!   written in one wave is visible to every worker in later waves, and to the
 //!   receiver of any `deliver` that follows the write.
 //! * **Capacity.** Arenas are sized by `MITHRIL_NODES` (cells, default 2^26)
-//!   and `MITHRIL_RECS` (records, default 2^24); exhaustion panics with
-//!   "arena exhausted".
+//!   and `MITHRIL_RECS` (records, default 2^27), at most 2^32 each because
+//!   slot indices are `u32`. Arenas are reserved virtually and committed as
+//!   chunks are touched, so they grow chunk by chunk up to the capacity;
+//!   exhaustion panics with "arena exhausted" naming the env var to raise.
 
 mod alloc;
 mod engine;

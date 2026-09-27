@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// Slots handed to a worker per global bump.
 pub(crate) const CHUNK: u64 = 1 << 16;
 
+/// Largest arena capacity: slot indices are `u32` in the public API
+/// (`Wctx::alloc`, `Engine::cell`, record indices), so 2^32 slots
+/// (indices 0..=u32::MAX) is the index-width limit, not a tuning clamp.
+/// Arenas are reserved up front but only committed as chunks are touched,
+/// so a large capacity grows physical memory chunk by chunk.
+pub(crate) const MAX_SLOTS: usize = 1 << 32;
+
 /// Waiting record: `pend` deliveries outstanding, two argument slots, and the
 /// static payload (`rule`, `d`, `s`, `parent`) fixed at allocation.
 pub(crate) struct Rec {
@@ -50,15 +57,15 @@ pub(crate) fn parse_cap(v: Option<&str>, default: usize) -> Result<usize, String
     let Some(raw) = v else { return Ok(default) };
     let s = raw.trim();
     let parsed = if let Some(k) = s.strip_prefix("1<<") {
-        k.trim().parse::<u32>().ok().filter(|&k| k < 32).map(|k| 1usize << k)
+        k.trim().parse::<u32>().ok().filter(|&k| k <= 32).map(|k| 1usize << k)
     } else if let Some(h) = s.strip_prefix("0x") {
         usize::from_str_radix(h, 16).ok()
     } else {
         s.parse::<usize>().ok()
     };
     match parsed {
-        Some(n) if n > 0 && n <= u32::MAX as usize => Ok(n),
-        _ => Err(format!("invalid capacity {raw:?} (want 1..=2^32-1)")),
+        Some(n) if n > 0 && n <= MAX_SLOTS => Ok(n),
+        _ => Err(format!("invalid capacity {raw:?} (want 1..=2^32, the u32 index range)")),
     }
 }
 
@@ -79,7 +86,7 @@ pub(crate) struct Arena {
 
 impl Arena {
     pub fn new(ncells: usize, nrecs: usize) -> Arena {
-        assert!(ncells <= u32::MAX as usize && nrecs <= u32::MAX as usize, "capacity exceeds u32 index space");
+        assert!(ncells <= MAX_SLOTS && nrecs <= MAX_SLOTS, "capacity exceeds the u32 index range (2^32 slots)");
         Arena {
             cells: zeroed_slice(2 * ncells),
             // record 0 is the reserved ROOT sink, so keep at least one slot
@@ -100,19 +107,23 @@ impl Arena {
         *self.has_result.get_mut() = false;
     }
 
-    fn claim(bump: &AtomicU64, cap: usize, what: &str, env: &str) -> (u32, u32) {
+    /// Claim the next chunk `[lo, hi)`; `hi` may be 2^32, hence u64.
+    fn claim(bump: &AtomicU64, cap: usize, what: &str, env: &str) -> (u64, u64) {
         let base = bump.fetch_add(CHUNK, Ordering::Relaxed);
         if base >= cap as u64 {
-            panic!("arena exhausted: {what} arena full at {cap} slots (raise {env})");
+            panic!(
+                "arena exhausted: {what} arena full at {cap} slots \
+                 (raise {env}, max {MAX_SLOTS} = 2^32, e.g. {env}=1<<28)"
+            );
         }
-        (base as u32, (base + CHUNK).min(cap as u64) as u32)
+        (base, (base + CHUNK).min(cap as u64))
     }
 
-    pub fn claim_cells(&self) -> (u32, u32) {
+    pub fn claim_cells(&self) -> (u64, u64) {
         Self::claim(&self.cbump, self.cells.len() / 2, "cell", "MITHRIL_NODES")
     }
 
-    pub fn claim_recs(&self) -> (u32, u32) {
+    pub fn claim_recs(&self) -> (u64, u64) {
         Self::claim(&self.rbump, self.recs.len(), "record", "MITHRIL_RECS")
     }
 
@@ -153,17 +164,24 @@ mod tests {
         assert!(parse_cap(Some("0"), 7).is_err());
         assert!(parse_cap(Some("lots"), 7).is_err());
         assert!(parse_cap(Some("1<<40"), 7).is_err());
-        assert!(parse_cap(Some("4294967296"), 7).is_err());
+        assert!(parse_cap(Some("1<<33"), 7).is_err());
+        assert_eq!(parse_cap(Some("1<<32"), 7), Ok(1 << 32));
+        assert_eq!(parse_cap(Some("4294967296"), 7), Ok(1 << 32));
+        assert!(parse_cap(Some("4294967297"), 7).is_err());
     }
 
     #[test]
     fn claims_are_chunked_and_capped() {
         let a = Arena::new(CHUNK as usize + 10, 3);
-        assert_eq!(a.claim_cells(), (0, CHUNK as u32));
-        assert_eq!(a.claim_cells(), (CHUNK as u32, CHUNK as u32 + 10));
+        assert_eq!(a.claim_cells(), (0, CHUNK));
+        assert_eq!(a.claim_cells(), (CHUNK, CHUNK + 10));
         assert_eq!(a.claim_recs(), (1, 3));
         let r = std::panic::catch_unwind(|| a.claim_cells());
-        assert!(r.is_err());
+        let msg = *r.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.contains("arena exhausted") && msg.contains("MITHRIL_NODES"), "{msg}");
+        let r = std::panic::catch_unwind(|| a.claim_recs());
+        let msg = *r.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.contains("record arena") && msg.contains("MITHRIL_RECS"), "{msg}");
     }
 
     #[test]
@@ -178,5 +196,21 @@ mod tests {
         a.reset();
         assert_eq!(a.result(), None);
         assert_eq!(a.claim_recs(), (1, 4));
+    }
+}
+
+#[cfg(test)]
+mod top_chunk {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn last_chunk_of_full_u32_range_ends_at_2_pow_32() {
+        // No 64 GiB arena needed: exercise the chunk arithmetic directly.
+        let bump = AtomicU64::new(MAX_SLOTS as u64 - CHUNK);
+        let (lo, hi) = Arena::claim(&bump, MAX_SLOTS, "cell", "MITHRIL_NODES");
+        assert_eq!((lo, hi), (MAX_SLOTS as u64 - CHUNK, MAX_SLOTS as u64));
+        assert_eq!((hi - 1) as u32, u32::MAX);
+        assert!(std::panic::catch_unwind(|| Arena::claim(&bump, MAX_SLOTS, "cell", "X")).is_err());
     }
 }
