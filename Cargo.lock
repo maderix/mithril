@@ -11,6 +11,14 @@ name = "mithril-front"
 version = "0.1.0"
 
 [[package]]
+name = "mithril-net"
+version = "0.1.0"
+dependencies = [
+ "mithril-core",
+ "mithril-front",
+]
+
+[[package]]
 name = "mithril-reassoc"
 version = "0.1.0"
 dependencies = [
