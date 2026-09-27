@@ -38,12 +38,22 @@ pub(crate) struct Seg {
 pub(crate) struct SegQ {
     pub next: u16,
     pub q: Vec<Seg>,
+    /// The same continuation is reached from every path that suspends at
+    /// its call site (the dive form, and each segment whose inline path
+    /// runs that call); it gets one segment, not one per path.
+    pub memo: std::collections::HashMap<String, u16>,
 }
 
 impl SegQ {
     pub(crate) fn add(&mut self, fid: u32, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
+        let key = format!("{fid} {slots:?} {env:?} {body:?}");
+        if let Some(&id) = self.memo.get(&key) {
+            return id;
+        }
         let id = self.next;
         self.next += 1;
+        assert!(self.next != 0, "codegen: more than 65535 rules");
+        self.memo.insert(key, id);
         self.q.push(Seg { id, fid, slots, env, body });
         id
     }
@@ -228,12 +238,11 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str
     if env.is_empty() {
         b.push_str(&format!("let {chn}: u64 = 0;\n"));
     } else {
-        // the record's one reference stands for every use `body` makes
-        let mut uses = Cnt::new();
-        cnt_rule(body, &mut uses);
+        let _ = body;
         b.push_str(&format!("let mut {chn}: u64 = 0;\n"));
         for v in env.iter().rev() {
-            let ev = ex.use_var_n(*v, uses.get(v).copied().unwrap_or(1), b);
+            ex.captured.insert(*v);
+            let ev = ex.use_var(*v, true, b);
             b.push_str(&format!("{chn} = ctx.alloc({ev}, {chn}) as u64 + 1;\n"));
         }
     }
@@ -243,6 +252,10 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str
     ));
     rn
 }
+
+/// Dives nested inline in one rule-form body before the rest is deferred
+/// to a record (see `rtail`).
+const MAX_INLINE_CALLS: u32 = 4;
 
 /// Emit `e` (normalized) in rule-form tail position, delivering to `par`.
 fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
@@ -265,14 +278,32 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
                     // suffix P runs now (inline, delivering to the join's
                     // second slot), the dependent rest J waits in a record.
                     let es: Vec<String> = gargs.iter().map(|a| ex.val(a, true, b)).collect();
+                    if ex.inline_calls >= MAX_INLINE_CALLS {
+                        // Deep in a call chain: the continuation waits in a
+                        // record (its own memoized segment) instead of being
+                        // nested inline again — code stays linear in the
+                        // chain length, and a finished dive just delivers.
+                        let mut env = free_vars(bo);
+                        env.remove(x);
+                        let env: Vec<u32> = env.into_iter().collect();
+                        let sid = sq.add(ex.self_fid, vec![*x], env.clone(), (**bo).clone());
+                        let rn = emit_rec(ex, &env, sid, 1, par, bo, b);
+                        b.push_str(&format!(
+                            "match ctx.dive({g}u16, &[(({rn} as u64) << 3), {}]) {{\nDiveResult::Done(v) => ctx.deliver(({rn} as u64) << 3, v),\nDiveResult::Suspended(_) => {{}}\n}}\n",
+                            es.join(", ")
+                        ));
+                        return;
+                    }
                     let saved = ex.rem.clone();
                     b.push_str(&format!("match ctx.dive({g}u16, &[NONE, {}]) {{\nDiveResult::Done(v) => {{\n", es.join(", ")));
+                    ex.inline_calls += 1;
                     if ex.rem.get(x).copied().unwrap_or(0) == 0 {
                         b.push_str("free_val(ctx, v);\n");
                     } else {
                         b.push_str(&format!("let v{x} = v;\n"));
                     }
                     rtail(ex, bo, par, b, sq);
+                    ex.inline_calls -= 1;
                     b.push_str("}\nDiveResult::Suspended(rec) => {\n");
                     ex.rem = saved.clone();
                     if let Some((p_body, live, j_body)) = crate::seq::split_frame(*x, bo) {

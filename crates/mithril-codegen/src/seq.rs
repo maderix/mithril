@@ -105,6 +105,10 @@ pub(crate) struct Ex<'m> {
     /// Variables proven to hold i56 immediates (see `numeric_vars`): their
     /// dup/free are elided and arithmetic on them is emitted inline.
     pub ints: HashSet<u32>,
+    /// Vars moved or shared into records by the capture being emitted.
+    pub captured: HashSet<u32>,
+    /// Rule form: dives whose continuation is being emitted inline, nested.
+    pub inline_calls: u32,
 }
 
 /// Variables that are *used* as arithmetic/comparison operands or bound to
@@ -178,7 +182,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -218,9 +222,24 @@ impl<'m> Ex<'m> {
     /// value-position frame — patch parents inward, and return the
     /// outermost record for the caller to attach.
     pub(crate) fn emit_capture(&mut self, rv: &str, own: Option<(u32, &Core)>, b: &mut String) {
+        let saved = self.rem.clone();
         let mut cb = String::new();
         let child = self.capture_chain(rv, own, &mut cb);
+        // Every record took one reference (sharing when the frame still
+        // had other uses); the frame itself is now abandoned, so release
+        // what it still owns. Borrowed and held (pinned) values are not
+        // ours to drop.
+        if self.pinned == 0 {
+            let mut left: Vec<u32> = self.rem.iter().filter(|(_, r)| **r > 0).map(|(v, _)| *v).collect();
+            left.sort_unstable();
+            for v in left {
+                if !self.ints.contains(&v) && !self.bset.contains(&v) && self.captured.contains(&v) {
+                    cb.push_str(&format!("free_val(ctx, v{v});\n"));
+                }
+            }
+        }
         cb.push_str(&format!("{child} as u64\n"));
+        self.rem = saved;
         // The chain runs once per suspension; keeping it out of line keeps
         // its record/spawn temporaries (and their stack slots) out of the
         // hot function so the entry fuel test can shrink-wrap.
@@ -236,7 +255,7 @@ impl<'m> Ex<'m> {
     /// Emit the record chain for a suspension into `b`, returning the name
     /// of the outermost record (see `emit_capture`).
     fn capture_chain(&mut self, rv: &str, own: Option<(u32, &Core)>, b: &mut String) -> String {
-        let saved = self.rem.clone();
+        self.captured.clear();
         let mut frames: Vec<(u32, Core)> = Vec::new();
         if let Some((x, bo)) = own {
             frames.push((x, bo.clone()));
@@ -277,7 +296,6 @@ impl<'m> Ex<'m> {
                 child = rn;
             }
         }
-        self.rem = saved;
         child
     }
 
@@ -366,18 +384,6 @@ impl<'m> Ex<'m> {
         }
     }
 
-    /// Read variable `i` as an escaping value standing for `n` of its
-    /// remaining uses at once (a record env slot serves every use the
-    /// segment body makes): the last of them moves, earlier ones share.
-    pub fn use_var_n(&mut self, i: u32, n: i64, b: &mut String) -> String {
-        if n > 1 {
-            if let Some(r) = self.rem.get_mut(&i) {
-                *r = (*r - (n - 1)).max(1);
-            }
-        }
-        self.use_var(i, true, b)
-    }
-
     /// Bind `let v{x} = expr;` and free it right away if it is never used.
     fn emit_bind(&mut self, x: u32, expr: &str, b: &mut String) {
         if self.ints.contains(&x) {
@@ -464,20 +470,28 @@ impl<'m> Ex<'m> {
             }
             return;
         }
+        if hold == Hold::Consume {
+            // chained arity: move every field out, dropping the unused ones
+            let names: Vec<String> = binders.iter().map(|bv| format!("v{bv}")).collect();
+            b.push_str(&format!(
+                "let [{}] = consume_chain::<{}>(ctx, {sv}, {cid}u16);\n",
+                names.join(", "),
+                binders.len()
+            ));
+            for bv in binders {
+                if self.rem.get(bv).copied().unwrap_or(0) == 0 {
+                    b.push_str(&format!("free_val(ctx, v{bv});\n"));
+                }
+            }
+            return;
+        }
         for (i, bv) in binders.iter().enumerate() {
             let cnt = self.rem.get(bv).copied().unwrap_or(0);
             match hold {
                 Hold::BorrowRaw => {
                     b.push_str(&format!("let v{bv} = field(ctx, {sv}, {i});\n"));
                 }
-                Hold::Consume => {
-                    // chained arity: incref used fields, decref the root
-                    if cnt > 0 {
-                        b.push_str(&format!(
-                            "let v{bv} = dup_val(ctx, field(ctx, {sv}, {i}));\n"
-                        ));
-                    }
-                }
+                Hold::Consume => unreachable!(),
                 Hold::BorrowDup => {
                     if cnt > 0 || self.pinned > 0 {
                         b.push_str(&format!(
@@ -500,7 +514,10 @@ impl<'m> Ex<'m> {
         args: &[Core],
         b: &mut String,
     ) -> (String, Vec<String>) {
-        assert!(self.dive, "codegen bug: call in a pure rule-form expression");
+        // rule-form segments have no fuel; only bounded callees (which never
+        // consume any) can be called from them as plain expressions
+        assert!(self.dive || crate::is_bounded(g), "codegen bug: call in a pure rule-form expression");
+        let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
         // args first (they may take tokens), then release the rest (below)
         let modes = &self.bor[g as usize];
         let mut post = Vec::new();
@@ -541,7 +558,7 @@ impl<'m> Ex<'m> {
         }
         self.flush_toks(b);
         let argl: String = es.iter().map(|e| format!(", {e}")).collect();
-        (format!("d_{g}(ctx, fuel{argl})"), post)
+        (format!("d_{g}(ctx, {fuel}{argl})"), post)
     }
 
     /// Emit statements computing `e` into `b`; returns a Rust expression
@@ -644,13 +661,19 @@ impl<'m> Ex<'m> {
                 self.val(bo, esc, b)
             }
             Core::Call(g, args) => {
-                // Only reachable for a call in bare value position, which
-                // ANF forbids; the tail/let paths own every real call site.
                 let (call, post) = self.dive_call(*g, args, b);
                 let t = self.fresh();
-                b.push_str(&format!("let {t} = match {call} {{\nOk(v) => v,\nErr(r) => {{\n"));
-                self.emit_capture("r", None, b);
-                b.push_str("}\n};\n");
+                if crate::is_bounded(*g) {
+                    // bounded callee: cannot suspend
+                    b.push_str(&format!("let {t} = match {call} {{ Ok(v) => v, Err(_) => unreachable!() }};\n"));
+                } else {
+                    // Only reachable for a suspendable call in bare value
+                    // position, which ANF forbids; the tail/let paths own
+                    // every real call site.
+                    b.push_str(&format!("let {t} = match {call} {{\nOk(v) => v,\nErr(r) => {{\n"));
+                    self.emit_capture("r", None, b);
+                    b.push_str("}\n};\n");
+                }
                 for p in post {
                     b.push_str(&format!("free_val(ctx, {p});\n"));
                 }
@@ -1045,6 +1068,9 @@ pub(crate) fn outer_vars(code: &str) -> Vec<String> {
 /// reads), and J is the dependent rest. `None` when P does no call or
 /// has zero or several live-outs (those frames wait as plain records).
 pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
+    if std::env::var_os("MITHRIL_NO_SPLIT").is_some() {
+        return None;
+    }
     let mut binds: Vec<(u32, &Core)> = Vec::new();
     let mut cur = bo;
     while let Core::Let(v, r, b) = cur {

@@ -201,7 +201,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             next += 1;
         }
     }
-    let mut sq = rules::SegQ { next, q: Vec::new() };
+    let mut sq = rules::SegQ { next, q: Vec::new(), memo: Default::default() };
     // forwarding segment: fuel-out at a dive entry spawns the pending call
     // against a record of this rule, which just passes the value upward
     let fwd = sq.add(u32::MAX, vec![0], vec![], Core::Var(0));
@@ -218,6 +218,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         .collect();
     let (bor, bsets) = borrows(m, &bodies);
 
+    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m));
     let scal = scalar::classify(m);
     let tys = ty::infer(m);
     let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
@@ -244,8 +245,12 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             }
         }
     }
+    let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {
+        if trace {
+            eprintln!("gen fn {} ({}) segs={} code={}B", fid, m.fns[fid].name, sq.q.len(), fns_code.len());
+        }
         if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
@@ -263,6 +268,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
+        if trace && done % 500 == 0 {
+            eprintln!("gen seg {} of {} (fn {}) code={}B", done, sq.q.len(), seg.fid, fns_code.len());
+        }
         fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared));
     }
 
@@ -430,10 +438,78 @@ fn call_fn(
 
 // ---- Core walkers shared by the emitters ----
 
+thread_local! {
+    /// Set for the module being emitted: `BOUNDED[f]` when every call path
+    /// out of `f` is acyclic, so `f` can never run out of fuel and a call to
+    /// it is an ordinary expression (no fuel check, no capture).
+    static BOUNDED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Functions on no call cycle (fixpoint over the call graph).
+pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
+    fn callees(e: &Core, out: &mut std::collections::HashSet<u32>) {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Call(g, xs) => {
+                out.insert(*g);
+                xs.iter().for_each(|x| callees(x, out));
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+                callees(a, out);
+                callees(b, out);
+            }
+            Core::If(a, b, c) => {
+                callees(a, out);
+                callees(b, out);
+                callees(c, out);
+            }
+            Core::Let(_, r, b) => {
+                callees(r, out);
+                callees(b, out);
+            }
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| callees(x, out)),
+            Core::Match(s, arms) => {
+                callees(s, out);
+                arms.iter().for_each(|(_, _, b)| callees(b, out));
+            }
+            Core::Proj(a, _) => callees(a, out),
+        }
+    }
+    let cs: Vec<std::collections::HashSet<u32>> = m
+        .fns
+        .iter()
+        .map(|f| {
+            let mut s = std::collections::HashSet::new();
+            callees(&f.body, &mut s);
+            s
+        })
+        .collect();
+    let n = m.fns.len();
+    let mut b = vec![false; n];
+    loop {
+        let mut changed = false;
+        for f in 0..n {
+            if !b[f] && cs[f].iter().all(|g| (*g as usize) != f && b[*g as usize]) {
+                b[f] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return b;
+        }
+    }
+}
+
+pub(crate) fn is_bounded(g: u32) -> bool {
+    BOUNDED.with(|b| b.borrow().get(g as usize).copied().unwrap_or(false))
+}
+
+/// Whether evaluating `e` may run a suspendable call (calls to bounded
+/// functions are plain expressions).
 pub(crate) fn has_call(e: &Core) -> bool {
     match e {
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Call(..) => true,
+        Core::Call(g, xs) => !is_bounded(*g) || xs.iter().any(has_call),
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
         Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
         Core::Let(_, r, b) => has_call(r) || has_call(b),
@@ -891,6 +967,41 @@ fn consume2r(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64, u32) {
         let _ = ctx.rc_dec(a);
         (f0, f1, NOTOK)
     }
+}
+
+/// Consume a chained (arity > 2) constructor: move every field out and
+/// free only the chain cells when this was the last reference (always,
+/// for linear types); otherwise share the fields and drop the root.
+#[inline(always)]
+fn consume_chain<const N: usize>(ctx: &mut Wctx, p: u64, k: u16) -> [u64; N] {
+    let a = con_addr(p);
+    let mut out = [0u64; N];
+    if N == 0 {
+        return out; // nullary: no cell
+    }
+    if lin(k) || ctx.rc_unique(a) {
+        let mut cur = a;
+        for slot in out.iter_mut().take(N.saturating_sub(2)) {
+            let c = ctx.cell(cur);
+            ctx.free(cur);
+            *slot = c[0];
+            cur = con_addr(c[1]);
+        }
+        let c = ctx.cell(cur);
+        ctx.free(cur);
+        if N >= 2 {
+            out[N - 2] = c[0];
+            out[N - 1] = c[1];
+        } else {
+            out[0] = c[0];
+        }
+    } else {
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = dup_val(ctx, field(ctx, p, i));
+        }
+        free_val(ctx, p);
+    }
+    out
 }
 
 /// Build a 2-field ctor in a reuse token's cell (or allocate).

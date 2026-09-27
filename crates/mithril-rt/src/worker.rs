@@ -50,6 +50,10 @@ pub struct Wctx<'e> {
     pub(crate) rewrites: u64,
     /// Nesting of records fired inline from `deliver` (see `MAX_INLINE`).
     inline_depth: u32,
+    /// `MITHRIL_CHECK_FREE` (debug builds): track freed cells and panic on
+    /// a double free.
+    check_free: bool,
+    freed: Vec<u64>,
 }
 
 impl<'e> Wctx<'e> {
@@ -71,6 +75,8 @@ impl<'e> Wctx<'e> {
             live_peak: 0,
             rewrites: 0,
             inline_depth: 0,
+            check_free: std::env::var_os("MITHRIL_CHECK_FREE").is_some(),
+            freed: Vec::new(),
         }
     }
 
@@ -79,6 +85,19 @@ impl<'e> Wctx<'e> {
     /// Allocate a cell holding `[a, b]`, reusing this worker's freed slots first.
     #[inline(always)]
     pub fn alloc(&mut self, a: u64, b: u64) -> u32 {
+        if cfg!(debug_assertions) && self.check_free {
+            let i = self.alloc_inner(a, b);
+            let (w, bt) = ((i / 64) as usize, i % 64);
+            if self.freed.len() > w {
+                self.freed[w] &= !(1 << bt);
+            }
+            return i;
+        }
+        self.alloc_inner(a, b)
+    }
+
+    #[inline(always)]
+    fn alloc_inner(&mut self, a: u64, b: u64) -> u32 {
         let i = if self.cfree_head != u32::MAX {
             let i = self.cfree_head;
             self.cfree_head = self.ar.cell(i)[0] as u32;
@@ -102,6 +121,19 @@ impl<'e> Wctx<'e> {
     /// refcount is never read, so it is never written (no rc cache line).
     #[inline(always)]
     pub fn alloc_lin(&mut self, a: u64, b: u64) -> u32 {
+        if cfg!(debug_assertions) && self.check_free {
+            let i = self.alloc_lin_inner(a, b);
+            let (w, bt) = ((i / 64) as usize, i % 64);
+            if self.freed.len() > w {
+                self.freed[w] &= !(1 << bt);
+            }
+            return i;
+        }
+        self.alloc_lin_inner(a, b)
+    }
+
+    #[inline(always)]
+    fn alloc_lin_inner(&mut self, a: u64, b: u64) -> u32 {
         let i = if self.cfree_head != u32::MAX {
             let i = self.cfree_head;
             self.cfree_head = self.ar.cell(i)[0] as u32;
@@ -146,6 +178,14 @@ impl<'e> Wctx<'e> {
     /// Return a cell to this worker's free list (the caller owns it linearly).
     #[inline(always)]
     pub fn free(&mut self, i: u32) {
+        if cfg!(debug_assertions) && self.check_free {
+            let (w, b) = ((i / 64) as usize, i % 64);
+            if self.freed.len() <= w {
+                self.freed.resize(w + 1, 0);
+            }
+            assert!(self.freed[w] & (1 << b) == 0, "double free of cell {i}");
+            self.freed[w] |= 1 << b;
+        }
         self.ar.set(i, 0, self.cfree_head as u64);
         self.cfree_head = i;
     }
