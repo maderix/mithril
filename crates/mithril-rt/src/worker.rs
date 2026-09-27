@@ -1,6 +1,6 @@
 //! Per-worker context: chunked bump + free-list allocation of cells and
 //! records, record delivery, and thread-local spawn buffers that the
-//! scheduler publishes to the worker's deque after every fire.
+//! coordinator merges into the global buckets after every wave.
 
 use crate::alloc::Arena;
 use crate::{DiveResult, Program, Redex};
@@ -9,13 +9,6 @@ use crate::{DiveResult, Program, Redex};
 /// fuel-bounded dive under it).
 const MAX_INLINE: u32 = 64;
 use std::sync::atomic::Ordering;
-
-/// A schedulable entry: a spawned redex or an activated record.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Item {
-    Redex(u16, Redex),
-    Rec(u16, u32),
-}
 
 /// Static payload of a waiting record, readable while its rule fires.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -328,23 +321,13 @@ impl<'e> Wctx<'e> {
         self.rfree.push(ri);
     }
 
-    /// Fire one scheduled entry.
-    #[inline]
-    pub(crate) fn fire_item(&mut self, it: Item) {
-        match it {
-            Item::Redex(rule, e) => self.fire_redex(rule, e),
-            Item::Rec(rule, ri) => self.fire_rec(rule, ri),
-        }
-    }
-
-    /// Move this worker's spawn buffers onto `q` (rule order within the
-    /// buffers preserved).
-    pub(crate) fn take_spawned(&mut self, q: &mut std::collections::VecDeque<Item>) {
+    /// Move this worker's output buffers into the global buckets.
+    pub(crate) fn merge_into(&mut self, redexes: &mut [Vec<Redex>], recs: &mut [Vec<u32>]) {
         for rule in self.dirty.drain(..) {
             let k = rule as usize;
             self.marked[k] = false;
-            q.extend(self.out[k].drain(..).map(|e| Item::Redex(rule, e)));
-            q.extend(self.out_recs[k].drain(..).map(|ri| Item::Rec(rule, ri)));
+            redexes[k].append(&mut self.out[k]);
+            recs[k].append(&mut self.out_recs[k]);
         }
     }
 }

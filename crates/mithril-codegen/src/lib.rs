@@ -1261,7 +1261,7 @@ fn main() {
             println!("{}", show(&eng, root));
             if std::env::var_os("MITHRIL_STATS").is_some() {
                 let st = eng.stats();
-                eprintln!("peak_cells={} live_peak={} pool_fired={} rewrites={}", st.peak_cells, st.live_peak, st.pool_fired, st.rewrites);
+                eprintln!("peak_cells={} live_peak={} waves={} rewrites={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites);
             }
         })
         .expect("spawn main runner");

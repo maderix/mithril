@@ -144,8 +144,7 @@ fn engine_empty_program() {
         assert_eq!(r, 42);
         let st = eng.stats();
         assert_eq!(st.rewrites, 1);
-        // the one entry fires wherever it is picked up
-        assert!(st.pool_fired <= 1);
+        assert_eq!(st.parallel_waves, 0);
         assert_eq!(st.peak_cells, 0);
     }
 }
@@ -161,18 +160,18 @@ fn fork_tree_20_threads_1_and_8() {
 }
 
 #[test]
-fn fork_tree_rule_form_uses_the_pool() {
+fn fork_tree_rule_form_uses_parallel_waves() {
     let prog = ForkTree { cut: 0 };
     let mut eng = small_engine(8, 1 << 11);
     assert_eq!(eng.run(&prog, fork_boot(20)), 1 << 20);
     let st = eng.stats();
-    assert!(st.pool_fired > 0, "a wide fork must be shared with the pool");
+    assert!(st.parallel_waves > 0, "wide fork waves must drain in parallel");
     // 2^21 - 1 forks + 2^20 - 1 joins
     assert_eq!(st.rewrites, (1u64 << 21) - 1 + (1u64 << 20) - 1);
     // single thread never runs a parallel wave
     let mut eng1 = small_engine(1, 1 << 11);
     assert_eq!(eng1.run(&prog, fork_boot(20)), 1 << 20);
-    assert_eq!(eng1.stats().pool_fired, 0);
+    assert_eq!(eng1.stats().parallel_waves, 0);
 }
 
 #[test]
@@ -540,39 +539,46 @@ impl Program for Weighted {
 }
 
 #[test]
-fn weighted_leaves_are_shared_with_the_pool() {
-    // 4000 heavy leaves, 8 workers: far more work than the coordinator can
-    // finish before the pool is up, so the pool takes part; every entry
-    // fires exactly once.
-    let n = 4000u64;
-    let prog = Weighted::new(n, 0, 1 << 14);
+fn work_weighted_pick_drains_parallel() {
+    // 10 entries x cost 2^12 = 40960 >= 2^14: must drain in parallel.
+    let prog = Weighted::new(10, 0, 1 << 12);
     let mut eng = small_engine(8, 1000);
-    let want: u64 = (0..n).map(|i| i * i).sum();
-    assert_eq!(eng.run(&prog, Redex { a: 0, b: ROOT, aux: 0 }), want);
-    assert!(eng.stats().pool_fired > 0);
-    let order = prog.order.lock().unwrap();
-    assert_eq!(order.iter().filter(|&&r| r == W_HEAVY).count(), n as usize);
-    assert_eq!(order.iter().filter(|&&r| r == W_JOIN).count(), n as usize - 1);
-}
-
-#[test]
-fn single_thread_never_uses_the_pool() {
-    let prog = Weighted::new(10, 0, 1);
-    let mut eng = small_engine(1, 1000);
     assert_eq!(eng.run(&prog, Redex { a: 0, b: ROOT, aux: 0 }), 285);
-    assert_eq!(eng.stats().pool_fired, 0);
+    assert!(eng.stats().parallel_waves > 0);
 }
 
 #[test]
-fn mixed_ready_entries_all_fire_exactly_once() {
-    // 100 LIGHT and 10 HEAVY are all ready after the boot; none is held
-    // back, and every entry fires exactly once across the pool.
+fn small_work_drains_single_threaded() {
+    // 10 entries x cost 1 is far below 2^14: no parallel wave.
+    let prog = Weighted::new(10, 0, 1);
+    let mut eng = small_engine(8, 1000);
+    assert_eq!(eng.run(&prog, Redex { a: 0, b: ROOT, aux: 0 }), 285);
+    assert_eq!(eng.stats().parallel_waves, 0);
+}
+
+#[test]
+fn threshold_boundary() {
+    // 4 x 2^12 = 2^14 exactly: parallel (>=); 4 x (2^12 - 1): not.
+    let at = Weighted::new(4, 0, 1 << 12);
+    let mut eng = small_engine(4, 1000);
+    assert_eq!(eng.run(&at, Redex { a: 0, b: ROOT, aux: 0 }), 14);
+    assert_eq!(eng.stats().parallel_waves, 1);
+    let below = Weighted::new(4, 0, (1 << 12) - 1);
+    let mut eng = small_engine(4, 1000);
+    assert_eq!(eng.run(&below, Redex { a: 0, b: ROOT, aux: 0 }), 14);
+    assert_eq!(eng.stats().parallel_waves, 0);
+}
+
+#[test]
+fn scheduler_prefers_weighted_work_over_entry_count() {
+    // 100 LIGHT (100 x 1) vs 10 HEAVY (10 x 2^12): HEAVY bucket goes first
+    // although it has fewer entries.
     let prog = Weighted::new(10, 100, 1 << 12);
     let mut eng = small_engine(4, 1000);
     assert_eq!(eng.run(&prog, Redex { a: 0, b: ROOT, aux: 0 }), 285 + 100);
     let order = prog.order.lock().unwrap();
     assert_eq!(order[0], W_BOOT);
-    assert_eq!(order.iter().filter(|&&r| r == W_HEAVY).count(), 10);
+    assert!(order[1..11].iter().all(|&r| r == W_HEAVY), "{:?}", &order[..12]);
     assert_eq!(order.iter().filter(|&&r| r == W_LIGHT).count(), 100);
     assert_eq!(order.iter().filter(|&&r| r == W_JOIN).count(), 109);
 }
@@ -591,8 +597,8 @@ fn cell_arena_exhaustion_panics_single_thread() {
 #[test]
 #[should_panic(expected = "arena exhausted")]
 fn record_arena_exhaustion_panics_in_parallel_wave() {
-    // Records recycle as joins fire, so only the pending-join depth is live
-    // at once; a cap below that depth must exhaust whichever worker hits it.
+    // Records recycle as joins fire; a cap below the pending-join depth
+    // must exhaust whichever worker hits it.
     let mut eng = Engine::with_capacity(8, 1000, 1 << 16, 8);
     eng.run(&ForkTree { cut: 0 }, fork_boot(16));
 }

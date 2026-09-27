@@ -90,8 +90,8 @@ pub struct Stats {
     /// Cell-arena footprint: distinct cell slots handed out during the run
     /// (free-list reuse keeps this near the live high-water mark).
     pub peak_cells: usize,
-    /// `fire` calls executed by pool workers (0 for single-threaded runs).
-    pub pool_fired: u64,
+    /// Waves drained across the worker pool rather than on the coordinator.
+    pub parallel_waves: usize,
     /// Total `fire` calls (spawned redexes plus activated records).
     pub rewrites: u64,
 }

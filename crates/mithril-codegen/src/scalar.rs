@@ -137,18 +137,40 @@ impl<'m> Chk<'m> {
         }
     }
 
-    /// A let binding: either a plain scalar RHS or the SK-destructure idiom.
+    /// A let binding: a plain scalar RHS, the SK-destructure idiom, or a
+    /// tuple-valued expression (a join point: `if`/`match` arms that each
+    /// yield a tuple of the variables they assign) bound as components.
     fn bind(&mut self, x: u32, r: &Core) {
-        if let Core::Call(g, args) = r {
-            if let Some(sig) = self.sigs[*g as usize].clone() {
-                if let Kind::SK(k) = sig.ret {
-                    self.args(sig.params, args);
-                    self.tvars.insert(x, k);
-                    return;
-                }
-            }
+        if let Some(k) = tuple_kind(self.sigs, r) {
+            self.tuple_expr(r, k);
+            self.tvars.insert(x, k);
+            return;
         }
         self.expr(r);
+    }
+
+    /// A tuple-valued expression of `k` components.
+    fn tuple_expr(&mut self, e: &Core, k: usize) {
+        if !self.ok {
+            return;
+        }
+        match e {
+            Core::Tuple(items) if items.len() == k => items.iter().for_each(|it| self.expr(it)),
+            Core::If(c, x, y) => {
+                self.expr(c);
+                self.tuple_expr(x, k);
+                self.tuple_expr(y, k);
+            }
+            Core::Let(x, r, b) => {
+                self.bind(*x, r);
+                self.tuple_expr(b, k);
+            }
+            Core::Call(g, args) => match &self.sigs[*g as usize] {
+                Some(sig) if sig.ret == Kind::SK(k) => self.args(sig.params.clone(), args),
+                _ => self.ok = false,
+            },
+            _ => self.ok = false,
+        }
     }
 
     /// Tail position; returns the tail kind (S1 / SK(k)) or sets !ok.
@@ -201,6 +223,29 @@ impl<'m> Chk<'m> {
                 Kind::S1
             }
         }
+    }
+}
+
+/// Component count of a tuple-valued expression (`None` for scalars or
+/// mixed shapes): a tuple literal, an `if` whose arms agree, a let chain
+/// ending in one, or a call returning SK(k).
+fn tuple_kind(sigs: &[Option<Sig>], e: &Core) -> Option<usize> {
+    match e {
+        Core::Tuple(items) => Some(items.len()),
+        Core::If(_, x, y) => {
+            let (a, b) = (tuple_kind(sigs, x), tuple_kind(sigs, y));
+            if a == b {
+                a
+            } else {
+                None
+            }
+        }
+        Core::Let(_, _, b) => tuple_kind(sigs, b),
+        Core::Call(g, _) => match &sigs[*g as usize] {
+            Some(Sig { ret: Kind::SK(k), .. }) => Some(*k),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -379,23 +424,42 @@ impl<'m> Sem<'m> {
     }
 
     fn bind(&mut self, x: u32, r: &Core, b: &mut String) {
-        if let Core::Call(g, args) = r {
-            if let Some(sig) = self.sigs[*g as usize].clone() {
-                if let Kind::SK(k) = sig.ret {
-                    let es = self.call_args(*g, args, b);
-                    let comps: Vec<String> = (0..k).map(|i| format!("q{x}_{i}")).collect();
-                    b.push_str(&format!(
-                        "let ({}) = s_{g}({});\n",
-                        comps.join(", "),
-                        es.join(", ")
-                    ));
-                    self.tvars.insert(x, k);
-                    return;
-                }
-            }
+        if let Some(k) = tuple_kind(self.sigs, r) {
+            let et = self.tval(r, b);
+            let comps: Vec<String> = (0..k).map(|i| format!("q{x}_{i}")).collect();
+            b.push_str(&format!("let ({}) = {et};\n", comps.join(", ")));
+            self.tvars.insert(x, k);
+            return;
         }
         let er = self.val(r, b);
         b.push_str(&format!("let v{x} = {er};\n"));
+    }
+
+    /// A tuple-valued expression as a native Rust tuple expression.
+    fn tval(&mut self, e: &Core, b: &mut String) -> String {
+        match e {
+            Core::Tuple(items) => {
+                let es: Vec<String> = items.iter().map(|it| self.val(it, b)).collect();
+                format!("({})", es.join(", "))
+            }
+            Core::If(c, x, y) => {
+                let ec = self.val(c, b);
+                let mut bx = String::new();
+                let vx = self.tval(x, &mut bx);
+                let mut by = String::new();
+                let vy = self.tval(y, &mut by);
+                format!("if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}}")
+            }
+            Core::Let(x, r, bo) => {
+                self.bind(*x, r, b);
+                self.tval(bo, b)
+            }
+            Core::Call(g, args) => {
+                let es = self.call_args(*g, args, b);
+                format!("s_{g}({})", es.join(", "))
+            }
+            _ => unreachable!("non-tuple Core in scalar tuple emission"),
+        }
     }
 
     fn val(&mut self, e: &Core, b: &mut String) -> String {
