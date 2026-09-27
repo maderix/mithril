@@ -1,0 +1,206 @@
+//! Per-worker context: chunked bump + free-list allocation of cells and
+//! records, record delivery, and thread-local spawn buffers that the
+//! coordinator merges into the global buckets after every wave.
+
+use crate::alloc::Arena;
+use crate::{DiveResult, Program, Redex};
+use std::sync::atomic::Ordering;
+
+/// Static payload of a waiting record, readable while its rule fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RecInfo {
+    pub rule: u16,
+    pub d: u32,
+    pub s: u32,
+    pub parent: u64,
+}
+
+/// A worker's view of the engine during a wave.
+pub struct Wctx<'e> {
+    ar: &'e Arena,
+    prog: &'e dyn Program,
+    fuel: i64,
+    cfree: Vec<u32>,
+    cchunk: (u32, u32),
+    rfree: Vec<u32>,
+    rchunk: (u32, u32),
+    /// Spawned redexes / activated records per rule, since the last merge.
+    out: Vec<Vec<Redex>>,
+    out_recs: Vec<Vec<u32>>,
+    /// Rules with non-empty output buffers (each listed once).
+    dirty: Vec<u16>,
+    marked: Vec<bool>,
+    /// Cell slots taken from the bump region (the footprint contribution).
+    pub(crate) issued: usize,
+    pub(crate) rewrites: u64,
+}
+
+impl<'e> Wctx<'e> {
+    pub(crate) fn new(ar: &'e Arena, prog: &'e dyn Program, fuel: i64, n_rules: usize) -> Wctx<'e> {
+        Wctx {
+            ar,
+            prog,
+            fuel,
+            cfree: Vec::new(),
+            cchunk: (0, 0),
+            rfree: Vec::new(),
+            rchunk: (0, 0),
+            out: (0..n_rules).map(|_| Vec::new()).collect(),
+            out_recs: (0..n_rules).map(|_| Vec::new()).collect(),
+            dirty: Vec::new(),
+            marked: vec![false; n_rules],
+            issued: 0,
+            rewrites: 0,
+        }
+    }
+
+    // ---- cells ----
+
+    /// Allocate a cell holding `[a, b]`, reusing this worker's freed slots first.
+    #[inline]
+    pub fn alloc(&mut self, a: u64, b: u64) -> u32 {
+        let i = match self.cfree.pop() {
+            Some(i) => i,
+            None => {
+                if self.cchunk.0 == self.cchunk.1 {
+                    self.cchunk = self.ar.claim_cells();
+                }
+                self.issued += 1;
+                self.cchunk.0 += 1;
+                self.cchunk.0 - 1
+            }
+        };
+        self.ar.set(i, 0, a);
+        self.ar.set(i, 1, b);
+        i
+    }
+
+    /// Return a cell to this worker's free list (the caller owns it linearly).
+    #[inline]
+    pub fn free(&mut self, i: u32) {
+        self.cfree.push(i);
+    }
+
+    #[inline]
+    pub fn cell(&self, i: u32) -> [u64; 2] {
+        self.ar.cell(i)
+    }
+
+    #[inline]
+    pub fn set(&self, i: u32, slot: usize, v: u64) {
+        self.ar.set(i, slot, v)
+    }
+
+    // ---- records ----
+
+    /// Allocate a waiting record that fires `rule` after `pend` deliveries.
+    pub fn alloc_rec(&mut self, rule: u16, pend: u32, d: u32, s: u32, parent: u64) -> u32 {
+        assert!(pend >= 1, "alloc_rec: pend must be >= 1");
+        assert!((rule as usize) < self.out.len(), "alloc_rec: rule {rule} out of range");
+        let i = match self.rfree.pop() {
+            Some(i) => i,
+            None => {
+                if self.rchunk.0 == self.rchunk.1 {
+                    self.rchunk = self.ar.claim_recs();
+                }
+                self.rchunk.0 += 1;
+                self.rchunk.0 - 1
+            }
+        };
+        let r = &self.ar.recs[i as usize];
+        r.rule.store(rule as u32, Ordering::Relaxed);
+        r.d.store(d, Ordering::Relaxed);
+        r.s.store(s, Ordering::Relaxed);
+        r.parent.store(parent, Ordering::Relaxed);
+        r.pend.store(pend, Ordering::Release);
+        i
+    }
+
+    /// Static payload of record `i` (valid while it is live, e.g. inside the
+    /// `fire` call it activated, where `e.aux == i`).
+    pub fn rec(&self, i: u32) -> RecInfo {
+        let r = &self.ar.recs[i as usize];
+        RecInfo {
+            rule: r.rule.load(Ordering::Relaxed) as u16,
+            d: r.d.load(Ordering::Relaxed),
+            s: r.s.load(Ordering::Relaxed),
+            parent: r.parent.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Fill slot `parent & 7` of record `parent >> 3`; the delivery that
+    /// brings `pend` to zero queues the record in its rule's bucket.
+    /// `parent == ROOT` finishes the run with `val`.
+    pub fn deliver(&mut self, parent: u64, val: u64) {
+        let ri = (parent >> 3) as u32;
+        if ri == 0 {
+            self.ar.deliver_root(val);
+            return;
+        }
+        let r = &self.ar.recs[ri as usize];
+        r.args[(parent & 7) as usize].store(val, Ordering::Release);
+        if r.pend.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let rule = r.rule.load(Ordering::Relaxed) as u16;
+            self.mark(rule);
+            self.out_recs[rule as usize].push(ri);
+        }
+    }
+
+    // ---- redexes ----
+
+    /// Queue `e` for `rule` in a later wave.
+    #[inline]
+    pub fn spawn(&mut self, rule: u16, e: Redex) {
+        assert!((rule as usize) < self.out.len(), "spawn: rule {rule} out of range");
+        self.mark(rule);
+        self.out[rule as usize].push(e);
+    }
+
+    /// Per-dive fuel budget configured on the engine.
+    pub fn fuel(&self) -> i64 {
+        self.fuel
+    }
+
+    /// Run `prog.dive(f, args)` with a fresh budget of `self.fuel()`.
+    pub fn dive(&mut self, f: u16, args: &[u64]) -> DiveResult {
+        let mut fuel = self.fuel;
+        let prog = self.prog;
+        prog.dive(f, args, &mut fuel, self)
+    }
+
+    // ---- engine side ----
+
+    #[inline]
+    fn mark(&mut self, rule: u16) {
+        if !self.marked[rule as usize] {
+            self.marked[rule as usize] = true;
+            self.dirty.push(rule);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fire_redex(&mut self, rule: u16, e: Redex) {
+        self.rewrites += 1;
+        let prog = self.prog;
+        prog.fire(rule, e, self);
+    }
+
+    /// Fire an activated record, then recycle it.
+    #[inline]
+    pub(crate) fn fire_rec(&mut self, rule: u16, ri: u32) {
+        let r = &self.ar.recs[ri as usize];
+        let e = Redex { a: r.args[0].load(Ordering::Acquire), b: r.args[1].load(Ordering::Acquire), aux: ri as u64 };
+        self.fire_redex(rule, e);
+        self.rfree.push(ri);
+    }
+
+    /// Move this worker's output buffers into the global buckets.
+    pub(crate) fn merge_into(&mut self, redexes: &mut [Vec<Redex>], recs: &mut [Vec<u32>]) {
+        for rule in self.dirty.drain(..) {
+            let k = rule as usize;
+            self.marked[k] = false;
+            redexes[k].append(&mut self.out[k]);
+            recs[k].append(&mut self.out_recs[k]);
+        }
+    }
+}
