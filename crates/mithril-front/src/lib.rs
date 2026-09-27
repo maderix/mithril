@@ -2,10 +2,14 @@
 //! a reference interpreter over Core.
 
 pub mod ast;
+pub mod core;
+pub mod desugar;
 pub mod lex;
 pub mod parse;
 
 pub use ast::Module;
+pub use core::{eval_core, CoreModule, Val};
+pub use desugar::desugar;
 
 /// A single diagnostic: a source line and a human-readable message.
 #[derive(Clone, PartialEq, Eq, Debug)]
