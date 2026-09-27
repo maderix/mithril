@@ -20,7 +20,8 @@ pub struct Wctx<'e> {
     ar: &'e Arena,
     prog: &'e dyn Program,
     fuel: i64,
-    cfree: Vec<u32>,
+    /// Intrusive free list threaded through cell word 0 (NIL = u32::MAX).
+    cfree_head: u32,
     /// Current bump chunk `[lo, hi)` (u64: `hi` may be 2^32).
     cchunk: (u64, u64),
     rfree: Vec<u32>,
@@ -33,6 +34,8 @@ pub struct Wctx<'e> {
     marked: Vec<bool>,
     /// Cell slots taken from the bump region (the footprint contribution).
     pub(crate) issued: usize,
+    pub(crate) live: i64,
+    pub(crate) live_peak: i64,
     pub(crate) rewrites: u64,
 }
 
@@ -42,7 +45,7 @@ impl<'e> Wctx<'e> {
             ar,
             prog,
             fuel,
-            cfree: Vec::new(),
+            cfree_head: u32::MAX,
             cchunk: (0, 0),
             rfree: Vec::new(),
             rchunk: (0, 0),
@@ -51,6 +54,8 @@ impl<'e> Wctx<'e> {
             dirty: Vec::new(),
             marked: vec![false; n_rules],
             issued: 0,
+            live: 0,
+            live_peak: 0,
             rewrites: 0,
         }
     }
@@ -58,32 +63,74 @@ impl<'e> Wctx<'e> {
     // ---- cells ----
 
     /// Allocate a cell holding `[a, b]`, reusing this worker's freed slots first.
-    #[inline]
+    #[inline(always)]
     pub fn alloc(&mut self, a: u64, b: u64) -> u32 {
-        let i = match self.cfree.pop() {
-            Some(i) => i,
-            None => {
-                if self.cchunk.0 == self.cchunk.1 {
-                    self.cchunk = self.ar.claim_cells();
-                }
-                self.issued += 1;
-                self.cchunk.0 += 1;
-                // chunks lie below the capacity, which is <= 2^32
-                (self.cchunk.0 - 1) as u32
+        let i = if self.cfree_head != u32::MAX {
+            let i = self.cfree_head;
+            self.cfree_head = self.ar.cell(i)[0] as u32;
+            i
+        } else {
+            if self.cchunk.0 == self.cchunk.1 {
+                self.cchunk = self.ar.claim_cells();
             }
+            self.issued += 1;
+            self.cchunk.0 += 1;
+            // chunks lie below the capacity, which is <= 2^32
+            (self.cchunk.0 - 1) as u32
+        };
+        self.ar.set(i, 0, a);
+        self.ar.set(i, 1, b);
+        self.ar.rc_set1(i);
+        i
+    }
+
+    /// Allocate a cell of a statically linear type (never shared): the
+    /// refcount is never read, so it is never written (no rc cache line).
+    #[inline(always)]
+    pub fn alloc_lin(&mut self, a: u64, b: u64) -> u32 {
+        let i = if self.cfree_head != u32::MAX {
+            let i = self.cfree_head;
+            self.cfree_head = self.ar.cell(i)[0] as u32;
+            i
+        } else {
+            if self.cchunk.0 == self.cchunk.1 {
+                self.cchunk = self.ar.claim_cells();
+            }
+            self.issued += 1;
+            self.cchunk.0 += 1;
+            (self.cchunk.0 - 1) as u32
         };
         self.ar.set(i, 0, a);
         self.ar.set(i, 1, b);
         i
     }
 
-    /// Return a cell to this worker's free list (the caller owns it linearly).
-    #[inline]
-    pub fn free(&mut self, i: u32) {
-        self.cfree.push(i);
+    /// O(1) share: bump cell i's refcount.
+    #[inline(always)]
+    pub fn rc_inc(&self, i: u32) {
+        self.ar.rc_inc(i)
     }
 
-    #[inline]
+    /// Drop one reference; true = last one (caller tears the cell down).
+    #[inline(always)]
+    pub fn rc_dec(&self, i: u32) -> bool {
+        self.ar.rc_dec(i)
+    }
+
+    /// True when the caller's reference is the only one.
+    #[inline(always)]
+    pub fn rc_unique(&self, i: u32) -> bool {
+        self.ar.rc_get(i) == 1
+    }
+
+    /// Return a cell to this worker's free list (the caller owns it linearly).
+    #[inline(always)]
+    pub fn free(&mut self, i: u32) {
+        self.ar.set(i, 0, self.cfree_head as u64);
+        self.cfree_head = i;
+    }
+
+    #[inline(always)]
     pub fn cell(&self, i: u32) -> [u64; 2] {
         self.ar.cell(i)
     }

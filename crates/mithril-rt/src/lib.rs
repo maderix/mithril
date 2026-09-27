@@ -80,6 +80,8 @@ pub trait Program: Sync {
 /// Per-run statistics, reset at the start of every `Engine::run`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
+    /// Sum of per-worker peak live cells (allocs minus frees).
+    pub live_peak: i64,
     /// Cell-arena footprint: distinct cell slots handed out during the run
     /// (free-list reuse keeps this near the live high-water mark).
     pub peak_cells: usize,

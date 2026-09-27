@@ -32,6 +32,8 @@ pub(crate) struct Rec {
 unsafe trait ZeroValid {}
 // SAFETY: AtomicU64 has the same in-memory representation as u64.
 unsafe impl ZeroValid for AtomicU64 {}
+// SAFETY: all-zero bytes are a valid AtomicU8 (value 0).
+unsafe impl ZeroValid for std::sync::atomic::AtomicU8 {}
 // SAFETY: Rec consists solely of AtomicU32/AtomicU64 fields.
 unsafe impl ZeroValid for Rec {}
 
@@ -77,6 +79,10 @@ pub(crate) fn cap_from_env(name: &str, default: usize) -> usize {
 pub(crate) struct Arena {
     /// Cell i occupies words 2i and 2i+1.
     cells: Box<[AtomicU64]>,
+    /// Reference count of cell i (valid while allocated; alloc sets 1).
+    /// u8 with saturation: 255 pins the cell immortal (never freed) — the
+    /// escape hatch keeps counts dense (64 cells per cache line).
+    rc: Box<[std::sync::atomic::AtomicU8]>,
     pub recs: Box<[Rec]>,
     cbump: AtomicU64,
     rbump: AtomicU64,
@@ -89,6 +95,7 @@ impl Arena {
         assert!(ncells <= MAX_SLOTS && nrecs <= MAX_SLOTS, "capacity exceeds the u32 index range (2^32 slots)");
         Arena {
             cells: zeroed_slice(2 * ncells),
+            rc: zeroed_slice(ncells),
             // record 0 is the reserved ROOT sink, so keep at least one slot
             recs: zeroed_slice(nrecs.max(1)),
             cbump: AtomicU64::new(0),
@@ -130,13 +137,62 @@ impl Arena {
     #[inline]
     pub fn cell(&self, i: u32) -> [u64; 2] {
         let k = 2 * i as usize;
-        [self.cells[k].load(Ordering::Relaxed), self.cells[k + 1].load(Ordering::Relaxed)]
+        debug_assert!(k + 1 < self.cells.len());
+        // SAFETY: cell indices only come from the allocator (claim/free
+        // lists), which never issues a slot at or beyond capacity.
+        unsafe {
+            [
+                self.cells.get_unchecked(k).load(Ordering::Relaxed),
+                self.cells.get_unchecked(k + 1).load(Ordering::Relaxed),
+            ]
+        }
     }
 
-    #[inline]
+    #[inline(always)]
+    fn rcs(&self, i: u32) -> &std::sync::atomic::AtomicU8 {
+        debug_assert!((i as usize) < self.rc.len());
+        // SAFETY: same allocator-issued index invariant as `cell`.
+        unsafe { self.rc.get_unchecked(i as usize) }
+    }
+
+    #[inline(always)]
+    pub fn rc_inc(&self, i: u32) {
+        // saturate at 255: a pinned cell is never freed (leak over UB)
+        let r = self.rcs(i);
+        if r.fetch_add(1, Ordering::Relaxed) >= 254 {
+            r.store(255, Ordering::Relaxed);
+        }
+    }
+
+    /// Decrement; returns true when this was the last reference (the caller
+    /// then owns the cell's teardown). Release/Acquire pairs the contents
+    /// writes with the freeing reader, HVM2-style.
+    #[inline(always)]
+    pub fn rc_dec(&self, i: u32) -> bool {
+        let r = self.rcs(i);
+        if r.load(Ordering::Relaxed) == 255 {
+            return false; // pinned
+        }
+        r.fetch_sub(1, Ordering::Release) == 1
+    }
+
+    #[inline(always)]
+    pub fn rc_set1(&self, i: u32) {
+        self.rcs(i).store(1, Ordering::Relaxed);
+    }
+
+    /// Current count (racy; only meaningful to a caller holding one ref).
+    #[inline(always)]
+    pub fn rc_get(&self, i: u32) -> u32 {
+        self.rcs(i).load(Ordering::Relaxed) as u32
+    }
+
+    #[inline(always)]
     pub fn set(&self, i: u32, slot: usize, v: u64) {
-        assert!(slot < 2, "cell slot {slot} out of range");
-        self.cells[2 * i as usize + slot].store(v, Ordering::Relaxed);
+        let k = 2 * i as usize + slot;
+        debug_assert!(slot < 2 && k < self.cells.len());
+        // SAFETY: allocator-issued index; slot is 0 or 1 at every call site.
+        unsafe { self.cells.get_unchecked(k).store(v, Ordering::Relaxed) }
     }
 
     pub fn deliver_root(&self, v: u64) {

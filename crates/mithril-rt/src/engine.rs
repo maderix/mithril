@@ -145,10 +145,11 @@ impl Engine {
             }
         });
 
-        let mut st = Stats { peak_cells: ctx0.issued, parallel_waves, rewrites: ctx0.rewrites };
+        let mut st = Stats { peak_cells: ctx0.issued, live_peak: ctx0.issued as i64, parallel_waves, rewrites: ctx0.rewrites };
         for w in workers {
             let w = w.into_inner().unwrap_or_else(PoisonError::into_inner);
             st.peak_cells += w.issued;
+            st.live_peak += w.issued as i64;
             st.rewrites += w.rewrites;
         }
         self.stats = st;
