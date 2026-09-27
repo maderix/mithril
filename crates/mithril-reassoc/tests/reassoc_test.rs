@@ -93,6 +93,7 @@ fn fold_scalar_sum_proven() {
     let r = report(&reps, "total");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "s");
+    assert_eq!(r.arity, 1);
     assert_eq!(fold_of(&m, "total"), &Some(FoldInfo { combiner: Combiner::WrapAdd, proven: true }));
 }
 
@@ -102,6 +103,7 @@ fn fold_tuple_hist_proven() {
     let r = report(&reps, "hist");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "h");
+    assert_eq!(r.arity, 8);
     assert_eq!(
         fold_of(&m, "hist"),
         &Some(FoldInfo { combiner: Combiner::TupleWrapAdd(8), proven: true })
@@ -200,6 +202,49 @@ fn fold_last_element_combiner_declined_unsupported_form() {
     assert!(!r.proven);
     assert!(r.reason.contains("wrapping add"), "reason: {}", r.reason);
     assert_eq!(fold_of(&m, "last"), &None);
+}
+
+#[test]
+fn fold_call_elem_reading_acc_declined() {
+    // form 1 where the element expression reads the accumulator:
+    // reassociation would miscompile (element is not per-iteration data).
+    let src = "\
+def add(a, b):
+    return a + b
+
+def bad(n):
+    s = 0
+    for i in range(n):
+        s = add(s, s + i)
+    return s
+";
+    let (m, reps) = analyzed(src);
+    let r = report(&reps, "bad");
+    assert!(!r.proven, "must not be proven: {}", r.reason);
+    assert!(r.reason.contains("accumulator"), "reason: {}", r.reason);
+    assert_eq!(fold_of(&m, "bad"), &None);
+}
+
+#[test]
+fn fold_call_elem_via_helper_reading_acc_declined() {
+    let src = "\
+def add(a, b):
+    return a + b
+
+def h(x):
+    return x * 2
+
+def bad2(n):
+    s = 0
+    for i in range(n):
+        s = add(s, h(s))
+    return s
+";
+    let (m, reps) = analyzed(src);
+    let r = report(&reps, "bad2");
+    assert!(!r.proven, "must not be proven: {}", r.reason);
+    assert!(r.reason.contains("accumulator"), "reason: {}", r.reason);
+    assert_eq!(fold_of(&m, "bad2"), &None);
 }
 
 #[test]
@@ -318,6 +363,21 @@ fn lean_obligations_no_proven_folds_is_just_the_generic_lemma() {
     let text = lean_obligations(&[]);
     assert!(text.contains("chunked_foldl"));
     assert!(!text.contains("comb_"));
+}
+
+#[test]
+#[should_panic(expected = "has no arity")]
+fn lean_obligations_rejects_proven_report_without_arity() {
+    // A proven report must carry its combiner arity; a malformed one must
+    // fail loudly rather than silently emit a wrong-shaped obligation.
+    let r = FoldReport {
+        func: "f".into(),
+        acc: "s".into(),
+        proven: true,
+        reason: "PROVEN".into(),
+        arity: 0,
+    };
+    lean_obligations(&[r]);
 }
 
 #[test]

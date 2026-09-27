@@ -3,19 +3,11 @@
 
 use crate::FoldReport;
 
-/// Extract "arity N" from a proven report's reason (written by
-/// `analyze`); a proven fold's shape is fully determined by its arity
-/// since only (componentwise) wrapping add is ever proven.
-fn arity_of(reason: &str) -> usize {
-    reason
-        .split_once("arity ")
-        .and_then(|(_, rest)| {
-            rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
-        })
-        .unwrap_or(1)
-}
-
-/// Emit the Lean obligations for every proven fold in `reports`.
+/// Emit the Lean obligations for every proven fold in `reports`. A
+/// proven fold's obligation shape is fully determined by its `arity`
+/// (only componentwise wrapping add is ever proven); a proven report
+/// without one (arity 0) is malformed and panics — emitting a
+/// wrong-shaped obligation would be far worse than failing loudly.
 pub fn lean_obligations(reports: &[FoldReport]) -> String {
     let mut lines: Vec<String> = vec![
         "-- GENERATED proof obligations for fold reassociation (mithril-reassoc).".into(),
@@ -25,7 +17,13 @@ pub fn lean_obligations(reports: &[FoldReport]) -> String {
     ];
     let mut abbrevs: Vec<usize> = Vec::new();
     for r in reports.iter().filter(|r| r.proven) {
-        let k = arity_of(&r.reason);
+        let k = r.arity;
+        assert!(
+            k >= 1,
+            "lean_obligations: proven FoldReport for {}::{} has no arity (arity = 0)",
+            r.func,
+            r.acc
+        );
         let nm = format!("{}_{}", r.func, r.acc);
         if k == 1 {
             lines.push(format!("def comb_{nm} (a b : BitVec 56) : BitVec 56 := a + b"));

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 /// A detected accumulation loop `for v in range(n): acc = <combiner>`.
 pub enum Cand<'a> {
     /// Form 1: `acc = f(acc, elem)` — `f` inlined symbolically.
-    Call { acc: &'a str, fname: &'a str },
+    Call { acc: &'a str, fname: &'a str, elem: &'a Expr },
     /// Form 2: `acc = <left spine using acc> op <acc-free elem>`.
     Expr { acc: &'a str, op: BinOp, left: &'a Expr },
 }
@@ -34,9 +34,12 @@ pub fn detect<'a>(var: &str, body: &'a [Stmt]) -> Option<Cand<'a>> {
         return None; // "accumulating" into the induction variable
     }
     if let Expr::Call(fname, args) = val {
-        if let [Expr::Var(a0), _] = args.as_slice() {
+        if let [Expr::Var(a0), elem] = args.as_slice() {
             if a0 == acc {
-                return Some(Cand::Call { acc, fname });
+                // NOTE: `elem` may still read `acc`; `analyze_for` declines
+                // that case explicitly (with a reason) — it must never be
+                // proven, since the element would not be per-iteration data.
+                return Some(Cand::Call { acc, fname, elem });
             }
         }
         return None;
@@ -49,7 +52,7 @@ pub fn detect<'a>(var: &str, body: &'a [Stmt]) -> Option<Cand<'a>> {
     None
 }
 
-fn uses_var(e: &Expr, name: &str) -> bool {
+pub fn uses_var(e: &Expr, name: &str) -> bool {
     match e {
         Expr::Var(n) => n == name,
         Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => false,

@@ -17,19 +17,21 @@ pub mod poly;
 
 pub use lean::lean_obligations;
 
-use detect::{detect, is_componentwise_add, prove, step_from_expr, step_from_fn, Cand, Step};
+use detect::{detect, is_componentwise_add, prove, step_from_expr, step_from_fn, uses_var, Cand, Step};
 use mithril_front::ast::{Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
 use std::collections::HashMap;
 
 /// One analyzed `for` loop. For loops that are not accumulation-shaped at
-/// all, `acc` is empty. Proven reports' `reason` records the combiner and
-/// its arity (`lean_obligations` reads the arity back from it).
+/// all, `acc` is empty. `arity` is the proven combiner's arity (1 =
+/// scalar, k = k-tuple componentwise) and is what `lean_obligations`
+/// shapes the obligation from; it is 0 on declined/non-fold reports.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FoldReport {
     pub func: String,
     pub acc: String,
     pub proven: bool,
     pub reason: String,
+    pub arity: usize,
 }
 
 /// What the accumulator provably holds when a loop is entered.
@@ -150,7 +152,13 @@ fn walk_block(
 }
 
 fn decline(out: &mut Vec<FoldReport>, func: &str, acc: &str, reason: String) {
-    out.push(FoldReport { func: func.to_string(), acc: acc.to_string(), proven: false, reason });
+    out.push(FoldReport {
+        func: func.to_string(),
+        acc: acc.to_string(),
+        proven: false,
+        reason,
+        arity: 0,
+    });
 }
 
 /// Detect + prove one `for var in range(_): body` loop; set `fold` iff
@@ -177,13 +185,32 @@ fn analyze_for(
     };
     let acc = cand.acc();
     let step: Step = match &cand {
-        Cand::Call { fname, .. } => match fns.get(*fname).map(step_from_fn) {
-            None => {
-                return decline(out, func, acc, format!("combiner opaque (unknown function '{fname}'), DECLINED"))
+        Cand::Call { fname, elem, .. } => {
+            if uses_var(elem, acc) {
+                // The "element" is not per-iteration data: reassociating
+                // would change semantics even for an associative combiner.
+                return decline(
+                    out,
+                    func,
+                    acc,
+                    format!("element expression reads the accumulator '{acc}', DECLINED"),
+                );
             }
-            Some(Err(e)) => return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED")),
-            Some(Ok(s)) => s,
-        },
+            match fns.get(*fname).map(step_from_fn) {
+                None => {
+                    return decline(
+                        out,
+                        func,
+                        acc,
+                        format!("combiner opaque (unknown function '{fname}'), DECLINED"),
+                    )
+                }
+                Some(Err(e)) => {
+                    return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED"))
+                }
+                Some(Ok(s)) => s,
+            }
+        }
         Cand::Expr { op, left, .. } => match step_from_expr(acc, *op, left) {
             Err(e) => return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED")),
             Ok(s) => s,
@@ -230,5 +257,6 @@ fn analyze_for(
         acc: acc.to_string(),
         proven: true,
         reason: format!("PROVEN assoc+identity (combiner: {desc}, arity {})", step.arity),
+        arity: step.arity,
     });
 }
