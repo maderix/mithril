@@ -98,15 +98,38 @@ fn compile(rs: &str, name: &str) -> PathBuf {
     bin
 }
 
-fn run(bin: &Path, args: &[&str]) -> String {
-    let out = Command::new(bin).args(args).output().expect("failed to run generated binary");
+fn run_env(bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, String) {
+    let mut c = Command::new(bin);
+    c.args(args);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    let out = c.output().expect("failed to run generated binary");
     assert!(
         out.status.success(),
-        "generated binary failed ({:?}): {}",
+        "generated binary failed ({:?}, env {:?}): {}",
         args,
+        envs,
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    (
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim_end().to_string(),
+    )
+}
+
+fn run(bin: &Path, args: &[&str]) -> String {
+    run_env(bin, args, &[]).0
+}
+
+/// `peak_cells=N` from the generated program's stderr stats line.
+fn peak_cells(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("peak_cells="))
+        .unwrap_or_else(|| panic!("no peak_cells line in stderr: {stderr:?}"))
+        .parse()
+        .expect("bad peak_cells value")
 }
 
 /// Full golden check at the given thread counts (all must equal the oracle).
@@ -220,6 +243,57 @@ fn fib_naive_parallel_equals_sequential() {
     let t8 = run(&bin, &["8"]);
     assert_eq!(t1, want, "fib_naive --threads 1 != oracle");
     assert_eq!(t8, t1, "fib_naive --threads 8 != --threads 1");
+}
+
+#[test]
+fn small_arena_tree_sum_and_fib() {
+    // Hard gate for the linear cell discipline: a 2^16-cell arena would be
+    // exhausted by leak-everything codegen (tree_sum alone allocates far
+    // more than 2^16 cells across mk retries and rebuilds without freeing).
+    let arena = &[("MITHRIL_NODES", "65536")];
+    for (fx, threads) in [("tree_sum.py", "1"), ("tree_sum.py", "8"), ("fib_naive.py", "8")] {
+        let src = fixture(fx);
+        let (cm, rs) = pipeline(&src, 0);
+        let want = oracle(&cm);
+        let bin = compile(&rs, &format!("small-arena-{}", fx.trim_end_matches(".py")));
+        let (got, _) = run_env(&bin, &[threads], arena);
+        assert_eq!(got, want, "{fx} with MITHRIL_NODES=2^16 at --threads {threads}");
+    }
+}
+
+#[test]
+fn tree_sum_peak_cells_is_o_tree_size() {
+    // mk(12) builds ~8k live cells (4096 Leaf + 4095 Node); with linear
+    // freeing the arena footprint stays a small multiple of that (failed
+    // dive attempts leak their partial allocations, bounded per attempt by
+    // the fuel), nowhere near the total allocation count.
+    let src = fixture("tree_sum.py");
+    let (cm, rs) = pipeline(&src, 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, "tree-sum-peak");
+    let (got, err) = run_env(&bin, &["1"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(got, want);
+    let peak = peak_cells(&err);
+    assert!(
+        peak < 48_000,
+        "tree_sum peak_cells = {peak}, expected O(tree size) (< 48k), not O(total allocations)"
+    );
+}
+
+#[test]
+fn wide_live_tuple_loop() {
+    // Defect D1 regression: a loop carrying 25 live locals (24 registers +
+    // the counter) desugars into a state tuple wider than the old 15-ary
+    // cap; the chained constructor encoding must round-trip it (nbody's
+    // step loop carries 52). Also forces suspension traffic on the wide
+    // state (500 iterations x 25 live values at small fuel).
+    let src = fixture("wide_loop.py");
+    let (cm, rs) = pipeline(&src, 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, "wide_loop");
+    assert_eq!(run(&bin, &["1"]), want, "wide_loop --threads 1 != eval_core");
+    assert_eq!(run(&bin, &["8"]), want, "wide_loop --threads 8 != eval_core");
+    assert_eq!(run(&bin, &["4", "64"]), want, "wide_loop --threads 4 fuel 64 != eval_core");
 }
 
 #[test]

@@ -117,7 +117,7 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
     let rc = 1 + fid;
     let zline = match pf.tuple {
         None => "let tz = num(0i64);".to_string(),
-        Some(n) => format!("let tz = zeros(ctx, {n});"),
+        Some(n) => format!("let tz = zeros(ctx, al, {n});"),
     };
     let left: Vec<String> = (0..ar)
         .map(|i| match i {
@@ -126,6 +126,9 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
             _ => format!("v{i}"),
         })
         .collect();
+    // The left chunk takes the original extras; the right chunk gets deep
+    // copies (both spawned calls own their arguments).
+    let mut dups = String::new();
     let right: Vec<String> = (0..ar)
         .map(|i| {
             if i == 0 {
@@ -135,19 +138,21 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
             } else if i == pf.acc {
                 "tz".into()
             } else {
-                format!("v{i}")
+                dups.push_str(&format!("let td{i} = dup_val(ctx, al, v{i});\n"));
+                format!("td{i}")
             }
         })
         .collect();
     format!(
-        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nif hi - lo > ctx.fuel().max(2) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\nlet j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
+        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet al: &mut Vec<u32> = &mut Vec::new();\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nif hi - lo > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
         left.join(", "),
         right.join(", ")
     )
 }
 
 /// The fold's join rule: combines the two 1-tuple partial results (each is
-/// `Tuple([acc])`) in place into the left one and delivers it.
+/// `Tuple([acc])`) in place into the left one, frees the consumed right
+/// side, and delivers the left.
 pub(crate) fn join_fn(fid: u32, pf: &ParFold) -> String {
     let combine = match pf.tuple {
         None => {
@@ -166,6 +171,6 @@ pub(crate) fn join_fn(fid: u32, pf: &ParFold) -> String {
         ),
     };
     format!(
-        "fn jn_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = ctx.rec(e.aux as u32).parent;\nlet ca = con_addr(e.a);\nlet cb = con_addr(e.b);\n{combine}ctx.deliver(parent, e.a);\n}}\n\n"
+        "fn jn_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = ctx.rec(e.aux as u32).parent;\nlet ca = con_addr(e.a);\nlet cb = con_addr(e.b);\n{combine}ctx.free(cb);\nctx.deliver(parent, e.a);\n}}\n\n"
     )
 }

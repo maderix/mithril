@@ -81,14 +81,23 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     }
     let mut sq = rules::SegQ { next, q: Vec::new() };
 
+    // Normalize every body first, then infer per-parameter borrow modes
+    // (read-only params are lent, not consumed; see `borrows`).
+    let bodies: Vec<Core> = m
+        .fns
+        .iter()
+        .map(|f| {
+            let mut c = max_var(&f.body).max(f.arity as u32) + 1;
+            rules::normalize(&f.body, &mut c)
+        })
+        .collect();
+    let (bor, bsets) = borrows(m, &bodies);
+
     let mut fns_code = String::new();
     for fid in 0..nf {
-        let f = &m.fns[fid];
-        let mut c = max_var(&f.body).max(f.arity as u32) + 1;
-        let body = rules::normalize(&f.body, &mut c);
-        fns_code.push_str(&seq::dive_fn(m, fid as u32, &body));
-        fns_code.push_str(&rules::expand_fn(m, fid as u32, &body, &mut sq));
-        fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid]));
+        fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid]));
+        fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq));
+        fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
         if let Some(pf) = &folds[fid] {
             fns_code.push_str(&fold::join_fn(fid as u32, pf));
         }
@@ -98,7 +107,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        fns_code.push_str(&rules::segment_fn(m, &seg, &mut sq));
+        fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq));
     }
 
     let n_rules = sq.next as usize;
@@ -123,7 +132,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     for fid in 0..nf {
         let ar = m.fns[fid].arity;
         let args: String = (0..ar).map(|i| format!(", args[{}]", i + 1)).collect();
-        dive_arms.push_str(&format!("            {fid} => d_{fid}(ctx, fuel, parent{args}),\n"));
+        dive_arms.push_str(&format!(
+            "            {fid} => d_{fid}(ctx, &mut fr, &mut al, fuel, parent{args}),\n"
+        ));
         exp_arms.push_str(&format!("                    {fid} => x_{fid}(ctx, parent{args}),\n"));
     }
 
@@ -146,14 +157,28 @@ impl Program for Pg {{
     }}
     fn dive(&self, f: u16, args: &[u64], fuel: &mut i64, ctx: &mut Wctx) -> DiveResult {{
         // args[0] is the destination; on unwind fall back to the rule form.
+        // Frees are deferred into `fr`: applied on completion or commit,
+        // dropped on unwind (nothing was really consumed then).
         let parent = args[0];
+        let mut fr: Vec<u32> = Vec::new();
+        let mut al: Vec<u32> = Vec::new();
         let r = match f as usize {{
 {dive_arms}            _ => unreachable!(\"dive {{}}\", f),
         }};
         match r {{
-            Ok(v) => DiveResult::Done(v),
-            Err(true) => DiveResult::Suspended,
+            Ok(v) => {{
+                flush(ctx, &mut fr);
+                DiveResult::Done(v)
+            }}
+            Err(true) => {{
+                flush(ctx, &mut fr);
+                DiveResult::Suspended
+            }}
             Err(false) => {{
+                // Roll back: nothing was consumed, and the attempt's own
+                // allocations are garbage.
+                fr.clear();
+                flush(ctx, &mut al);
                 match f as usize {{
 {exp_arms}                    _ => unreachable!(),
                 }}
@@ -168,8 +193,16 @@ impl Program for Pg {{
     out
 }
 
-/// The per-function CALL-rule fire arm: unpack, (par-fold split), dive.
-fn call_fn(m: &CoreModule, fid: u32, pf: Option<&fold::ParFold>, jr: u16) -> String {
+/// The per-function CALL-rule fire arm: unpack (freeing the arg chain),
+/// (par-fold split), dive. Arguments arrive owned; on completion the fire
+/// reclaims the ones the dive form only borrowed (read-only parameters).
+fn call_fn(
+    m: &CoreModule,
+    fid: u32,
+    pf: Option<&fold::ParFold>,
+    jr: u16,
+    bor: &[Vec<bool>],
+) -> String {
     let ar = m.fns[fid as usize].arity;
     let mut s = format!("fn fc_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = e.aux;\n");
     match ar {
@@ -180,7 +213,7 @@ fn call_fn(m: &CoreModule, fid: u32, pf: Option<&fold::ParFold>, jr: u16) -> Str
             s.push_str("let v0 = e.a;\nlet mut ch = e.b;\n");
             for i in 1..ar {
                 s.push_str(&format!(
-                    "let v{i} = {{ let c = ctx.cell((ch - 1) as u32); ch = c[1]; c[0] }};\n"
+                    "let v{i} = {{ let c = ctx.cell((ch - 1) as u32); ctx.free((ch - 1) as u32); ch = c[1]; c[0] }};\n"
                 ));
             }
         }
@@ -189,8 +222,17 @@ fn call_fn(m: &CoreModule, fid: u32, pf: Option<&fold::ParFold>, jr: u16) -> Str
         s.push_str(&fold::split_snippet(fid, ar, pf, jr));
     }
     let args: String = (0..ar).map(|i| format!(", v{i}")).collect();
+    let mut done_frees = String::new();
+    let lent: Vec<usize> = (0..ar).filter(|&i| bor[fid as usize][i]).collect();
+    if !lent.is_empty() {
+        done_frees.push_str("let fr = &mut Vec::new();\n");
+        for i in &lent {
+            done_frees.push_str(&format!("free_val(ctx, fr, v{i});\n"));
+        }
+        done_frees.push_str("flush(ctx, fr);\n");
+    }
     s.push_str(&format!(
-        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => ctx.deliver(parent, v),\nDiveResult::Suspended => {{}}\n}}\n}}\n\n"
+        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => {{\nctx.deliver(parent, v);\n{done_frees}}}\nDiveResult::Suspended => {{}}\n}}\n}}\n\n"
     ));
     s
 }
@@ -295,6 +337,243 @@ pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
     out
 }
 
+// ---- use counting (linear cell discipline) ----
+
+/// Remaining-use counts per variable.
+pub(crate) type Cnt = std::collections::HashMap<u32, i64>;
+
+/// Count every variable occurrence in an expression (sum over subtrees).
+pub(crate) fn cnt_expr(e: &Core, m: &mut Cnt) {
+    match e {
+        Core::Var(i) => *m.entry(*i).or_insert(0) += 1,
+        Core::Num(_) | Core::Flo(_) => {}
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+            cnt_expr(a, m);
+            cnt_expr(b, m);
+        }
+        Core::If(c, t, f) => {
+            cnt_expr(c, m);
+            cnt_expr(t, m);
+            cnt_expr(f, m);
+        }
+        Core::Let(_, r, b) => {
+            cnt_expr(r, m);
+            cnt_expr(b, m);
+        }
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => {
+            xs.iter().for_each(|x| cnt_expr(x, m))
+        }
+        Core::Match(s, arms) => {
+            cnt_expr(s, m);
+            for (_, _, b) in arms {
+                cnt_expr(b, m);
+            }
+        }
+        Core::Proj(a, _) => cnt_expr(a, m),
+    }
+}
+
+/// Fold branch counts into `into` taking the per-variable maximum across
+/// branches (only one branch executes).
+pub(crate) fn merge_max(into: &mut Cnt, branches: Vec<Cnt>) {
+    let mut mx = Cnt::new();
+    for b in branches {
+        for (k, v) in b {
+            let e = mx.entry(k).or_insert(0);
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
+    for (k, v) in mx {
+        *into.entry(k).or_insert(0) += v;
+    }
+}
+
+/// Use counts of a dive-form body: tail If/Match branches merge by max.
+pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
+    match e {
+        Core::Let(_, r, b) => {
+            cnt_expr(r, m);
+            cnt_dive(b, m);
+        }
+        Core::If(c, t, f) => {
+            cnt_expr(c, m);
+            let mut mt = Cnt::new();
+            cnt_dive(t, &mut mt);
+            let mut mf = Cnt::new();
+            cnt_dive(f, &mut mf);
+            merge_max(m, vec![mt, mf]);
+        }
+        Core::Match(s, arms) => {
+            cnt_expr(s, m);
+            let bs: Vec<Cnt> = arms
+                .iter()
+                .map(|(_, _, b)| {
+                    let mut mm = Cnt::new();
+                    cnt_dive(b, &mut mm);
+                    mm
+                })
+                .collect();
+            merge_max(m, bs);
+        }
+        Core::Call(_, xs) => xs.iter().for_each(|x| cnt_expr(x, m)),
+        other => cnt_expr(other, m),
+    }
+}
+
+// ---- borrow inference (read-only parameters) ----
+//
+// A parameter is *borrowed* when the function (and everything derived from
+// it via match binders and var aliases) never needs ownership: it is only
+// matched on, projected, or lent onward to other borrowed parameters. A
+// value derived from a borrowed parameter that escapes into a constructor,
+// a tuple, or an owned call argument forces the parameter to be owned.
+// Escaping reads elsewhere (returns, ops) are deep-copied at the use site,
+// so they do not force ownership. Fixpoint over the module, initialized
+// optimistically (everything borrowed).
+
+fn borrows(m: &CoreModule, bodies: &[Core]) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
+    let nf = m.fns.len();
+    let mut bor: Vec<Vec<bool>> = m.fns.iter().map(|f| vec![f.arity <= 60; f.arity]).collect();
+    for _ in 0..32 {
+        let mut changed = false;
+        for f in 0..nf {
+            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor);
+            for (i, b) in bor[f].iter_mut().enumerate() {
+                if *b && esc & (1u64 << i) != 0 {
+                    *b = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let bsets = (0..nf).map(|f| derive_set(&bodies[f], &bor[f])).collect();
+    (bor, bsets)
+}
+
+/// Bitmask of borrowed-candidate params whose derived values escape.
+fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -> u64 {
+    use std::collections::HashMap;
+    if arity > 60 {
+        return u64::MAX;
+    }
+    let mut mask: HashMap<u32, u64> = HashMap::new();
+    for (i, b) in own_bor.iter().enumerate() {
+        if *b {
+            mask.insert(i as u32, 1u64 << i);
+        }
+    }
+    let mut esc = 0u64;
+    fn var_mask(e: &Core, mask: &HashMap<u32, u64>) -> u64 {
+        match e {
+            Core::Var(i) => mask.get(i).copied().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    fn walk(e: &Core, mask: &mut HashMap<u32, u64>, esc: &mut u64, bor: &[Vec<bool>]) {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+                walk(a, mask, esc, bor);
+                walk(b, mask, esc, bor);
+            }
+            Core::If(c, t, f) => {
+                walk(c, mask, esc, bor);
+                walk(t, mask, esc, bor);
+                walk(f, mask, esc, bor);
+            }
+            Core::Let(x, r, b) => {
+                if let Core::Var(y) = r.as_ref() {
+                    let v = mask.get(y).copied().unwrap_or(0);
+                    mask.insert(*x, v);
+                }
+                walk(r, mask, esc, bor);
+                walk(b, mask, esc, bor);
+            }
+            Core::Ctor(_, xs) | Core::Tuple(xs) => {
+                for x in xs {
+                    *esc |= var_mask(x, mask);
+                    walk(x, mask, esc, bor);
+                }
+            }
+            Core::Call(g, xs) => {
+                for (j, x) in xs.iter().enumerate() {
+                    let owned_param =
+                        bor.get(*g as usize).map(|ps| !ps.get(j).copied().unwrap_or(false)).unwrap_or(true);
+                    if owned_param {
+                        *esc |= var_mask(x, mask);
+                    }
+                    walk(x, mask, esc, bor);
+                }
+            }
+            Core::Match(s, arms) => {
+                let sm = var_mask(s, mask);
+                walk(s, mask, esc, bor);
+                for (_, binders, b) in arms {
+                    for bv in binders {
+                        mask.insert(*bv, sm);
+                    }
+                    walk(b, mask, esc, bor);
+                }
+            }
+            Core::Proj(a, _) => walk(a, mask, esc, bor),
+        }
+    }
+    walk(body, &mut mask, &mut esc, bor);
+    esc
+}
+
+/// Variables derived from borrowed parameters (raw reads, owner upstream).
+fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
+    let mut s: std::collections::HashSet<u32> =
+        own_bor.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i as u32).collect();
+    fn walk(e: &Core, s: &mut std::collections::HashSet<u32>) {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+                walk(a, s);
+                walk(b, s);
+            }
+            Core::If(c, t, f) => {
+                walk(c, s);
+                walk(t, s);
+                walk(f, s);
+            }
+            Core::Let(x, r, b) => {
+                if let Core::Var(y) = r.as_ref() {
+                    if s.contains(y) {
+                        s.insert(*x);
+                    }
+                }
+                walk(r, s);
+                walk(b, s);
+            }
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) => {
+                xs.iter().for_each(|x| walk(x, s))
+            }
+            Core::Match(sc, arms) => {
+                let inb = matches!(sc.as_ref(), Core::Var(y) if s.contains(y));
+                walk(sc, s);
+                for (_, binders, b) in arms {
+                    if inb {
+                        for bv in binders {
+                            s.insert(*bv);
+                        }
+                    }
+                    walk(b, s);
+                }
+            }
+            Core::Proj(a, _) => walk(a, s),
+        }
+    }
+    walk(body, &mut s);
+    s
+}
+
 // ---- generated-program templates ----
 
 const PRELUDE: &str = r#"// GENERATED by mithril-codegen. Do not edit.
@@ -320,27 +599,32 @@ const T_CON: u64 = 4;
 #[inline] fn con_addr(p: u64) -> u32 { ((p >> 16) & ((1u64 << 40) - 1)) as u32 }
 #[inline] fn con_tag(p: u64) -> u16 { ((p >> 4) & 0xFFF) as u16 }
 #[inline] fn con_ar(p: u64) -> u8 { (p & 0xF) as u8 }
-#[inline] fn flo(ctx: &mut Wctx, v: f64) -> u64 { let a = ctx.alloc(v.to_bits(), 0); (T_FLO << 56) | a as u64 }
+#[inline] fn flo(ctx: &mut Wctx, al: &mut Vec<u32>, v: f64) -> u64 { let a = ctx.alloc(v.to_bits(), 0); al.push(a); (T_FLO << 56) | a as u64 }
 #[inline] fn flo_val(ctx: &Wctx, p: u64) -> f64 { f64::from_bits(ctx.cell((p & M56) as u32)[0]) }
 
 fn mith_unreachable() -> u64 { panic!("unreachable match arm reached at runtime") }
 
 /// Constructor allocation; arity <= 2 direct, wider ctors chain cells
-/// (slot 0 = field, slot 1 = continuation con carrying arity-1).
-fn mk_con(ctx: &mut Wctx, k: u16, fs: &[u64]) -> u64 {
+/// (slot 0 = field, slot 1 = continuation con). The arity nibble saturates
+/// at 15: any nibble > 2 means "one field + a link", so arbitrary widths
+/// chain fine and walkers never rely on the nibble as an exact total.
+fn mk_con(ctx: &mut Wctx, al: &mut Vec<u32>, k: u16, fs: &[u64]) -> u64 {
     let n = fs.len();
     if n == 0 { return con(0, k, 0); }
     if n <= 2 {
         let a = ctx.alloc(fs[0], if n == 2 { fs[1] } else { 0 });
+        al.push(a);
         return con(a, k, n as u8);
     }
     let a = ctx.alloc(fs[n - 2], fs[n - 1]);
+    al.push(a);
     let mut chain = con(a, k, 2);
     let mut i = n - 2;
     while i > 0 {
         i -= 1;
         let a = ctx.alloc(fs[i], chain);
-        chain = con(a, k, (n - i) as u8);
+        al.push(a);
+        chain = con(a, k, (n - i).min(15) as u8);
     }
     chain
 }
@@ -371,7 +655,148 @@ fn py_mod(a: i64, b: i64) -> i64 {
     if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
 }
 
-fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64) -> u64 {
+/// Apply deferred frees (a dive that unwinds drops its list instead).
+fn flush(ctx: &mut Wctx, fr: &mut Vec<u32>) {
+    for &c in fr.iter() {
+        ctx.free(c);
+    }
+    fr.clear();
+}
+
+/// Deep-copy a value (used for non-last uses of shared owned values and
+/// escaping reads of borrowed values). Immediates copy for free.
+fn dup_val(ctx: &mut Wctx, al: &mut Vec<u32>, p: u64) -> u64 {
+    match tag(p) {
+        T_FLO => {
+            let bits = ctx.cell((p & M56) as u32)[0];
+            let a = ctx.alloc(bits, 0);
+            al.push(a);
+            (T_FLO << 56) | a as u64
+        }
+        T_CON => {
+            if con_ar(p) == 0 {
+                return p;
+            }
+            let k = con_tag(p);
+            let mut fs: Vec<u64> = Vec::new();
+            let mut q = p;
+            loop {
+                let ar = con_ar(q) as usize;
+                let c = ctx.cell(con_addr(q));
+                if ar > 2 {
+                    fs.push(c[0]);
+                    q = c[1];
+                } else {
+                    for s in 0..ar {
+                        fs.push(c[s]);
+                    }
+                    break;
+                }
+            }
+            for f in fs.iter_mut() {
+                *f = dup_val(ctx, al, *f);
+            }
+            mk_con(ctx, al, k, &fs)
+        }
+        _ => p,
+    }
+}
+
+/// Deep-free a dead value (deferred).
+fn free_val(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
+    match tag(p) {
+        T_FLO => fr.push((p & M56) as u32),
+        T_CON => {
+            let mut q = p;
+            loop {
+                let ar = con_ar(q) as usize;
+                if ar == 0 {
+                    return;
+                }
+                let ca = con_addr(q);
+                let c = ctx.cell(ca);
+                fr.push(ca);
+                if ar > 2 {
+                    free_val(ctx, fr, c[0]);
+                    q = c[1];
+                } else {
+                    for s in 0..ar {
+                        free_val(ctx, fr, c[s]);
+                    }
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Free only a constructor's spine cells (fields were moved out).
+fn free_spine(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
+    if tag(p) != T_CON {
+        if tag(p) == T_FLO {
+            fr.push((p & M56) as u32);
+        }
+        return;
+    }
+    let mut q = p;
+    loop {
+        let ar = con_ar(q) as usize;
+        if ar == 0 {
+            return;
+        }
+        let ca = con_addr(q);
+        if ar > 2 {
+            let c = ctx.cell(ca);
+            fr.push(ca);
+            q = c[1];
+        } else {
+            fr.push(ca);
+            return;
+        }
+    }
+}
+
+/// Consume a tuple/ctor: return field `i`, deep-free the other fields and
+/// the spine.
+fn take_field(ctx: &Wctx, fr: &mut Vec<u32>, p: u64, i: usize) -> u64 {
+    if tag(p) != T_CON || con_ar(p) == 0 {
+        panic!("projection on a non-constructor value");
+    }
+    let mut out = 0u64;
+    let mut q = p;
+    let mut idx = 0usize;
+    loop {
+        let ar = con_ar(q) as usize;
+        let ca = con_addr(q);
+        let c = ctx.cell(ca);
+        fr.push(ca);
+        if ar > 2 {
+            if idx == i {
+                out = c[0];
+            } else {
+                free_val(ctx, fr, c[0]);
+            }
+            idx += 1;
+            q = c[1];
+        } else {
+            for (s, cv) in c.iter().enumerate().take(ar) {
+                if idx == i {
+                    out = *cv;
+                } else {
+                    free_val(ctx, fr, *cv);
+                }
+                idx += 1;
+                let _ = s;
+            }
+            return out;
+        }
+    }
+}
+
+/// `own` bits 0/1: the respective operand is owned and dies here (its box
+/// is freed on the float path; a borrowed read stays live).
+fn bin(ctx: &mut Wctx, fr: &mut Vec<u32>, al: &mut Vec<u32>, op: u8, a: u64, b: u64, own: u8) -> u64 {
     if tag(a) == T_NUM && tag(b) == T_NUM {
         let (x, y) = (as_i(a), as_i(b));
         return num(wrap56(match op {
@@ -389,14 +814,18 @@ fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64) -> u64 {
         }));
     }
     let (x, y) = (flo_val(ctx, a), flo_val(ctx, b));
+    if own & 1 != 0 { fr.push((a & M56) as u32); }
+    if own & 2 != 0 { fr.push((b & M56) as u32); }
     let v = match op { 0 => x + y, 1 => x - y, 2 => x * y, 3 => x / y, _ => panic!("op not defined on floats") };
-    flo(ctx, v)
+    flo(ctx, al, v)
 }
 
-fn cmp(ctx: &Wctx, op: u8, a: u64, b: u64) -> u64 {
+fn cmp(ctx: &Wctx, fr: &mut Vec<u32>, op: u8, a: u64, b: u64, own: u8) -> u64 {
     let o = if tag(a) == T_NUM && tag(b) == T_NUM {
         as_i(a).partial_cmp(&as_i(b))
     } else {
+        if own & 1 != 0 { fr.push((a & M56) as u32); }
+        if own & 2 != 0 { fr.push((b & M56) as u32); }
         flo_val(ctx, a).partial_cmp(&flo_val(ctx, b))
     };
     let o = o.expect("incomparable values (NaN?)");
@@ -431,13 +860,14 @@ fn spawn_call(ctx: &mut Wctx, rule: u16, args: &[u64], parent: u64) {
 }
 
 /// n-tuple of int zeros (the identity of the additive fold combiners).
-fn zeros(ctx: &mut Wctx, n: usize) -> u64 {
+fn zeros(ctx: &mut Wctx, al: &mut Vec<u32>, n: usize) -> u64 {
     let fs: Vec<u64> = (0..n).map(|_| num(0)).collect();
-    mk_con(ctx, 0xFFF, &fs)
+    mk_con(ctx, al, 0xFFF, &fs)
 }
 
 /// Elementwise wrapping add of two equal-shape int tuples, in place into `a`
-/// (re-masked to the low 32 bits per element when `mask32`).
+/// (re-masked to the low 32 bits per element when `mask32`); `b` is
+/// consumed and its cells freed.
 fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
     let (mut pa, mut pb) = (a, b);
     loop {
@@ -445,6 +875,7 @@ fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
         if n == 0 { return a; }
         let (ca, cb) = (con_addr(pa), con_addr(pb));
         let (xa, xb) = (ctx.cell(ca), ctx.cell(cb));
+        ctx.free(cb);
         let add = |x: u64, y: u64| {
             let v = as_i(x).wrapping_add(as_i(y));
             num(if mask32 { v & 0xFFFF_FFFF } else { wrap56(v) })
@@ -466,19 +897,22 @@ fn show(eng: &Engine, p: u64) -> String {
         T_FLO => format!("{:?}", f64::from_bits(eng.cell((p & M56) as u32)[0])),
         T_CON => {
             let k = con_tag(p);
-            let mut n = con_ar(p) as usize;
             let mut q = p;
             let mut fs: Vec<String> = Vec::new();
-            while n > 0 {
-                let c = eng.cell(con_addr(q));
-                if n <= 2 {
-                    fs.push(show(eng, c[0]));
-                    if n == 2 { fs.push(show(eng, c[1])); }
-                    break;
+            if con_ar(p) > 0 {
+                loop {
+                    let ar = con_ar(q) as usize;
+                    let c = eng.cell(con_addr(q));
+                    if ar > 2 {
+                        fs.push(show(eng, c[0]));
+                        q = c[1];
+                    } else {
+                        for s in 0..ar {
+                            fs.push(show(eng, c[s]));
+                        }
+                        break;
+                    }
                 }
-                fs.push(show(eng, c[0]));
-                q = c[1];
-                n -= 1;
             }
             if k == 0xFFF { format!("({})", fs.join(", ")) } else { format!("C{}({})", k, fs.join(", ")) }
         }
@@ -490,12 +924,28 @@ fn show(eng: &Engine, p: u64) -> String {
 
 const MAIN: &str = r#"
 fn main() {
-    let a: Vec<String> = std::env::args().collect();
-    let threads: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let fuel: i64 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(4096);
+    // threads = argv[1] (default 1), fuel = argv[2] (default 4096);
+    // `--threads N` / `--fuel N` flag forms are accepted too.
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    let mut threads: usize = 1;
+    let mut fuel: i64 = 4096;
+    let mut pos: Vec<&str> = Vec::new();
+    let mut it = a.iter();
+    while let Some(w) = it.next() {
+        match w.as_str() {
+            "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads),
+            "--fuel" => fuel = it.next().and_then(|s| s.parse().ok()).unwrap_or(fuel),
+            other => pos.push(other),
+        }
+    }
+    if let Some(p) = pos.first() { if let Ok(v) = p.parse() { threads = v; } }
+    if let Some(p) = pos.get(1) { if let Ok(v) = p.parse() { fuel = v; } }
     let pg = Pg { fuel: fuel.clamp(1, u32::MAX as i64) as u32 };
     let mut eng = Engine::new(threads, fuel);
     let root = eng.run(&pg, Redex { a: 0, b: 0, aux: ROOT });
     println!("{}", show(&eng, root));
+    if std::env::var_os("MITHRIL_STATS").is_some() {
+        eprintln!("peak_cells={}", eng.stats().peak_cells);
+    }
 }
 "#;
