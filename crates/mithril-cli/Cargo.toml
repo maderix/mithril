@@ -1,0 +1,20 @@
+[package]
+name = "mithril-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mithril"
+path = "src/main.rs"
+
+[dependencies]
+mithril-core = { path = "../mithril-core" }
+mithril-front = { path = "../mithril-front" }
+mithril-reassoc = { path = "../mithril-reassoc" }
+mithril-net = { path = "../mithril-net" }
+mithril-codegen = { path = "../mithril-codegen" }
+mithril-rt = { path = "../mithril-rt" }
+mithril-gpu = { path = "../mithril-gpu", optional = true }
+
+[features]
+gpu = ["dep:mithril-gpu"]
