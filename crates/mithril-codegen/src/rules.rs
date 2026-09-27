@@ -39,7 +39,7 @@ pub(crate) struct SegQ {
 }
 
 impl SegQ {
-    fn add(&mut self, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
+    pub(crate) fn add(&mut self, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
         let id = self.next;
         self.next += 1;
         self.q.push(Seg { id, slots, env, body });
@@ -174,7 +174,7 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
 // ---- fork detection (shared by counting and emission) ----
 
 /// `Let(x, Call g, Let(y, Call h, bo2))` with `h`'s args independent of `x`.
-fn fork_parts<'e>(x: &u32, bo: &'e Core) -> Option<(&'e u32, &'e u32, &'e Vec<Core>, &'e Core)> {
+pub(crate) fn fork_parts<'e>(x: &u32, bo: &'e Core) -> Option<(&'e u32, &'e u32, &'e Vec<Core>, &'e Core)> {
     if let Core::Let(y, r2, bo2) = bo {
         if let Core::Call(h, hargs) = r2.as_ref() {
             if !hargs.iter().any(|a| free_vars(a).contains(x)) {
@@ -254,7 +254,7 @@ pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) {
 
 /// Allocate a waiting record for segment `rule` with the given spilled
 /// environment; returns the record temp name.
-fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str, b: &mut String) -> String {
+pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str, b: &mut String) -> String {
     let chn = ex.fresh();
     if env.is_empty() {
         b.push_str(&format!("let {chn}: u64 = 0;\n"));
@@ -272,7 +272,7 @@ fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &str, b: &mut S
     rn
 }
 
-fn emit_spawn(ex: &mut Ex, g: u32, args: &[Core], par: &str, b: &mut String) {
+pub(crate) fn emit_spawn(ex: &mut Ex, g: u32, args: &[Core], par: &str, b: &mut String) {
     let es: Vec<String> = args.iter().map(|a| ex.val(a, true, b)).collect();
     b.push_str(&format!("spawn_call(ctx, {}u16, &[{}], {});\n", 1 + g, es.join(", "), par));
 }
@@ -284,7 +284,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
             if !has_call(r) {
                 let er = ex.val(r, false, b);
                 if ex.rem.get(x).copied().unwrap_or(0) == 0 {
-                    b.push_str(&format!("free_val(ctx, fr, {er});\n"));
+                    b.push_str(&format!("free_val(ctx, {er});\n"));
                 } else {
                     b.push_str(&format!("let v{x} = {er};\n"));
                 }
@@ -373,19 +373,19 @@ pub(crate) fn expand_fn(
     let ar = m.fns[fid as usize].arity;
     let params: String = (0..ar).map(|i| format!(", v{i}: u64")).collect();
     let mut s = format!("fn x_{fid}(ctx: &mut Wctx, parent: u64{params}) {{\n");
-    s.push_str("let fr = &mut Vec::new();\nlet al: &mut Vec<u32> = &mut Vec::new();\n");
     let mut rem = Cnt::new();
     cnt_rule(body, &mut rem);
-    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor);
+    let ints = crate::seq::numeric_vars(body, crate::float_free(m));
+    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, 0);
     let mut bb = String::new();
     for i in 0..ar as u32 {
         if ex.rem.get(&i).copied().unwrap_or(0) == 0 {
-            bb.push_str(&format!("free_val(ctx, fr, v{i});\n"));
+            bb.push_str(&format!("free_val(ctx, v{i});\n"));
         }
     }
     rtail(&mut ex, body, "parent", &mut bb, sq);
     s.push_str(&bb);
-    s.push_str("flush(ctx, fr);\n}\n\n");
+    s.push_str("}\n\n");
     s
 }
 
@@ -395,7 +395,6 @@ pub(crate) fn expand_fn(
 pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ) -> String {
     let _ = m;
     let mut s = format!("fn sg_{}(ctx: &mut Wctx, e: Redex) {{\n", seg.id);
-    s.push_str("let fr = &mut Vec::new();\nlet al: &mut Vec<u32> = &mut Vec::new();\n");
     s.push_str("let inf = ctx.rec(e.aux as u32);\nlet parent = inf.parent;\n");
     let mut rem = Cnt::new();
     cnt_rule(&seg.body, &mut rem);
@@ -414,13 +413,14 @@ pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut 
     // Unused owned inputs die immediately.
     for sv in &seg.slots {
         if rem.get(sv).copied().unwrap_or(0) == 0 {
-            s.push_str(&format!("free_val(ctx, fr, v{sv});\n"));
+            s.push_str(&format!("free_val(ctx, v{sv});\n"));
         }
     }
-    let mut ex = Ex::new(false, u32::MAX, false, rem, HashSet::new(), bor);
+    let ints = crate::seq::numeric_vars(&seg.body, crate::float_free(m));
+    let mut ex = Ex::new(false, u32::MAX, false, rem, HashSet::new(), bor, ints, None, 0);
     let mut bb = String::new();
     rtail(&mut ex, &seg.body, "parent", &mut bb, sq);
     s.push_str(&bb);
-    s.push_str("flush(ctx, fr);\n}\n\n");
+    s.push_str("}\n\n");
     s
 }

@@ -554,7 +554,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
                     bargs.push(format!("a{p}_{i}"));
                 }
                 if !bor[fid as usize][p] {
-                    unpack.push_str(&format!("free_spine(ctx, fr, v{p});\n"));
+                    unpack.push_str(&format!("free_spine(ctx, v{p});\n"));
                 }
             }
         }
@@ -566,7 +566,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
             let packs: Vec<String> = (0..k).map(|i| format!("num(r{i})")).collect();
             format!(
-                "{unpack}let ({}) = s_{fid}({});\nOk(mk_con(ctx, al, 0xFFFu16, &[{}]))",
+                "{unpack}let ({}) = s_{fid}({});\nOk(mk_con(ctx, 0xFFFu16, &[{}]))",
                 comps.join(", "),
                 bargs.join(", "),
                 packs.join(", ")
@@ -574,14 +574,12 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         }
         Kind::No => unreachable!(),
     };
-    let cx = if needs_cell_read || matches!(sig.ret, Kind::SK(_)) { "ctx" } else { "_ctx" };
-    let alx = if matches!(sig.ret, Kind::SK(_)) { "al" } else { "_al" };
-    let frx = if owns_tuple { "fr" } else { "_fr" };
+    let cx = if needs_cell_read || owns_tuple || matches!(sig.ret, Kind::SK(_)) { "ctx" } else { "_ctx" };
     format!(
         "#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
          fn s_{fid}({}) -> {ret} {{\n{body}}}\n\n\
          #[allow(unused_variables, clippy::too_many_arguments)]\n\
-         fn d_{fid}({cx}: &mut Wctx, {frx}: &mut Vec<u32>, {alx}: &mut Vec<u32>, _fuel: &mut i64, _parent: u64{}) -> R {{\n\
+         fn d_{fid}({cx}: &mut Wctx, _fuel: &mut i64{}) -> R {{\n\
          {bridge_body}\n}}\n\n",
         params.join(", "),
         (0..ar).map(|i| format!(", v{i}: u64")).collect::<String>(),

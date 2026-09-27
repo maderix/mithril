@@ -130,6 +130,13 @@ impl<'e> Wctx<'e> {
         }
     }
 
+    /// Re-point a live record's parent (used when a suspended dive captures
+    /// its continuation as records whose destination is only known higher
+    /// up the call chain). Must happen before any delivery can fire `i`.
+    pub fn set_parent(&self, i: u32, parent: u64) {
+        self.ar.recs[i as usize].parent.store(parent, Ordering::Relaxed);
+    }
+
     /// Fill slot `parent & 7` of record `parent >> 3`; the delivery that
     /// brings `pend` to zero queues the record in its rule's bucket.
     /// `parent == ROOT` finishes the run with `val`.

@@ -117,7 +117,7 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
     let rc = 1 + fid;
     let zline = match pf.tuple {
         None => "let tz = num(0i64);".to_string(),
-        Some(n) => format!("let tz = zeros(ctx, al, {n});"),
+        Some(n) => format!("let tz = zeros(ctx, {n});"),
     };
     let left: Vec<String> = (0..ar)
         .map(|i| match i {
@@ -138,13 +138,13 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
             } else if i == pf.acc {
                 "tz".into()
             } else {
-                dups.push_str(&format!("let td{i} = dup_val(ctx, al, v{i});\n"));
+                dups.push_str(&format!("let td{i} = dup_val(ctx, v{i});\n"));
                 format!("td{i}")
             }
         })
         .collect();
     format!(
-        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet al: &mut Vec<u32> = &mut Vec::new();\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nif hi - lo > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
+        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nif hi - lo > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
         left.join(", "),
         right.join(", ")
     )

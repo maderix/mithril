@@ -58,6 +58,24 @@ pub fn fmt_val(v: &Val) -> String {
     }
 }
 
+/// True when no function body contains a float literal: floats cannot
+/// arise any other way, so every numeric value in the program is an i56.
+pub(crate) fn float_free(m: &CoreModule) -> bool {
+    fn has_flo(e: &Core) -> bool {
+        match e {
+            Core::Flo(_) => true,
+            Core::Num(_) | Core::Var(_) => false,
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_flo(a) || has_flo(b),
+            Core::If(c, t, f) => has_flo(c) || has_flo(t) || has_flo(f),
+            Core::Let(_, r, b) => has_flo(r) || has_flo(b),
+            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) => a.iter().any(has_flo),
+            Core::Match(s, arms) => has_flo(s) || arms.iter().any(|(_, _, b)| has_flo(b)),
+            Core::Proj(b, _) => has_flo(b),
+        }
+    }
+    !m.fns.iter().any(|f| has_flo(&f.body))
+}
+
 /// Emit a complete `main.rs` for the module (see module docs).
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     // Const path: the compile-time reducer already finished the program.
@@ -81,6 +99,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         }
     }
     let mut sq = rules::SegQ { next, q: Vec::new() };
+    // forwarding segment: fuel-out at a dive entry spawns the pending call
+    // against a record of this rule, which just passes the value upward
+    let fwd = sq.add(vec![0], vec![], Core::Var(0));
 
     // Normalize every body first, then infer per-parameter borrow modes
     // (read-only params are lent, not consumed; see `borrows`).
@@ -101,7 +122,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             // native scalar form + bridging dive form (see scalar.rs)
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
         } else {
-            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid]));
+            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd));
         }
         fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq));
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
@@ -135,14 +156,10 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         fire_arms.push_str(&format!("            {} => sg_{}(ctx, e),\n", seg.id, seg.id));
     }
     let mut dive_arms = String::new();
-    let mut exp_arms = String::new();
     for fid in 0..nf {
         let ar = m.fns[fid].arity;
         let args: String = (0..ar).map(|i| format!(", args[{}]", i + 1)).collect();
-        dive_arms.push_str(&format!(
-            "            {fid} => d_{fid}(ctx, &mut fr, &mut al, fuel, parent{args}),\n"
-        ));
-        exp_arms.push_str(&format!("                    {fid} => x_{fid}(ctx, parent{args}),\n"));
+        dive_arms.push_str(&format!("            {fid} => d_{fid}(ctx, fuel{args}),\n"));
     }
 
     let mut out = String::with_capacity(fns_code.len() + 8192);
@@ -163,32 +180,16 @@ impl Program for Pg {{
         }}
     }}
     fn dive(&self, f: u16, args: &[u64], fuel: &mut i64, ctx: &mut Wctx) -> DiveResult {{
-        // args[0] is the destination; on unwind fall back to the rule form.
-        // Frees are deferred into `fr`: applied on completion or commit,
-        // dropped on unwind (nothing was really consumed then).
+        // args[0] is the destination. A suspended dive has already spawned
+        // its residue behind a record chain; attach the chain's root here.
         let parent = args[0];
-        let mut fr: Vec<u32> = Vec::new();
-        let mut al: Vec<u32> = Vec::new();
         let r = match f as usize {{
 {dive_arms}            _ => unreachable!(\"dive {{}}\", f),
         }};
         match r {{
-            Ok(v) => {{
-                flush(ctx, &mut fr);
-                DiveResult::Done(v)
-            }}
-            Err(true) => {{
-                flush(ctx, &mut fr);
-                DiveResult::Suspended
-            }}
-            Err(false) => {{
-                // Roll back: nothing was consumed, and the attempt's own
-                // allocations are garbage.
-                fr.clear();
-                flush(ctx, &mut al);
-                match f as usize {{
-{exp_arms}                    _ => unreachable!(),
-                }}
+            Ok(v) => DiveResult::Done(v),
+            Err(rec) => {{
+                ctx.set_parent(rec, parent);
                 DiveResult::Suspended
             }}
         }}
@@ -231,12 +232,8 @@ fn call_fn(
     let args: String = (0..ar).map(|i| format!(", v{i}")).collect();
     let mut done_frees = String::new();
     let lent: Vec<usize> = (0..ar).filter(|&i| bor[fid as usize][i]).collect();
-    if !lent.is_empty() {
-        done_frees.push_str("let fr = &mut Vec::new();\n");
-        for i in &lent {
-            done_frees.push_str(&format!("free_val(ctx, fr, v{i});\n"));
-        }
-        done_frees.push_str("flush(ctx, fr);\n");
+    for i in &lent {
+        done_frees.push_str(&format!("free_val(ctx, v{i});\n"));
     }
     s.push_str(&format!(
         "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => {{\nctx.deliver(parent, v);\n{done_frees}}}\nDiveResult::Suspended => {{}}\n}}\n}}\n\n"
@@ -587,9 +584,9 @@ const PRELUDE: &str = r#"// GENERATED by mithril-codegen. Do not edit.
 #![allow(unused, unused_mut, unreachable_code, unreachable_patterns, non_snake_case, clippy::all)]
 use mithril_rt::{DiveResult, Engine, Program, Redex, Wctx, ROOT};
 
-/// Dive result: Ok(value) | Err(true) = suspended, residue already spawned |
-/// Err(false) = fuel out with no spawnable destination (caller unwinds).
-type R = Result<u64, bool>;
+/// Dive result: Ok(value) | Err(rec) = suspended; the residue is spawned
+/// behind a record chain whose root `rec` still needs its parent set.
+type R = Result<u64, u32>;
 
 /// "No destination" sentinel for nested dives (they unwind on fuel-out).
 const NONE: u64 = u64::MAX;
@@ -606,7 +603,7 @@ const T_CON: u64 = 4;
 #[inline] fn con_addr(p: u64) -> u32 { ((p >> 16) & ((1u64 << 40) - 1)) as u32 }
 #[inline] fn con_tag(p: u64) -> u16 { ((p >> 4) & 0xFFF) as u16 }
 #[inline] fn con_ar(p: u64) -> u8 { (p & 0xF) as u8 }
-#[inline] fn flo(ctx: &mut Wctx, al: &mut Vec<u32>, v: f64) -> u64 { let a = ctx.alloc(v.to_bits(), 0); al.push(a); (T_FLO << 56) | a as u64 }
+#[inline] fn flo(ctx: &mut Wctx, v: f64) -> u64 { let a = ctx.alloc(v.to_bits(), 0); (T_FLO << 56) | a as u64 }
 #[inline] fn flo_val(ctx: &Wctx, p: u64) -> f64 { f64::from_bits(ctx.cell((p & M56) as u32)[0]) }
 
 fn mith_unreachable() -> u64 { panic!("unreachable match arm reached at runtime") }
@@ -615,26 +612,26 @@ fn mith_unreachable() -> u64 { panic!("unreachable match arm reached at runtime"
 /// (slot 0 = field, slot 1 = continuation con). The arity nibble saturates
 /// at 15: any nibble > 2 means "one field + a link", so arbitrary widths
 /// chain fine and walkers never rely on the nibble as an exact total.
-fn mk_con(ctx: &mut Wctx, al: &mut Vec<u32>, k: u16, fs: &[u64]) -> u64 {
+fn mk_con(ctx: &mut Wctx, k: u16, fs: &[u64]) -> u64 {
     let n = fs.len();
     if n == 0 { return con(0, k, 0); }
     if n <= 2 {
         let a = ctx.alloc(fs[0], if n == 2 { fs[1] } else { 0 });
-        al.push(a);
         return con(a, k, n as u8);
     }
     let a = ctx.alloc(fs[n - 2], fs[n - 1]);
-    al.push(a);
     let mut chain = con(a, k, 2);
     let mut i = n - 2;
     while i > 0 {
         i -= 1;
         let a = ctx.alloc(fs[i], chain);
-        al.push(a);
         chain = con(a, k, (n - i).min(15) as u8);
     }
     chain
 }
+
+#[inline] fn mk_con1(ctx: &mut Wctx, k: u16, f0: u64) -> u64 { let a = ctx.alloc(f0, 0); con(a, k, 1) }
+#[inline] fn mk_con2(ctx: &mut Wctx, k: u16, f0: u64, f1: u64) -> u64 { let a = ctx.alloc(f0, f1); con(a, k, 2) }
 
 /// Field `i` of a constructor value (walks the >2-arity chain).
 fn field(ctx: &Wctx, p: u64, i: usize) -> u64 {
@@ -662,23 +659,14 @@ fn py_mod(a: i64, b: i64) -> i64 {
     if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
 }
 
-/// Apply deferred frees (a dive that unwinds drops its list instead).
-fn flush(ctx: &mut Wctx, fr: &mut Vec<u32>) {
-    for &c in fr.iter() {
-        ctx.free(c);
-    }
-    fr.clear();
-}
-
 /// Deep-copy a value (used for non-last uses of shared owned values and
 /// escaping reads of borrowed values). Immediates copy for free.
-fn dup_val(ctx: &mut Wctx, al: &mut Vec<u32>, p: u64) -> u64 {
+fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
     match tag(p) {
         T_FLO => {
             let bits = ctx.cell((p & M56) as u32)[0];
             let a = ctx.alloc(bits, 0);
-            al.push(a);
-            (T_FLO << 56) | a as u64
+                (T_FLO << 56) | a as u64
         }
         T_CON => {
             if con_ar(p) == 0 {
@@ -701,18 +689,18 @@ fn dup_val(ctx: &mut Wctx, al: &mut Vec<u32>, p: u64) -> u64 {
                 }
             }
             for f in fs.iter_mut() {
-                *f = dup_val(ctx, al, *f);
+                *f = dup_val(ctx, *f);
             }
-            mk_con(ctx, al, k, &fs)
+            mk_con(ctx, k, &fs)
         }
         _ => p,
     }
 }
 
 /// Deep-free a dead value (deferred).
-fn free_val(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
+fn free_val(ctx: &mut Wctx, p: u64) {
     match tag(p) {
-        T_FLO => fr.push((p & M56) as u32),
+        T_FLO => ctx.free((p & M56) as u32),
         T_CON => {
             let mut q = p;
             loop {
@@ -722,13 +710,13 @@ fn free_val(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
                 }
                 let ca = con_addr(q);
                 let c = ctx.cell(ca);
-                fr.push(ca);
+                ctx.free(ca);
                 if ar > 2 {
-                    free_val(ctx, fr, c[0]);
+                    free_val(ctx, c[0]);
                     q = c[1];
                 } else {
                     for s in 0..ar {
-                        free_val(ctx, fr, c[s]);
+                        free_val(ctx, c[s]);
                     }
                     return;
                 }
@@ -739,10 +727,10 @@ fn free_val(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
 }
 
 /// Free only a constructor's spine cells (fields were moved out).
-fn free_spine(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
+fn free_spine(ctx: &mut Wctx, p: u64) {
     if tag(p) != T_CON {
         if tag(p) == T_FLO {
-            fr.push((p & M56) as u32);
+            ctx.free((p & M56) as u32);
         }
         return;
     }
@@ -755,10 +743,10 @@ fn free_spine(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
         let ca = con_addr(q);
         if ar > 2 {
             let c = ctx.cell(ca);
-            fr.push(ca);
+            ctx.free(ca);
             q = c[1];
         } else {
-            fr.push(ca);
+            ctx.free(ca);
             return;
         }
     }
@@ -766,7 +754,7 @@ fn free_spine(ctx: &Wctx, fr: &mut Vec<u32>, p: u64) {
 
 /// Consume a tuple/ctor: return field `i`, deep-free the other fields and
 /// the spine.
-fn take_field(ctx: &Wctx, fr: &mut Vec<u32>, p: u64, i: usize) -> u64 {
+fn take_field(ctx: &mut Wctx, p: u64, i: usize) -> u64 {
     if tag(p) != T_CON || con_ar(p) == 0 {
         panic!("projection on a non-constructor value");
     }
@@ -777,12 +765,12 @@ fn take_field(ctx: &Wctx, fr: &mut Vec<u32>, p: u64, i: usize) -> u64 {
         let ar = con_ar(q) as usize;
         let ca = con_addr(q);
         let c = ctx.cell(ca);
-        fr.push(ca);
+        ctx.free(ca);
         if ar > 2 {
             if idx == i {
                 out = c[0];
             } else {
-                free_val(ctx, fr, c[0]);
+                free_val(ctx, c[0]);
             }
             idx += 1;
             q = c[1];
@@ -791,7 +779,7 @@ fn take_field(ctx: &Wctx, fr: &mut Vec<u32>, p: u64, i: usize) -> u64 {
                 if idx == i {
                     out = *cv;
                 } else {
-                    free_val(ctx, fr, *cv);
+                    free_val(ctx, *cv);
                 }
                 idx += 1;
                 let _ = s;
@@ -803,7 +791,7 @@ fn take_field(ctx: &Wctx, fr: &mut Vec<u32>, p: u64, i: usize) -> u64 {
 
 /// `own` bits 0/1: the respective operand is owned and dies here (its box
 /// is freed on the float path; a borrowed read stays live).
-fn bin(ctx: &mut Wctx, fr: &mut Vec<u32>, al: &mut Vec<u32>, op: u8, a: u64, b: u64, own: u8) -> u64 {
+fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     if tag(a) == T_NUM && tag(b) == T_NUM {
         let (x, y) = (as_i(a), as_i(b));
         return num(wrap56(match op {
@@ -821,18 +809,18 @@ fn bin(ctx: &mut Wctx, fr: &mut Vec<u32>, al: &mut Vec<u32>, op: u8, a: u64, b: 
         }));
     }
     let (x, y) = (flo_val(ctx, a), flo_val(ctx, b));
-    if own & 1 != 0 { fr.push((a & M56) as u32); }
-    if own & 2 != 0 { fr.push((b & M56) as u32); }
+    if own & 1 != 0 { ctx.free((a & M56) as u32); }
+    if own & 2 != 0 { ctx.free((b & M56) as u32); }
     let v = match op { 0 => x + y, 1 => x - y, 2 => x * y, 3 => x / y, _ => panic!("op not defined on floats") };
-    flo(ctx, al, v)
+    flo(ctx, v)
 }
 
-fn cmp(ctx: &Wctx, fr: &mut Vec<u32>, op: u8, a: u64, b: u64, own: u8) -> u64 {
+fn cmp(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     let o = if tag(a) == T_NUM && tag(b) == T_NUM {
         as_i(a).partial_cmp(&as_i(b))
     } else {
-        if own & 1 != 0 { fr.push((a & M56) as u32); }
-        if own & 2 != 0 { fr.push((b & M56) as u32); }
+        if own & 1 != 0 { ctx.free((a & M56) as u32); }
+        if own & 2 != 0 { ctx.free((b & M56) as u32); }
         flo_val(ctx, a).partial_cmp(&flo_val(ctx, b))
     };
     let o = o.expect("incomparable values (NaN?)");
@@ -867,9 +855,9 @@ fn spawn_call(ctx: &mut Wctx, rule: u16, args: &[u64], parent: u64) {
 }
 
 /// n-tuple of int zeros (the identity of the additive fold combiners).
-fn zeros(ctx: &mut Wctx, al: &mut Vec<u32>, n: usize) -> u64 {
+fn zeros(ctx: &mut Wctx, n: usize) -> u64 {
     let fs: Vec<u64> = (0..n).map(|_| num(0)).collect();
-    mk_con(ctx, al, 0xFFF, &fs)
+    mk_con(ctx, 0xFFF, &fs)
 }
 
 /// Elementwise wrapping add of two equal-shape int tuples, in place into `a`

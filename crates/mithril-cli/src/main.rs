@@ -209,7 +209,7 @@ fn rustc_rlib(out_dir: &Path, name: &str, src: &Path) -> Result<(), CliErr> {
 }
 
 /// Compile (or reuse) the cached `mithril_rt` rlib + its `mithril_core`
-/// dep under `target/mithril-cache/rt-<hash of rustc -V>/`.
+/// dep under `target/mithril-cache/rt-<hash of rustc -V + rt/core sources>/`.
 fn rt_cache_dir() -> Result<PathBuf, CliErr> {
     let ver = Command::new("rustc")
         .arg("-V")
@@ -218,8 +218,24 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
     if !ver.status.success() {
         return Err("rustc -V failed".into());
     }
+    // key: rustc version + the runtime/core sources, so edits to the
+    // runtime never serve a stale rlib
+    let crates_root = workspace_root().join("crates");
+    let mut key: Vec<u8> = ver.stdout.clone();
+    for c in ["mithril-core", "mithril-rt"] {
+        let src = crates_root.join(c).join("src");
+        if let Ok(rd) = fs::read_dir(&src) {
+            let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            names.sort();
+            for f in names {
+                if let Ok(bytes) = fs::read(&f) {
+                    key.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
     let base = target_dir().join("mithril-cache");
-    let dir = base.join(format!("rt-{:016x}", fnv64(&ver.stdout)));
+    let dir = base.join(format!("rt-{:016x}", fnv64(&key)));
     if dir.join("libmithril_rt.rlib").exists() {
         return Ok(dir);
     }
