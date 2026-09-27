@@ -1,0 +1,9 @@
+[package]
+name = "mithril-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mithril-core = { path = "../mithril-core" }
+mithril-front = { path = "../mithril-front" }
+mithril-rt = { path = "../mithril-rt" }
