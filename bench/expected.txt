@@ -1,0 +1,2 @@
+# Full-size checksum of the spatial-tree benchmark.
+kdtree 1660315459
