@@ -5,3 +5,14 @@ version = 4
 [[package]]
 name = "mithril-core"
 version = "0.1.0"
+
+[[package]]
+name = "mithril-front"
+version = "0.1.0"
+
+[[package]]
+name = "mithril-rt"
+version = "0.1.0"
+dependencies = [
+ "mithril-core",
+]
