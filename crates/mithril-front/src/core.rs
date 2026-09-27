@@ -56,6 +56,10 @@ pub struct FoldInfo {
 pub enum Combiner {
     WrapAdd,
     TupleWrapAdd(usize),
+    /// u32-emulation folds (`& 4294967295`-masked): wrapping add mod
+    /// 2^32; the join must re-mask its result to the low 32 bits.
+    WrapAdd32,
+    TupleWrapAdd32(usize),
     Fn(FnId),
 }
 

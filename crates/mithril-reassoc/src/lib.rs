@@ -22,9 +22,10 @@ use mithril_front::ast::{Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
 use std::collections::HashMap;
 
 /// One analyzed `for` loop. For loops that are not accumulation-shaped at
-/// all, `acc` is empty. `arity` is the proven combiner's arity (1 =
-/// scalar, k = k-tuple componentwise) and is what `lean_obligations`
-/// shapes the obligation from; it is 0 on declined/non-fold reports.
+/// all, `acc` is empty. `arity` (1 = scalar, k = k-tuple componentwise)
+/// and `bits` (56 native, 32 for `& 4294967295`-masked u32-emulation
+/// folds) describe the proven combiner and are what `lean_obligations`
+/// shapes the obligation from; both are 0 on declined/non-fold reports.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FoldReport {
     pub func: String,
@@ -32,6 +33,7 @@ pub struct FoldReport {
     pub proven: bool,
     pub reason: String,
     pub arity: usize,
+    pub bits: u32,
 }
 
 /// What the accumulator provably holds when a loop is entered.
@@ -158,6 +160,7 @@ fn decline(out: &mut Vec<FoldReport>, func: &str, acc: &str, reason: String) {
         proven: false,
         reason,
         arity: 0,
+        bits: 0,
     });
 }
 
@@ -172,7 +175,7 @@ fn analyze_for(
     inits: &HashMap<String, Init>,
     out: &mut Vec<FoldReport>,
 ) {
-    let cand = match detect(var, body) {
+    let (cand, top_masked) = match detect(var, body) {
         None => {
             return decline(
                 out,
@@ -196,7 +199,7 @@ fn analyze_for(
                     format!("element expression reads the accumulator '{acc}', DECLINED"),
                 );
             }
-            match fns.get(*fname).map(step_from_fn) {
+            match fns.get(*fname).map(|fd| step_from_fn(fd, top_masked)) {
                 None => {
                     return decline(
                         out,
@@ -211,7 +214,7 @@ fn analyze_for(
                 Some(Ok(s)) => s,
             }
         }
-        Cand::Expr { op, left, .. } => match step_from_expr(acc, *op, left) {
+        Cand::Expr { op, left, .. } => match step_from_expr(acc, *op, left, top_masked) {
             Err(e) => return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED")),
             Ok(s) => s,
         },
@@ -246,10 +249,18 @@ fn analyze_for(
             format!("loop entry value of '{acc}' is not the combiner identity (expected {want}), DECLINED"),
         );
     }
-    let (combiner, desc) = if step.arity == 1 {
-        (Combiner::WrapAdd, "wrapping add".to_string())
-    } else {
-        (Combiner::TupleWrapAdd(step.arity), format!("componentwise wrapping add on {}-tuple", step.arity))
+    let mode32 = step.mask == poly::MASK32;
+    let bits: u32 = if mode32 { 32 } else { 56 };
+    let (combiner, desc) = match (step.arity, mode32) {
+        (1, false) => (Combiner::WrapAdd, "wrapping add".to_string()),
+        (1, true) => (Combiner::WrapAdd32, "wrapping add mod 2^32".to_string()),
+        (k, false) => {
+            (Combiner::TupleWrapAdd(k), format!("componentwise wrapping add on {k}-tuple"))
+        }
+        (k, true) => (
+            Combiner::TupleWrapAdd32(k),
+            format!("componentwise wrapping add mod 2^32 on {k}-tuple"),
+        ),
     };
     *fold = Some(FoldInfo { combiner, proven: true });
     out.push(FoldReport {
@@ -258,5 +269,6 @@ fn analyze_for(
         proven: true,
         reason: format!("PROVEN assoc+identity (combiner: {desc}, arity {})", step.arity),
         arity: step.arity,
+        bits,
     });
 }

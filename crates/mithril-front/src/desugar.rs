@@ -593,6 +593,8 @@ fn convert_combiner(c: &AstCombiner, fn_table: &HashMap<String, FnId>) -> Result
     Ok(match c {
         AstCombiner::WrapAdd => Combiner::WrapAdd,
         AstCombiner::TupleWrapAdd(n) => Combiner::TupleWrapAdd(*n),
+        AstCombiner::WrapAdd32 => Combiner::WrapAdd32,
+        AstCombiner::TupleWrapAdd32(n) => Combiner::TupleWrapAdd32(*n),
         AstCombiner::Fn(name) => Combiner::Fn(
             *fn_table.get(name).ok_or_else(|| Diag::new(0, format!("unknown fold combiner function: {}", name)))?,
         ),

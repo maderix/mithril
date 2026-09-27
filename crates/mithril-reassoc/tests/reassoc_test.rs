@@ -93,7 +93,7 @@ fn fold_scalar_sum_proven() {
     let r = report(&reps, "total");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "s");
-    assert_eq!(r.arity, 1);
+    assert_eq!((r.arity, r.bits), (1, 56));
     assert_eq!(fold_of(&m, "total"), &Some(FoldInfo { combiner: Combiner::WrapAdd, proven: true }));
 }
 
@@ -103,7 +103,7 @@ fn fold_tuple_hist_proven() {
     let r = report(&reps, "hist");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "h");
-    assert_eq!(r.arity, 8);
+    assert_eq!((r.arity, r.bits), (8, 56));
     assert_eq!(
         fold_of(&m, "hist"),
         &Some(FoldInfo { combiner: Combiner::TupleWrapAdd(8), proven: true })
@@ -127,6 +127,146 @@ fn fold_tuple_hist_proven() {
         Val::I(0),
     ]);
     assert_eq!(v, want);
+}
+
+// ---- masked (u32-emulation) folds: `& 4294967295` => Z_2^32 mode ----
+
+#[test]
+fn fold_masked_scalar_proven() {
+    let src = "\
+def f(x):
+    return x*x + 1
+
+def total32(n):
+    s = 0
+    for i in range(n):
+        s = (s + f(i)) & 4294967295
+    return s
+";
+    let (m, reps) = analyzed(src);
+    let r = report(&reps, "total32");
+    assert!(r.proven, "expected proven, got: {}", r.reason);
+    assert_eq!((r.arity, r.bits), (1, 32));
+    assert_eq!(
+        fold_of(&m, "total32"),
+        &Some(FoldInfo { combiner: Combiner::WrapAdd32, proven: true })
+    );
+    // desugar carry-through + sequential oracle unchanged by the marking
+    let cm = desugar(&m).expect("desugar failed");
+    let helper = cm.fns.iter().find(|f| f.fold.is_some()).expect("no CoreFn carries fold info");
+    assert_eq!(helper.fold.as_ref().unwrap().combiner, CoreCombiner::WrapAdd32);
+    assert_eq!(eval_core(&cm, fn_id(&cm, "total32"), &[Val::I(3)]), Val::I(8)); // 1+2+5
+    assert_eq!(eval_core(&cm, fn_id(&cm, "total32"), &[Val::I(0)]), Val::I(0));
+}
+
+#[test]
+fn fold_masked_tuple_proven() {
+    let src = "\
+def hadd32(a, b):
+    return ((a[0] + b[0]) & 4294967295, (a[1] + b[1]) & 4294967295)
+
+def hist32(n):
+    h = (0, 0)
+    for i in range(n):
+        h = hadd32(h, (i, i*i))
+    return h
+";
+    let (m, reps) = analyzed(src);
+    let r = report(&reps, "hist32");
+    assert!(r.proven, "expected proven, got: {}", r.reason);
+    assert_eq!((r.arity, r.bits), (2, 32));
+    assert_eq!(
+        fold_of(&m, "hist32"),
+        &Some(FoldInfo { combiner: Combiner::TupleWrapAdd32(2), proven: true })
+    );
+    let cm = desugar(&m).expect("desugar failed");
+    let v = eval_core(&cm, fn_id(&cm, "hist32"), &[Val::I(3)]);
+    assert_eq!(v, Val::T(vec![Val::I(3), Val::I(5)]));
+}
+
+#[test]
+fn fold_other_mask_declined() {
+    let (m, reps) = analyzed(
+        "def m255(n):\n    s = 0\n    for i in range(n):\n        s = (s + i) & 255\n    return s\n",
+    );
+    let r = report(&reps, "m255");
+    assert!(!r.proven, "must not be proven: {}", r.reason);
+    assert!(r.reason.contains("opaque"), "reason: {}", r.reason);
+    assert_eq!(fold_of(&m, "m255"), &None);
+}
+
+#[test]
+fn fold_unmasked_result_declined() {
+    // an inner `& 4294967295` without the combiner's top-level result
+    // being masked is unsound to strip: decline.
+    let (m, reps) = analyzed(
+        "def um(n):\n    s = 0\n    for i in range(n):\n        s = (s & 4294967295) + i\n    return s\n",
+    );
+    let r = report(&reps, "um");
+    assert!(!r.proven, "must not be proven: {}", r.reason);
+    assert!(r.reason.contains("masked"), "reason: {}", r.reason);
+    assert_eq!(fold_of(&m, "um"), &None);
+}
+
+#[test]
+fn fold_partially_masked_tuple_declined() {
+    let src = "\
+def hmix(a, b):
+    return ((a[0] + b[0]) & 4294967295, a[1] + b[1])
+
+def histmix(n):
+    h = (0, 0)
+    for i in range(n):
+        h = hmix(h, (i, i))
+    return h
+";
+    let (m, reps) = analyzed(src);
+    let r = report(&reps, "histmix");
+    assert!(!r.proven, "must not be proven: {}", r.reason);
+    assert!(r.reason.contains("component"), "reason: {}", r.reason);
+    assert_eq!(fold_of(&m, "histmix"), &None);
+}
+
+#[test]
+fn lean_obligations_masked_use_bitvec_32_and_check() {
+    let src = "\
+def hadd32(a, b):
+    return ((a[0] + b[0]) & 4294967295, (a[1] + b[1]) & 4294967295)
+
+def hist32(n):
+    h = (0, 0)
+    for i in range(n):
+        h = hadd32(h, (i, i*i))
+    return h
+
+def total32(n):
+    s = 0
+    for i in range(n):
+        s = (s + i) & 4294967295
+    return s
+";
+    let (_m, reps) = analyzed(src);
+    let text = lean_obligations(&reps);
+    assert!(text.contains("Fin 2 → BitVec 32"), "text:\n{text}");
+    assert!(text.contains("(a b : BitVec 32)"), "text:\n{text}");
+    assert!(!text.contains("BitVec 56"), "masked-only module must not emit BitVec 56:\n{text}");
+    let home = std::env::var("HOME").unwrap_or_default();
+    let lean = std::path::Path::new(&home).join(".elan/bin/lean");
+    if !lean.exists() {
+        eprintln!("skipping lean check: {} not found", lean.display());
+        return;
+    }
+    let dir = std::env::temp_dir().join("mithril-reassoc-test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("obligations32.lean");
+    std::fs::write(&file, &text).expect("write obligations32.lean");
+    let out = std::process::Command::new(&lean).arg(&file).output().expect("failed to run lean");
+    assert!(
+        out.status.success(),
+        "lean rejected the BitVec 32 obligations:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ---- declined folds ----
@@ -376,6 +516,7 @@ fn lean_obligations_rejects_proven_report_without_arity() {
         proven: true,
         reason: "PROVEN".into(),
         arity: 0,
+        bits: 0,
     };
     lean_obligations(&[r]);
 }
