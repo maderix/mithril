@@ -38,6 +38,7 @@
 
 mod fold;
 mod rules;
+mod scalar;
 mod seq;
 
 use mithril_core::net::Net;
@@ -93,9 +94,15 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         .collect();
     let (bor, bsets) = borrows(m, &bodies);
 
+    let scal = scalar::classify(m);
     let mut fns_code = String::new();
     for fid in 0..nf {
-        fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid]));
+        if scal[fid].is_some() {
+            // native scalar form + bridging dive form (see scalar.rs)
+            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
+        } else {
+            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid]));
+        }
         fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq));
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
         if let Some(pf) = &folds[fid] {
