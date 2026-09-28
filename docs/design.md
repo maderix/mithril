@@ -190,6 +190,26 @@ A loop with one state variable returns the value itself (no 1-tuple, no
 `Proj`; the fold join combines bare partial results), which also made
 mandelbrot/terrain's loop helpers native-scalar.
 
+The thesis on a spike-5 shape, with the first-order stack: an expression
+interpreter (`ev`/`look` over an AST with `Let`/`If`/arith and an
+association-list environment) applied to a constant program and a
+dynamic input specializes, by the rules alone, to the program's own
+arithmetic — no match, no call, no constructor left (the first Futamura
+projection, `specialize_test::interpreter_over_a_static_program_...`):
+
+```
+run(x) = ev(prog(), Bind(0, x, Emp()))          # 605 rewrites
+   ==>  let v = (x * 3) & M in
+        if v != 0 { (v + ((x * x) & M)) & M } else { 7 }
+```
+
+Nothing in the specializer knows what an interpreter is: matches on
+known constructors select, `look`'s recursion over the known environment
+unfolds, the `Let` case's environment cell is consumed by the lookup that
+reads it, and only the branch and ops on the input stay. Phase B
+(closures shared by `DUP` at runtime) extends the same mechanism to
+programs whose static part is only known at runtime.
+
 Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose

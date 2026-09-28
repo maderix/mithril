@@ -264,3 +264,23 @@ fn readback_nests_single_use_scalars_and_binds_calls() {
     assert_eq!(lets, 1, "expected exactly the call bound, got: {f:?}");
     assert!(has(f, |c| matches!(c, Core::Let(_, r, _) if matches!(**r, Core::Call(..)))), "call not bound: {f:?}");
 }
+
+// ---- the thesis on a spike-5 shape: an interpreter over a static program ----
+
+#[test]
+fn interpreter_over_a_static_program_specializes_to_its_arithmetic() {
+    // first Futamura projection by the rules alone: `ev` over a program
+    // that is a constant AST and an environment binding the dynamic input
+    // leaves no match, no call and no constructor: the residual is the
+    // program's arithmetic over the input
+    let src = "@data\nclass E:\n    Lit: (n,)\n    Var: (i,)\n    Add: (a, b)\n    Mul: (a, b)\n    If: (c, t, f)\n    Let: (i, v, b)\n\n@data\nclass Env:\n    Emp: ()\n    Bind: (i, v, rest)\n\ndef look(env, i):\n    match env:\n        case Emp():\n            return 0\n        case Bind(j, v, rest):\n            if i == j:\n                return v\n            return look(rest, i)\n\ndef ev(e, env):\n    match e:\n        case Lit(n):\n            return n\n        case Var(i):\n            return look(env, i)\n        case Add(a, b):\n            return (ev(a, env) + ev(b, env)) & 1048575\n        case Mul(a, b):\n            return (ev(a, env) * ev(b, env)) & 1048575\n        case If(c, t, f):\n            if ev(c, env) != 0:\n                return ev(t, env)\n            return ev(f, env)\n        case Let(i, v, b):\n            return ev(b, Bind(i, ev(v, env), env))\n\ndef prog():\n    return Let(1, Mul(Var(0), Lit(3)), If(Var(1), Add(Var(1), Mul(Var(0), Var(0))), Lit(7)))\n\ndef run(x):\n    return ev(prog(), Bind(0, x, Emp()))\n\ndef main():\n    return run(5) + run(0) + run(1000)\n";
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&s), oracle(&m));
+    let r = body(&s, "run");
+    assert!(!has(r, |c| matches!(c, Core::Call(..))), "interpreter call remains: {r:?}");
+    assert!(!has(r, |c| matches!(c, Core::Match(..))), "dispatch remains: {r:?}");
+    assert!(!has(r, |c| matches!(c, Core::Ctor(..))), "program data remains: {r:?}");
+    // the program's own branch on the runtime value is what is left
+    assert!(has(r, |c| matches!(c, Core::If(..))), "the program's branch is gone: {r:?}");
+    assert!(has(r, |c| matches!(c, Core::Op2(mithril_front::ast::BinOp::Mul, ..))), "the program's arithmetic is gone: {r:?}");
+}
