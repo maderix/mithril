@@ -367,6 +367,9 @@ pub(crate) fn classify(m: &CoreModule) -> Vec<Option<Sig>> {
 
 struct Sem<'m> {
     sigs: &'m [Option<Sig>],
+    ranges: crate::range::Ranges,
+    /// the Op2 about to be emitted only has its low bits observed
+    low: bool,
     tmp: u32,
     /// component vars (SK-destructured lets and T(k) params): var -> arity;
     /// components live as q<var>_<i>
@@ -431,6 +434,7 @@ impl<'m> Sem<'m> {
             self.tvars.insert(x, k);
             return;
         }
+        self.low = self.ranges.masked(x);
         let er = self.val(r, b);
         b.push_str(&format!("let v{x} = {er};\n"));
     }
@@ -456,13 +460,14 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
-                format!("s_{g}({})", es.join(", "))
+                format!("s_{g}(fuel, {})", es.join(", "))
             }
             _ => unreachable!("non-tuple Core in scalar tuple emission"),
         }
     }
 
     fn val(&mut self, e: &Core, b: &mut String) -> String {
+        let low = std::mem::take(&mut self.low);
         match e {
             Core::Num(n) => format!("{n}i64"),
             Core::Var(i) => format!("v{i}"),
@@ -471,8 +476,11 @@ impl<'m> Sem<'m> {
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
             Core::Op2(op, x, y) => {
-                let (ex, ey) = (self.val(x, b), self.val(y, b));
+                self.low = crate::range::feeds_mask(op, y);
+                let ex = self.val(x, b);
+                let ey = self.val(y, b);
                 let t = self.fresh();
+                let wrap = self.ranges.wrap(op, x, y, low);
                 let body = match bin_code(op) {
                     0 => format!("{ex}.wrapping_add({ey})"),
                     1 => format!("{ex}.wrapping_sub({ey})"),
@@ -486,7 +494,11 @@ impl<'m> Sem<'m> {
                     9 => format!("{ex} | {ey}"),
                     _ => format!("{ex} ^ {ey}"),
                 };
-                b.push_str(&format!("let {t} = wrap56({body});\n"));
+                if wrap {
+                    b.push_str(&format!("let {t} = wrap56({body});\n"));
+                } else {
+                    b.push_str(&format!("let {t} = {body};\n"));
+                }
                 t
             }
             Core::Cmp(op, x, y) => {
@@ -519,7 +531,9 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
-                format!("s_{g}({})", es.join(", "))
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = s_{g}(fuel, {});\n", es.join(", ")));
+                t
             }
             _ => unreachable!("non-scalar Core in scalar emission"),
         }
@@ -553,15 +567,15 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
-                b.push_str(&format!("return s_{g}({});\n", es.join(", ")));
+                b.push_str(&format!("*fuel -= fl;\nreturn s_{g}(fuel, {});\n", es.join(", ")));
             }
             Core::Tuple(items) => {
                 let es: Vec<String> = items.iter().map(|a| self.val(a, b)).collect();
-                b.push_str(&format!("return ({});\n", es.join(", ")));
+                b.push_str(&format!("*fuel -= fl;\nreturn ({});\n", es.join(", ")));
             }
             other => {
                 let v = self.val(other, b);
-                b.push_str(&format!("return {v};\n"));
+                b.push_str(&format!("*fuel -= fl;\nreturn {v};\n"));
             }
         }
     }
@@ -571,7 +585,7 @@ impl<'m> Sem<'m> {
 /// `bor[fid][p]` = param p is borrowed (bridge must not free a tuple arg's
 /// spine; owned tuple args are freed after unpacking — components are NUMs,
 /// so only the spine cells matter).
-pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[Vec<bool>]) -> String {
+pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[Vec<bool>], bridge: bool) -> String {
     let f = &m.fns[fid as usize];
     let ar = f.arity;
     let lp = f.self_tail_rec;
@@ -599,10 +613,18 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             tv.insert(p as u32, *k);
         }
     }
-    let mut sem = Sem { sigs, tmp: 0, tvars: tv };
+    let mut sem = Sem { sigs, ranges: crate::range::Ranges::of(&f.body), low: false, tmp: 0, tvars: tv };
     let mut bb = String::new();
     sem.tail(&f.body, fid, lp, &mut bb);
-    let body = if lp { format!("'l: loop {{\n{bb}}}\n") } else { bb };
+    // one fuel unit per call and loop iteration, as in the dive form: native
+    // code never suspends, but its work counts toward the enclosing dive's
+    // budget (so parallel granularity tracks work, not dive calls). Counted
+    // in a local and settled at each return, so it stays in a register.
+    let body = if lp {
+        format!("let mut fl: i64 = 1;\n'l: loop {{\nfl += 1;\n{bb}}}\n")
+    } else {
+        format!("let fl: i64 = 1;\n{bb}")
+    };
 
     // bridge: unpack ports per param type, call, repack per return kind
     let mut unpack = String::new();
@@ -625,12 +647,12 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     }
     let owns_tuple = sig.params.iter().enumerate().any(|(p, pt)| matches!(pt, PTy::T(_)) && !bor[fid as usize][p]);
     let bridge_body = match sig.ret {
-        Kind::S1 => format!("{unpack}Ok(num(s_{fid}({})))", bargs.join(", ")),
+        Kind::S1 => format!("{unpack}Ok(num(s_{fid}(fuel, {})))", bargs.join(", ")),
         Kind::SK(k) => {
             let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
             let packs: Vec<String> = (0..k).map(|i| format!("num(r{i})")).collect();
             format!(
-                "{unpack}let ({}) = s_{fid}({});\nOk(mk_con(ctx, 0xFFFu16, &[{}]))",
+                "{unpack}let ({}) = s_{fid}(fuel, {});\nOk(mk_con(ctx, 0xFFFu16, &[{}]))",
                 comps.join(", "),
                 bargs.join(", "),
                 packs.join(", ")
@@ -639,11 +661,18 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         Kind::No => unreachable!(),
     };
     let cx = if needs_cell_read || owns_tuple || matches!(sig.ret, Kind::SK(_)) { "ctx" } else { "_ctx" };
+    if !bridge {
+        return format!(
+            "#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
+             fn s_{fid}(fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n",
+            params.join(", ")
+        );
+    }
     format!(
         "#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
-         fn s_{fid}({}) -> {ret} {{\n{body}}}\n\n\
+         fn s_{fid}(fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n\
          #[allow(unused_variables, clippy::too_many_arguments)]\n\
-         fn d_{fid}({cx}: &mut Wctx, _fuel: &mut i64{}) -> R {{\n\
+         fn d_{fid}({cx}: &mut Wctx, fuel: &mut i64{}) -> R {{\n\
          {bridge_body}\n}}\n\n",
         params.join(", "),
         (0..ar).map(|i| format!(", v{i}: u64")).collect::<String>(),

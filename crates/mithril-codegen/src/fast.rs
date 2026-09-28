@@ -38,6 +38,7 @@ struct Fp<'m> {
     bor: &'m [bool],
     /// int locals, held as raw i64 `w<i>`
     ints: HashSet<u32>,
+    ranges: crate::range::Ranges,
     /// params whose value is a cell-free immediate on the current path
     imm: Vec<u32>,
     tails: usize,
@@ -65,12 +66,16 @@ impl Fp<'_> {
 
     /// A pure int expression as raw i64 Rust, or None.
     fn pexpr(&self, e: &Core) -> Option<String> {
+        self.pexpr_low(e, false)
+    }
+
+    fn pexpr_low(&self, e: &Core, low: bool) -> Option<String> {
         Some(match e {
             Core::Num(n) => format!("{n}i64"),
             Core::Var(i) if self.ints.contains(i) => format!("w{i}"),
             Core::Var(i) if self.int_param(*i) => format!("as_i(v{i})"),
             Core::Op2(op, a, b) => {
-                let (x, y) = (self.pexpr(a)?, self.pexpr(b)?);
+                let (x, y) = (self.pexpr_low(a, crate::range::feeds_mask(op, b))?, self.pexpr(b)?);
                 let body = match bin_code(op) {
                     0 => format!("{x}.wrapping_add({y})"),
                     1 => format!("{x}.wrapping_sub({y})"),
@@ -84,7 +89,11 @@ impl Fp<'_> {
                     9 => format!("({x} | {y})"),
                     _ => format!("({x} ^ {y})"),
                 };
-                format!("wrap56({body})")
+                if self.ranges.wrap(op, a, b, low) {
+                    format!("wrap56({body})")
+                } else {
+                    body
+                }
             }
             Core::Cmp(op, a, b) => {
                 let (x, y) = (self.pexpr(a)?, self.pexpr(b)?);
@@ -110,7 +119,8 @@ impl Fp<'_> {
     fn tail(&mut self, e: &Core, b: &mut String) {
         match e {
             Core::Let(x, r, bo) => match self.pexpr(r) {
-                Some(s) => {
+                Some(_) => {
+                    let s = self.pexpr_low(r, self.ranges.masked(*x)).unwrap();
                     b.push_str(&format!("let w{x}: i64 = {s};\n"));
                     self.ints.insert(*x);
                     self.tail(bo, b);
@@ -224,7 +234,8 @@ pub(crate) fn fast_fn(
     if !calls_self(fid, body) {
         return None;
     }
-    let mut fp = Fp { m, fid, tys, unbox, sigs, bor, ints: HashSet::new(), imm: Vec::new(), tails: 0, falls: 0 };
+    let ranges = crate::range::Ranges::of(body);
+    let mut fp = Fp { m, fid, tys, unbox, sigs, bor, ints: HashSet::new(), ranges, imm: Vec::new(), tails: 0, falls: 0 };
     let mut b = String::new();
     fp.tail(body, &mut b);
     if fp.tails == 0 || fp.falls == 0 {

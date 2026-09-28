@@ -363,3 +363,234 @@ pub(crate) fn records_to_tuples(m: &CoreModule, tys: &crate::ty::Types) -> CoreM
     out
 }
 
+
+// ---- compile-time unfolding of calls with static control ----
+//
+// A call whose callee's control flow is decided entirely by its constant
+// arguments reduces at compile time to straight-line residual code: the
+// statically reducible part of the program is reduced before it runs (the
+// dynamic values stay as let-bound variables). Constant operations fold
+// with the reference interpreter's i56 semantics. Anything dynamic in
+// control position (a branch on a runtime value, a match, a constructor)
+// or over budget leaves the call as it was.
+
+/// Calls unfolded per site, residual bindings per site, and evaluation
+/// steps per site (constant work is free at runtime but not at compile time).
+const UNFOLD_CALLS: usize = 256;
+const UNFOLD_SIZE: usize = 2000;
+const UNFOLD_WORK: usize = 200_000;
+
+#[derive(Clone)]
+enum Pv {
+    K(i64),
+    D(Core), // an atom: Num or Var of the caller
+}
+
+impl Pv {
+    fn core(&self) -> Core {
+        match self {
+            Pv::K(n) => Core::Num(*n),
+            Pv::D(c) => c.clone(),
+        }
+    }
+}
+
+fn wrap56(v: i64) -> i64 {
+    ((v as u64) << 8) as i64 >> 8
+}
+
+/// Fold an int op exactly as `eval_core` does; None where evaluation would
+/// fail at runtime (division by zero), so the failure stays at runtime.
+fn fold_op2(op: &mithril_front::ast::BinOp, x: i64, y: i64) -> Option<i64> {
+    use mithril_front::ast::BinOp::*;
+    Some(wrap56(match op {
+        Add => x.wrapping_add(y),
+        Sub => x.wrapping_sub(y),
+        Mul => x.wrapping_mul(y),
+        Div => {
+            if y == 0 {
+                return None;
+            }
+            x.wrapping_div(y)
+        }
+        FloorDiv => {
+            if y == 0 {
+                return None;
+            }
+            let (q, r) = (x.wrapping_div(y), x.wrapping_rem(y));
+            if r != 0 && (r < 0) != (y < 0) {
+                q - 1
+            } else {
+                q
+            }
+        }
+        Mod => {
+            if y == 0 {
+                return None;
+            }
+            let r = x.wrapping_rem(y);
+            if r != 0 && (r < 0) != (y < 0) {
+                r + y
+            } else {
+                r
+            }
+        }
+        Shl => x.wrapping_shl(y as u32),
+        Shr => x.wrapping_shr(y as u32),
+        BitAnd => x & y,
+        BitOr => x | y,
+        BitXor => x ^ y,
+    }))
+}
+
+fn fold_cmp(op: &mithril_front::ast::CmpOp, x: i64, y: i64) -> i64 {
+    use mithril_front::ast::CmpOp::*;
+    (match op {
+        Lt => x < y,
+        Le => x <= y,
+        Gt => x > y,
+        Ge => x >= y,
+        Eq => x == y,
+        Ne => x != y,
+    }) as i64
+}
+
+struct Pe<'m> {
+    m: &'m CoreModule,
+    next: u32,
+    lets: Vec<(u32, Core)>,
+    iters: usize,
+    size: usize,
+    work: usize,
+}
+
+impl Pe<'_> {
+    /// Residual value of `e` under `env` (callee var -> value); None aborts.
+    fn val(&mut self, e: &Core, env: &mut HashMap<u32, Pv>) -> Option<Pv> {
+        self.work += 1;
+        if self.work > UNFOLD_WORK {
+            return None;
+        }
+        Some(match e {
+            Core::Num(n) => Pv::K(*n),
+            Core::Var(i) => env.get(i)?.clone(),
+            Core::Op2(op, a, b) => {
+                let (x, y) = (self.val(a, env)?, self.val(b, env)?);
+                match (&x, &y) {
+                    (Pv::K(p), Pv::K(q)) => Pv::K(fold_op2(op, *p, *q)?),
+                    _ => self.bind(Core::Op2(*op, Box::new(x.core()), Box::new(y.core()))),
+                }
+            }
+            Core::Cmp(op, a, b) => {
+                let (x, y) = (self.val(a, env)?, self.val(b, env)?);
+                match (&x, &y) {
+                    (Pv::K(p), Pv::K(q)) => Pv::K(fold_cmp(op, *p, *q)),
+                    _ => self.bind(Core::Cmp(*op, Box::new(x.core()), Box::new(y.core()))),
+                }
+            }
+            Core::If(c, t, f) => match self.val(c, env)? {
+                Pv::K(k) => self.val(if k != 0 { t } else { f }, env)?,
+                Pv::D(_) => return None, // dynamic control
+            },
+            Core::Let(x, r, b) => {
+                let v = self.val(r, env)?;
+                env.insert(*x, v);
+                self.val(b, env)?
+            }
+            Core::Call(g, args) => {
+                let vs: Option<Vec<Pv>> = args.iter().map(|a| self.val(a, env)).collect();
+                self.call(*g, vs?)?
+            }
+            _ => return None, // data: not unfolded
+        })
+    }
+
+    fn bind(&mut self, rhs: Core) -> Pv {
+        self.size += 1;
+        let v = self.next;
+        self.next += 1;
+        self.lets.push((v, rhs));
+        Pv::D(Core::Var(v))
+    }
+
+    /// Unfold `g(args)`: its body under a fresh env; a self tail call is the
+    /// next iteration of the same loop.
+    fn call(&mut self, g: u32, args: Vec<Pv>) -> Option<Pv> {
+        self.iters += 1;
+        if self.iters > UNFOLD_CALLS || self.size > UNFOLD_SIZE {
+            return None;
+        }
+        let f = &self.m.fns[g as usize];
+        let mut env: HashMap<u32, Pv> = args.into_iter().enumerate().map(|(i, v)| (i as u32, v)).collect();
+        self.val(&f.body, &mut env)
+    }
+}
+
+/// `Some(residual)` when `Call(g, args)` (args evaluated in the caller)
+/// unfolds; the residual's fresh binders start at `*next`.
+fn unfold_call(m: &CoreModule, g: u32, args: &[Core], next: &mut u32) -> Option<Core> {
+    if !args.iter().any(|a| matches!(a, Core::Num(_))) {
+        return None;
+    }
+    let mut pe = Pe { m, next: *next, lets: Vec::new(), iters: 0, size: 0, work: 0 };
+    // dynamic arguments are evaluated once, in the caller, as before
+    let mut pre: Vec<(u32, Core)> = Vec::new();
+    let mut vals = Vec::new();
+    for a in args {
+        match a {
+            Core::Num(n) => vals.push(Pv::K(*n)),
+            Core::Var(_) => vals.push(Pv::D(a.clone())),
+            _ => {
+                let v = pe.next;
+                pe.next += 1;
+                pre.push((v, a.clone()));
+                vals.push(Pv::D(Core::Var(v)));
+            }
+        }
+    }
+    let res = pe.call(g, vals)?;
+    if pe.size > UNFOLD_SIZE {
+        return None;
+    }
+    *next = pe.next;
+    let mut out = res.core();
+    for (v, r) in pe.lets.into_iter().rev() {
+        out = Core::Let(v, Box::new(r), Box::new(out));
+    }
+    for (v, r) in pre.into_iter().rev() {
+        out = Core::Let(v, Box::new(r), Box::new(out));
+    }
+    Some(out)
+}
+
+/// Unfold every call with static control in every function (see above).
+pub(crate) fn unfold_static(m: &CoreModule) -> CoreModule {
+    fn go(e: &Core, m: &CoreModule, next: &mut u32) -> Core {
+        let rec = |x: &Core, next: &mut u32| go(x, m, next);
+        match e {
+            Core::Call(g, args) => {
+                let args: Vec<Core> = args.iter().map(|a| rec(a, next)).collect();
+                unfold_call(m, *g, &args, next).unwrap_or(Core::Call(*g, args))
+            }
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
+            Core::Op2(o, a, b) => Core::Op2(*o, Box::new(rec(a, next)), Box::new(rec(b, next))),
+            Core::Cmp(o, a, b) => Core::Cmp(*o, Box::new(rec(a, next)), Box::new(rec(b, next))),
+            Core::If(c, t, f) => Core::If(Box::new(rec(c, next)), Box::new(rec(t, next)), Box::new(rec(f, next))),
+            Core::Let(x, r, b) => Core::Let(*x, Box::new(rec(r, next)), Box::new(rec(b, next))),
+            Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| rec(x, next)).collect()),
+            Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| rec(x, next)).collect()),
+            Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| rec(x, next)).collect()),
+            Core::Proj(a, i) => Core::Proj(Box::new(rec(a, next)), *i),
+            Core::Match(s, arms) => Core::Match(
+                Box::new(rec(s, next)),
+                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), rec(b, next))).collect(),
+            ),
+        }
+    }
+    let mut out = m.clone();
+    for f in out.fns.iter_mut() {
+        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
+        f.body = go(&f.body, m, &mut next);
+    }
+    out
+}

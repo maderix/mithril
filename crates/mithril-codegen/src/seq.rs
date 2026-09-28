@@ -607,7 +607,9 @@ impl<'m> Ex<'m> {
                         9 => format!("{a} | {c}"),
                         _ => format!("{a} ^ {c}"),
                     };
-                    b.push_str(&format!("let {t} = num(wrap56({body}));\n"));
+                    // num keeps the low 56 bits and as_i sign-extends from
+                    // bit 55: storing is the i56 wrap
+                    b.push_str(&format!("let {t} = num({body});\n"));
                 } else {
                     b.push_str(&format!(
                         "let {t} = bin(ctx, {}u8, {ex}, {ey}, {own}u8);\n",

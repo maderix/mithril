@@ -403,3 +403,22 @@ fn base_case_wrappers_match_oracle_under_suspension() {
     let q = &q[..q.find("\n}\n").unwrap()];
     assert!(q.contains("free_val(ctx, v1)"), "zipsum's base case leaks u");
 }
+
+// ---- compile-time unfolding, wrap elision, fuel in scalar code ----
+
+#[test]
+fn unfolding_and_wrap_elision_match_oracle() {
+    let (cm, rs) = trmc_golden("unfold_wrap.py");
+    // `rounds(3, 0, i)` has static control: unfolded, no call remains in loop
+    let rounds = cm.fns.iter().position(|f| f.name == "rounds").unwrap();
+    let collatz = cm.fns.iter().position(|f| f.name == "collatz").unwrap();
+    let lp = cm.fns.iter().position(|f| f.name == "loop").unwrap();
+    let s_loop = &rs[rs.find(&format!("fn s_{lp}(")).expect("loop is scalar")..];
+    let s_loop = &s_loop[..s_loop.find("\n}\n").unwrap()];
+    assert!(!s_loop.contains(&format!("s_{rounds}(")), "rounds(3, 0, i) was not unfolded");
+    // collatz branches on a runtime value: still called
+    assert!(s_loop.contains(&format!("s_{collatz}(")), "collatz must not be unfolded");
+    // ftree forks: it keeps a real (splittable) dive form, not a bridge
+    let ft = cm.fns.iter().position(|f| f.name == "ftree").unwrap();
+    assert!(dive_form(&cm, &rs, "ftree").contains(&format!("d_{ft}(ctx, fuel")), "ftree has no splittable dive form");
+}

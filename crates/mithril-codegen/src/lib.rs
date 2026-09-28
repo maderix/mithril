@@ -38,6 +38,7 @@
 
 mod fast;
 mod fold;
+mod range;
 mod rewrite;
 mod rules;
 mod scalar;
@@ -178,7 +179,8 @@ fn uniquify(m: &CoreModule) -> CoreModule {
 
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     let m_i = rewrite::inline_leaves(m);
-    let m_u = uniquify(&m_i);
+    let m_s = rewrite::unfold_static(&m_i);
+    let m_u = uniquify(&m_s);
     // records_to_tuples (rewrite.rs) is parked: without native multi-value
     // returns in the dive form it only trades ctor cells for tuple chains.
     let m = &m_u;
@@ -291,9 +293,15 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         if trace {
             eprintln!("gen fn {} ({}) segs={} code={}B", fid, m.fns[fid].name, sq.q.len(), fns_code.len());
         }
-        if scal[fid].is_some() {
+        if scal[fid].is_some() && fork_recursive(fid as u32, &m.fns[fid]) {
+            // native scalar form for scalar callers, and a real dive form so
+            // the fork's independent calls can split across workers (a
+            // native scalar call never suspends)
+            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, false));
+            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
+        } else if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
-            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
+            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, true));
         } else {
             fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
         }
@@ -565,6 +573,23 @@ pub(crate) fn is_bounded(g: u32) -> bool {
 
 /// Whether evaluating `e` may run a suspendable call (calls to bounded
 /// functions are plain expressions).
+/// Two or more self calls, not all in tail position: recursion that forks.
+fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
+    fn n(fid: u32, e: &Core) -> usize {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => 0,
+            Core::Call(g, xs) => usize::from(*g == fid) + xs.iter().map(|x| n(fid, x)).sum::<usize>(),
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => n(fid, a) + n(fid, b),
+            Core::If(a, b, c) => n(fid, a) + n(fid, b) + n(fid, c),
+            Core::Let(_, r, b) => n(fid, r) + n(fid, b),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().map(|x| n(fid, x)).sum(),
+            Core::Match(s, arms) => n(fid, s) + arms.iter().map(|(_, _, b)| n(fid, b)).sum::<usize>(),
+            Core::Proj(a, _) => n(fid, a),
+        }
+    }
+    !f.self_tail_rec && n(fid, &f.body) >= 2
+}
+
 pub(crate) fn has_call(e: &Core) -> bool {
     match e {
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
