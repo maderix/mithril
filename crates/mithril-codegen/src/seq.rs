@@ -154,7 +154,7 @@ pub(crate) fn numeric_vars(body: &Core, float_free: bool) -> HashSet<u32> {
                 walk(r, out);
                 walk(b, out);
             }
-            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) => {
+            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) | Core::Prim(_, a) => {
                 for x in a {
                     walk(x, out);
                 }
@@ -222,8 +222,33 @@ impl<'m> Ex<'m> {
                 sh.classes.insert(c);
             }
             Ty::Tup(_) => sh.tuples = true,
+            Ty::Arr => {} // arrays always carry a refcount
             Ty::Dyn => sh.poison = true,
         }
+    }
+
+    /// Read `e` without taking ownership (an array operand of a read): a
+    /// variable is lent raw, and released after the read at its last use;
+    /// any other expression is evaluated to a temporary released after.
+    fn borrow_read(&mut self, e: &Core, b: &mut String) -> (String, Option<String>) {
+        if let Core::Var(i) = e {
+            if self.bset.contains(i) || self.pinned > 0 {
+                return (format!("v{i}"), None);
+            }
+            match self.rem.get_mut(i) {
+                Some(r) if *r >= 2 => {
+                    *r -= 1;
+                    return (format!("v{i}"), None);
+                }
+                Some(r) if *r == 1 => {
+                    *r = 0;
+                    return (format!("v{i}"), Some(format!("v{i}")));
+                }
+                _ => return (format!("v{i}"), None),
+            }
+        }
+        let t = self.val(e, true, b);
+        (t.clone(), Some(t))
     }
 
     /// Emit the suspension path for a dive call whose result `rv` (a record
@@ -604,6 +629,50 @@ impl<'m> Ex<'m> {
     /// (temp name, local, or literal) holding the value.
     pub fn val(&mut self, e: &Core, esc: bool, b: &mut String) -> String {
         match e {
+            Core::Prim(p, args) => {
+                use mithril_front::core::Prim;
+                let t = self.fresh();
+                match p {
+                    Prim::ArrNew => {
+                        let n = self.val(&args[0], false, b);
+                        // n copies of the element: its type is shared
+                        if let Core::Var(v) = &args[1] {
+                            self.note_share(*v);
+                        } else if !self.is_int(&args[1]) {
+                            self.shared.borrow_mut().poison = true;
+                        }
+                        let v = self.val(&args[1], true, b);
+                        b.push_str(&format!("let {t} = arr_new(ctx, as_i({n}), {v});\n"));
+                    }
+                    Prim::ArrGet => {
+                        let (a, post) = self.borrow_read(&args[0], b);
+                        let i = self.val(&args[1], false, b);
+                        // the element stays in the array too: shared
+                        match self.cur_let {
+                            Some(v) => self.note_share(v),
+                            None => self.shared.borrow_mut().poison = true,
+                        }
+                        b.push_str(&format!("let {t} = arr_get(ctx, {a}, as_i({i}));\n"));
+                        if let Some(p) = post {
+                            b.push_str(&format!("free_val(ctx, {p});\n"));
+                        }
+                    }
+                    Prim::ArrSet => {
+                        let a = self.val(&args[0], true, b);
+                        let i = self.val(&args[1], false, b);
+                        let v = self.val(&args[2], true, b);
+                        b.push_str(&format!("let {t} = arr_set(ctx, {a}, as_i({i}), {v});\n"));
+                    }
+                    Prim::ArrLen => {
+                        let (a, post) = self.borrow_read(&args[0], b);
+                        b.push_str(&format!("let {t} = num(arr_len_of({a}) as i64);\n"));
+                        if let Some(p) = post {
+                            b.push_str(&format!("free_val(ctx, {p});\n"));
+                        }
+                    }
+                }
+                t
+            }
             Core::Num(n) => format!("num({}i64)", n),
             Core::Flo(x) => {
                 let t = self.fresh();
@@ -1130,7 +1199,7 @@ pub(crate) fn reuse_var(body: &Core, sv: &str) -> Option<u32> {
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has(a, v) || has(b, v),
             Core::If(c, t, f) => has(c, v) || has(t, v) || has(f, v),
             Core::Let(_, r, b) => has(r, v) || has(b, v),
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => xs.iter().any(|x| has(x, v)),
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| has(x, v)),
             Core::Proj(b, _) => has(b, v),
             Core::Match(s, arms) => has(s, v) || arms.iter().any(|(_, _, b)| has(b, v)),
         }
@@ -1363,7 +1432,7 @@ pub(crate) fn dps_param(fid: u32, f: &mut dyn FnMut(u32) -> bool, body: &Core, a
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => calls_ok(fid, a, f) && calls_ok(fid, b, f),
             Core::If(a, b, c) => calls_ok(fid, a, f) && calls_ok(fid, b, f) && calls_ok(fid, c, f),
             Core::Let(_, r, b) => calls_ok(fid, r, f) && calls_ok(fid, b, f),
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().all(|x| calls_ok(fid, x, f)),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|x| calls_ok(fid, x, f)),
             Core::Match(s, arms) => calls_ok(fid, s, f) && arms.iter().all(|(_, _, b)| calls_ok(fid, b, f)),
             Core::Proj(a, _) => calls_ok(fid, a, f),
         }
@@ -1541,7 +1610,7 @@ pub(crate) fn only_projected(x: u32, e: &Core) -> bool {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => only_projected(x, a) && only_projected(x, b),
         Core::If(a, b, c) => only_projected(x, a) && only_projected(x, b) && only_projected(x, c),
         Core::Let(_, r, b) => only_projected(x, r) && only_projected(x, b),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().all(|a| only_projected(x, a)),
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|a| only_projected(x, a)),
         Core::Match(s, arms) => only_projected(x, s) && arms.iter().all(|(_, _, a)| only_projected(x, a)),
     }
 }

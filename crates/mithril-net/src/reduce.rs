@@ -14,6 +14,9 @@ use mithril_front::core::{CoreModule, Val};
 /// fuel-starved reduction can be resumed by calling `reduce` again.
 /// Returns the number of rewrites performed.
 pub fn reduce(net: &mut Net, m: &CoreModule, fuel: u64) -> u64 {
+    if crate::uses_prims(m) {
+        return 0;
+    }
     let prog = NetProg::new(m);
     let mut done = 0u64;
     let mut i = 0usize;

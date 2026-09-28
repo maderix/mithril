@@ -46,7 +46,7 @@ fn collect_self_calls<'e>(e: &'e Core, fid: u32, out: &mut Vec<&'e Vec<Core>>) {
             collect_self_calls(r, fid, out);
             collect_self_calls(b, fid, out);
         }
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
             for x in xs {
                 collect_self_calls(x, fid, out);
             }

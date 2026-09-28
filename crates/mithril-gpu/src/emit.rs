@@ -73,7 +73,7 @@ fn has_call(e: &Core) -> bool {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
         Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
         Core::Let(_, a, b) => has_call(a) || has_call(b),
-        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => args.iter().any(has_call),
+        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => args.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
     }
@@ -102,7 +102,7 @@ fn free_vars(e: &Core, bound: &mut Vec<u32>, acc: &mut BTreeSet<u32>) {
             free_vars(b, bound, acc);
             bound.pop();
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
             for a in args {
                 free_vars(a, bound, acc);
             }
@@ -138,7 +138,7 @@ fn max_var(e: &Core, mx: &mut u32) {
             max_var(r, mx);
             max_var(b, mx);
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
             for a in args {
                 max_var(a, mx);
             }
@@ -271,6 +271,7 @@ impl Em {
                 w!(out, "  u64 {tv} = mk_con({tk}, {TUPLE_CTOR}u, {}u);", items.len());
                 tv
             }
+            Core::Prim(..) => panic!("gpu: array primitives are not supported yet"),
             Core::Proj(e1, i) => {
                 let te = self.gen_val(e1, out, dive, bail);
                 let ak = self.t();
@@ -497,6 +498,7 @@ impl Em {
                     Core::Let(wv, Box::new(items[i].clone()), Box::new(Core::Tuple(items2)));
                 self.gen_fire(&hoisted, dest, out);
             }
+            Core::Prim(..) => panic!("gpu: array primitives are not supported yet"),
             Core::Proj(e1, i) => {
                 let wv = self.fresh_var();
                 let hoisted = Core::Let(

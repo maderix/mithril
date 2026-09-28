@@ -23,7 +23,7 @@ fn size(e: &Core) -> usize {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => 1 + size(a) + size(b),
         Core::If(c, t, f) => 1 + size(c) + size(t) + size(f),
         Core::Let(_, r, b) => 1 + size(r) + size(b),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
             1 + xs.iter().map(size).sum::<usize>()
         }
         Core::Proj(b, _) => 1 + size(b),
@@ -43,6 +43,7 @@ fn subst(e: &Core, map: &HashMap<u32, u32>) -> Core {
         Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| subst(x, map)).collect()),
         Core::Reuse(v, c, xs) => Core::Reuse(*map.get(v).unwrap_or(v), *c, xs.iter().map(|x| subst(x, map)).collect()),
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| subst(x, map)).collect()),
+        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| subst(x, map)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(subst(b, map)), *i),
         Core::Match(s, arms) => Core::Match(
             Box::new(subst(s, map)),
@@ -103,6 +104,7 @@ fn inline_in(e: &Core, m: &CoreModule, leafy: &[bool], next: &mut u32) -> Core {
         Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| rec(x, next)).collect()),
         Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| rec(x, next)).collect()),
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| rec(x, next)).collect()),
+        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| rec(x, next)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(rec(b, next)), *i),
         Core::Match(s, arms) => Core::Match(
             Box::new(rec(s, next)),
@@ -126,6 +128,7 @@ fn shift_binders(e: &Core, shift: u32, arity: u32, map: &HashMap<u32, u32>) -> C
         Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
         Core::Reuse(v, c, xs) => Core::Reuse(mv(*v), *c, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
+        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(shift_binders(b, shift, arity, map)), *i),
         Core::Match(s, arms) => Core::Match(
             Box::new(shift_binders(s, shift, arity, map)),
@@ -155,7 +158,7 @@ fn count_uses(e: &Core, m: &mut HashMap<u32, u32>) {
             count_uses(r, m);
             count_uses(b, m);
         }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) => xs.iter().for_each(|x| count_uses(x, m)),
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| count_uses(x, m)),
         Core::Reuse(v, _, xs) => {
             *m.entry(*v).or_insert(0) += 1;
             xs.iter().for_each(|x| count_uses(x, m));
@@ -237,6 +240,7 @@ fn val(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
         Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(val(a, cx, avail)), Box::new(val(b, cx, avail))),
         Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(val(a, cx, avail)), Box::new(val(b, cx, avail))),
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| val(x, cx, avail)).collect()),
+        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| val(x, cx, avail)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(val(b, cx, avail)), *i),
         Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| val(x, cx, avail)).collect()),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
@@ -329,6 +333,7 @@ pub(crate) fn records_to_tuples(m: &CoreModule, tys: &crate::ty::Types) -> CoreM
         match e {
             Core::Ctor(c, xs) if rec[*c as usize] => Core::Tuple(xs.iter().map(|x| go(x, rec, next)).collect()),
             Core::Reuse(_, c, xs) if rec[*c as usize] => Core::Tuple(xs.iter().map(|x| go(x, rec, next)).collect()),
+            Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| go(x, rec, next)).collect()),
             Core::Match(s, arms) if arms.len() == 1 && rec[arms[0].0 as usize] => {
                 let (_, bs, body) = &arms[0];
                 let t = *next;
@@ -631,6 +636,7 @@ pub(crate) fn unfold_static(m: &CoreModule) -> CoreModule {
             Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| rec(x, next, ks)).collect()),
             Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| rec(x, next, ks)).collect()),
             Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| rec(x, next, ks)).collect()),
+            Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| rec(x, next, ks)).collect()),
             Core::Proj(a, i) => Core::Proj(Box::new(rec(a, next, ks)), *i),
             Core::Match(s, arms) => Core::Match(
                 Box::new(rec(s, next, ks)),
@@ -666,6 +672,7 @@ fn untuple(e: &Core) -> Core {
             Core::Ctor(c, xs2) => Core::Ctor(*c, xs2.iter().map(r).collect()),
             Core::Reuse(v, c, xs2) => Core::Reuse(*v, *c, xs2.iter().map(r).collect()),
             Core::Tuple(xs2) => Core::Tuple(xs2.iter().map(r).collect()),
+            Core::Prim(p, xs2) => Core::Prim(*p, xs2.iter().map(r).collect()),
             Core::Proj(t, i) => Core::Proj(Box::new(r(t)), *i),
             Core::Match(s, arms) => Core::Match(Box::new(r(s)), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), r(b))).collect()),
         }

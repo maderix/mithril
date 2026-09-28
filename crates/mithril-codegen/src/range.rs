@@ -72,7 +72,7 @@ impl Ranges {
                 self.collect(t);
                 self.collect(f);
             }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 xs.iter().for_each(|x| self.collect(x))
             }
             Core::Match(s, arms) => {
@@ -225,7 +225,7 @@ fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usiz
             count(r, all, masked, m32);
             count(b, all, masked, m32);
         }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
             xs.iter().for_each(|x| count(x, all, masked, m32))
         }
         Core::Match(s, arms) => {

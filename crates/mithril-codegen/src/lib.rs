@@ -59,6 +59,7 @@ pub fn fmt_val(v: &Val) -> String {
             format!("C{}({})", c, fs.iter().map(fmt_val).collect::<Vec<_>>().join(", "))
         }
         Val::T(fs) => format!("({})", fs.iter().map(fmt_val).collect::<Vec<_>>().join(", ")),
+        Val::A(fs) => format!("[{}]", fs.iter().map(fmt_val).collect::<Vec<_>>().join(", ")),
     }
 }
 
@@ -72,7 +73,7 @@ pub(crate) fn float_free(m: &CoreModule) -> bool {
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_flo(a) || has_flo(b),
             Core::If(c, t, f) => has_flo(c) || has_flo(t) || has_flo(f),
             Core::Let(_, r, b) => has_flo(r) || has_flo(b),
-            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) => a.iter().any(has_flo),
+            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) | Core::Prim(_, a) => a.iter().any(has_flo),
             Core::Match(s, arms) => has_flo(s) || arms.iter().any(|(_, _, b)| has_flo(b)),
             Core::Proj(b, _) => has_flo(b),
         }
@@ -138,6 +139,7 @@ fn uniquify(m: &CoreModule) -> CoreModule {
             Core::Ctor(c, a) => Core::Ctor(*c, a.iter().map(|x| go(x, env, next)).collect()),
             Core::Reuse(v, c, a) => Core::Reuse(*env.get(v).unwrap_or(v), *c, a.iter().map(|x| go(x, env, next)).collect()),
             Core::Tuple(a) => Core::Tuple(a.iter().map(|x| go(x, env, next)).collect()),
+            Core::Prim(p, a) => Core::Prim(*p, a.iter().map(|x| go(x, env, next)).collect()),
             Core::Proj(b, i) => Core::Proj(Box::new(go(b, env, next)), *i),
             Core::Match(sc, arms) => {
                 let sc2 = go(sc, env, next);
@@ -583,7 +585,7 @@ pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
                 callees(r, out);
                 callees(b, out);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| callees(x, out)),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| callees(x, out)),
             Core::Match(s, arms) => {
                 callees(s, out);
                 arms.iter().for_each(|(_, _, b)| callees(b, out));
@@ -644,7 +646,7 @@ fn callees(e: &Core) -> std::collections::HashSet<u32> {
                 go(r, out);
                 go(b, out);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| go(x, out)),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| go(x, out)),
             Core::Match(s, arms) => {
                 go(s, out);
                 arms.iter().for_each(|(_, _, b)| go(b, out));
@@ -666,7 +668,7 @@ fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => n(fid, a) + n(fid, b),
             Core::If(a, b, c) => n(fid, a) + n(fid, b) + n(fid, c),
             Core::Let(_, r, b) => n(fid, r) + n(fid, b),
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().map(|x| n(fid, x)).sum(),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| n(fid, x)).sum(),
             Core::Match(s, arms) => n(fid, s) + arms.iter().map(|(_, _, b)| n(fid, b)).sum::<usize>(),
             Core::Proj(a, _) => n(fid, a),
         }
@@ -681,7 +683,7 @@ pub(crate) fn has_call(e: &Core) -> bool {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
         Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
         Core::Let(_, r, b) => has_call(r) || has_call(b),
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(has_call),
+        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
     }
@@ -706,7 +708,7 @@ pub(crate) fn max_var(e: &Core) -> u32 {
                 go(r, m);
                 go(b, m);
             }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 xs.iter().for_each(|x| go(x, m))
             }
             Core::Match(s, arms) => {
@@ -750,7 +752,7 @@ pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
                 go(b, bound, out);
                 bound.pop();
             }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 for x in xs {
                     go(x, bound, out);
                 }
@@ -795,7 +797,7 @@ pub(crate) fn cnt_expr(e: &Core, m: &mut Cnt) {
             cnt_expr(r, m);
             cnt_expr(b, m);
         }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
             xs.iter().for_each(|x| cnt_expr(x, m))
         }
         Core::Match(s, arms) => {
@@ -903,7 +905,7 @@ fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::H
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => builds(a, ar, m) || builds(b, ar, m),
             Core::If(a, b, c) => builds(a, ar, m) || builds(b, ar, m) || builds(c, ar, m),
             Core::Let(_, r, b) => builds(r, ar, m) || builds(b, ar, m),
-            Core::Call(_, xs) | Core::Tuple(xs) => xs.iter().any(|x| builds(x, ar, m)),
+            Core::Call(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| builds(x, ar, m)),
             Core::Match(s, arms) => builds(s, ar, m) || arms.iter().any(|(_, _, b)| builds(b, ar, m)),
             Core::Proj(a, _) => builds(a, ar, m),
         }
@@ -926,7 +928,7 @@ fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::H
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => go(a, p, m) || go(b, p, m),
             Core::If(a, b, c) => go(a, p, m) || go(b, p, m) || go(c, p, m),
             Core::Let(_, r, b) => go(r, p, m) || go(b, p, m),
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(|x| go(x, p, m)),
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| go(x, p, m)),
             Core::Proj(a, _) => go(a, p, m),
         }
     }
@@ -1011,7 +1013,7 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                 walk(r, mask, esc, bor);
                 walk(b, mask, esc, bor);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 for x in xs {
                     *esc |= var_mask(x, mask);
                     walk(x, mask, esc, bor);
@@ -1069,7 +1071,7 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
                 walk(r, s);
                 walk(b, s);
             }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) | Core::Reuse(_, _, xs) => {
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 xs.iter().for_each(|x| walk(x, s))
             }
             Core::Match(sc, arms) => {
@@ -1107,6 +1109,7 @@ const M56: u64 = (1u64 << 56) - 1;
 const T_NUM: u64 = 2;
 const T_FLO: u64 = 3;
 const T_CON: u64 = 4;
+const T_ARR: u64 = 5;
 
 #[inline] fn tag(p: u64) -> u64 { p >> 56 }
 // unboxed unary ctors: tag = TU + slot, i56 value in the payload
@@ -1340,8 +1343,117 @@ fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
             }
             p
         }
+        T_ARR => {
+            arr_rc(p).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            p
+        }
         _ => p,
     }
+}
+
+// ---- arrays: a heap block [refcount, len, elements..] behind a T_ARR port;
+// value semantics, updated in place when this is the only reference ----
+
+#[inline(always)]
+fn arr_block(p: u64) -> *mut u64 {
+    (p & M56) as *mut u64
+}
+#[inline(always)]
+fn arr_rc(p: u64) -> &'static std::sync::atomic::AtomicU64 {
+    // SAFETY: a live T_ARR port points at a block whose first word is its
+    // refcount (arr_alloc), alive while this reference is
+    unsafe { &*(arr_block(p) as *const std::sync::atomic::AtomicU64) }
+}
+#[inline(always)]
+fn arr_len_of(p: u64) -> usize {
+    // SAFETY: as arr_rc; word 1 is the length
+    unsafe { *arr_block(p).add(1) as usize }
+}
+#[inline(always)]
+fn arr_elems(p: u64) -> *mut u64 {
+    // SAFETY: as arr_rc; elements start at word 2
+    unsafe { arr_block(p).add(2) }
+}
+fn arr_alloc(n: usize) -> u64 {
+    let mut v: Vec<u64> = Vec::with_capacity(n + 2);
+    v.push(1);
+    v.push(n as u64);
+    v.resize(n + 2, 0);
+    let b = Box::into_raw(v.into_boxed_slice()) as *mut u64;
+    debug_assert!((b as u64) >> 56 == 0);
+    (T_ARR << 56) | (b as u64)
+}
+fn arr_free_block(p: u64) {
+    let n = arr_len_of(p);
+    // SAFETY: the block was made by arr_alloc with n + 2 words and this
+    // was its last reference
+    unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(arr_block(p), n + 2))) }
+}
+#[cold]
+#[inline(never)]
+fn arr_oob(i: i64, n: usize) -> ! {
+    panic!("array index {} out of bounds (length {})", i, n)
+}
+fn arr_new(ctx: &mut Wctx, n: i64, v: u64) -> u64 {
+    if n < 0 {
+        panic!("negative array size {}", n);
+    }
+    let n = n as usize;
+    let p = arr_alloc(n);
+    let e = arr_elems(p);
+    for k in 0..n {
+        // SAFETY: k < n, inside the block
+        unsafe { *e.add(k) = if k + 1 == n { v } else { dup_val(ctx, v) } }
+    }
+    if n == 0 {
+        free_val(ctx, v);
+    }
+    p
+}
+#[inline(always)]
+fn arr_get(ctx: &mut Wctx, a: u64, i: i64) -> u64 {
+    let n = arr_len_of(a);
+    if i < 0 || i as usize >= n {
+        arr_oob(i, n);
+    }
+    // SAFETY: bounds checked
+    dup_val(ctx, unsafe { *arr_elems(a).add(i as usize) })
+}
+#[inline(always)]
+fn arr_set(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
+    let n = arr_len_of(a);
+    if i < 0 || i as usize >= n {
+        arr_oob(i, n);
+    }
+    let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) };
+    // SAFETY: bounds checked; `a` is now uniquely ours
+    let slot = unsafe { arr_elems(a).add(i as usize) };
+    free_val(ctx, unsafe { *slot });
+    unsafe { *slot = v };
+    a
+}
+#[cold]
+#[inline(never)]
+fn arr_copy(ctx: &mut Wctx, a: u64) -> u64 {
+    let n = arr_len_of(a);
+    let b = arr_alloc(n);
+    for k in 0..n {
+        // SAFETY: k < n in both blocks
+        unsafe { *arr_elems(b).add(k) = dup_val(ctx, *arr_elems(a).add(k)) }
+    }
+    free_val(ctx, a);
+    b
+}
+fn arr_drop(ctx: &mut Wctx, p: u64) {
+    if arr_rc(p).fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
+        return;
+    }
+    let n = arr_len_of(p);
+    for k in 0..n {
+        // SAFETY: k < n; the block is still allocated
+        free_val(ctx, unsafe { *arr_elems(p).add(k) });
+    }
+    arr_free_block(p);
 }
 
 /// Drop a reference; the last one tears the value down (frees the chain
@@ -1351,13 +1463,12 @@ fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
 #[inline(always)]
 fn free_val(ctx: &mut Wctx, p: u64) {
     let t = tag(p);
-    if t != T_CON && t != T_FLO {
+    if t != T_CON && t != T_FLO && t != T_ARR {
         return;
     }
     free_val_slow(ctx, p);
 }
 
-#[inline(never)]
 /// Last use of a boxed value that is only projected: move field `i` out,
 /// freeing the cells and dropping the other fields (a shared value keeps
 /// its fields: share field `i`, drop this reference).
@@ -1395,8 +1506,10 @@ fn take_field(ctx: &mut Wctx, p: u64, i: usize) -> u64 {
     }
 }
 
+#[inline(never)]
 fn free_val_slow(ctx: &mut Wctx, p: u64) {
     match tag(p) {
+        T_ARR => arr_drop(ctx, p),
         t if t >= TU => {}
         T_FLO => {
             let a = (p & M56) as u32;
@@ -1553,6 +1666,11 @@ fn show(eng: &Engine, p: u64) -> String {
                 }
             }
             if k == 0xFFF { format!("({})", fs.join(", ")) } else { format!("C{}({})", k, fs.join(", ")) }
+        }
+        T_ARR => {
+            let n = arr_len_of(p);
+            let fs: Vec<String> = (0..n).map(|k| show(eng, unsafe { *arr_elems(p).add(k) })).collect();
+            format!("[{}]", fs.join(", "))
         }
         _ => panic!("unprintable result port {:#x}", p),
     }

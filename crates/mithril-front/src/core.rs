@@ -34,6 +34,34 @@ pub enum Core {
     Reuse(u32, CtorId, Vec<Core>),
     Tuple(Vec<Core>),
     Proj(Box<Core>, usize),
+    /// A builtin with value semantics (see `Prim`).
+    Prim(Prim, Vec<Core>),
+}
+
+/// Builtins. Arrays are values: `ArrSet` yields a new array (the compiled
+/// code updates in place when it holds the only reference).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Prim {
+    /// `array_new(n, v)`: n copies of v
+    ArrNew,
+    /// `array_get(a, i)`
+    ArrGet,
+    /// `array_set(a, i, v)`: a with element i replaced by v
+    ArrSet,
+    /// `array_len(a)`
+    ArrLen,
+}
+
+impl Prim {
+    pub fn by_name(name: &str) -> Option<(Prim, usize)> {
+        Some(match name {
+            "array_new" => (Prim::ArrNew, 2),
+            "array_get" => (Prim::ArrGet, 2),
+            "array_set" => (Prim::ArrSet, 3),
+            "array_len" => (Prim::ArrLen, 1),
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -81,6 +109,7 @@ pub enum Val {
     F(f64),
     C(CtorId, Vec<Val>),
     T(Vec<Val>),
+    A(Vec<Val>),
 }
 
 /// Wrap a 64-bit result down to the signed 56-bit `int` range, matching
@@ -215,6 +244,30 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
             Val::T(items) => items[*i].clone(),
             other => panic!("eval_core: Proj on non-tuple value {:?}", other),
         },
+        Core::Prim(p, args) => {
+            let vs: Vec<Val> = args.iter().map(|a| eval(m, env, a)).collect();
+            let idx = |v: &Val, len: usize| -> usize {
+                let i = as_i(v);
+                assert!(i >= 0 && (i as usize) < len, "eval_core: array index {} out of bounds ({})", i, len);
+                i as usize
+            };
+            match (p, vs.as_slice()) {
+                (Prim::ArrNew, [n, v]) => {
+                    let n = as_i(n);
+                    assert!(n >= 0, "eval_core: negative array size {}", n);
+                    Val::A(vec![v.clone(); n as usize])
+                }
+                (Prim::ArrGet, [Val::A(xs), i]) => xs[idx(i, xs.len())].clone(),
+                (Prim::ArrSet, [Val::A(xs), i, v]) => {
+                    let mut ys = xs.clone();
+                    let k = idx(i, ys.len());
+                    ys[k] = v.clone();
+                    Val::A(ys)
+                }
+                (Prim::ArrLen, [Val::A(xs)]) => Val::I(xs.len() as i64),
+                (p, vs) => panic!("eval_core: bad arguments to {:?}: {:?}", p, vs),
+            }
+        }
     }
 }
 

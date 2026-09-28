@@ -375,7 +375,28 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
             prog.metas.push(MatchMeta::Proj(*i));
             NExpr::Proj(Box::new(lower(e, prog)), mid as u16)
         }
+        // never lowered: modules with builtins skip compile-time reduction
+        // (see `uses_prims`); a placeholder keeps the entry table total
+        Core::Prim(..) => NExpr::Num(0),
     }
+}
+
+/// Whether any function uses a builtin. Arrays are runtime values with
+/// in-place updates, so such a module is not reduced at compile time.
+pub fn uses_prims(m: &CoreModule) -> bool {
+    fn has(e: &Core) -> bool {
+        match e {
+            Core::Prim(..) => true,
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has(a) || has(b),
+            Core::If(a, b, c) => has(a) || has(b) || has(c),
+            Core::Let(_, r, b) => has(r) || has(b),
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(has),
+            Core::Match(s, arms) => has(s) || arms.iter().any(|(_, _, b)| has(b)),
+            Core::Proj(a, _) => has(a),
+        }
+    }
+    m.fns.iter().any(|f| has(&f.body))
 }
 
 fn free_vars(c: &Core) -> BTreeSet<u32> {
@@ -406,7 +427,7 @@ fn fv(c: &Core, out: &mut BTreeSet<u32>) {
             inner.remove(v);
             out.extend(inner);
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
             for a in args {
                 fv(a, out);
             }
@@ -468,7 +489,7 @@ fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), D
             bound.insert(*v);
             check_bound(b, bound, fname)
         }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
+        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
             for a in args {
                 check_bound(a, bound, fname)?;
             }

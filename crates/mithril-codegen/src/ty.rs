@@ -20,6 +20,7 @@ pub(crate) enum Ty {
     Flo,
     Tup(u32),
     Adt(u32), // class id (representative ctor)
+    Arr,
 }
 
 pub(crate) struct Types {
@@ -50,6 +51,11 @@ impl Types {
             Core::Call(g, _) => self.ret[*g as usize],
             Core::Ctor(c, _) | Core::Reuse(_, c, _) => self.field.get(*c as usize).map(|_| Ty::Adt(*c)).unwrap_or(Ty::Dyn),
             Core::Tuple(xs) => Ty::Tup(xs.len() as u32),
+            Core::Prim(p, _) => match p {
+                mithril_front::core::Prim::ArrNew | mithril_front::core::Prim::ArrSet => Ty::Arr,
+                mithril_front::core::Prim::ArrLen => Ty::Int,
+                mithril_front::core::Prim::ArrGet => Ty::Dyn,
+            },
             Core::Proj(b, i) => match self.expr(fid, b) {
                 Ty::Tup(_) => Ty::Dyn, // refined during inference via tvars
                 _ => {
@@ -71,6 +77,8 @@ enum Node {
     Flo,
     Tup(u32),
     Adt(u32),
+    /// an array; its element type is the tyvar
+    Arr(u32),
     Link(u32),
 }
 
@@ -124,6 +132,7 @@ impl Uf {
             Node::Tup(k) => Ty::Tup(k),
             Node::Adt(u32::MAX) => Ty::Dyn,
             Node::Adt(c) => Ty::Adt(c),
+            Node::Arr(_) => Ty::Arr,
             _ => Ty::Dyn,
         }
     }
@@ -179,7 +188,29 @@ impl<'m> Inf<'m> {
 
     fn unify(&mut self, a: u32, b: u32) {
         self.merge_adts(a, b);
+        // arrays unify their element types
+        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
+        if let (Node::Arr(x), Node::Arr(y)) = (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
+            if ra != rb {
+                self.uf.n[ra as usize] = Node::Link(rb);
+                self.unify(x, y);
+                return;
+            }
+        }
         self.uf.union(a, b);
+    }
+
+    /// A fresh array node with element tyvar `e`.
+    fn arr_of(&mut self, e: u32) -> u32 {
+        let t = self.uf.fresh();
+        self.uf.n[t as usize] = Node::Arr(e);
+        t
+    }
+
+    fn int(&mut self) -> u32 {
+        let t = self.uf.fresh();
+        self.uf.set(t, Node::Int);
+        t
     }
 
     fn set_adt(&mut self, t: u32, k: Node) {
@@ -274,6 +305,38 @@ impl<'m> Inf<'m> {
             Core::Proj(b, _) => {
                 let _ = self.walk(fid, b, env);
                 self.uf.fresh() // element type unknown structurally
+            }
+            Core::Prim(p, args) => {
+                use mithril_front::core::Prim;
+                let ts: Vec<u32> = args.iter().map(|a| self.walk(fid, a, env)).collect();
+                match p {
+                    Prim::ArrNew => {
+                        let n = self.int();
+                        self.unify(ts[0], n);
+                        self.arr_of(ts[1])
+                    }
+                    Prim::ArrGet => {
+                        let e = self.uf.fresh();
+                        let a = self.arr_of(e);
+                        self.unify(ts[0], a);
+                        let i = self.int();
+                        self.unify(ts[1], i);
+                        e
+                    }
+                    Prim::ArrSet => {
+                        let a = self.arr_of(ts[2]);
+                        self.unify(ts[0], a);
+                        let i = self.int();
+                        self.unify(ts[1], i);
+                        ts[0]
+                    }
+                    Prim::ArrLen => {
+                        let e = self.uf.fresh();
+                        let a = self.arr_of(e);
+                        self.unify(ts[0], a);
+                        self.int()
+                    }
+                }
             }
             Core::Match(s, arms) => {
                 let ts = self.walk(fid, s, env);

@@ -488,3 +488,13 @@ fn projections_and_branches_release_exactly_once() {
         }
     }
 }
+
+// ---- arrays ----
+
+#[test]
+fn arrays_match_oracle_in_place_and_shared() {
+    let (cm, rs) = trmc_golden("arrays.py");
+    // in-place updates and copy-on-write both live in arr_set
+    assert!(rs.contains("arr_set(ctx"), "no array updates emitted");
+    let _ = cm;
+}

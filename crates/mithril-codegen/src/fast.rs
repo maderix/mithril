@@ -214,7 +214,7 @@ fn calls_self(fid: u32, e: &Core) -> bool {
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => calls_self(fid, a) || calls_self(fid, b),
         Core::If(a, b, c) => calls_self(fid, a) || calls_self(fid, b) || calls_self(fid, c),
         Core::Let(_, r, b) => calls_self(fid, r) || calls_self(fid, b),
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(|x| calls_self(fid, x)),
+        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_self(fid, x)),
         Core::Match(s, arms) => calls_self(fid, s) || arms.iter().any(|(_, _, b)| calls_self(fid, b)),
         Core::Proj(a, _) => calls_self(fid, a),
     }

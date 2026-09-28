@@ -44,12 +44,38 @@ def data(cls):
     return cls
 
 
+# arrays are values: array_set returns a new array
+def array_new(n, v):
+    return [v] * n
+
+
+def array_get(a, i):
+    return a[i]
+
+
+def array_set(a, i, v):
+    b = list(a)
+    b[i] = v
+    return b
+
+
+def array_len(a):
+    return len(a)
+
+
 def run(path):
     src = open(path).read()
     code = compile(
         src, path, "exec", flags=__future__.annotations.compiler_flag, dont_inherit=True
     )
-    g = {"data": data, "__name__": "__mithril_port__"}
+    g = {
+        "data": data,
+        "__name__": "__mithril_port__",
+        "array_new": array_new,
+        "array_get": array_get,
+        "array_set": array_set,
+        "array_len": array_len,
+    }
     exec(code, g)
     print(g["main"]())
 

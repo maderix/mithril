@@ -279,6 +279,11 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
                     return Err(Diag::new(0, format!("constructor '{}' expects {} arg(s), got {}", name, arity, cargs.len())));
                 }
                 Ok(Core::Ctor(cid, cargs))
+            } else if let (None, Some((p, arity))) = (t.fn_table.get(name), crate::core::Prim::by_name(name)) {
+                if cargs.len() != arity {
+                    return Err(Diag::new(0, format!("builtin '{}' expects {} arg(s), got {}", name, arity, cargs.len())));
+                }
+                Ok(Core::Prim(p, cargs))
             } else if let Some(&fid) = t.fn_table.get(name) {
                 let arity = t.fn_arity[fid as usize];
                 if cargs.len() != arity {
@@ -704,7 +709,7 @@ fn walk_tail(fid: FnId, c: &Core, is_tail: bool, ok: &mut bool) {
                 *ok = false;
             }
         }
-        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) => {
+        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
             for a in args {
                 walk_tail(fid, a, false, ok);
             }

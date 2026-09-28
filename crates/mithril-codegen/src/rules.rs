@@ -193,6 +193,7 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         Core::Ctor(k, args) => {
             Core::Ctor(*k, args.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
+        Core::Prim(p, items) => Core::Prim(*p, items.iter().map(|a| norm_pure(a, c, lets)).collect()),
         Core::Tuple(items) => {
             Core::Tuple(items.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
