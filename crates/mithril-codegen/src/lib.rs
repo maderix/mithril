@@ -395,6 +395,7 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         })
         .collect();
     seq::NTUP.with(|n| *n.borrow_mut() = ntup);
+    seq::FOLDS.with(|f| *f.borrow_mut() = folds.iter().map(|p| p.is_some()).collect());
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {
@@ -417,6 +418,7 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
         if let Some(pf) = &folds[fid] {
             fns_code.push_str(&fold::join_fn(fid as u32, pf));
+            fns_code.push_str(&fold::est_static(fid as u32));
         }
     }
     // Segments may enqueue further segments while being emitted.

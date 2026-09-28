@@ -143,10 +143,25 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
             }
         })
         .collect();
+    // Split by work, not iterations: FOLD_EST_<fid> is the measured fuel
+    // per iteration (set when a chunk's dive runs out of fuel; 1 until
+    // then), so a range splits while its estimated work exceeds one budget
     format!(
-        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nif hi - lo > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
+        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nlet est = FOLD_EST_{fid}.load(std::sync::atomic::Ordering::Relaxed).max(1);\nif hi - lo >= 2 && (hi - lo).saturating_mul(est) > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
         left.join(", "),
         right.join(", ")
+    )
+}
+
+/// The per-fold work estimate and the dive-side measurement: at a fuel-out
+/// the chunk has run `v0 - fold_start` iterations on one budget.
+pub(crate) fn est_static(fid: u32) -> String {
+    format!("static FOLD_EST_{fid}: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);\n")
+}
+
+pub(crate) fn est_update(fid: u32) -> String {
+    format!(
+        "{{ let it = (as_i(v0) - as_i(fold_start)).max(1); FOLD_EST_{fid}.store((ctx.fuel() / it).max(1), std::sync::atomic::Ordering::Relaxed); }}\n"
     )
 }
 

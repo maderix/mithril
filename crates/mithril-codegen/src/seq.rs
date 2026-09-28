@@ -127,6 +127,12 @@ pub(crate) struct Ex<'m> {
 }
 
 thread_local! {
+    /// `FOLDS[g]`: `g` is a proven fold split by its CALL rule (its dive
+    /// form measures fuel per iteration, see fold.rs).
+    pub(crate) static FOLDS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// `NTUP[g] = k > 0`: dive function `g` has a native multi-value entry
     /// `n_<g>(..) -> Result<[u64; k], u64>` (see `ntup_fns`).
     pub(crate) static NTUP: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1479,8 +1485,10 @@ pub(crate) fn dive_fn<'m>(
         .filter(|&i| bor[fid as usize][i])
         .map(|i| format!("let v{i} = dup_val(ctx, v{i});\n"))
         .collect();
+    let is_fold = FOLDS.with(|f| f.borrow().get(fid as usize).copied().unwrap_or(false));
+    let est = if is_fold { crate::fold::est_update(fid) } else { String::new() };
     let fuel_check = format!(
-        "*fuel -= 1;\nif *fuel < 0 {{\n#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\n{dups}let r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err({});\n}}\n",
+        "*fuel -= 1;\nif *fuel < 0 {{\n{est}#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\n{dups}let r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err({});\n}}\n",
         1 + fid,
         {
             let c = format!("cap(ctx{})", (0..ar).map(|i| format!(", v{i}")).collect::<String>());
@@ -1529,6 +1537,9 @@ pub(crate) fn dive_fn<'m>(
     }
     if lp {
         let fc = if leafy { String::new() } else { fuel_check.clone() };
+        if is_fold {
+            s.push_str("let fold_start = v0;\n");
+        }
         s.push_str(&format!("'l: loop {{\n{fc}{bb}}}\n"));
     } else if leafy {
         s.push_str(&format!("let _ = fuel;\n{bb}unreachable!()\n"));
