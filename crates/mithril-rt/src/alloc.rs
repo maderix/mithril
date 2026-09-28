@@ -37,6 +37,32 @@ unsafe impl ZeroValid for std::sync::atomic::AtomicU8 {}
 // SAFETY: Rec consists solely of AtomicU32/AtomicU64 fields.
 unsafe impl ZeroValid for Rec {}
 
+/// Ask for transparent huge pages on an arena block (Linux; the kernel's
+/// default THP mode is `madvise`, so without this every arena is 4 KiB
+/// pages and pointer-chasing workloads pay a TLB miss per node). Best
+/// effort: failure leaves ordinary pages.
+fn advise_huge(p: *mut u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_HUGEPAGE: i32 = 14;
+        const HUGE: usize = 2 << 20;
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        let start = (p as usize).next_multiple_of(HUGE);
+        let end = (p as usize + len) & !(HUGE - 1);
+        if end > start {
+            // SAFETY: [start, end) lies inside the block just allocated;
+            // MADV_HUGEPAGE changes no contents, only the backing page size.
+            unsafe {
+                madvise(start as *mut u8, end - start, MADV_HUGEPAGE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (p, len);
+}
+
 /// Allocate `n` zeroed values without touching the pages (calloc keeps large
 /// arenas lazily committed, so a 1 GiB default capacity costs nothing upfront).
 fn zeroed_slice<T: ZeroValid>(n: usize) -> Box<[T]> {
@@ -49,6 +75,7 @@ fn zeroed_slice<T: ZeroValid>(n: usize) -> Box<[T]> {
     if p.is_null() {
         handle_alloc_error(layout);
     }
+    advise_huge(p as *mut u8, layout.size());
     // SAFETY: p is a fresh global-allocator block with Layout::array::<T>(n),
     // exclusively owned here, and all-zero bytes are a valid T (ZeroValid).
     unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, n)) }
