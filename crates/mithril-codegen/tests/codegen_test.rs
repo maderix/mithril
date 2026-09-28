@@ -462,3 +462,29 @@ fn forks_reached_from_scalar_callers_stay_splittable() {
     assert!(!rs.contains(&format!("fn s_{}(", id("run"))), "run calls the fork natively");
     assert!(rs.contains(&format!("fn s_{}(", id("leafwork"))), "leafwork is not native");
 }
+
+// ---- ownership at projections and branch points ----
+
+#[test]
+fn projections_and_branches_release_exactly_once() {
+    // A table carried through loops and read back: projecting the loop's
+    // tuple result must move (not copy) a never-shared value, and a branch
+    // that walks one subtree must release the other. Peak cells stay at one
+    // table (~520) whatever the iteration count at one thread; a use after
+    // free shows up as a wrong result or a crash at any thread count.
+    let src = fixture("table_loop.py");
+    let (cm, rs) = pipeline(&src, 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, "table_loop");
+    for t in ["1", "16"] {
+        for fuel in ["64", "4096"] {
+            let (got, err) = run_env(&bin, &[t, fuel], &[("MITHRIL_STATS", "1")]);
+            assert_eq!(got, want, "table_loop --threads {t} fuel {fuel}");
+            // (with several workers, cells freed by one worker go to its own
+            // free list, so the peak also reflects allocator migration)
+            if t == "1" {
+                assert!(peak_cells(&err) < 1024, "table_loop leaks: {err}");
+            }
+        }
+    }
+}

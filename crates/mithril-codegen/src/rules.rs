@@ -277,7 +277,9 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
     match e {
         Core::Let(x, r, bo) => {
             if !has_call(r) {
+                ex.cur_let = Some(*x);
                 let er = ex.val(r, false, b);
+                ex.cur_let = None;
                 if ex.rem.get(x).copied().unwrap_or(0) == 0 {
                     b.push_str(&format!("free_val(ctx, {er});\n"));
                 } else {
@@ -356,10 +358,16 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
         Core::If(c, t, f) => {
             let ec = ex.val(c, false, b);
             let saved = ex.rem.clone();
+            let live = free_vars(e);
+            let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
+            cnt_rule(t, &mut lt);
+            cnt_rule(f, &mut lf);
             b.push_str(&format!("if as_i({ec}) != 0 {{\n"));
+            ex.enter_branch(&live, &lt, b);
             rtail(ex, t, par, b, sq);
             ex.rem = saved.clone();
             b.push_str("} else {\n");
+            ex.enter_branch(&live, &lf, b);
             rtail(ex, f, par, b, sq);
             ex.rem = saved;
             b.push_str("}\n");
@@ -367,12 +375,19 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
         Core::Match(s, arms) => {
             let (sv, hold) = ex.scrutinee(s, b);
             let saved = ex.rem.clone();
+            let mut live = free_vars(e);
+            if let Core::Var(v) = &**s {
+                live.remove(v);
+            }
             let (open, plan, close) = crate::seq::plan_arms(&sv, arms, ex.unbox);
             b.push_str(&open);
             for (i, pre, suf) in plan {
                 let (cid, binders, body) = &arms[i];
                 ex.rem = saved.clone();
                 b.push_str(&pre);
+                let mut local = Cnt::new();
+                cnt_rule(body, &mut local);
+                ex.enter_branch(&live, &local, b);
                 if ex.unbox.contains_key(cid) {
                     if let Some(bv) = binders.first() {
                         if ex.rem.get(bv).copied().unwrap_or(0) > 0 {

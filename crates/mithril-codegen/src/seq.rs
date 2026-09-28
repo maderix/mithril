@@ -111,6 +111,8 @@ pub(crate) struct Ex<'m> {
     pub inline_calls: u32,
     /// Vars holding a native scalar tuple result, as locals `q<var>_<i>`.
     pub ntup: HashSet<u32>,
+    /// The let binder whose right-hand side is being emitted.
+    pub cur_let: Option<u32>,
     /// Dive form of a TRMC function: (ctor id, hole-fill rule).
     pub trmc: Option<(u32, u16)>,
     /// The delayed self call being emitted: (its var, evaluated args).
@@ -190,7 +192,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -392,6 +394,30 @@ impl<'m> Ex<'m> {
                 let t = self.fresh();
                 b.push_str(&format!("let {t} = dup_val(ctx, v{i});\n"));
                 t
+            }
+        }
+    }
+
+    /// Entering one branch of a tail-position branch point: `live` are the
+    /// variables in scope that the branch point uses, `local` this branch's
+    /// uses. Use counts at a branch point cover all branches, so each is
+    /// rebased to this branch, and an owned boxed value this branch never
+    /// uses is released here (else it leaks on this path, or its one use
+    /// makes a needless copy whose extra reference is never dropped).
+    pub(crate) fn enter_branch(&mut self, live: &std::collections::BTreeSet<u32>, local: &Cnt, b: &mut String) {
+        for v in live {
+            let l = local.get(v).copied().unwrap_or(0);
+            let r = self.rem.get(v).copied().unwrap_or(0);
+            let owned = self.pinned == 0
+                && !self.ints.contains(v)
+                && !self.bset.contains(v)
+                && !self.ntup.contains(v)
+                && self.pending.as_ref().map_or(true, |(x, _)| x != v);
+            if l == 0 && r > 0 && owned {
+                b.push_str(&format!("free_val(ctx, v{v});\n"));
+            }
+            if r > 0 {
+                self.rem.insert(*v, l);
             }
         }
     }
@@ -670,13 +696,17 @@ impl<'m> Ex<'m> {
                     }
                     if has_call(r) {
                         self.kframes.push((*x, (**bo).clone()));
-                        let er = self.val(r, false, b);
+                        self.cur_let = Some(*x);
+                let er = self.val(r, false, b);
+                self.cur_let = None;
                         self.kframes.pop();
                         self.emit_bind(*x, &er, b);
                         return self.val(bo, esc, b);
                     }
                 }
+                self.cur_let = Some(*x);
                 let er = self.val(r, false, b);
+                self.cur_let = None;
                 self.emit_bind(*x, &er, b);
                 self.val(bo, esc, b)
             }
@@ -759,9 +789,17 @@ impl<'m> Ex<'m> {
             Core::Proj(x, i) => {
                 let (sv, hold) = self.scrutinee(x, b);
                 let t = self.fresh();
-                b.push_str(&format!("let {t} = dup_val(ctx, field(ctx, {sv}, {i}));\n"));
                 if hold == Hold::Consume {
-                    b.push_str(&format!("free_val(ctx, {sv});\n"));
+                    // the container dies here: move the field out
+                    b.push_str(&format!("let {t} = take_field(ctx, {sv}, {i});\n"));
+                } else {
+                    // the container stays: the field is now shared, so its
+                    // type must carry a refcount
+                    match self.cur_let {
+                        Some(v) => self.note_share(v),
+                        None => self.shared.borrow_mut().poison = true,
+                    }
+                    b.push_str(&format!("let {t} = dup_val(ctx, field(ctx, {sv}, {i}));\n"));
                 }
                 t
             }
@@ -865,12 +903,16 @@ impl<'m> Ex<'m> {
                 }
                 if has_call(r) {
                     self.kframes.push((*x, (**bo).clone()));
-                    let er = self.val(r, false, b);
+                    self.cur_let = Some(*x);
+                let er = self.val(r, false, b);
+                self.cur_let = None;
                     self.kframes.pop();
                     self.emit_bind(*x, &er, b);
                     return self.dive_tail(bo, b);
                 }
+                self.cur_let = Some(*x);
                 let er = self.val(r, false, b);
+                self.cur_let = None;
                 self.emit_bind(*x, &er, b);
                 self.dive_tail(bo, b);
             }
@@ -880,11 +922,17 @@ impl<'m> Ex<'m> {
                 // terminal (call/return/back-edge) that releases its unused ones
                 let toks = self.toks.clone();
                 let saved = self.rem.clone();
+                let live = free_vars(e);
+                let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
+                cnt_dive(th, &mut lt);
+                cnt_dive(el, &mut lf);
                 b.push_str(&format!("if as_i({ec}) != 0 {{\n"));
+                self.enter_branch(&live, &lt, b);
                 self.dive_tail(th, b);
                 self.rem = saved.clone();
                 self.toks = toks.clone();
                 b.push_str("} else {\n");
+                self.enter_branch(&live, &lf, b);
                 self.dive_tail(el, b);
                 self.rem = saved;
                 self.toks.clear();
@@ -894,6 +942,10 @@ impl<'m> Ex<'m> {
                 let (sv, hold) = self.scrutinee(s, b);
                 let toks = self.toks.clone();
                 let saved = self.rem.clone();
+                let mut live = free_vars(e);
+                if let Core::Var(v) = &**s {
+                    live.remove(v); // consumed by the match itself
+                }
                 let (open, plan, close) = plan_arms(&sv, arms, self.unbox);
                 b.push_str(&open);
                 for (i, pre, suf) in plan {
@@ -901,6 +953,9 @@ impl<'m> Ex<'m> {
                     self.rem = saved.clone();
                     self.toks = toks.clone();
                     b.push_str(&pre);
+                    let mut local = Cnt::new();
+                    cnt_dive(body, &mut local);
+                    self.enter_branch(&live, &local, b);
                     if self.unbox.contains_key(cid) {
                         if let Some(bv) = binders.first() {
                             if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
@@ -1155,7 +1210,7 @@ pub(crate) fn dive_fn<'m>(
 ) -> String {
     let f = &m.fns[fid as usize];
     let ar = f.arity;
-    let trmc = if bor[fid as usize].iter().any(|b| *b) { None } else { trmc_ctor(fid, body, m, unbox) };
+    let trmc = if bor[fid as usize].iter().any(|b| *b) || std::env::var_os("MITHRIL_NO_TRMC").is_some() { None } else { trmc_ctor(fid, body, m, unbox) };
     let hole_rule = trmc.map(|c| sq.add_hole(c));
     let lp = f.self_tail_rec || trmc.is_some();
     let params: String =

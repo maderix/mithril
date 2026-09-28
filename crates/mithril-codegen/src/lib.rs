@@ -1358,6 +1358,43 @@ fn free_val(ctx: &mut Wctx, p: u64) {
 }
 
 #[inline(never)]
+/// Last use of a boxed value that is only projected: move field `i` out,
+/// freeing the cells and dropping the other fields (a shared value keeps
+/// its fields: share field `i`, drop this reference).
+fn take_field(ctx: &mut Wctx, p: u64, i: usize) -> u64 {
+    let root = con_addr(p);
+    if !lin(con_tag(p)) && !ctx.rc_unique(root) {
+        let f = dup_val(ctx, field(ctx, p, i));
+        free_val(ctx, p);
+        return f;
+    }
+    let (mut q, mut idx, mut out) = (p, 0usize, 0u64);
+    loop {
+        let ar = con_ar(q) as usize;
+        let ca = con_addr(q);
+        let c = ctx.cell(ca);
+        ctx.free(ca);
+        if ar > 2 {
+            if idx == i {
+                out = c[0];
+            } else {
+                free_val(ctx, c[0]);
+            }
+            idx += 1;
+            q = c[1];
+        } else {
+            for (s, f) in c.iter().enumerate().take(ar) {
+                if idx + s == i {
+                    out = *f;
+                } else {
+                    free_val(ctx, *f);
+                }
+            }
+            return out;
+        }
+    }
+}
+
 fn free_val_slow(ctx: &mut Wctx, p: u64) {
     match tag(p) {
         t if t >= TU => {}
