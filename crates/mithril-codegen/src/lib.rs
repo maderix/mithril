@@ -285,6 +285,9 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         }
     }
     let native: Vec<bool> = scal.iter().map(|s| s.is_some()).collect();
+    scalar::LEAF.with(|l| {
+        *l.borrow_mut() = (0..m.fns.len()).map(|f| native[f] && !has_call(&m.fns[f].body)).collect()
+    });
     BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
     scalar::SIGS.with(|s| {
         *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
@@ -344,6 +347,25 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         })
         .collect();
     fast::FAST.with(|f| *f.borrow_mut() = fast_code.iter().map(|c| c.is_some()).collect());
+    // native multi-value returns: dive functions returning a k-tuple (see
+    // seq::NTUP); not scalar (own lowering), not destination-passing, not
+    // behind a base-case wrapper, not main
+    let ntup: Vec<usize> = (0..nf)
+        .map(|fid| match tys.ret[fid] {
+            ty::Ty::Tup(k)
+                if (2..=8).contains(&k)
+                    && scal[fid].is_none()
+                    && dps[fid].is_none()
+                    && fast_code[fid].is_none()
+                    && fid as u32 != m.main
+                    && std::env::var_os("MITHRIL_NO_NTUP").is_none() =>
+            {
+                k as usize
+            }
+            _ => 0,
+        })
+        .collect();
+    seq::NTUP.with(|n| *n.borrow_mut() = ntup);
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {
@@ -615,6 +637,18 @@ pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
         if !changed {
             return b;
         }
+    }
+}
+
+/// Inlining attribute for an emitted function: a small call-free body
+/// (bounded work, typically a loop body helper) always inlines into its
+/// callers; rustc's heuristic declines multi-site helpers.
+pub(crate) fn inline_attr(body: &Core) -> &'static str {
+    const MAX: usize = 192;
+    if !has_call(body) && rewrite::size(body) <= MAX {
+        "#[inline(always)]\n"
+    } else {
+        ""
     }
 }
 
@@ -951,7 +985,8 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
             (0..f.arity as u32)
                 .map(|p| {
                     f.arity <= 60
-                        && matches!(tys.var(fid, p), ty::Ty::Adt(c) if shared.contains(&c))
+                        && (matches!(tys.var(fid, p), ty::Ty::Adt(c) if shared.contains(&c))
+                            || matches!(tys.var(fid, p), ty::Ty::Arr(_)))
                         && !reuses_param(&bodies[fid], p, m, unbox)
                 })
                 .collect()
@@ -1012,6 +1047,15 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                 }
                 walk(r, mask, esc, bor);
                 walk(b, mask, esc, bor);
+            }
+            // an array read only looks at its array: not an escape
+            Core::Prim(mithril_front::core::Prim::ArrGet | mithril_front::core::Prim::ArrLen, xs) => {
+                for (j, x) in xs.iter().enumerate() {
+                    if j > 0 {
+                        *esc |= var_mask(x, mask);
+                    }
+                    walk(x, mask, esc, bor);
+                }
             }
             Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 for x in xs {
@@ -1352,7 +1396,28 @@ fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
 }
 
 // ---- arrays: a heap block [refcount, len, elements..] behind a T_ARR port;
-// value semantics, updated in place when this is the only reference ----
+// value semantics, updated in place when this is the only reference. Bit 63
+// of the len word (ARR_BOXED) is set once the array has stored a heap value:
+// until then drop and copy need not visit the elements ----
+
+const ARR_BOXED: u64 = 1 << 63;
+#[inline(always)]
+fn is_heap(v: u64) -> bool {
+    let t = tag(v);
+    t == T_CON || t == T_FLO || t == T_ARR
+}
+#[inline(always)]
+fn arr_mark_boxed(a: u64, v: u64) {
+    if is_heap(v) {
+        // SAFETY: as arr_rc; word 1 is the len word, `a` uniquely ours
+        unsafe { *arr_block(a).add(1) |= ARR_BOXED }
+    }
+}
+#[inline(always)]
+fn arr_boxed(p: u64) -> bool {
+    // SAFETY: as arr_rc
+    unsafe { *arr_block(p).add(1) & ARR_BOXED != 0 }
+}
 
 #[inline(always)]
 fn arr_block(p: u64) -> *mut u64 {
@@ -1367,7 +1432,7 @@ fn arr_rc(p: u64) -> &'static std::sync::atomic::AtomicU64 {
 #[inline(always)]
 fn arr_len_of(p: u64) -> usize {
     // SAFETY: as arr_rc; word 1 is the length
-    unsafe { *arr_block(p).add(1) as usize }
+    unsafe { (*arr_block(p).add(1) & !ARR_BOXED) as usize }
 }
 #[inline(always)]
 fn arr_elems(p: u64) -> *mut u64 {
@@ -1375,10 +1440,13 @@ fn arr_elems(p: u64) -> *mut u64 {
     unsafe { arr_block(p).add(2) }
 }
 fn arr_alloc(n: usize) -> u64 {
+    arr_alloc_fill(n, 0)
+}
+fn arr_alloc_fill(n: usize, fill: u64) -> u64 {
     let mut v: Vec<u64> = Vec::with_capacity(n + 2);
     v.push(1);
     v.push(n as u64);
-    v.resize(n + 2, 0);
+    v.resize(n + 2, fill);
     let b = Box::into_raw(v.into_boxed_slice()) as *mut u64;
     debug_assert!((b as u64) >> 56 == 0);
     (T_ARR << 56) | (b as u64)
@@ -1399,6 +1467,9 @@ fn arr_new(ctx: &mut Wctx, n: i64, v: u64) -> u64 {
         panic!("negative array size {}", n);
     }
     let n = n as usize;
+    if !is_heap(v) {
+        return arr_alloc_fill(n, v);
+    }
     let p = arr_alloc(n);
     let e = arr_elems(p);
     for k in 0..n {
@@ -1407,6 +1478,8 @@ fn arr_new(ctx: &mut Wctx, n: i64, v: u64) -> u64 {
     }
     if n == 0 {
         free_val(ctx, v);
+    } else {
+        arr_mark_boxed(p, v);
     }
     p
 }
@@ -1430,16 +1503,69 @@ fn arr_set(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
     let slot = unsafe { arr_elems(a).add(i as usize) };
     free_val(ctx, unsafe { *slot });
     unsafe { *slot = v };
+    arr_mark_boxed(a, v);
     a
+}
+/// Int-element arrays: elements are immediates, no element refcounting.
+#[inline(always)]
+fn arr_get_i(a: u64, i: i64) -> u64 {
+    let n = arr_len_of(a);
+    if i < 0 || i as usize >= n {
+        arr_oob(i, n);
+    }
+    // SAFETY: bounds checked
+    unsafe { *arr_elems(a).add(i as usize) }
+}
+#[inline(always)]
+fn arr_set_i(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
+    let n = arr_len_of(a);
+    if i < 0 || i as usize >= n {
+        arr_oob(i, n);
+    }
+    let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) };
+    // SAFETY: bounds checked; `a` is now uniquely ours
+    unsafe { *arr_elems(a).add(i as usize) = v };
+    a
+}
+/// Native code: arrays there are linear and made unique at the boundary
+/// (`arr_own`), so a write needs no refcount check.
+#[inline(always)]
+fn arr_set_u(a: u64, i: i64, v: u64) -> u64 {
+    let n = arr_len_of(a);
+    if i < 0 || i as usize >= n {
+        arr_oob(i, n);
+    }
+    debug_assert!(arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1);
+    // SAFETY: bounds checked; `a` is unique (see arr_own)
+    unsafe { *arr_elems(a).add(i as usize) = v };
+    a
+}
+/// Take `a` as the unique reference (copy when shared).
+#[inline(always)]
+fn arr_own(ctx: &mut Wctx, a: u64) -> u64 {
+    if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) }
+}
+fn arr_new_i(n: i64, v: u64) -> u64 {
+    if n < 0 {
+        panic!("negative array size {}", n);
+    }
+    arr_alloc_fill(n as usize, v)
 }
 #[cold]
 #[inline(never)]
 fn arr_copy(ctx: &mut Wctx, a: u64) -> u64 {
     let n = arr_len_of(a);
     let b = arr_alloc(n);
-    for k in 0..n {
-        // SAFETY: k < n in both blocks
-        unsafe { *arr_elems(b).add(k) = dup_val(ctx, *arr_elems(a).add(k)) }
+    if arr_boxed(a) {
+        for k in 0..n {
+            // SAFETY: k < n in both blocks
+            unsafe { *arr_elems(b).add(k) = dup_val(ctx, *arr_elems(a).add(k)) }
+        }
+        // SAFETY: as arr_rc; `b` is ours
+        unsafe { *arr_block(b).add(1) |= ARR_BOXED }
+    } else {
+        // SAFETY: n elements in both blocks, distinct allocations
+        unsafe { std::ptr::copy_nonoverlapping(arr_elems(a), arr_elems(b), n) }
     }
     free_val(ctx, a);
     b
@@ -1448,10 +1574,12 @@ fn arr_drop(ctx: &mut Wctx, p: u64) {
     if arr_rc(p).fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
         return;
     }
-    let n = arr_len_of(p);
-    for k in 0..n {
-        // SAFETY: k < n; the block is still allocated
-        free_val(ctx, unsafe { *arr_elems(p).add(k) });
+    if arr_boxed(p) {
+        let n = arr_len_of(p);
+        for k in 0..n {
+            // SAFETY: k < n; the block is still allocated
+            free_val(ctx, unsafe { *arr_elems(p).add(k) });
+        }
     }
     arr_free_block(p);
 }
@@ -1501,6 +1629,34 @@ fn take_field(ctx: &mut Wctx, p: u64, i: usize) -> u64 {
                     free_val(ctx, *f);
                 }
             }
+            return out;
+        }
+    }
+}
+
+/// Move every field out of a boxed k-tuple at its last use, freeing its
+/// cells (a shared tuple keeps its fields: share them, drop this reference).
+fn untup<const K: usize>(ctx: &mut Wctx, p: u64) -> [u64; K] {
+    let mut out = [0u64; K];
+    if !lin(con_tag(p)) && !ctx.rc_unique(con_addr(p)) {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = dup_val(ctx, field(ctx, p, i));
+        }
+        free_val(ctx, p);
+        return out;
+    }
+    let (mut q, mut idx) = (p, 0usize);
+    loop {
+        let ar = con_ar(q) as usize;
+        let ca = con_addr(q);
+        let c = ctx.cell(ca);
+        ctx.free(ca);
+        if ar > 2 {
+            out[idx] = c[0];
+            idx += 1;
+            q = c[1];
+        } else {
+            out[idx..idx + ar].copy_from_slice(&c[..ar]);
             return out;
         }
     }

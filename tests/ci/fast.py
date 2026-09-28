@@ -216,7 +216,10 @@ def main():
         print(f"{r['name']:13} {small:5} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('build_s', '-'):>6} {insg}  {st} {notes}")
     print(f"total {time.time() - t0:.1f}s, {fails} failing")
     if a.update:
-        json.dump({r["name"]: r for r in results}, open(BASELINE, "w"), indent=1, sort_keys=True)
+        # merge: `--update --only X` refreshes X and keeps every other entry
+        base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
+        base.update({r["name"]: r for r in results})
+        json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"baseline written: {BASELINE}")
     sys.exit(fails)
 

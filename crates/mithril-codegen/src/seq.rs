@@ -119,6 +119,40 @@ pub(crate) struct Ex<'m> {
     pub pending: Option<(u32, Vec<String>)>,
     /// Destination-passing form: the tail parameter (not a real param).
     pub dps_param: Option<usize>,
+    /// Native multi-value form (`n_<fid>`): the function returns its
+    /// k-tuple as `[u64; k]` instead of a heap tuple (0: not this form).
+    pub nret: usize,
+}
+
+thread_local! {
+    /// `NTUP[g] = k > 0`: dive function `g` has a native multi-value entry
+    /// `n_<g>(..) -> Result<[u64; k], u64>` (see `ntup_fns`).
+    pub(crate) static NTUP: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn ntup_of(g: u32) -> usize {
+    NTUP.with(|n| n.borrow().get(g as usize).copied().unwrap_or(0))
+}
+
+/// `bo` starts with component bindings `xi = x[i]` (distinct i < k) and
+/// then never mentions `x`: the shape tuple unpacking lowers to. Returns
+/// the bindings and the rest.
+pub(crate) fn proj_prefix(x: u32, k: usize, bo: &Core) -> Option<(Vec<(u32, usize)>, &Core)> {
+    let mut binds: Vec<(u32, usize)> = Vec::new();
+    let mut e = bo;
+    while let Core::Let(y, r, rest) = e {
+        match &**r {
+            Core::Proj(v, i) if **v == Core::Var(x) && *i < k && binds.iter().all(|(_, j)| j != i) => {
+                binds.push((*y, *i));
+                e = rest;
+            }
+            _ => break,
+        }
+    }
+    if binds.is_empty() || free_vars(e).contains(&x) {
+        return None;
+    }
+    Some((binds, e))
 }
 
 /// Variables that are *used* as arithmetic/comparison operands or bound to
@@ -192,7 +226,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -222,7 +256,7 @@ impl<'m> Ex<'m> {
                 sh.classes.insert(c);
             }
             Ty::Tup(_) => sh.tuples = true,
-            Ty::Arr => {} // arrays always carry a refcount
+            Ty::Arr(_) => {} // arrays always carry a refcount
             Ty::Dyn => sh.poison = true,
         }
     }
@@ -353,9 +387,16 @@ impl<'m> Ex<'m> {
         self.emit_bind(x, &t, b);
     }
 
+    /// `e` is an array whose elements are proven ints.
+    fn int_arr(&self, e: &Core) -> bool {
+        self.self_fid != u32::MAX && self.tys.expr(self.self_fid as usize, e) == Ty::Arr(true)
+    }
+
     /// An expression whose runtime value is a proven i56 immediate.
     fn is_int(&self, e: &Core) -> bool {
         match e {
+            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => self.int_arr(&xs[0]),
+            Core::Prim(mithril_front::core::Prim::ArrLen, _) => true,
             Core::Num(_) | Core::Cmp(..) => true,
             Core::Op2(_, a, b) => self.is_int(a) && self.is_int(b),
             Core::Var(i) => self.ints.contains(i),
@@ -577,6 +618,17 @@ impl<'m> Ex<'m> {
         args: &[Core],
         b: &mut String,
     ) -> (String, Vec<String>) {
+        self.dive_call_as(g, args, false, b)
+    }
+
+    /// `native`: call the multi-value entry `n_<g>` (see `NTUP`).
+    fn dive_call_as(
+        &mut self,
+        g: u32,
+        args: &[Core],
+        native: bool,
+        b: &mut String,
+    ) -> (String, Vec<String>) {
         // rule-form segments have no fuel; only bounded callees (which never
         // consume any) can be called from them as plain expressions
         assert!(self.dive || crate::is_bounded(g), "codegen bug: call in a pure rule-form expression");
@@ -621,7 +673,13 @@ impl<'m> Ex<'m> {
         }
         self.flush_toks(b);
         let argl: String = es.iter().map(|e| format!(", {e}")).collect();
-        let entry = if self.dive && crate::fast::has_fast(g) { "q" } else { "d" };
+        let entry = if native {
+            "n"
+        } else if self.dive && crate::fast::has_fast(g) {
+            "q"
+        } else {
+            "d"
+        };
         (format!("{entry}_{g}(ctx, {fuel}{argl})"), post)
     }
 
@@ -633,6 +691,25 @@ impl<'m> Ex<'m> {
                 use mithril_front::core::Prim;
                 let t = self.fresh();
                 match p {
+                    Prim::ArrNew if self.is_int(&args[1]) => {
+                        let n = self.val(&args[0], false, b);
+                        let v = self.val(&args[1], true, b);
+                        b.push_str(&format!("let {t} = arr_new_i(as_i({n}), {v});\n"));
+                    }
+                    Prim::ArrGet if self.int_arr(&args[0]) => {
+                        let (a, post) = self.borrow_read(&args[0], b);
+                        let i = self.val(&args[1], false, b);
+                        b.push_str(&format!("let {t} = arr_get_i({a}, as_i({i}));\n"));
+                        if let Some(p) = post {
+                            b.push_str(&format!("free_val(ctx, {p});\n"));
+                        }
+                    }
+                    Prim::ArrSet if self.int_arr(&args[0]) => {
+                        let a = self.val(&args[0], true, b);
+                        let i = self.val(&args[1], false, b);
+                        let v = self.val(&args[2], true, b);
+                        b.push_str(&format!("let {t} = arr_set_i(ctx, {a}, as_i({i}), {v});\n"));
+                    }
                     Prim::ArrNew => {
                         let n = self.val(&args[0], false, b);
                         // n copies of the element: its type is shared
@@ -784,7 +861,8 @@ impl<'m> Ex<'m> {
                 let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
                 let t = self.fresh();
                 b.push_str(&format!(
-                    "let {t} = num(s_{g}({fuel}{}));\n",
+                    "{}let {t} = num(s_{g}(ctx, {fuel}{}));\n",
+                    if self.dive && crate::scalar::is_leaf(*g) { "*fuel -= 1;\n" } else { "" },
                     es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
                 ));
                 t
@@ -964,6 +1042,9 @@ impl<'m> Ex<'m> {
                 if self.native_let(*x, r, bo, b) {
                     return self.dive_tail(bo, b);
                 }
+                if let Some(rest) = self.ntup_let(*x, r, bo, b) {
+                    return self.dive_tail(rest, b);
+                }
                 if let Core::Call(g, args) = &**r {
                     if !crate::is_bounded(*g) {
                         self.let_call(*x, *g, args, bo, b);
@@ -1104,6 +1185,26 @@ impl<'m> Ex<'m> {
                     self.hole_exit("r")
                 ));
             }
+            Core::Call(g, args) if self.nret > 0 => {
+                // native multi-value form: a callee with the same native
+                // shape passes its components straight through; any other
+                // result is unpacked (a suspension still delivers the boxed
+                // tuple to our caller's continuation)
+                let k = self.nret;
+                let native = ntup_of(*g) == k;
+                let (call, post) = self.dive_call_as(*g, args, native, b);
+                b.push_str(&format!("let tr = {call};\n"));
+                for p in post {
+                    b.push_str(&format!("free_val(ctx, {p});\n"));
+                }
+                if native {
+                    b.push_str("return tr;\n");
+                } else {
+                    b.push_str(&format!(
+                        "match tr {{\nOk(v) => return Ok(untup::<{k}>(ctx, v)),\nErr(r) => return Err(r),\n}}\n"
+                    ));
+                }
+            }
             Core::Call(g, args) => {
                 // Tail call: pass our own destination through, so a downstream
                 // suspension spawns its pending call against the right parent.
@@ -1118,12 +1219,64 @@ impl<'m> Ex<'m> {
                     b.push_str("return tr;\n");
                 }
             }
+            Core::Tuple(items) if self.nret == items.len() => {
+                let es: Vec<String> = items.iter().map(|a| self.val(a, true, b)).collect();
+                self.flush_toks(b);
+                b.push_str(&format!("return Ok([{}]);\n", es.join(", ")));
+            }
+            other if self.nret > 0 => {
+                let v = self.val(other, true, b);
+                self.flush_toks(b);
+                b.push_str(&format!("return Ok(untup::<{}>(ctx, {v}));\n", self.nret));
+            }
             other => {
                 let v = self.val(other, true, b);
                 self.flush_toks(b);
                 b.push_str(&format!("return Ok({});\n", self.hole_value(&v)));
             }
         }
+    }
+
+    /// `x = g(..)` with `g` a native multi-value dive function and `bo`
+    /// binding its components (`proj_prefix`): call `n_<g>` and bind the
+    /// components from the returned array, no heap tuple. Returns the rest
+    /// of the body to emit. On suspension the continuation receives the
+    /// boxed tuple and runs `bo` as written.
+    fn ntup_let<'a>(&mut self, x: u32, r: &Core, bo: &'a Core, b: &mut String) -> Option<&'a Core> {
+        if !self.dive || self.pending.is_some() {
+            return None;
+        }
+        let Core::Call(g, args) = r else { return None };
+        let k = ntup_of(*g);
+        if k == 0 {
+            return None;
+        }
+        let (binds, rest) = proj_prefix(x, k, bo)?;
+        let (call, post) = self.dive_call_as(*g, args, true, b);
+        let t = self.fresh();
+        if crate::is_bounded(*g) {
+            // bounded work never suspends
+            b.push_str(&format!("let {t} = match {call} {{ Ok(a) => a, Err(_) => unreachable!() }};\n"));
+        } else {
+            b.push_str(&format!("let {t} = match {call} {{\nOk(a) => a,\nErr(r) => {{\n"));
+            for p in &post {
+                b.push_str(&format!("free_val(ctx, {p});\n"));
+            }
+            self.emit_capture("r", Some((x, bo)), b);
+            b.push_str("}\n};\n");
+        }
+        for p in post {
+            b.push_str(&format!("free_val(ctx, {p});\n"));
+        }
+        // x itself is never materialized
+        self.rem.insert(x, 0);
+        for i in 0..k {
+            match binds.iter().find(|(_, j)| *j == i) {
+                Some((y, _)) => self.emit_bind(*y, &format!("{t}[{i}]"), b),
+                None => b.push_str(&format!("free_val(ctx, {t}[{i}]);\n")),
+            }
+        }
+        Some(rest)
     }
 
     /// `x = g(..)` with `g` native scalar returning a tuple that `bo` only
@@ -1139,7 +1292,8 @@ impl<'m> Ex<'m> {
         let es: Vec<String> = args.iter().map(|a| self.val(a, false, b)).collect();
         let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
         b.push_str(&format!(
-            "let ({}) = s_{g}({fuel}{});\n",
+            "{}let ({}) = s_{g}(ctx, {fuel}{});\n",
+            if self.dive && crate::scalar::is_leaf(*g) { "*fuel -= 1;\n" } else { "" },
             (0..k).map(|i| format!("q{x}_{i}")).collect::<Vec<_>>().join(", "),
             es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
         ));
@@ -1279,7 +1433,8 @@ pub(crate) fn dive_fn<'m>(
 ) -> String {
     let f = &m.fns[fid as usize];
     let ar = f.arity;
-    let trmc = if bor[fid as usize].iter().any(|b| *b) || std::env::var_os("MITHRIL_NO_TRMC").is_some() { None } else { trmc_ctor(fid, body, m, unbox) };
+    let nret = ntup_of(fid);
+    let trmc = if nret > 0 || bor[fid as usize].iter().any(|b| *b) || std::env::var_os("MITHRIL_NO_TRMC").is_some() { None } else { trmc_ctor(fid, body, m, unbox) };
     let hole_rule = trmc.map(|c| sq.add_hole(c));
     let lp = f.self_tail_rec || trmc.is_some();
     let params: String =
@@ -1309,6 +1464,7 @@ pub(crate) fn dive_fn<'m>(
     let ints = crate::ints_of(tys, fid as usize);
     let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
     ex.trmc = trmc.zip(hole_rule);
+    ex.nret = nret;
     // the fuel-out spawn takes references to borrowed params
     for i in 0..ar as u32 {
         if bor[fid as usize][i as usize] {
@@ -1328,10 +1484,15 @@ pub(crate) fn dive_fn<'m>(
     // A call-free body does bounded work: no fuel check, and it inlines
     // into its (recursive) callers.
     let leafy = !has_call(body);
-    let mut s = format!(
-        "{}#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n",
-        if leafy { "" } else { "" }
-    );
+    let inl = crate::inline_attr(body);
+    let mut s = if nret > 0 {
+        // boxing entry for the runtime and callers outside the native shape
+        format!(
+            "#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{cparams}) -> R {{\nmatch n_{fid}(ctx, fuel, {argl}) {{\nOk(a) => Ok(mk_con(ctx, 4095u16, &a)),\nErr(r) => Err(r),\n}}\n}}\n\n{inl}#[allow(clippy::too_many_arguments)]\nfn n_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> Result<[u64; {nret}], u64> {{\n"
+        )
+    } else {
+        format!("{inl}#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n")
+    };
     if trmc.is_some() {
         s.push_str("let mut th_head: u64 = 0;\nlet mut th_hole: u32 = NOHOLE;\n");
     }

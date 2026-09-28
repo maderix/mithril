@@ -37,18 +37,73 @@ pub(crate) enum Kind {
     SK(usize),
 }
 
-/// Scalar parameter type: a bare i64, or a k-tuple of i64s passed as k
-/// native components (read only through constant `Proj`).
+/// Scalar parameter type: a bare i64, a k-tuple of i64s passed as k
+/// native components (read only through constant `Proj`), or an int array
+/// (its port bits in an i64) the function owns (`A`: consumed, or freed at
+/// the end of each path) or borrows (`B`: only read; the caller keeps it).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum PTy {
     I,
     T(usize),
+    A,
+    B,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Sig {
     pub params: Vec<PTy>,
     pub ret: Kind, // S1 or SK(k); No never appears inside a Some(Sig)
+    /// which return components are (owned) int arrays: one entry for S1,
+    /// k for SK(k)
+    pub ra: Vec<bool>,
+}
+
+/// An owned array slot: a variable, or component `i` of a destructured
+/// tuple variable `t`.
+fn slot_key(e: &Core, tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>) -> Option<u64> {
+    match e {
+        Core::Var(v) if arrs.contains_key(v) => Some(*v as u64),
+        Core::Proj(b, i) => match &**b {
+            Core::Var(t) if tarr.get(t).is_some_and(|m| m.get(*i).copied().unwrap_or(false)) => {
+                Some((1u64 << 40) | ((*t as u64) << 8) | *i as u64)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn slot_name(key: u64) -> String {
+    if key >> 40 != 0 {
+        format!("q{}_{}", (key >> 8) & 0xFFFF_FFFF, key & 0xFF)
+    } else {
+        format!("v{key}")
+    }
+}
+
+/// Whether `e` is array-valued (under the current bindings).
+fn akind(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core) -> bool {
+    use mithril_front::core::Prim;
+    match e {
+        Core::Var(v) => arrs.contains_key(v),
+        Core::Proj(..) => slot_key(e, tarr, arrs).is_some(),
+        Core::Prim(Prim::ArrNew | Prim::ArrSet, _) => true,
+        Core::Call(g, _) => matches!(&sigs[*g as usize], Some(s) if s.ret == Kind::S1 && s.ra.first() == Some(&true)),
+        Core::If(_, x, _) => akind(sigs, tarr, arrs, x),
+        Core::Let(_, _, b) => akind(sigs, tarr, arrs, b),
+        _ => false,
+    }
+}
+
+/// Array mask of a tuple-valued expression of `k` components.
+fn tmask(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core, k: usize) -> Vec<bool> {
+    match e {
+        Core::Tuple(items) => items.iter().map(|it| akind(sigs, tarr, arrs, it)).collect(),
+        Core::If(_, x, _) => tmask(sigs, tarr, arrs, x, k),
+        Core::Let(_, _, b) => tmask(sigs, tarr, arrs, b, k),
+        Core::Call(g, _) => sigs[*g as usize].as_ref().map(|s| s.ra.clone()).unwrap_or_else(|| vec![false; k]),
+        _ => vec![false; k],
+    }
 }
 
 /// Occurrences of `Var(t)` in `e` that are NOT directly under a `Proj`.
@@ -78,9 +133,132 @@ struct Chk<'m> {
     /// component vars: SK-destructured lets AND T(k) params -> arity
     tvars: HashMap<u32, usize>,
     ok: bool,
+    /// array vars -> borrowed (true) or owned
+    arrs: HashMap<u32, bool>,
+    /// tuple vars -> which components are arrays
+    tarr: HashMap<u32, Vec<bool>>,
+    /// owned array slots alive on the current path
+    live: std::collections::BTreeSet<u64>,
+    /// borrowed params this body consumes (they must become owned)
+    demote: Vec<u32>,
 }
 
 impl<'m> Chk<'m> {
+    fn fail(&mut self, e: &Core) {
+        if self.why.is_none() {
+            self.why = Some(format!("{:.160}", format!("{:?}", e)));
+        }
+        self.ok = false;
+    }
+
+    fn akind(&self, e: &Core) -> bool {
+        akind(self.sigs, &self.tarr, &self.arrs, e)
+    }
+
+    fn slot(&self, e: &Core) -> Option<u64> {
+        slot_key(e, &self.tarr, &self.arrs)
+    }
+
+    /// An array read in place: must name a live slot or a borrowed var.
+    /// (Every array in native code holds ints: parameters are typed
+    /// `Arr(true)` at the boundary, and inside, arrays are only built and
+    /// written with int-checked values.)
+    fn read(&mut self, e: &Core) {
+        match e {
+            Core::Var(v) if self.arrs.get(v) == Some(&true) => {}
+            _ => match self.slot(e) {
+                Some(k) if self.live.contains(&k) => {}
+                _ => self.fail(e),
+            },
+        }
+    }
+
+    /// Consume slot `k` (an owned array moves on).
+    fn consume(&mut self, e: &Core, k: u64) {
+        if let Core::Var(v) = e {
+            if self.arrs.get(v) == Some(&true) {
+                // a borrowed param handed on as owned: it must be owned
+                self.demote.push(*v);
+                return self.fail(e);
+            }
+        }
+        if !self.live.remove(&k) {
+            self.fail(e); // consumed twice on this path
+        }
+    }
+
+    /// An array-valued expression in a consuming position. A slot operand
+    /// is returned for deferred consumption (it moves when the enclosing
+    /// operation runs, after its other operands are evaluated).
+    fn aexpr(&mut self, e: &Core) -> Option<u64> {
+        use mithril_front::core::Prim;
+        if !self.ok {
+            return None;
+        }
+        if let Some(k) = self.slot(e) {
+            return Some(k);
+        }
+        match e {
+            Core::Var(v) if self.arrs.get(v) == Some(&true) => {
+                self.demote.push(*v);
+                self.fail(e);
+            }
+            Core::Prim(Prim::ArrNew, xs) => {
+                self.expr(&xs[0]);
+                self.expr(&xs[1]);
+            }
+            Core::Prim(Prim::ArrSet, xs) => {
+                let d = self.aexpr(&xs[0]);
+                self.expr(&xs[1]);
+                self.expr(&xs[2]);
+                if let Some(k) = d {
+                    self.consume(&xs[0], k);
+                }
+            }
+            Core::Call(g, args) => match &self.sigs[*g as usize] {
+                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() == Some(&true) => self.args(sig.params.clone(), args),
+                _ => self.fail(e),
+            },
+            Core::If(c, x, y) => {
+                self.expr(c);
+                let before = self.live.clone();
+                let d = self.aexpr(x);
+                self.settle(x, d);
+                let after = std::mem::replace(&mut self.live, before);
+                let d = self.aexpr(y);
+                self.settle(y, d);
+                if self.live != after {
+                    self.fail(e);
+                }
+            }
+            Core::Let(x, r, b) => {
+                self.bind(*x, r);
+                let d = self.aexpr(b);
+                self.settle(b, d);
+            }
+            _ => self.fail(e),
+        }
+        None
+    }
+
+    /// Consume a deferred slot now.
+    fn settle(&mut self, e: &Core, d: Option<u64>) {
+        if let Some(k) = d {
+            self.consume(e, k);
+        }
+    }
+
+    /// A value in a consuming position that may be an int or an array:
+    /// returns the deferred slot, if any.
+    fn any(&mut self, e: &Core) -> Option<u64> {
+        if self.akind(e) {
+            self.aexpr(e)
+        } else {
+            self.expr(e);
+            None
+        }
+    }
+
     /// `e` is a plain i64-valued expression.
     fn expr(&mut self, e: &Core) {
         if !self.ok {
@@ -88,6 +266,12 @@ impl<'m> Chk<'m> {
         }
         match e {
             Core::Num(_) => {}
+            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
+                self.read(&xs[0]);
+                self.expr(&xs[1]);
+            }
+            Core::Prim(mithril_front::core::Prim::ArrLen, xs) => self.read(&xs[0]),
+            Core::Var(i) if self.arrs.contains_key(i) => self.fail(e),
             Core::Var(i) => {
                 if self.tvars.contains_key(i) {
                     { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false }; // tuple var escaping without Proj
@@ -99,8 +283,13 @@ impl<'m> Chk<'m> {
             }
             Core::If(c, x, y) => {
                 self.expr(c);
+                let before = self.live.clone();
                 self.expr(x);
+                let after = std::mem::replace(&mut self.live, before);
                 self.expr(y);
+                if self.live != after {
+                    self.fail(e);
+                }
             }
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
@@ -108,10 +297,11 @@ impl<'m> Chk<'m> {
             }
             Core::Call(g, args) => {
                 match &self.sigs[*g as usize] {
-                    Some(sig) if sig.ret == Kind::S1 => self.args(sig.params.clone(), args),
+                    Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(sig.params.clone(), args),
                     _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
                 }
             }
+            Core::Proj(..) if self.slot(e).is_some() => self.fail(e), // an array component
             Core::Proj(b, i) => match &**b {
                 Core::Var(t) if self.tvars.get(t).is_some_and(|k| i < k) => {}
                 _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
@@ -122,8 +312,20 @@ impl<'m> Chk<'m> {
 
     /// Check call arguments against the callee's parameter types.
     fn args(&mut self, ptys: Vec<PTy>, args: &[Core]) {
-        for (pt, a) in ptys.iter().zip(args) {
+        let mut moved: Vec<(usize, u64)> = Vec::new();
+        let mut lent: Vec<u64> = Vec::new();
+        for (j, (pt, a)) in ptys.iter().zip(args).enumerate() {
             match pt {
+                PTy::A => {
+                    if let Some(k) = self.aexpr(a) {
+                        moved.push((j, k));
+                    }
+                }
+                PTy::B => {
+                    self.read(a);
+                    lent.extend(self.slot(a));
+                }
+                PTy::I if self.akind(a) => self.fail(a),
                 PTy::I => self.expr(a),
                 PTy::T(k) => match a {
                     Core::Var(t) if self.tvars.get(t) == Some(k) => {}
@@ -136,6 +338,14 @@ impl<'m> Chk<'m> {
                 },
             }
         }
+        // an array lent to the callee must not also move into it: the
+        // callee would read what it writes
+        if moved.iter().any(|(_, k)| lent.contains(k)) {
+            return self.fail(&Core::Tuple(args.to_vec()));
+        }
+        for (j, k) in moved {
+            self.consume(&args[j], k);
+        }
     }
 
     /// A let binding: a plain scalar RHS, the SK-destructure idiom, or a
@@ -143,8 +353,28 @@ impl<'m> Chk<'m> {
     /// yield a tuple of the variables they assign) bound as components.
     fn bind(&mut self, x: u32, r: &Core) {
         if let Some(k) = tuple_kind(self.sigs, r) {
+            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, k);
             self.tuple_expr(r, k);
             self.tvars.insert(x, k);
+            for (i, a) in mask.iter().enumerate() {
+                if *a {
+                    self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
+                }
+            }
+            self.tarr.insert(x, mask);
+            return;
+        }
+        if self.akind(r) {
+            if let Core::Var(v) = r {
+                if self.arrs.get(v) == Some(&true) {
+                    self.arrs.insert(x, true); // alias of a borrowed array
+                    return;
+                }
+            }
+            let d = self.aexpr(r);
+            self.settle(r, d);
+            self.arrs.insert(x, false);
+            self.live.insert(x as u64);
             return;
         }
         self.expr(r);
@@ -156,11 +386,22 @@ impl<'m> Chk<'m> {
             return;
         }
         match e {
-            Core::Tuple(items) if items.len() == k => items.iter().for_each(|it| self.expr(it)),
+            Core::Tuple(items) if items.len() == k => {
+                let moved: Vec<(usize, u64)> =
+                    items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
+                for (j, d) in moved {
+                    self.consume(&items[j], d);
+                }
+            }
             Core::If(c, x, y) => {
                 self.expr(c);
+                let before = self.live.clone();
                 self.tuple_expr(x, k);
+                let after = std::mem::replace(&mut self.live, before);
                 self.tuple_expr(y, k);
+                if self.live != after || tmask(self.sigs, &self.tarr, &self.arrs, x, k) != tmask(self.sigs, &self.tarr, &self.arrs, y, k) {
+                    self.fail(e);
+                }
             }
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
@@ -174,10 +415,12 @@ impl<'m> Chk<'m> {
         }
     }
 
-    /// Tail position; returns the tail kind (S1 / SK(k)) or sets !ok.
-    fn tail(&mut self, e: &Core, fid: u32) -> Kind {
+    /// Tail position; returns the tail kind (S1 / SK(k)) with its array
+    /// mask, or sets !ok. Owned arrays still alive at a tail are freed there
+    /// by the emitter.
+    fn tail(&mut self, e: &Core, fid: u32) -> (Kind, Vec<bool>) {
         if !self.ok {
-            return Kind::No;
+            return (Kind::No, vec![]);
         }
         match e {
             Core::Let(x, r, b) => {
@@ -186,44 +429,76 @@ impl<'m> Chk<'m> {
             }
             Core::If(c, x, y) => {
                 self.expr(c);
+                let before = self.live.clone();
                 let a = self.tail(x, fid);
+                self.live = before;
                 let b = self.tail(y, fid);
-                if a == b || b == Kind::No {
+                if a == b || b.0 == Kind::No {
                     a
-                } else if a == Kind::No {
+                } else if a.0 == Kind::No {
                     b
                 } else {
-                    { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false };
-                    Kind::No
+                    self.fail(e);
+                    (Kind::No, vec![])
                 }
             }
             Core::Tuple(items) => {
-                for it in items {
-                    self.expr(it);
+                let mask: Vec<bool> = items.iter().map(|it| self.akind(it)).collect();
+                let moved: Vec<(usize, u64)> =
+                    items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
+                for (j, d) in moved {
+                    self.consume(&items[j], d);
                 }
-                Kind::SK(items.len())
+                (Kind::SK(items.len()), mask)
             }
             Core::Call(g, args) => {
                 match &self.sigs[*g as usize] {
                     Some(sig) => {
+                        let sig = sig.clone();
                         self.args(sig.params.clone(), args);
                         if *g == fid {
-                            Kind::No // own kind, resolved by the caller of tail()
+                            (Kind::No, vec![]) // own kind, resolved by the caller of tail()
                         } else {
-                            sig.ret
+                            (sig.ret, sig.ra.clone())
                         }
                     }
                     None => {
-                        { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false };
-                        Kind::No
+                        self.fail(e);
+                        (Kind::No, vec![])
                     }
                 }
             }
             other => {
-                self.expr(other);
-                Kind::S1
+                if self.akind(other) {
+                    let d = self.aexpr(other);
+                    self.settle(other, d);
+                    (Kind::S1, vec![true])
+                } else {
+                    self.expr(other);
+                    (Kind::S1, vec![false])
+                }
             }
         }
+    }
+}
+
+/// A variable or constant.
+fn is_atom(e: &Core) -> bool {
+    matches!(e, Core::Num(_) | Core::Var(_))
+}
+
+/// An expression that can be evaluated as a value join: no calls and no
+/// array writes or allocations (reads are fine).
+fn join_arm(e: &Core) -> bool {
+    use mithril_front::core::Prim;
+    match e {
+        Core::Num(_) | Core::Var(_) | Core::Proj(..) => true,
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => join_arm(a) && join_arm(b),
+        Core::If(c, t, f) => join_arm(c) && join_arm(t) && join_arm(f),
+        Core::Let(_, r, b) => join_arm(r) && join_arm(b),
+        Core::Tuple(xs) => xs.iter().all(join_arm),
+        Core::Prim(Prim::ArrGet | Prim::ArrLen, xs) => xs.iter().all(join_arm),
+        _ => false,
     }
 }
 
@@ -291,27 +566,59 @@ thread_local! {
     /// Scalar signatures of the module being emitted, for direct calls
     /// from dive code (`native_sig`).
     pub(crate) static SIGS: std::cell::RefCell<Vec<Option<Sig>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// `LEAF[g]`: native `g` is call-free and loop-free. It settles no fuel
+    /// itself; its one unit is counted at the call site (a register
+    /// increment in native callers), so fuel still measures work.
+    pub(crate) static LEAF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn is_leaf(g: u32) -> bool {
+    LEAF.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
+}
+
+/// Fuel accounting a native caller emits for a call to `g`.
+fn leaf_unit(g: u32) -> &'static str {
+    if is_leaf(g) {
+        "fl += 1;\n"
+    } else {
+        ""
+    }
 }
 
 /// The signature of `g` when dive code may call its native form directly:
 /// scalar-lowered, all-int parameters, and never suspending (a forking
 /// scalar function keeps a dive form of its own and is not included).
 pub(crate) fn native_sig(g: u32) -> Option<Sig> {
-    SIGS.with(|s| s.borrow().get(g as usize).cloned().flatten()).filter(|s| s.params.iter().all(|p| *p == PTy::I))
+    SIGS.with(|s| s.borrow().get(g as usize).cloned().flatten())
+        .filter(|s| s.params.iter().all(|p| *p == PTy::I) && s.ra.iter().all(|a| !a))
 }
 
 /// A tuple param's component count cannot be read off the body alone (a
 /// caller may pass a wider tuple); seed with maxproj+1 and demote on caller
 /// mismatch. Bare use of a param whose callers pass tuples also demotes.
 pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig>> {
+    use crate::ty::Ty;
     let n = m.fns.len();
+    // a value native code cannot represent at the boundary (a non-int
+    // array) rules the function out for good
+    let forbid: Vec<bool> = (0..n)
+        .map(|fi| {
+            tys.params[fi].iter().chain(std::iter::once(&tys.ret[fi])).any(|t| matches!(t, Ty::Arr(false)))
+        })
+        .collect();
     let mut sigs: Vec<Option<Sig>> = m
         .fns
         .iter()
         .enumerate()
         .map(|(fi, f)| {
+            if forbid[fi] {
+                return None;
+            }
             let params = (0..f.arity as u32)
                 .map(|p| {
+                    if tys.params[fi].get(p as usize) == Some(&Ty::Arr(true)) {
+                        return PTy::B; // optimistic: demoted when consumed
+                    }
                     let (mut bare, mut mx) = (false, -1i64);
                     proj_shape(&f.body, p, &mut bare, &mut mx);
                     if !bare && mx >= 0 {
@@ -323,70 +630,106 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
                 .collect();
             // seed the return kind from type inference: mutually recursive
             // functions returning tuples cannot discover it from each other
-            let ret = match tys.ret.get(fi) {
-                Some(crate::ty::Ty::Tup(k)) => Kind::SK(*k as usize),
-                _ => Kind::S1,
+            let (ret, ra) = match tys.ret.get(fi) {
+                Some(Ty::Tup(k)) => (Kind::SK(*k as usize), vec![false; *k as usize]),
+                Some(Ty::Arr(true)) => (Kind::S1, vec![true]),
+                _ => (Kind::S1, vec![false]),
             };
-            Some(Sig { params, ret })
+            Some(Sig { params, ret, ra })
         })
         .collect();
-    // Param types are body-derived and fixed; rets/eligibility are
+    // Param types are body-derived (array params start borrowed and are
+    // demoted to owned when a body consumes them); rets/eligibility are
     // recomputed for EVERY fn each round (a demotion is not sticky: a fn
     // rejected while its callee's return kind was still a guess re-qualifies
     // once the callee settles). Bounded rounds; convergence break.
-    let param_seed: Vec<Vec<PTy>> =
-        sigs.iter().map(|s| s.as_ref().unwrap().params.clone()).collect();
-    for _ in 0..2 * n + 4 {
+    let mut param_seed: Vec<Vec<PTy>> =
+        sigs.iter().enumerate().map(|(fi, s)| s.as_ref().map(|s| s.params.clone()).unwrap_or_else(|| vec![PTy::I; m.fns[fi].arity])).collect();
+    fn run<'a>(m: &CoreModule, sigs: &'a [Option<Sig>], fid: usize, params: &[PTy]) -> (Chk<'a>, (Kind, Vec<bool>)) {
+        let mut c = Chk {
+            why: None,
+            sigs,
+            tvars: HashMap::new(),
+            ok: true,
+            arrs: HashMap::new(),
+            tarr: HashMap::new(),
+            live: Default::default(),
+            demote: Vec::new(),
+        };
+        for (p, pt) in params.iter().enumerate() {
+            match pt {
+                PTy::T(k) => {
+                    c.tvars.insert(p as u32, *k);
+                }
+                PTy::A => {
+                    c.arrs.insert(p as u32, false);
+                    c.live.insert(p as u64);
+                }
+                PTy::B => {
+                    c.arrs.insert(p as u32, true);
+                }
+                PTy::I => {}
+            }
+        }
+        let tk = c.tail(&m.fns[fid].body, fid as u32);
+        (c, tk)
+    }
+    let seed = sigs.clone();
+    let mut whys: Vec<Option<String>> = vec![None; n];
+    for _ in 0..3 * n + 4 {
         let mut next = sigs.clone();
-        for (fid, f) in m.fns.iter().enumerate() {
+        let mut demoted = false;
+        for fid in 0..n {
+            if forbid[fid] {
+                continue;
+            }
             let params = param_seed[fid].clone();
-            let ret_guess = sigs[fid].as_ref().map(|s| s.ret).unwrap_or(Kind::S1);
-            let mut tv = HashMap::new();
-            for (p, pt) in params.iter().enumerate() {
-                if let PTy::T(k) = pt {
-                    tv.insert(p as u32, *k);
+            let guess = sigs[fid].as_ref().or(seed[fid].as_ref()).map(|s| (s.ret, s.ra.clone())).unwrap_or((Kind::S1, vec![false]));
+            // a function is checked assuming its own signature (self calls)
+            let mut own = sigs.clone();
+            if own[fid].is_none() {
+                own[fid] = Some(Sig { params: params.clone(), ret: guess.0, ra: guess.1.clone() });
+            }
+            let (c, tk) = run(m, &own, fid, &params);
+            whys[fid] = c.why.clone();
+            for v in &c.demote {
+                if let Some(PTy::B) = param_seed[fid].get(*v as usize) {
+                    param_seed[fid][*v as usize] = PTy::A;
+                    demoted = true;
                 }
             }
-            let mut c = Chk { why: None, sigs: &sigs, tvars: tv, ok: true };
-            let tk = c.tail(&f.body, fid as u32);
             next[fid] = if !c.ok {
                 None
             } else {
-                let ret = match tk {
-                    Kind::No => ret_guess, // only self tail calls: keep guess
+                let (ret, ra) = match tk {
+                    (Kind::No, _) => guess, // only self tail calls: keep guess
                     k => k,
                 };
-                Some(Sig { params, ret })
+                Some(Sig { params, ret, ra })
             };
         }
-        if next == sigs {
+        if next == sigs && !demoted {
             break;
         }
         sigs = next;
     }
     // final verification (stale optimistic ret guesses)
     let snapshot = sigs.clone();
-    for (fid, f) in m.fns.iter().enumerate() {
+    for fid in 0..n {
         let Some(sig) = &snapshot[fid] else { continue };
-        let mut tv = HashMap::new();
-        for (p, pt) in sig.params.iter().enumerate() {
-            if let PTy::T(k) = pt {
-                tv.insert(p as u32, *k);
-            }
-        }
-        let mut c = Chk { why: None, sigs: &snapshot, tvars: tv, ok: true };
-        let tk = c.tail(&f.body, fid as u32);
-        let consistent = c.ok && matches!(tk, Kind::No) || (c.ok && tk == sig.ret);
+        let (c, tk) = run(m, &snapshot, fid, &sig.params);
+        let consistent = c.ok && c.demote.is_empty() && (tk.0 == Kind::No || (tk.0 == sig.ret && tk.1 == sig.ra));
         if !consistent {
             sigs[fid] = None;
         }
     }
     if std::env::var_os("MITHRIL_DEBUG_SCALAR").is_some() {
         for (fid, f) in m.fns.iter().enumerate() {
-            if sigs[fid].is_none() {
-                let mut c = Chk { why: None, sigs: &sigs, tvars: HashMap::new(), ok: true };
-                let _ = c.tail(&f.body, fid as u32);
-                eprintln!("not scalar {fid} {}: {}", f.name, c.why.unwrap_or_else(|| "ret kind".into()));
+            match &sigs[fid] {
+                None => {
+                    eprintln!("not scalar {fid} {}: {}", f.name, whys[fid].clone().unwrap_or_else(|| "ret kind".into()));
+                }
+                Some(sig) => eprintln!("scalar {fid} {}: {:?} -> {:?} {:?}", f.name, sig.params, sig.ret, sig.ra),
             }
         }
     }
@@ -406,12 +749,117 @@ struct Sem<'m> {
     /// component vars (SK-destructured lets and T(k) params): var -> arity;
     /// components live as q<var>_<i>
     tvars: HashMap<u32, usize>,
+    /// array vars -> borrowed; tuple vars -> array components; owned array
+    /// slots alive on the current path (mirrors the classifier's `Chk`)
+    arrs: HashMap<u32, bool>,
+    tarr: HashMap<u32, Vec<bool>>,
+    live: std::collections::BTreeSet<u64>,
+    /// the function counts fuel (it loops or calls); a call-free, loop-free
+    /// body does bounded work and settles none
+    fuel: bool,
 }
 
 impl<'m> Sem<'m> {
+    fn settle_fuel(&self) -> &'static str {
+        if self.fuel {
+            "*fuel -= fl;\n"
+        } else {
+            ""
+        }
+    }
+
     fn fresh(&mut self) -> String {
         self.tmp += 1;
         format!("s{}", self.tmp)
+    }
+
+    fn akind(&self, e: &Core) -> bool {
+        akind(self.sigs, &self.tarr, &self.arrs, e)
+    }
+
+    fn slot(&self, e: &Core) -> Option<u64> {
+        slot_key(e, &self.tarr, &self.arrs)
+    }
+
+    /// Name of an array read in place (a live slot or a borrowed var).
+    fn rd(&self, e: &Core) -> String {
+        match e {
+            Core::Var(v) => format!("v{v}"),
+            _ => slot_name(self.slot(e).expect("array read of a non-slot in scalar emission")),
+        }
+    }
+
+    /// An array-valued expression in a consuming position; a slot operand
+    /// is returned by name with its key for deferred consumption.
+    fn aval(&mut self, e: &Core, b: &mut String) -> (String, Option<u64>) {
+        use mithril_front::core::Prim;
+        if let Some(k) = self.slot(e) {
+            return (slot_name(k), Some(k));
+        }
+        let t = self.fresh();
+        match e {
+            Core::Prim(Prim::ArrNew, xs) => {
+                let n = self.val(&xs[0], b);
+                let v = self.val(&xs[1], b);
+                b.push_str(&format!("let {t} = arr_new_i({n}, num({v})) as i64;\n"));
+            }
+            Core::Prim(Prim::ArrSet, xs) => {
+                let (a, d) = self.aval(&xs[0], b);
+                let i = self.val(&xs[1], b);
+                let v = self.val(&xs[2], b);
+                if let Some(k) = d {
+                    self.live.remove(&k);
+                }
+                b.push_str(&format!("let {t} = arr_set_u({a} as u64, {i}, num({v})) as i64;\n"));
+            }
+            Core::Call(g, args) => {
+                let es = self.call_args(*g, args, b);
+                b.push_str(leaf_unit(*g));
+                b.push_str(&format!("let {t} = s_{g}(ctx, fuel, {});\n", es.join(", ")));
+            }
+            Core::If(c, x, y) => {
+                let ec = self.val(c, b);
+                let before = self.live.clone();
+                let mut bx = String::new();
+                let vx = self.aval_now(x, &mut bx);
+                let after = std::mem::replace(&mut self.live, before);
+                let mut by = String::new();
+                let vy = self.aval_now(y, &mut by);
+                self.live = after;
+                b.push_str(&format!("let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"));
+            }
+            Core::Let(x, r, bo) => {
+                self.bind(*x, r, b);
+                return (self.aval_now(bo, b), None);
+            }
+            _ => unreachable!("non-array Core in scalar array emission"),
+        }
+        (t, None)
+    }
+
+    /// `aval`, consuming a slot operand immediately.
+    fn aval_now(&mut self, e: &Core, b: &mut String) -> String {
+        let (v, d) = self.aval(e, b);
+        if let Some(k) = d {
+            self.live.remove(&k);
+        }
+        v
+    }
+
+    /// Any value in a consuming position (int or array).
+    fn anyval(&mut self, e: &Core, b: &mut String) -> (String, Option<u64>) {
+        if self.akind(e) {
+            self.aval(e, b)
+        } else {
+            (self.val(e, b), None)
+        }
+    }
+
+    /// Free the owned arrays still alive at a path's end.
+    fn drop_live(&self, b: &mut String) {
+        for k in &self.live {
+            b.push_str(&format!("free_val(ctx, {} as u64);\n", slot_name(*k)));
+        }
     }
 
     /// The mutable local names of `fid`'s flattened parameter list, in
@@ -421,7 +869,7 @@ impl<'m> Sem<'m> {
         let mut out = Vec::new();
         for (p, pt) in sig.params.iter().enumerate() {
             match pt {
-                PTy::I => out.push(format!("v{p}")),
+                PTy::I | PTy::A | PTy::B => out.push(format!("v{p}")),
                 PTy::T(k) => {
                     for i in 0..*k {
                         out.push(format!("q{p}_{i}"));
@@ -437,8 +885,15 @@ impl<'m> Sem<'m> {
     fn call_args(&mut self, g: u32, args: &[Core], b: &mut String) -> Vec<String> {
         let sig = self.sigs[g as usize].clone().expect("call to non-scalar in scalar emission");
         let mut es = Vec::new();
+        let mut moved = Vec::new();
         for (pt, a) in sig.params.iter().zip(args) {
             match pt {
+                PTy::A => {
+                    let (v, d) = self.aval(a, b);
+                    moved.extend(d);
+                    es.push(v);
+                }
+                PTy::B => es.push(self.rd(a)),
                 PTy::I => es.push(self.val(a, b)),
                 PTy::T(k) => match a {
                     Core::Var(t) if self.tvars.contains_key(t) => {
@@ -455,15 +910,39 @@ impl<'m> Sem<'m> {
                 },
             }
         }
+        for k in moved {
+            self.live.remove(&k);
+        }
         es
     }
 
     fn bind(&mut self, x: u32, r: &Core, b: &mut String) {
         if let Some(k) = tuple_kind(self.sigs, r) {
+            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, k);
             let et = self.tval(r, b);
             let comps: Vec<String> = (0..k).map(|i| format!("q{x}_{i}")).collect();
             b.push_str(&format!("let ({}) = {et};\n", comps.join(", ")));
             self.tvars.insert(x, k);
+            for (i, a) in mask.iter().enumerate() {
+                if *a {
+                    self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
+                }
+            }
+            self.tarr.insert(x, mask);
+            return;
+        }
+        if self.akind(r) {
+            if let Core::Var(v) = r {
+                if self.arrs.get(v) == Some(&true) {
+                    self.arrs.insert(x, true);
+                    b.push_str(&format!("let v{x} = v{v};\n"));
+                    return;
+                }
+            }
+            let er = self.aval_now(r, b);
+            b.push_str(&format!("let v{x} = {er};\n"));
+            self.arrs.insert(x, false);
+            self.live.insert(x as u64);
             return;
         }
         self.low = self.ranges.masked(x);
@@ -476,15 +955,29 @@ impl<'m> Sem<'m> {
     fn tval(&mut self, e: &Core, b: &mut String) -> String {
         match e {
             Core::Tuple(items) => {
-                let es: Vec<String> = items.iter().map(|it| self.val(it, b)).collect();
+                let mut moved = Vec::new();
+                let es: Vec<String> = items
+                    .iter()
+                    .map(|it| {
+                        let (v, d) = self.anyval(it, b);
+                        moved.extend(d);
+                        v
+                    })
+                    .collect();
+                for k in moved {
+                    self.live.remove(&k);
+                }
                 format!("({})", es.join(", "))
             }
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
+                let before = self.live.clone();
                 let mut bx = String::new();
                 let vx = self.tval(x, &mut bx);
+                let after = std::mem::replace(&mut self.live, before);
                 let mut by = String::new();
                 let vy = self.tval(y, &mut by);
+                self.live = after;
                 format!("if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}}")
             }
             Core::Let(x, r, bo) => {
@@ -493,7 +986,8 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
-                format!("s_{g}(fuel, {})", es.join(", "))
+                b.push_str(leaf_unit(*g));
+                format!("s_{g}(ctx, fuel, {})", es.join(", "))
             }
             _ => unreachable!("non-tuple Core in scalar tuple emission"),
         }
@@ -504,6 +998,17 @@ impl<'m> Sem<'m> {
         let low32 = std::mem::take(&mut self.low32);
         match e {
             Core::Num(n) => format!("{n}i64"),
+            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
+                let a = self.rd(&xs[0]);
+                let i = self.val(&xs[1], b);
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = as_i(arr_get_i({a} as u64, {i}));\n"));
+                t
+            }
+            Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
+                let a = self.rd(&xs[0]);
+                format!("(arr_len_of({a} as u64) as i64)")
+            }
             Core::Var(i) => format!("v{i}"),
             Core::Proj(base, i) => match &**base {
                 Core::Var(t) if self.tvars.contains_key(t) => format!("q{t}_{i}"),
@@ -570,12 +1075,25 @@ impl<'m> Sem<'m> {
                 };
                 format!("(({ex} {o} {ey}) as i64)")
             }
+            Core::If(c, x, y) if is_atom(x) && is_atom(y) => {
+                // a select of computed values (what if-conversion leaves):
+                // mask arithmetic, so the backend cannot turn it back into
+                // an unpredictable branch on a loop-carried chain
+                let ec = self.val(c, b);
+                let (vx, vy) = (self.val(x, b), self.val(y, b));
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = {{ let m = -(({ec} != 0) as i64); ({vx} & m) | ({vy} & !m) }};\n"));
+                t
+            }
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
+                let before = self.live.clone();
                 let mut bx = String::new();
                 let vx = self.val(x, &mut bx);
+                let after = std::mem::replace(&mut self.live, before);
                 let mut by = String::new();
                 let vy = self.val(y, &mut by);
+                self.live = after;
                 let t = self.fresh();
                 b.push_str(&format!(
                     "let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"
@@ -589,7 +1107,8 @@ impl<'m> Sem<'m> {
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
                 let t = self.fresh();
-                b.push_str(&format!("let {t} = s_{g}(fuel, {});\n", es.join(", ")));
+                b.push_str(leaf_unit(*g));
+                b.push_str(&format!("let {t} = s_{g}(ctx, fuel, {});\n", es.join(", ")));
                 t
             }
             _ => unreachable!("non-scalar Core in scalar emission"),
@@ -604,10 +1123,27 @@ impl<'m> Sem<'m> {
                 self.bind(*x, r, b);
                 self.tail(bo, fid, lp, b);
             }
+            Core::If(..) if join_arm(e) && !self.akind(e) && tuple_kind(self.sigs, e).is_none_or(|k| {
+                tmask(self.sigs, &self.tarr, &self.arrs, e, k).iter().all(|a| !a)
+            }) =>
+            {
+                // call-free, array-free arms: one value join and a single
+                // return (per-arm returns each settle fuel, which keeps the
+                // backend from turning a cheap unpredictable branch into a
+                // select)
+                let v = match tuple_kind(self.sigs, e) {
+                    Some(_) => self.tval(e, b),
+                    None => self.val(e, b),
+                };
+                self.drop_live(b);
+                b.push_str(&format!("{}return {v};\n", self.settle_fuel()));
+            }
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
+                let (live, arrs, tarr) = (self.live.clone(), self.arrs.clone(), self.tarr.clone());
                 b.push_str(&format!("if {ec} != 0 {{\n"));
                 self.tail(x, fid, lp, b);
+                (self.live, self.arrs, self.tarr) = (live, arrs, tarr);
                 b.push_str("} else {\n");
                 self.tail(y, fid, lp, b);
                 b.push_str("}\n");
@@ -617,6 +1153,7 @@ impl<'m> Sem<'m> {
                 for (i, ea) in es.iter().enumerate() {
                     b.push_str(&format!("let n{i} = {ea};\n"));
                 }
+                self.drop_live(b);
                 for (i, slot) in self.slot_names(fid).into_iter().enumerate() {
                     b.push_str(&format!("{slot} = n{i};\n"));
                 }
@@ -624,15 +1161,19 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
-                b.push_str(&format!("*fuel -= fl;\nreturn s_{g}(fuel, {});\n", es.join(", ")));
+                self.drop_live(b);
+                b.push_str(leaf_unit(*g));
+                b.push_str(&format!("{}return s_{g}(ctx, fuel, {});\n", self.settle_fuel(), es.join(", ")));
             }
-            Core::Tuple(items) => {
-                let es: Vec<String> = items.iter().map(|a| self.val(a, b)).collect();
-                b.push_str(&format!("*fuel -= fl;\nreturn ({});\n", es.join(", ")));
+            Core::Tuple(_) => {
+                let v = self.tval(e, b);
+                self.drop_live(b);
+                b.push_str(&format!("{}return {v};\n", self.settle_fuel()));
             }
             other => {
-                let v = self.val(other, b);
-                b.push_str(&format!("*fuel -= fl;\nreturn {v};\n"));
+                let v = if self.akind(other) { self.aval_now(other, b) } else { self.val(other, b) };
+                self.drop_live(b);
+                b.push_str(&format!("{}return {v};\n", self.settle_fuel()));
             }
         }
     }
@@ -651,7 +1192,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     let mw = if lp { "mut " } else { "" };
     for (p, pt) in sig.params.iter().enumerate() {
         match pt {
-            PTy::I => params.push(format!("{mw}v{p}: i64")),
+            PTy::I | PTy::A | PTy::B => params.push(format!("{mw}v{p}: i64")),
             PTy::T(k) => {
                 for i in 0..*k {
                     params.push(format!("{mw}q{p}_{i}: i64"));
@@ -664,13 +1205,33 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         Kind::SK(k) => format!("({})", vec!["i64"; k].join(", ")),
         Kind::No => unreachable!(),
     };
-    let mut tv = HashMap::new();
+    let mut sem = Sem {
+        sigs,
+        ranges: crate::range::Ranges::of(&f.body),
+        low: false,
+        low32: false,
+        tmp: 0,
+        tvars: HashMap::new(),
+        arrs: HashMap::new(),
+        tarr: HashMap::new(),
+        live: Default::default(),
+        fuel: !is_leaf(fid),
+    };
     for (p, pt) in sig.params.iter().enumerate() {
-        if let PTy::T(k) = pt {
-            tv.insert(p as u32, *k);
+        match pt {
+            PTy::T(k) => {
+                sem.tvars.insert(p as u32, *k);
+            }
+            PTy::A => {
+                sem.arrs.insert(p as u32, false);
+                sem.live.insert(p as u64);
+            }
+            PTy::B => {
+                sem.arrs.insert(p as u32, true);
+            }
+            PTy::I => {}
         }
     }
-    let mut sem = Sem { sigs, ranges: crate::range::Ranges::of(&f.body), low: false, low32: false, tmp: 0, tvars: tv };
     let mut bb = String::new();
     sem.tail(&f.body, fid, lp, &mut bb);
     // one fuel unit per call and loop iteration, as in the dive form: native
@@ -687,9 +1248,26 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     let mut unpack = String::new();
     let mut bargs: Vec<String> = Vec::new();
     let mut needs_cell_read = false;
+    let mut after = String::new();
     for (p, pt) in sig.params.iter().enumerate() {
         match pt {
             PTy::I => bargs.push(format!("as_i(v{p})")),
+            // array ports pass as their bits; the dive side's borrow mode
+            // for this param may differ from the native one
+            PTy::A => {
+                if bor[fid as usize][p] {
+                    unpack.push_str(&format!("let v{p} = dup_val(ctx, v{p});\n"));
+                }
+                // native code writes owned arrays without refcount checks
+                unpack.push_str(&format!("let v{p} = arr_own(ctx, v{p});\n"));
+                bargs.push(format!("v{p} as i64"));
+            }
+            PTy::B => {
+                if !bor[fid as usize][p] {
+                    after.push_str(&format!("free_val(ctx, v{p});\n"));
+                }
+                bargs.push(format!("v{p} as i64"));
+            }
             PTy::T(k) => {
                 needs_cell_read = true;
                 for i in 0..*k {
@@ -703,13 +1281,15 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         }
     }
     let owns_tuple = sig.params.iter().enumerate().any(|(p, pt)| matches!(pt, PTy::T(_)) && !bor[fid as usize][p]);
+    let leafc = if is_leaf(fid) { "*fuel -= 1;\n" } else { "" };
+    let pack = |i: usize, r: &str| if sig.ra.get(i).copied().unwrap_or(false) { format!("{r} as u64") } else { format!("num({r})") };
     let bridge_body = match sig.ret {
-        Kind::S1 => format!("{unpack}Ok(num(s_{fid}(fuel, {})))", bargs.join(", ")),
+        Kind::S1 => format!("{unpack}{leafc}let r = s_{fid}(ctx, fuel, {});\n{after}Ok({})", bargs.join(", "), pack(0, "r")),
         Kind::SK(k) => {
             let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
-            let packs: Vec<String> = (0..k).map(|i| format!("num(r{i})")).collect();
+            let packs: Vec<String> = (0..k).map(|i| pack(i, &format!("r{i}"))).collect();
             format!(
-                "{unpack}let ({}) = s_{fid}(fuel, {});\nOk(mk_con(ctx, 0xFFFu16, &[{}]))",
+                "{unpack}{leafc}let ({}) = s_{fid}(ctx, fuel, {});\n{after}Ok(mk_con(ctx, 0xFFFu16, &[{}]))",
                 comps.join(", "),
                 bargs.join(", "),
                 packs.join(", ")
@@ -717,19 +1297,20 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         }
         Kind::No => unreachable!(),
     };
-    let cx = if needs_cell_read || owns_tuple || matches!(sig.ret, Kind::SK(_)) { "ctx" } else { "_ctx" };
+    let _ = (needs_cell_read, owns_tuple);
+    let inl = crate::inline_attr(&f.body);
     if !bridge {
         return format!(
-            "#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
-             fn s_{fid}(fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n",
+            "{inl}#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
+             fn s_{fid}(ctx: &mut Wctx, fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n",
             params.join(", ")
         );
     }
     format!(
-        "#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
-         fn s_{fid}(fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n\
+        "{inl}#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
+         fn s_{fid}(ctx: &mut Wctx, fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n\
          #[allow(unused_variables, clippy::too_many_arguments)]\n\
-         fn d_{fid}({cx}: &mut Wctx, fuel: &mut i64{}) -> R {{\n\
+         fn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{}) -> R {{\n\
          {bridge_body}\n}}\n\n",
         params.join(", "),
         (0..ar).map(|i| format!(", v{i}: u64")).collect::<String>(),

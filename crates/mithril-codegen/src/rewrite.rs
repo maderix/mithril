@@ -17,7 +17,7 @@ use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
 use std::collections::HashMap;
 
 /// Node count of an expression (size heuristic for inlining).
-fn size(e: &Core) -> usize {
+pub(crate) fn size(e: &Core) -> usize {
     match e {
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => 1,
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => 1 + size(a) + size(b),
@@ -83,15 +83,24 @@ fn inline_in(e: &Core, m: &CoreModule, leafy: &[bool], next: &mut u32) -> Core {
             *next += callee.arity as u32;
             let shift = *next;
             *next += max_var(&callee.body).max(callee.arity as u32) + 1;
+            // a variable argument is substituted for its parameter (no alias
+            // let: an alias of a live value would force a reference-count
+            // copy where the callee only reads it); the callee's binders are
+            // renamed past the caller's range, so nothing captures it
             let mut map = HashMap::new();
             for p in 0..callee.arity as u32 {
-                map.insert(p, base + p);
+                match &args[p as usize] {
+                    Core::Var(y) => map.insert(p, *y),
+                    _ => map.insert(p, base + p),
+                };
             }
             // rename the callee's own binders past the caller's range too
             let body = shift_binders(&callee.body, shift, callee.arity as u32, &map);
             let mut out = body;
             for (p, a) in args.iter().enumerate().rev() {
-                out = Core::Let(base + p as u32, Box::new(rec(a, next)), Box::new(out));
+                if !matches!(a, Core::Var(_)) {
+                    out = Core::Let(base + p as u32, Box::new(rec(a, next)), Box::new(out));
+                }
             }
             out
         }

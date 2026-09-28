@@ -72,6 +72,26 @@ inspects a benchmark name or shape.
 | register-returned dives, out-of-line cold capture | `Result<u64,u64>`; suspension code never bloats the hot frame | 257G -> 241G |
 | Lean-checked reassociation | fold combiners proven associative are split in parallel | (fold ports) |
 
+Arrays (`array_new/get/set/len`; a heap block `[rc, len|boxed, elems]`,
+value semantics, in place when unique). Measured on bfs, 2^19 mazes (reference
+4.75 / 0.555 s):
+
+| mechanism | what it proves / does | bfs SEQ / PAR16 |
+|---|---|---|
+| (arrays in dive form, heap tuples) | | 26.7 / 3.72 |
+| native multi-value returns (`n_<f>`) | a dive function returning a k-tuple returns `[u64; k]`; `x = g(..)` followed by `xi = x[i]` bindings takes the components, no heap tuple; a suspension still delivers the boxed tuple to the continuation | 12.7 / 1.42 |
+| borrowed array reads | a read (`get`/`len`) lends the array; a param only read is borrowed (same escape analysis as shared ADTs); inlining substitutes variable args instead of alias lets | (in the above) |
+| int-element arrays | `Arr(true)` from inference (the element tyvar resolves to `Int`): tag-free reads, writes that free no old element; the `boxed` bit lets drop/copy skip element scans | 10.4 / 1.13 |
+| native code over int arrays (`scalar.rs`) | params are borrowed (only read) or owned (inferred by fixpoint); owned arrays are linear on every path (consumed at most once, never read after, freed at path end); tuple results carry an array mask | 9.65 / 0.94 |
+| small call-free functions inline always | rustc declines multi-site helpers; the loop body helper is the hot path | 5.63 / 0.59 |
+| static uniqueness | inside native code arrays are linear, and the bridge makes an owned array unique once (`arr_own`), so writes skip the refcount check | 5.19 / 0.52 |
+| leaf fuel at the call site | a call-free native function settles no fuel through the pointer; its one unit is a register increment in the caller (fuel keeps measuring the same work, so parallel split granularity is unchanged) | 4.85 / 0.48 |
+| selects as mask arithmetic | an `if` choosing between computed atoms (what if-conversion leaves) is emitted as `(a & m) \| (b & !m)`, which the backend cannot turn back into a branch on a loop-carried chain | **4.48 / 0.45** |
+
+Each step was first proven on hand-edited generated code (the same
+runtime helpers), then made a codegen rule; the final generated code
+matches the hand proof.
+
 Refcounting is Perceus-style (u8 saturating), used only where linearity
 cannot be proven; chained (arity > 2) constructors move their fields on
 consume like arity <= 2 ones do.
@@ -112,7 +132,8 @@ at 1 and 16 threads; the set of scalar-lowered functions must not shrink;
 generated lines / segment count / build time within tolerance; instruction
 count of a mid-size run within 15% of `tests/ci/baseline.json`; arena
 exhaustion reported as its own failure class. `--update` rewrites the
-baseline — only from a state verified against reference.
+baseline — only from a state verified against reference (`--update --only X`
+refreshes X's entry and keeps the rest).
 
 Why it exists: one day of tree-bitonic tuning silently dropped mandelbrot
 off the scalar path (6x), double-freed in merkle, and made nbody's
@@ -120,27 +141,21 @@ generated code exponential; all were found hours later by full runs.
 
 ## 6. Standings vs reference (big sizes, this box; ours = wave runtime)
 
-| bench | ours SEQ / PAR16 | reference | state |
+| bench | ours SEQ / PAR16 | reference SEQ / PAR16 | state |
 |---|---|---|---|
-| tree-bitonic | 10.46 / 2.82 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
-| mandelbrot | 4.39 / 0.55 | 4.96 / 0.62 | met |
-| tree-radix | 5.3 / 0.56 | 4.84 / 0.75 | PAR met, SEQ 10% off |
-| lexer | 3.6 / 0.50 | 2.96 / 0.40 | ~20% off |
-| symreg | 7.3 / 0.96 | 4.76 / 0.60 | |
-| tree-matmul | 7.8 / 1.00 | 4.16 / 0.61 | |
-| merkle | 7.4 / 4.5 | 5.67 / 0.72 | PAR does not scale (Speck loops are scalar chains) |
-| queens | 18.7 / 2.6 | 8.32 / 1.23 | |
-| kmeans | 15.7 / 1.6 | 7.84 / 0.77 | |
-| gameoflife | 30.5 / 3.9 | 9.89 / 1.50 | |
-| bfs, editdist, hashmap, terrain | need > 2^26 cells | | array-as-tree spelling; memory, not time |
-| nbody, raytrace | > 60 s | 6.3 / 7.6 | float emulation (no native f32) |
-
-Numbers other than tree-bitonic/mandelbrot are from a 60 s-capped status
-sweep, not clean runs. The rows that are off are off by *usecase geometry*
-(array-as-tree memory, emulated floats, scalar loops that never suspend
-so never fork) — the next general mechanisms are unique-owner in-place
-arrays, native f32, and fork exposure for loop-shaped work; none is a
-runtime change.
+| bfs | 4.48 / 0.45 | 4.75 / 0.555 | met |
+| mandelbrot | 3.8 / 0.50 | 4.96 / 0.62 | met |
+| tree-radix | 4.3 / 0.70 | 4.84 / 0.75 | met |
+| lexer | 2.4 / 0.31 | 2.96 / 0.40 | met |
+| symreg | 2.95 / 0.41 | 4.76 / 0.60 | met |
+| tree-matmul | 3.6 / 0.58 | 4.16 / 0.61 | met |
+| merkle | 5.2 / 0.58 | 5.67 / 0.72 | met |
+| gameoflife | 9.07 / 1.19 | 9.89 / 1.50 | met |
+| queens | 4.73 / 0.47 | 8.32 / 1.23 | met |
+| tree-bitonic | 10.3 / 2.73 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
+| kmeans | 10.7 / 1.47 | 7.84 / 0.77 | needs lane-level (u32) vectorization; hand proof 5.81 |
+| hashmap, editdist, terrain | | 3.22 / 0.40, 2.44 / 0.39, 3.21 / 0.46 | being ported to arrays (the bfs mechanisms) |
+| nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
 
 ## 7. Process rules (from the user)
 

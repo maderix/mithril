@@ -446,7 +446,7 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     // the dive-form caller destructures the native tuple (no heap tuple)
     let leaf = dive_form(&cm, &rs, "leaf");
     let b = cm.fns.iter().position(|f| f.name == "bins").unwrap();
-    assert!(leaf.contains(&format!(") = s_{b}(fuel")), "leaf does not call bins natively");
+    assert!(leaf.contains(&format!(") = s_{b}(ctx, fuel")), "leaf does not call bins natively");
     assert!(!leaf.contains("field(ctx"), "leaf reads its tuple from the heap");
     // a branch choosing between boxed subtrees is not if-converted
     assert_eq!(dive_form(&cm, &rs, "pick").matches("continue 'l").count(), 2, "pick's subtree choice became a select");
@@ -497,4 +497,62 @@ fn arrays_match_oracle_in_place_and_shared() {
     // in-place updates and copy-on-write both live in arr_set
     assert!(rs.contains("arr_set(ctx"), "no array updates emitted");
     let _ = cm;
+}
+
+// ---- native code over int arrays, native multi-value returns ----
+
+/// The native form `s_<fid>` of the function named `name`.
+fn native_form<'a>(cm: &CoreModule, rs: &'a str, name: &str) -> &'a str {
+    let fid = cm.fns.iter().position(|f| f.name == name).unwrap_or_else(|| panic!("no fn {name}"));
+    let start = rs.find(&format!("fn s_{fid}(")).unwrap_or_else(|| panic!("{name} is not native"));
+    let end = rs[start..].find("\nfn ").map(|e| start + e).unwrap_or(rs.len());
+    &rs[start..end]
+}
+
+#[test]
+fn native_arrays_match_oracle_under_suspension() {
+    let (cm, rs) = trmc_golden("native_arrays.py");
+    let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
+    // loops and helpers over int arrays run natively
+    for f in ["step", "fill", "score", "walk", "upd2", "pick"] {
+        native_form(&cm, &rs, f);
+    }
+    // writes in native code need no refcount check: arrays there are
+    // linear and made unique where they enter (the bridge)
+    let fill_loop = cm.fns.iter().position(|f| f.name.starts_with("__for")).unwrap();
+    assert!(rs[rs.find(&format!("fn s_{fill_loop}(")).expect("fill's loop is native")..].contains("arr_set_u("), "native write still checks the refcount");
+    assert!(dive_form(&cm, &rs, "fill").contains("arr_own(ctx"), "bridge does not make an owned array unique");
+    // step returns (array, array, int) as a native tuple the loop destructures
+    let step = native_form(&cm, &rs, "step");
+    assert!(step.contains("-> (i64, i64, i64)"), "step does not return a native tuple");
+    let wl = cm.fns.iter().position(|f| f.name.starts_with("__while")).expect("walk's loop helper");
+    let w = rs.find(&format!("fn s_{wl}(")).map(|s| &rs[s..]).expect("walk's loop is native");
+    let w = &w[..w[1..].find("\nfn ").map(|e| e + 1).unwrap_or(w.len())];
+    assert!(!w.contains("mk_con"), "walk's loop builds heap tuples");
+    assert!(w.contains(&format!("= s_{}(ctx, fuel", id("step"))), "the loop does not call step natively");
+    // step is a call-free leaf: no fuel settlement of its own; the caller
+    // counts its unit in a register
+    assert!(!step.contains("*fuel"), "leaf settles fuel through the pointer");
+    assert!(w.contains("fl += 1;"), "caller does not count the leaf's fuel unit");
+    // the if/else accumulator became mask selects
+    assert!(rs.contains("& !m)"), "if-converted selects are not mask arithmetic");
+    // one array lent and moved into the same call is not native (the
+    // callee would read its own in-place write)
+    assert!(!rs.contains(&format!("fn s_{}(", id("alias"))), "aliasing call lowered natively");
+    // a dive-form function returning a tuple hands it back unboxed
+    let sp = id("split");
+    assert!(rs.contains(&format!("fn n_{sp}(")), "split has no native multi-value entry");
+    assert!(dive_form(&cm, &rs, "listy").contains(&format!("n_{sp}(ctx, fuel")) || rs.contains(&format!("n_{sp}(ctx, fuel")), "listy does not take split's components natively");
+}
+
+#[test]
+fn int_arrays_go_native_boxed_arrays_keep_refcounts() {
+    let (cm, rs) = trmc_golden("arrays.py");
+    // an int array filled in a loop: native, unchecked in-place writes
+    native_form(&cm, &rs, "fill");
+    assert!(rs.contains("arr_set_u("), "int array writes are not native");
+    // an array of lists keeps refcounted element handling in dive form
+    let lp = cm.fns.iter().position(|f| f.name.starts_with("__for") && rs[rs.find(&format!("fn d_{}(", cm.fns.iter().position(|g| g.name == f.name).unwrap())).unwrap()..].split("\nfn ").next().unwrap().contains("arr_set(ctx")).expect("buckets' loop keeps refcounted updates");
+    assert!(!rs.contains(&format!("fn s_{lp}(")), "boxed array loop went native");
+    assert!(!rs.contains(&format!("fn s_{}(", cm.fns.iter().position(|f| f.name == "buckets").unwrap())), "boxed array went native");
 }

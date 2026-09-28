@@ -20,7 +20,9 @@ pub(crate) enum Ty {
     Flo,
     Tup(u32),
     Adt(u32), // class id (representative ctor)
-    Arr,
+    /// an array; `true` when its elements are proven `Int` (then reads and
+    /// writes need no reference counting of elements)
+    Arr(bool),
 }
 
 pub(crate) struct Types {
@@ -51,10 +53,17 @@ impl Types {
             Core::Call(g, _) => self.ret[*g as usize],
             Core::Ctor(c, _) | Core::Reuse(_, c, _) => self.field.get(*c as usize).map(|_| Ty::Adt(*c)).unwrap_or(Ty::Dyn),
             Core::Tuple(xs) => Ty::Tup(xs.len() as u32),
-            Core::Prim(p, _) => match p {
-                mithril_front::core::Prim::ArrNew | mithril_front::core::Prim::ArrSet => Ty::Arr,
+            Core::Prim(p, xs) => match p {
+                mithril_front::core::Prim::ArrNew => Ty::Arr(self.expr(fid, &xs[1]) == Ty::Int),
+                mithril_front::core::Prim::ArrSet => match self.expr(fid, &xs[0]) {
+                    Ty::Arr(i) => Ty::Arr(i),
+                    _ => Ty::Arr(false),
+                },
                 mithril_front::core::Prim::ArrLen => Ty::Int,
-                mithril_front::core::Prim::ArrGet => Ty::Dyn,
+                mithril_front::core::Prim::ArrGet => match self.expr(fid, &xs[0]) {
+                    Ty::Arr(true) => Ty::Int,
+                    _ => Ty::Dyn,
+                },
             },
             Core::Proj(b, i) => match self.expr(fid, b) {
                 Ty::Tup(_) => Ty::Dyn, // refined during inference via tvars
@@ -132,7 +141,7 @@ impl Uf {
             Node::Tup(k) => Ty::Tup(k),
             Node::Adt(u32::MAX) => Ty::Dyn,
             Node::Adt(c) => Ty::Adt(c),
-            Node::Arr(_) => Ty::Arr,
+            Node::Arr(e) => Ty::Arr(self.read(e) == Ty::Int),
             _ => Ty::Dyn,
         }
     }
