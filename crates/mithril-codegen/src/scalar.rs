@@ -512,6 +512,21 @@ fn calls_other(e: &Core, g: u32) -> bool {
     }
 }
 
+/// `e` calls a function other than `g` that does not always inline.
+fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
+    match e {
+        Core::Call(h, xs) => {
+            (*h != g && crate::inline_attr(&m.fns[*h as usize].body).is_empty()) || xs.iter().any(|x| calls_other_real(m, x, g))
+        }
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_other_real(m, a, g) || calls_other_real(m, b, g),
+        Core::If(a, b, c) => calls_other_real(m, a, g) || calls_other_real(m, b, g) || calls_other_real(m, c, g),
+        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_other_real(m, x, g)),
+        Core::Match(sc, arms) => calls_other_real(m, sc, g) || arms.iter().any(|(_, _, b)| calls_other_real(m, b, g)),
+        Core::Proj(b, _) => calls_other_real(m, b, g),
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+    }
+}
+
 /// A variable or constant.
 fn is_atom(e: &Core) -> bool {
     matches!(e, Core::Num(_) | Core::Var(_))
@@ -600,6 +615,12 @@ thread_local! {
     /// itself; its one unit is counted at the call site (a register
     /// increment in native callers), so fuel still measures work.
     pub(crate) static LEAF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `BRIDGE_LIVE[g]`: native `g` can be reached through its dive bridge
+    /// (it is the entry, a fold, or has a non-native caller).
+    pub(crate) static BRIDGE_LIVE: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1748,7 +1769,9 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     // Only in a loop whose body calls nothing but itself: the lengths
     // take registers, which a call-free loop body has to spare; a loop
     // with inlined callees is register-bound and reloading is cheaper.
-    let leaf_loop = calls_fn(&f.body, fid) && !calls_other(&f.body, fid);
+    // (a call to a small call-free function that always inlines does not
+    // count: after inlining the body is still call-free)
+    let leaf_loop = calls_fn(&f.body, fid) && !calls_other_real(m, &f.body, fid);
     let looping = lp && leaf_loop && arr_params >= 2 && writes;
     sem.use_lens = looping;
     if looping {
@@ -1832,6 +1855,15 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         Kind::No => unreachable!(),
     };
     let _ = (needs_cell_read, owns_tuple);
+    // Every caller native: nothing dives this function, so the bridge
+    // has no caller and must not look like one (a live bridge call site
+    // with unknown arguments blocks the backend's interprocedural
+    // constant propagation and single-call-site inlining).
+    let bridge_body = if BRIDGE_LIVE.with(|b| b.borrow().get(fid as usize).copied().unwrap_or(true)) {
+        bridge_body
+    } else {
+        "unreachable!(\"no dive reaches a function whose callers are all native\")".to_string()
+    };
     let inl = crate::inline_attr_fn(m, fid);
     if !bridge {
         return format!(

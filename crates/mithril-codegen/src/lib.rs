@@ -396,6 +396,20 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         .collect();
     seq::NTUP.with(|n| *n.borrow_mut() = ntup);
     seq::FOLDS.with(|f| *f.borrow_mut() = folds.iter().map(|p| p.is_some()).collect());
+    {
+        // a native function's bridge is live when something may dive it:
+        // the entry, a fold, or any caller that is not native
+        let calls: Vec<std::collections::HashSet<u32>> = m.fns.iter().map(|f| callees(&f.body)).collect();
+        let live: Vec<bool> = (0..nf)
+            .map(|g| {
+                g as u32 == m.main
+                    || folds[g].is_some()
+                    || (0..nf).any(|f| calls[f].contains(&(g as u32)) && scal[f].is_none())
+                    || !(0..nf).any(|f| f != g && calls[f].contains(&(g as u32)))
+            })
+            .collect();
+        scalar::BRIDGE_LIVE.with(|b| *b.borrow_mut() = live);
+    }
     seq::FOLD_SPLIT.with(|f| {
         *f.borrow_mut() = folds
             .iter()
@@ -678,6 +692,23 @@ pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
     }
 }
 
+/// `from` (transitively) calls `to`.
+fn reaches(m: &CoreModule, from: u32, to: u32) -> bool {
+    let mut seen = vec![false; m.fns.len()];
+    let mut stack = vec![from];
+    while let Some(g) = stack.pop() {
+        if std::mem::replace(&mut seen[g as usize], true) {
+            continue;
+        }
+        let cs = callees(&m.fns[g as usize].body);
+        if cs.contains(&to) {
+            return true;
+        }
+        stack.extend(cs);
+    }
+    false
+}
+
 /// Whether `e` contains any call at all (`has_call` counts only calls
 /// that may suspend).
 pub(crate) fn any_call(e: &Core) -> bool {
@@ -743,10 +774,23 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
         return "";
     }
     let mut n = 0;
+    let mut caller = None;
     for (h, other) in m.fns.iter().enumerate() {
         if h as u32 != fid {
+            let before = n;
             count(&other.body, fid, &mut n);
+            if n > before {
+                caller = Some(h as u32);
+            }
         }
+    }
+    // only on a recursive cycle with its caller (the helper reaches the
+    // caller again): there the backend must pick which member absorbs the
+    // other, and the source says the loop belongs to its function.
+    // Elsewhere the backend's own inlining decision stands.
+    let Some(c) = caller else { return "" };
+    if !reaches(m, fid, c) {
+        return "";
     }
     if std::env::var_os("MITHRIL_DEBUG_INLINE").is_some() {
         eprintln!("loop helper {fid} {}: {n} call sites", f.name);
