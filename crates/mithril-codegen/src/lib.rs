@@ -239,8 +239,8 @@ pub enum Rule {
 }
 
 /// A lowered program: every function as `lir`, the rule and dive tables,
-/// and the tables its value helpers branch on. A backend prints it.
-#[derive(Clone, Debug)]
+/// the tables its value helpers branch on, and its net region. A backend
+/// prints it.
 pub struct LirProgram {
     pub fns: Vec<lir::FnDef>,
     /// rule id -> what it fires (dense: every id below `rules.len()`)
@@ -262,6 +262,13 @@ pub struct LirProgram {
     pub fill_rule: u16,
     /// `Some(value)`: the whole program reduced to a literal at compile time
     pub constant: Option<Val>,
+    /// The net region: the derived program (entries with `NExpr` bodies)
+    /// plus the closures compiled code builds; `net_live[e]` = entry `e`
+    /// can be reached by a Ref at runtime and ships with the program.
+    pub net: mithril_net::NetProg,
+    pub net_live: Vec<bool>,
+    /// the forwarding segment (a suspended `apply` delivers through it)
+    pub fwd: u16,
 }
 
 /// Lower a specialized module (see `emit_rust`); `rust_program` prints the
@@ -285,7 +292,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     // records_to_tuples (rewrite.rs) is parked: without native multi-value
     // returns in the dive form it only trades ctor cells for tuple chains.
     let m = &m_u;
-    let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, constant };
+    let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
     // Const path: the whole program reduced to its value at compile time.
     if let Some(v) = core_value(&m.fns[m.main as usize].body) {
         return (empty(Some(v)), m_u.clone());
@@ -580,6 +587,8 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         ((0..m.ctors.len()).map(|c| !sh.poison && !sh.classes.contains(&tys.class_of[c])).collect(), !sh.poison && !sh.tuples)
     };
     let _ = fns_code;
+    let net = CLOSURES.with(|c| c.borrow_mut().take()).expect("closure registry");
+    let net_live = net_live_entries(&net, nf);
     let prog = LirProgram {
         fns,
         rules,
@@ -592,14 +601,55 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         net_rule,
         fill_rule,
         constant: None,
+        net,
+        net_live,
+        fwd,
     };
-    RUST_TAILS.with(|t| *t.borrow_mut() = Some((net_region(m, net_rule, fill_rule, fwd), fns_code_of(&prog))));
     (prog, m_u.clone())
 }
 
-thread_local! {
-    /// Rust-only parts of the last lowered program (the net region text)
-    static RUST_TAILS: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+/// Only what a Ref in the net region can reach is instantiated at
+/// runtime: the closures compiled code builds and, transitively, the
+/// lifted branches/arms their bodies mention (a real function is run by
+/// its CALL rule, never instantiated).
+fn net_live_entries(np: &mithril_net::NetProg, nfns: usize) -> Vec<bool> {
+    let mut live = vec![false; np.entries.len()];
+    let mut work: Vec<usize> = (nfns..np.entries.len()).filter(|e| np.closure_entry(*e)).collect();
+    fn refs(e: &mithril_net::NExpr, out: &mut Vec<usize>) {
+        use mithril_net::NExpr::*;
+        match e {
+            Num(_) | Flo(_) | Var(_) => {}
+            Op2(_, a, b) | Let(_, a, b) | App(a, b) => {
+                refs(a, out);
+                refs(b, out);
+            }
+            Call(f, xs) => {
+                // a call whose arguments are not all produced when it is
+                // met runs as a net: the callee's body must be shipped
+                out.push(*f as usize);
+                xs.iter().for_each(|x| refs(x, out));
+            }
+            Ctor(_, xs) | Tuple(xs) | Prim(_, xs) => xs.iter().for_each(|x| refs(x, out)),
+            If(c, t, e2) => {
+                refs(c, out);
+                out.push(t.entry as usize);
+                out.push(e2.entry as usize);
+            }
+            Match(s, _, specs) => {
+                refs(s, out);
+                specs.iter().for_each(|sp| out.push(sp.entry as usize));
+            }
+            Proj(a, _) | Lam(_, a) => refs(a, out),
+        }
+    }
+    while let Some(e) = work.pop() {
+        if live[e] {
+            continue;
+        }
+        live[e] = true;
+        refs(&np.entries[e].body, &mut work);
+    }
+    live
 }
 
 fn fns_code_of(prog: &LirProgram) -> String {
@@ -620,7 +670,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
             fmt_val(v)
         );
     }
-    let (net_text, fns_code) = RUST_TAILS.with(|t| t.borrow_mut().take()).expect("lowered");
+    let (net_text, fns_code) = (net_region(&prog), fns_code_of(&prog));
     let mut fire_arms = String::new();
     for (id, r) in prog.rules.iter().enumerate() {
         let arm = match r {
@@ -743,49 +793,10 @@ fn nexpr_src(e: &mithril_net::NExpr) -> String {
 /// engine rules of the region, and the bridge compiled code uses: build a
 /// closure, apply one (synchronously when it finishes within budget,
 /// otherwise through a forwarding record).
-fn net_region(m: &CoreModule, net_rule: u16, fill_rule: u16, fwd: u16) -> String {
-    let np = CLOSURES.with(|c| c.borrow_mut().take()).expect("closure registry");
-    // only what a Ref in the net region can reach is instantiated at
-    // runtime: the closures compiled code builds and, transitively, the
-    // lifted branches/arms their bodies mention (a real function is run by
-    // its CALL rule, never instantiated)
-    let nfns = m.fns.len();
-    let mut live = vec![false; np.entries.len()];
-    let mut work: Vec<usize> = (nfns..np.entries.len()).filter(|e| np.closure_entry(*e)).collect();
-    fn refs(e: &mithril_net::NExpr, out: &mut Vec<usize>) {
-        use mithril_net::NExpr::*;
-        match e {
-            Num(_) | Flo(_) | Var(_) => {}
-            Op2(_, a, b) | Let(_, a, b) | App(a, b) => {
-                refs(a, out);
-                refs(b, out);
-            }
-            Call(f, xs) => {
-                // a call whose arguments are not all produced when it is
-                // met runs as a net: the callee's body must be shipped
-                out.push(*f as usize);
-                xs.iter().for_each(|x| refs(x, out));
-            }
-            Ctor(_, xs) | Tuple(xs) | Prim(_, xs) => xs.iter().for_each(|x| refs(x, out)),
-            If(c, t, e2) => {
-                refs(c, out);
-                out.push(t.entry as usize);
-                out.push(e2.entry as usize);
-            }
-            Match(s, _, specs) => {
-                refs(s, out);
-                specs.iter().for_each(|sp| out.push(sp.entry as usize));
-            }
-            Proj(a, _) | Lam(_, a) => refs(a, out),
-        }
-    }
-    while let Some(e) = work.pop() {
-        if live[e] {
-            continue;
-        }
-        live[e] = true;
-        refs(&np.entries[e].body, &mut work);
-    }
+fn net_region(prog: &LirProgram) -> String {
+    let (np, live) = (&prog.net, &prog.net_live);
+    let (nfns, net_rule, fill_rule, fwd) = (prog.dives.len(), prog.net_rule, prog.fill_rule, prog.fwd);
+    let _ = net_rule;
     let mut s = String::new();
     s.push_str("fn net_entries() -> Vec<Entry> {\n    vec![\n");
     for (i, e) in np.entries.iter().enumerate() {
