@@ -1468,7 +1468,7 @@ impl<'m> Sem<'m> {
                 let t = self.fresh();
                 let m = format!("{t}m");
                 b.push(let_(&m, Ty::I64, E::Neg(Box::new(cast(bin(Bop::Ne, ec, i64_(0)), Ty::I64)))));
-                b.push(let_(&t, Ty::I64, bin(Bop::Or, bin(Bop::And, vx, v(&m)), bin(Bop::And, vy, E::Not(Box::new(v(&m)))))));
+                b.push(let_(&t, Ty::I64, bin(Bop::Or, bin(Bop::And, vx, v(&m)), bin(Bop::And, vy, bin(Bop::Xor, v(&m), i64_(-1))))));
                 v(t)
             }
             Core::If(cd, x, y) => {

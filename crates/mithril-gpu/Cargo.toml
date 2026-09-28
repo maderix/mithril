@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mithril-codegen = { path = "../mithril-codegen" }
 mithril-core = { path = "../mithril-core" }
 mithril-front = { path = "../mithril-front" }
 mithril-rt = { path = "../mithril-rt" }
+
+[dev-dependencies]
+mithril-net = { path = "../mithril-net" }
+mithril-reassoc = { path = "../mithril-reassoc" }

@@ -71,6 +71,7 @@ fn cu(r: CUresult, what: &str) -> Result<(), String> {
 #[derive(Clone, Copy, Default)]
 struct Dev {
     nodes: CUdeviceptr,
+    rc: CUdeviceptr,
     recs: CUdeviceptr,
     nbump: CUdeviceptr,
     rbump: CUdeviceptr,
@@ -84,12 +85,24 @@ struct Dev {
     bdone: CUdeviceptr,
     result: CUdeviceptr,
     abortf: CUdeviceptr,
+    heap: CUdeviceptr,
+    hbump: CUdeviceptr,
+    hcap: u64,
     ncap: u32,
     rcap: u32,
     bcap: u32,
     ovfcap: u32,
     chunksz: u32,
     nrules: u32,
+    fuel: i32,
+}
+
+/// What a run delivered to ROOT: the port, and its printed form (the same
+/// text the CPU program prints).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuResult {
+    pub port: u64,
+    pub text: String,
 }
 
 const REC_SIZE: usize = 40; // sizeof(Rec) in engine.cu
@@ -164,7 +177,7 @@ fn nvcc_compile(dir: &Path) -> Result<(), String> {
 /// `cache_dir`, compile to a .cubin via docker nvcc (skipped on a cache
 /// hit), load it through the driver API and run the wave loop. Returns the
 /// result port raw delivered to ROOT.
-pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<u64, String> {
+pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<GpuResult, String> {
     // key on program AND engine source, so an engine change invalidates too
     let key = fnv1a(cu_src) ^ fnv1a(ENGINE_CU).rotate_left(1);
     let dir = cache_dir.join(format!("{key:016x}"));
@@ -185,7 +198,7 @@ pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<u6
 pub struct GpuRunner;
 
 impl GpuRunner {
-    pub fn run(cubin: &[u8], boot: Redex) -> Result<u64, String> {
+    pub fn run(cubin: &[u8], boot: Redex) -> Result<GpuResult, String> {
         unsafe {
             cu(cuInit(0), "cuInit")?;
             let mut dev = 0i32;
@@ -215,7 +228,7 @@ unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Res
     Ok(v)
 }
 
-unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String> {
+unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, String> {
     let stack = env_cap("MITHRIL_GPU_STACK", 32 * 1024) as usize;
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
@@ -246,6 +259,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
         ((1u64 << 24) / nrules as u64).clamp(1 << 14, 1 << 20) as u32
     };
     let ovfcap: u32 = 1 << 20;
+    let hcap = env_cap("MITHRIL_GPU_HEAP", 1 << 26);
+    let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
 
     // Cap the cell arena to what this device can actually serve: free VRAM
     // minus the fixed buffers, the driver's local-memory (stack) reserve for
@@ -264,10 +279,11 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
         + (4 * MAXLANES * FREECAP + 12 * MAXLANES) as u64
         + 4 * ovfcap as u64
         + 8 * nrules as u64
+        + 8 * hcap
         + (1 << 20);
     let slack: u64 = 1 << 30;
     let budget = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
-    let max_ncap = (budget / 16).max(1 << 10).min(u32::MAX as u64 - 1);
+    let max_ncap = (budget / 20).max(1 << 10).min(u32::MAX as u64 - 1);
     let ncap = if ncap_req > max_ncap {
         eprintln!(
             "mithril-gpu: warning: MITHRIL_GPU_NODES={ncap_req} does not fit in free VRAM \
@@ -283,6 +299,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
     // device buffers
     let d = Dev {
         nodes: alloc(16 * ncap as usize, "alloc nodes")?,
+        rc: alloc(4 * ncap as usize, "alloc rc")?,
         recs: alloc(REC_SIZE * rcap as usize, "alloc recs")?,
         nbump: alloc(4, "alloc nbump")?,
         rbump: alloc(4, "alloc rbump")?,
@@ -296,12 +313,16 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
         bdone: alloc(4 * nrules, "alloc bdone")?,
         result: alloc(16, "alloc result")?,
         abortf: alloc(4, "alloc abortf")?,
+        heap: alloc(8 * hcap as usize, "alloc heap")?,
+        hbump: alloc(8, "alloc hbump")?,
+        hcap,
         ncap,
         rcap,
         bcap,
         ovfcap,
         chunksz,
         nrules: nrules as u32,
+        fuel,
     };
     cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?;
     cu(cuMemsetD8_v2(d.nfreen, 0, 4 * MAXLANES), "memset nfreen")?;
@@ -312,9 +333,12 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
     cu(cuMemsetD8_v2(d.bdone, 0, 4 * nrules), "memset bdone")?;
     cu(cuMemsetD8_v2(d.result, 0, 16), "memset result")?;
     cu(cuMemsetD8_v2(d.abortf, 0, 4), "memset abortf")?;
-    let one: u32 = 1; // cell 0 and record 0 are reserved
+    let one: u32 = 1; // cell 0, record 0 and heap word 0 are reserved
     cu(cuMemcpyHtoD_v2(d.nbump, (&one as *const u32).cast(), 4), "init nbump")?;
     cu(cuMemcpyHtoD_v2(d.rbump, (&one as *const u32).cast(), 4), "init rbump")?;
+    let one64: u64 = 1;
+    cu(cuMemcpyHtoD_v2(d.hbump, (&one64 as *const u64).cast(), 8), "init hbump")?;
+    cu(cuMemsetD8_v2(d.rc, 0, 4 * ncap as usize), "memset rc")?;
 
     // publish Dev to the module global G
     let mut g_ptr: CUdeviceptr = 0;
@@ -365,14 +389,17 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
     loop {
         cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
         let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
-        if ab >= 2 {
-            return Err(
-                "mithril-gpu: arena exhausted (raise MITHRIL_GPU_NODES / MITHRIL_GPU_RECS / MITHRIL_GPU_BUCKET)"
-                    .to_string(),
-            );
-        }
-        if ab == 1 {
-            return Err("mithril-gpu: unreachable match arm reached".to_string());
+        match ab {
+            0 => {}
+            1 => return Err("mithril-gpu: unreachable match arm reached".to_string()),
+            3 => return Err("mithril-gpu: array index out of bounds".to_string()),
+            4 => return Err("mithril-gpu: closures (the net region) run on the device in stage 3".to_string()),
+            _ => {
+                return Err(
+                    "mithril-gpu: arena exhausted (raise MITHRIL_GPU_NODES / MITHRIL_GPU_RECS / MITHRIL_GPU_BUCKET / MITHRIL_GPU_HEAP)"
+                        .to_string(),
+                )
+            }
         }
         let mut lens = dtoh::<u32>(d.blen, nrules, "read blen")?;
         let mut dones = dtoh::<u32>(d.bdone, nrules, "read bdone")?;
@@ -442,5 +469,72 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<u64, String>
     if res[0] == 0 {
         return Err("mithril-gpu: run finished without delivering a result to ROOT".to_string());
     }
-    Ok(res[1])
+    // the printed form: read the cells the result reaches, on demand
+    let mut ub_ptr: CUdeviceptr = 0;
+    let mut ub_sz = 0usize;
+    cu(cuModuleGetGlobal_v2(&mut ub_ptr, &mut ub_sz, module, c"UNBOX_CID".as_ptr()), "cuModuleGetGlobal(UNBOX_CID)")?;
+    let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
+    let text = show(&d, &unbox, res[1])?;
+    Ok(GpuResult { port: res[1], text })
+}
+
+// ---- readback of a result port (mirrors mithril_rt::prelude::show) ----
+
+const T_NUM: u64 = 2;
+const T_FLO: u64 = 3;
+const T_CON: u64 = 4;
+const T_LAM: u64 = 6;
+const T_ARR: u64 = 14;
+const TU: u64 = 16;
+const M56: u64 = (1u64 << 56) - 1;
+
+unsafe fn cell(d: &Dev, i: u32) -> Result<[u64; 2], String> {
+    let v = dtoh::<u64>(d.nodes + 16 * i as u64, 2, "read cell")?;
+    Ok([v[0], v[1]])
+}
+
+unsafe fn show(d: &Dev, unbox: &[u32], p: u64) -> Result<String, String> {
+    let as_i = |p: u64| ((p << 8) as i64) >> 8;
+    let t = p >> 56;
+    Ok(match t {
+        t if t >= TU => format!("C{}({})", unbox.get((t - TU) as usize).copied().unwrap_or(0), as_i(p)),
+        T_LAM => "<closure>".to_string(),
+        T_NUM => as_i(p).to_string(),
+        T_FLO => format!("{:?}", f64::from_bits(cell(d, (p & M56) as u32)?[0])),
+        T_CON => {
+            let k = ((p >> 4) & 0xFFF) as u16;
+            let mut q = p;
+            let mut fs: Vec<String> = Vec::new();
+            if p & 0xF != 0 {
+                loop {
+                    let ar = (q & 0xF) as usize;
+                    let c = cell(d, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
+                    if ar > 2 {
+                        fs.push(show(d, unbox, c[0])?);
+                        q = c[1];
+                    } else {
+                        for s in c.iter().take(ar) {
+                            fs.push(show(d, unbox, *s)?);
+                        }
+                        break;
+                    }
+                }
+            }
+            if k == 0xFFF { format!("({})", fs.join(", ")) } else { format!("C{}({})", k, fs.join(", ")) }
+        }
+        T_ARR => {
+            let base = p & M56;
+            let hdr = dtoh::<u64>(d.heap + 8 * base, 2, "read array header")?;
+            let raw = hdr[1] & (1 << 62) != 0;
+            let n = (hdr[1] & !((1u64 << 63) | (1u64 << 62))) as usize;
+            let elems = dtoh::<u64>(d.heap + 8 * (base + 2), n, "read array")?;
+            let mut fs = Vec::new();
+            for e in elems {
+                let e = if raw { (e >> 8) | (T_NUM << 56) } else { e };
+                fs.push(show(d, unbox, e)?);
+            }
+            format!("[{}]", fs.join(", "))
+        }
+        _ => return Err(format!("mithril-gpu: unprintable result port {p:#x}")),
+    })
 }

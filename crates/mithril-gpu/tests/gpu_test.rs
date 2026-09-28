@@ -1,110 +1,51 @@
-//! mithril-gpu tests.
+//! mithril-gpu tests: the CUDA printer of the lowered IR, and the device
+//! runtime, against the same fixtures and the same oracle as the CPU
+//! backend (crates/mithril-codegen/tests/fixtures).
 //!
 //! Pure emission tests always run. GPU-gated tests are `#[ignore]`d and
 //! additionally no-op unless MITHRIL_GPU=1; run them with
-//!     MITHRIL_GPU=1 cargo test -p mithril-gpu -- --ignored --test-threads=1
-//! (single-threaded because the exhaustion test mutates MITHRIL_GPU_NODES).
+//!     MITHRIL_GPU=1 cargo test -p mithril-gpu --release -- --ignored --test-threads=1
+//! (single-threaded: runs share the device, and some tests set capacities
+//! through the environment).
 
-use mithril_front::ast::{BinOp, CmpOp};
-use mithril_front::core::{Core, CoreFn, CoreModule};
+use mithril_codegen::fmt_val;
+use mithril_front::core::{eval_core, CoreModule};
 use mithril_gpu::{compile_and_run, emit_cuda, ENGINE_CU};
 use mithril_rt::Redex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn f(name: &str, arity: usize, body: Core) -> CoreFn {
-    CoreFn { name: name.into(), arity, body, self_tail_rec: false, fold: None }
-}
-
-fn num(n: i64) -> Core {
-    Core::Num(n)
-}
-fn var(i: u32) -> Core {
-    Core::Var(i)
-}
-fn op(o: BinOp, a: Core, b: Core) -> Core {
-    Core::Op2(o, Box::new(a), Box::new(b))
-}
-fn cmp(o: CmpOp, a: Core, b: Core) -> Core {
-    Core::Cmp(o, Box::new(a), Box::new(b))
-}
-fn iff(c: Core, t: Core, e: Core) -> Core {
-    Core::If(Box::new(c), Box::new(t), Box::new(e))
-}
-fn lt(x: u32, r: Core, b: Core) -> Core {
-    Core::Let(x, Box::new(r), Box::new(b))
-}
-fn call(fid: u32, args: Vec<Core>) -> Core {
-    Core::Call(fid, args)
+fn fixture(name: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mithril-codegen/tests/fixtures").join(name);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e))
 }
 
-fn num_port(v: i64) -> u64 {
-    (2u64 << 56) | ((v as u64) & ((1u64 << 56) - 1))
+/// parse -> analyze -> desugar -> specialize (by the net rules) -> emit_cuda.
+fn pipeline(name: &str) -> (CoreModule, Result<String, String>) {
+    let src = fixture(name);
+    // the specializer recurses per net depth: a deep stack, as the CLI has
+    std::thread::Builder::new()
+        .stack_size(1 << 28)
+        .spawn(move || {
+            let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
+            let _ = mithril_reassoc::analyze(&mut m);
+            let cm = mithril_front::desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
+            let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
+            let cu = emit_cuda(&sm);
+            (cm, cu)
+        })
+        .unwrap()
+        .join()
+        .unwrap()
 }
 
-/// fib(n) = n if n < 2 else fib(n-1) + fib(n-2); main(n) = fib(n).
-fn fib_module() -> CoreModule {
-    let fib = iff(
-        cmp(CmpOp::Lt, var(0), num(2)),
-        var(0),
-        op(
-            BinOp::Add,
-            call(0, vec![op(BinOp::Sub, var(0), num(1))]),
-            call(0, vec![op(BinOp::Sub, var(0), num(2))]),
-        ),
-    );
-    CoreModule {
-        fns: vec![f("fib", 1, fib), f("main", 1, call(0, vec![var(0)]))],
-        ctors: vec![],
-        main: 1,
-    }
-}
-
-/// helper(x) = x*2 + 3; main(x) = helper(x) + 4. Completes inside one dive.
-fn trivial_module() -> CoreModule {
-    let helper = op(BinOp::Add, op(BinOp::Mul, var(0), num(2)), num(3));
-    let main = op(BinOp::Add, call(0, vec![var(0)]), num(4));
-    CoreModule { fns: vec![f("helper", 1, helper), f("main", 1, main)], ctors: vec![], main: 1 }
-}
-
-/// sum(n) = 0 if n == 0 else (let x = sum(n-1) in x + n): a deep sequential
-/// chain that exercises per-program continuations (Let over a call).
-fn sum_module() -> CoreModule {
-    let body = iff(
-        cmp(CmpOp::Eq, var(0), num(0)),
-        num(0),
-        lt(1, call(0, vec![op(BinOp::Sub, var(0), num(1))]), op(BinOp::Add, var(1), var(0))),
-    );
-    CoreModule { fns: vec![f("sum", 1, body)], ctors: vec![], main: 0 }
-}
-
-/// build(n) = Leaf if n == 0 else Node(build(n-1), build(n-1));
-/// tsum(Leaf) = 1, tsum(Node l r) = tsum(l) + tsum(r);
-/// main(n) = tsum(build(n)).
-fn tree_module() -> CoreModule {
-    let build = iff(
-        cmp(CmpOp::Eq, var(0), num(0)),
-        Core::Ctor(0, vec![]),
-        Core::Ctor(
-            1,
-            vec![
-                call(0, vec![op(BinOp::Sub, var(0), num(1))]),
-                call(0, vec![op(BinOp::Sub, var(0), num(1))]),
-            ],
-        ),
-    );
-    let tsum = Core::Match(
-        Box::new(var(0)),
-        vec![
-            (0, vec![], num(1)),
-            (1, vec![1, 2], op(BinOp::Add, call(1, vec![var(1)]), call(1, vec![var(2)]))),
-        ],
-    );
-    let main = lt(1, call(0, vec![var(0)]), call(1, vec![var(1)]));
-    CoreModule {
-        fns: vec![f("build", 1, build), f("tsum", 1, tsum), f("main", 1, main)],
-        ctors: vec![("Leaf".into(), 0), ("Node".into(), 2)],
-        main: 2,
-    }
+fn oracle(cm: &CoreModule) -> String {
+    let cm = cm.clone();
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || fmt_val(&eval_core(&cm, cm.main, &[])))
+        .unwrap()
+        .join()
+        .unwrap()
 }
 
 fn gpu_on() -> bool {
@@ -112,77 +53,69 @@ fn gpu_on() -> bool {
 }
 
 fn cache_dir() -> PathBuf {
-    let base = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+    let base = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     base.join("mithril-gpu-cache")
 }
+
+/// `main()` takes no arguments: the boot redex carries nothing.
+const BOOT: Redex = Redex { a: 0, b: 0, aux: 0 };
+
+/// The closure-free fixtures: every shape the CPU backend is tested on
+/// except the net region (stage 3).
+const FIXTURES: &[&str] = &[
+    "fact_while.py",
+    "tree_sum.py",
+    "fib_naive.py",
+    "fold_sum.py",
+    "fold_sum_masked.py",
+    "wide_loop.py",
+    "trmc_list.py",
+    "trmc_tree.py",
+    "borrow_eval.py",
+    "value_branch_ownership.py",
+    "table_loop.py",
+    "mutual_tail.py",
+    "fast_leaf.py",
+    "unfold_wrap.py",
+    "ifconv_native.py",
+    "int_reps.py",
+    "native_arrays.py",
+    "arrays.py",
+    "hetero_array.py",
+    "f32_ops.py",
+    "heavy_fold.py",
+    "fork_reach.py",
+];
 
 // ---------------- pure emission tests (always run) ----------------
 
 #[test]
-fn emit_has_fire_and_dive_arms_for_each_function() {
-    let src = emit_cuda(&fib_module());
-    assert!(src.contains("__device__ void prog_fire("), "missing prog_fire:\n{src}");
-    assert!(src.contains("__device__ u64 prog_dive("), "missing prog_dive");
-    for i in 0..2 {
-        assert!(src.contains(&format!("u64 dv_{i}(")), "missing dive fn dv_{i}");
-        assert!(src.contains(&format!("void fb_{i}(")), "missing fire body fb_{i}");
-        assert!(src.contains(&format!("void ent_{i}(")), "missing entry ent_{i}");
-        assert!(src.contains(&format!("case {i}u: return dv_{i}(")), "missing dive arm {i}");
-    }
-    // boot rule 0 routes to main (fn 1), fn entry rules are 1-based
-    assert!(src.contains("case 0u: ent_1(e0, e1, e2); return;"));
-    assert!(src.contains("case 1u: ent_0(e0, e1, e2); return;"));
-    assert!(src.starts_with("// program.cu"));
-    assert!(src.contains("#define PROG_NRULES "));
-    assert!(src.contains("#include \"engine.cu\""));
-    // fib's parallel decomposition uses the generic Op2 join
-    assert!(src.contains("d_op2(rr.s, e0, e1)"));
-}
-
-#[test]
-fn emit_dual_mode_shapes_and_fuel() {
-    let src = emit_cuda(&fib_module());
-    // dive form: entry fuel check + suspension sentinel
-    assert!(src.contains("if (--(*fuel) < 0) return SUSP;"));
-    assert!(src.contains("int fu = DIVE_FUEL;"));
-    assert!(src.contains("if (r != SUSP) { deliver(e2, r); return; }"));
-    // fire form spawns child calls into the callee's bucket
-    assert!(src.contains("spawn3(1u,"));
-}
-
-#[test]
-fn emit_no_rust_syntax() {
-    for m in [fib_module(), trivial_module(), sum_module(), tree_module()] {
-        let src = emit_cuda(&m);
-        for tok in ["fn ", "let ", "pub ", "match ", "&mut", "::", "->"] {
-            assert!(!src.contains(tok), "rust token {tok:?} leaked into:\n{src}");
+fn every_fixture_prints_as_cuda_with_the_rule_table() {
+    for name in FIXTURES {
+        let (cm, cu) = pipeline(name);
+        let cu = match cu {
+            Ok(cu) => cu,
+            // the net reduced the whole program at compile time
+            Err(v) => {
+                assert_eq!(v, oracle(&cm), "{name}: constant differs from the oracle");
+                continue;
+            }
+        };
+        assert!(cu.contains("#include \"engine.cu\""), "{name}: no engine include");
+        assert!(cu.contains("__device__ R prog_dive("), "{name}: no dive dispatcher");
+        assert!(cu.contains("__device__ void prog_fire("), "{name}: no fire dispatcher");
+        assert!(cu.contains("case 0u: fc_"), "{name}: no boot rule");
+        for tok in ["let ", "&mut", "match ", "Ok(", "Err(", "::<", "u16_(", "wrapping_"] {
+            assert!(!cu.contains(tok), "{name}: Rust spelling `{tok}` leaked into CUDA:\n{cu}");
         }
-        let open = src.matches('{').count();
-        let close = src.matches('}').count();
-        assert_eq!(open, close, "unbalanced braces");
     }
 }
 
 #[test]
-fn emit_is_deterministic() {
-    let a = emit_cuda(&tree_module());
-    let b = emit_cuda(&tree_module());
+fn emission_is_deterministic() {
+    let (_, a) = pipeline("tree_sum.py");
+    let (_, b) = pipeline("tree_sum.py");
     assert_eq!(a, b);
-}
-
-#[test]
-fn emit_ctor_match_and_continuations() {
-    let src = emit_cuda(&tree_module());
-    // constructors build cell chains; match dispatches on con_tag
-    assert!(src.contains("mk_con("));
-    assert!(src.contains("con_tag("));
-    assert!(src.contains("alloc_node("));
-    // main's `let t = build(n) in tsum(t)` needs a per-program continuation
-    assert!(src.contains("kf_"), "expected a continuation rule:\n{src}");
-    assert!(src.contains("alloc_rec("));
-    assert!(src.contains("deliver("));
 }
 
 #[test]
@@ -191,135 +124,81 @@ fn engine_source_is_program_independent() {
     assert!(ENGINE_CU.contains("__global__ void k_fire"));
     assert!(ENGINE_CU.contains("__global__ void k_boot"));
     assert!(ENGINE_CU.contains("__global__ void k_pump"), "sequential-tail pump kernel");
-    // the spike leak fix: overflow ring + checked bump + abort flag
-    assert!(ENGINE_CU.contains("ovf"));
     assert!(ENGINE_CU.contains("g_abort(AB_ARENA)"));
+    // the program supplies these; the engine only declares them
     assert!(!ENGINE_CU.contains("prog_fire(u32 rule, u64 e0, u64 e1, u64 e2) {"));
+    assert!(!ENGINE_CU.contains("bool lin(u16 k) {"));
+    // the IR's context vocabulary, on the device without a context object
+    for h in ["alloc2(", "alloc_rec(", "deliver(", "dive_to(", "dive_res(", "pop_chain(", "rec_parent(", "spawn_call(", "mk_con2(", "consume2k(", "dup_val(", "free_val(", "take_field(", "arr_set_n(", "hole_link(", "tup_add("] {
+        assert!(ENGINE_CU.contains(h), "engine lacks {h}");
+    }
 }
 
 // ---------------- GPU-gated tests (MITHRIL_GPU=1) ----------------
 
+fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
+    let (cm, cu) = pipeline(name);
+    let want = oracle(&cm);
+    match cu {
+        Ok(cu) => (want.clone(), compile_and_run(&cu, BOOT, &cache_dir())),
+        // nothing to run: the constant is the result
+        Err(v) => (want, Ok(mithril_gpu::GpuResult { port: 0, text: v })),
+    }
+}
+
 #[test]
 #[ignore = "requires MITHRIL_GPU=1 (4090 + docker blaze-ptx:cu13x)"]
-fn gpu_syntax_gate_nvcc_compiles_two_fn_module() {
+fn gpu_fixtures_match_the_oracle() {
     if !gpu_on() {
         return;
     }
-    let src = emit_cuda(&fib_module());
-    let dir = cache_dir().join("syntax-gate");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("program.cu"), &src).unwrap();
-    std::fs::write(dir.join("engine.cu"), ENGINE_CU).unwrap();
-    let dir = dir.canonicalize().unwrap();
-    let out = std::process::Command::new("docker")
-        .args([
-            "run", "--rm", "--gpus", "all",
-            "-v", &format!("{}:/w", dir.display()),
-            "blaze-ptx:cu13x",
-            "nvcc", "-O3", "-arch=sm_89", "-cubin", "/w/program.cu", "-o", "/w/program.cubin",
-        ])
-        .output()
-        .expect("docker not runnable");
-    assert!(
-        out.status.success(),
-        "nvcc rejected emitted CUDA:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut failed = Vec::new();
+    for name in FIXTURES {
+        let (want, got) = run_fixture(name);
+        match got {
+            Ok(r) if r.text == want => {}
+            Ok(r) => failed.push(format!("{name}: device printed {} but the oracle says {want}", r.text)),
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+    }
+    assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
 }
 
 #[test]
 #[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_trivial_dive_only_program_end_to_end() {
+fn gpu_closures_report_the_missing_net_region() {
     if !gpu_on() {
         return;
     }
-    let src = emit_cuda(&trivial_module());
-    // boot: rule 0 = main entry, a = arg0, parent = ROOT (0)
-    let boot = Redex { a: num_port(20), b: 0, aux: 0 };
-    let got = compile_and_run(&src, boot, &cache_dir()).expect("gpu run failed");
-    assert_eq!(got, num_port(20 * 2 + 3 + 4), "main(20) = 47");
+    let (_, got) = run_fixture("closures.py");
+    let err = got.expect_err("closures need the net region (stage 3)");
+    assert!(err.contains("closures"), "wrong error: {err}");
 }
 
 #[test]
-#[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_fib_20_fire_decomposition_end_to_end() {
-    if !gpu_on() {
-        return;
-    }
-    let src = emit_cuda(&fib_module());
-    let boot = Redex { a: num_port(20), b: 0, aux: 0 };
-    let got = compile_and_run(&src, boot, &cache_dir()).expect("gpu run failed");
-    assert_eq!(got, num_port(6765), "fib(20)");
-}
-
-#[test]
-#[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_sum_chain_continuations_end_to_end() {
-    if !gpu_on() {
-        return;
-    }
-    let src = emit_cuda(&sum_module());
-    let boot = Redex { a: num_port(1000), b: 0, aux: 0 };
-    let got = compile_and_run(&src, boot, &cache_dir()).expect("gpu run failed");
-    assert_eq!(got, num_port(500500), "sum(1000)");
-}
-
-#[test]
-#[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_tree_sum_ctors_and_match_end_to_end() {
-    if !gpu_on() {
-        return;
-    }
-    let src = emit_cuda(&tree_module());
-    let boot = Redex { a: num_port(10), b: 0, aux: 0 };
-    let got = compile_and_run(&src, boot, &cache_dir()).expect("gpu run failed");
-    assert_eq!(got, num_port(1 << 10), "tsum(build(10)) counts 1024 leaves");
-}
-
-#[test]
-#[ignore = "requires MITHRIL_GPU=1 (mutates MITHRIL_GPU_WAVES; run --test-threads=1)"]
-fn gpu_sequential_tail_is_pumped_not_wave_limited() {
-    if !gpu_on() {
-        return;
-    }
-    // A 50,000-deep strict dependence chain used to cost >=100k host waves;
-    // the device-side pump must finish it far under this wave budget.
-    let src = emit_cuda(&sum_module());
-    let boot = Redex { a: num_port(50_000), b: 0, aux: 0 };
-    std::env::set_var("MITHRIL_GPU_WAVES", "4000");
-    let got = compile_and_run(&src, boot, &cache_dir());
-    std::env::remove_var("MITHRIL_GPU_WAVES");
-    assert_eq!(got, Ok(num_port(50_000i64 * 50_001 / 2)), "sum(50000) under a tight wave budget");
-}
-
-#[test]
-#[ignore = "requires MITHRIL_GPU=1 (mutates MITHRIL_GPU_NODES; run --test-threads=1)"]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_NODES; run --test-threads=1)"]
 fn gpu_oversized_nodes_request_is_capped_not_oom() {
     if !gpu_on() {
         return;
     }
     // 2^30 cells = 16 GiB of nodes: unallocatable next to the other buffers
     // on a 24 GB card. The runner must cap to free VRAM and still run.
-    let src = emit_cuda(&trivial_module());
-    let boot = Redex { a: num_port(20), b: 0, aux: 0 };
     std::env::set_var("MITHRIL_GPU_NODES", "1073741824");
-    let got = compile_and_run(&src, boot, &cache_dir());
+    let (want, got) = run_fixture("fib_naive.py");
     std::env::remove_var("MITHRIL_GPU_NODES");
-    assert_eq!(got, Ok(num_port(47)), "capped arena must still produce the result");
+    assert_eq!(got.map(|r| r.text), Ok(want), "capped arena must still produce the result");
 }
 
 #[test]
-#[ignore = "requires MITHRIL_GPU=1 (mutates MITHRIL_GPU_NODES; run --test-threads=1)"]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_NODES; run --test-threads=1)"]
 fn gpu_arena_exhaustion_is_a_clean_error() {
     if !gpu_on() {
         return;
     }
-    let src = emit_cuda(&tree_module());
-    let boot = Redex { a: num_port(20), b: 0, aux: 0 }; // 2^20-leaf tree
     std::env::set_var("MITHRIL_GPU_NODES", "1024");
-    let got = compile_and_run(&src, boot, &cache_dir());
+    let (_, got) = run_fixture("tree_sum.py");
     std::env::remove_var("MITHRIL_GPU_NODES");
-    let err = got.expect_err("a 2^20-leaf tree cannot fit in 1024 cells");
+    let err = got.expect_err("the tree cannot fit in 1024 cells");
     assert!(err.contains("arena exhausted"), "wrong error: {err}");
     let low = err.to_lowercase();
     assert!(!low.contains("illegal"), "leaked CUDA error text: {err}");

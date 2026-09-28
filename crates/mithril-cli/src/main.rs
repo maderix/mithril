@@ -363,17 +363,20 @@ fn lean_binary() -> Option<PathBuf> {
 
 #[cfg(feature = "gpu")]
 fn run_gpu(cm: &CoreModule) -> Result<i32, CliErr> {
-    use mithril_core::port::{Port, Tag};
-    let cu = mithril_gpu::emit_cuda(cm);
+    // the same lowering as the CPU program, printed for the device
+    let (sm, _) = mithril_net::specialize(cm, REDUCE_FUEL);
+    let cu = match mithril_gpu::emit_cuda(&sm) {
+        Ok(cu) => cu,
+        Err(constant) => {
+            println!("{constant}");
+            return Ok(0);
+        }
+    };
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     let cache = target_dir().join("mithril-cache").join("gpu");
     fs::create_dir_all(&cache)?;
-    let raw = mithril_gpu::compile_and_run(&cu, boot, &cache).map_err(CliErr::Other)?;
-    let p = Port(raw);
-    match p.tag() {
-        Tag::Num => println!("{}", p.as_i64()),
-        t => println!("{:?}({})", t, p.payload()),
-    }
+    let r = mithril_gpu::compile_and_run(&cu, boot, &cache).map_err(CliErr::Other)?;
+    println!("{}", r.text);
     Ok(0)
 }
 

@@ -38,8 +38,11 @@ version = "0.1.0"
 name = "mithril-gpu"
 version = "0.1.0"
 dependencies = [
+ "mithril-codegen",
  "mithril-core",
  "mithril-front",
+ "mithril-net",
+ "mithril-reassoc",
  "mithril-rt",
 ]
 

@@ -540,7 +540,7 @@ fn native_arrays_match_oracle_under_suspension() {
     assert!(!step.contains("*fuel"), "leaf settles fuel through the pointer");
     assert!(w.contains("fl = fl.wrapping_add(1i64);"), "caller does not count the leaf's fuel unit");
     // the if/else accumulator became mask selects
-    assert!(rs.contains("m) | (") && rs.contains("& !s"), "if-converted selects are not mask arithmetic");
+    assert!(rs.contains("m) | (") && rs.contains("m ^ -1i64)"), "if-converted selects are not mask arithmetic");
     // one array lent and moved into the same call: the net inlines the
     // callee, and the native body must read the array before writing it
     // in place (value semantics: the read sees the old element)
