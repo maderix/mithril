@@ -551,3 +551,44 @@ fn native_arrays_match_oracle_under_suspension() {
     assert!(dive_form(&cm, &rs, "listy").contains(&format!("n_{sp}(ctx, fuel")) || rs.contains(&format!("n_{sp}(ctx, fuel")), "listy does not take split's components natively");
 }
 
+
+// ---- native int representations (plain / pre-shifted) ----
+
+#[test]
+fn int_representations_agree_with_oracle() {
+    let src = fixture("int_reps.py");
+    let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
+    let _ = mithril_reassoc::analyze(&mut m);
+    let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
+    let mut net = mithril_net::build(&cm);
+    let _ = mithril_net::reduce(&mut net, &cm, 0);
+    let want = oracle(&cm);
+    let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
+    for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
+        let rs = mithril_codegen::emit_rust_opts(&cm, &net, mithril_codegen::EmitOpts { int_rep: rep });
+        // the arithmetic, the DP rows and the recursion all run natively
+        for f in ["mix", "dp", "walk"] {
+            assert!(rs.contains(&format!("fn s_{}(", id(f))), "{tag}: {f} is not native");
+        }
+        if rep == Some(true) {
+            assert!(!rs[rs.find("fn s_").unwrap()..].contains("wrap56("), "shifted: native code still re-wraps");
+        }
+        if rep.is_none() {
+            // the rolling-row inner loop keeps array lengths in locals
+            assert!(rs.contains("arr_get_n("), "chosen: DP loop does not use length locals");
+        }
+        let bin = compile(&rs, &format!("int_reps_{tag}"));
+        for t in ["1", "4"] {
+            assert_eq!(run(&bin, &[t]), want, "int_reps {tag} --threads {t}");
+            assert_eq!(run(&bin, &[t, "3"]), want, "int_reps {tag} --threads {t} fuel 3");
+        }
+    }
+}
+
+#[test]
+fn raw_int_array_converts_on_first_non_int_write() {
+    // all-int arrays store pre-shifted words; storing a list converts the
+    // array to tagged elements (and a shared copy keeps its raw words)
+    let (_cm, rs) = trmc_golden("hetero_array.py");
+    assert!(rs.contains("fn arr_unraw("), "no raw-to-tagged conversion in the runtime prelude");
+}

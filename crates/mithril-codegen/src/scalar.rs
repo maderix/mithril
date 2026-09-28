@@ -486,6 +486,32 @@ impl<'m> Chk<'m> {
     }
 }
 
+/// `e` calls `g` somewhere.
+fn calls_fn(e: &Core, g: u32) -> bool {
+    match e {
+        Core::Call(h, xs) => *h == g || xs.iter().any(|x| calls_fn(x, g)),
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_fn(a, g) || calls_fn(b, g),
+        Core::If(a, b, c) => calls_fn(a, g) || calls_fn(b, g) || calls_fn(c, g),
+        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_fn(x, g)),
+        Core::Match(sc, arms) => calls_fn(sc, g) || arms.iter().any(|(_, _, b)| calls_fn(b, g)),
+        Core::Proj(b, _) => calls_fn(b, g),
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+    }
+}
+
+/// `e` calls some function other than `g`.
+fn calls_other(e: &Core, g: u32) -> bool {
+    match e {
+        Core::Call(h, xs) => *h != g || xs.iter().any(|x| calls_other(x, g)),
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_other(a, g) || calls_other(b, g),
+        Core::If(a, b, c) => calls_other(a, g) || calls_other(b, g) || calls_other(c, g),
+        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_other(x, g)),
+        Core::Match(sc, arms) => calls_other(sc, g) || arms.iter().any(|(_, _, b)| calls_other(b, g)),
+        Core::Proj(b, _) => calls_other(b, g),
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+    }
+}
+
 /// A variable or constant.
 fn is_atom(e: &Core) -> bool {
     matches!(e, Core::Num(_) | Core::Var(_))
@@ -652,6 +678,11 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     }
 }
 
+thread_local! {
+    /// Test override of `choose_reps` (see `EmitOpts`).
+    pub(crate) static FORCE_REP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn shifted(g: u32) -> bool {
     SHIFTED.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
 }
@@ -734,6 +765,9 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     let n = m.fns.len();
     if std::env::var_os("MITHRIL_PLAIN_INTS").is_some() {
         return vec![false; n];
+    }
+    if let Some(r) = FORCE_REP.with(|f| f.get()) {
+        return (0..n).map(|f| r && sigs[f].is_some()).collect();
     }
     // local op counts
     let local: Vec<(usize, usize)> = (0..n)
@@ -1019,6 +1053,12 @@ struct Sem<'m> {
     fuel: bool,
     /// this function's ints are pre-shifted (see `choose_reps`)
     shifted: bool,
+    /// array value name -> the local holding its length (read once where
+    /// the array enters; a write or a move keeps it), so bounds checks
+    /// compare against a register instead of reloading the header
+    lens: HashMap<String, String>,
+    /// length locals are used in this function (see `scalar_fn`)
+    use_lens: bool,
 }
 
 impl<'m> Sem<'m> {
@@ -1059,6 +1099,24 @@ impl<'m> Sem<'m> {
         conv(&v, self.shifted, true)
     }
 
+    /// The length local of array value `a`, reading it now if unknown
+    /// (only where a loop carries it).
+    fn len_of(&mut self, a: &str, b: &mut String) -> String {
+        if let Some(l) = self.lens.get(a) {
+            return l.clone();
+        }
+        let l = format!("l_{a}");
+        b.push_str(&format!("let {l} = arr_len_of({a} as u64);\n"));
+        self.lens.insert(a.to_string(), l.clone());
+        l
+    }
+
+    /// `(get, set)` accessor prefixes for array value `a`: with its length
+    /// in a local when known, else checked against the header.
+    fn acc(&self, a: &str) -> Option<String> {
+        self.lens.get(a).cloned()
+    }
+
     /// Name of an array read in place (a live slot or a borrowed var).
     fn rd(&self, e: &Core) -> String {
         match e {
@@ -1080,6 +1138,10 @@ impl<'m> Sem<'m> {
                 let n = self.unshifted(&xs[0], b);
                 let v = self.stored(&xs[1], b);
                 b.push_str(&format!("let {t} = arr_new_raw({n}, {v}) as i64;\n"));
+                if self.use_lens {
+                    b.push_str(&format!("let l_{t} = arr_len_of({t} as u64);\n"));
+                    self.lens.insert(t.clone(), format!("l_{t}"));
+                }
             }
             Core::Prim(Prim::ArrSet, xs) => {
                 let (a, d) = self.aval(&xs[0], b);
@@ -1088,7 +1150,13 @@ impl<'m> Sem<'m> {
                 if let Some(k) = d {
                     self.live.remove(&k);
                 }
-                b.push_str(&format!("let {t} = arr_set_u({a} as u64, {i}, {v} as u64) as i64;\n"));
+                match self.acc(&a) {
+                    Some(l) => {
+                        b.push_str(&format!("let {t} = arr_set_n({a} as u64, {l}, {i}, {v} as u64) as i64;\n"));
+                        self.lens.insert(t.clone(), l);
+                    }
+                    None => b.push_str(&format!("let {t} = arr_set_u({a} as u64, {i}, {v} as u64) as i64;\n")),
+                }
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
@@ -1098,12 +1166,15 @@ impl<'m> Sem<'m> {
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
                 let before = self.live.clone();
+                let lens0 = self.lens.clone();
                 let mut bx = String::new();
                 let vx = self.aval_now(x, &mut bx);
                 let after = std::mem::replace(&mut self.live, before);
+                self.lens = lens0.clone();
                 let mut by = String::new();
                 let vy = self.aval_now(y, &mut by);
                 self.live = after;
+                self.lens = lens0;
                 b.push_str(&format!("let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"));
             }
             Core::Let(x, r, bo) => {
@@ -1238,11 +1309,17 @@ impl<'m> Sem<'m> {
                 if self.arrs.get(v) == Some(&true) {
                     self.arrs.insert(x, true);
                     b.push_str(&format!("let v{x} = v{v};\n"));
+                    if let Some(l) = self.lens.get(&format!("v{v}")).cloned() {
+                        self.lens.insert(format!("v{x}"), l);
+                    }
                     return;
                 }
             }
             let er = self.aval_now(r, b);
             b.push_str(&format!("let v{x} = {er};\n"));
+            if let Some(l) = self.lens.get(&er).cloned() {
+                self.lens.insert(format!("v{x}"), l);
+            }
             self.arrs.insert(x, false);
             self.live.insert(x as u64);
             return;
@@ -1274,12 +1351,15 @@ impl<'m> Sem<'m> {
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
                 let before = self.live.clone();
+                let lens0 = self.lens.clone();
                 let mut bx = String::new();
                 let vx = self.tval(x, &mut bx);
                 let after = std::mem::replace(&mut self.live, before);
+                self.lens = lens0.clone();
                 let mut by = String::new();
                 let vy = self.tval(y, &mut by);
                 self.live = after;
+                self.lens = lens0;
                 format!("if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}}")
             }
             Core::Let(x, r, bo) => {
@@ -1305,12 +1385,18 @@ impl<'m> Sem<'m> {
                     let a = self.rd(&xs[0]);
                     let i = self.val(&xs[1], b);
                     let t = self.fresh();
-                    b.push_str(&format!("let {t} = (arr_get_r({a} as u64, {i}) as i64) >> 8;\n"));
+                    match self.acc(&a) {
+                        Some(l) => b.push_str(&format!("let {t} = (arr_get_n({a} as u64, {l}, {i}) as i64) >> 8;\n")),
+                        None => b.push_str(&format!("let {t} = (arr_get_r({a} as u64, {i}) as i64) >> 8;\n")),
+                    }
                     return t;
                 }
                 Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
                     let a = self.rd(&xs[0]);
-                    return format!("(arr_len_of({a} as u64) as i64)");
+                    return match self.acc(&a) {
+                        Some(l) => format!("({l} as i64)"),
+                        None => format!("(arr_len_of({a} as u64) as i64)"),
+                    };
                 }
                 Core::Op2(..) | Core::Cmp(..) => return self.plain_arith(e, low, low32, b),
                 _ => {}
@@ -1324,12 +1410,18 @@ impl<'m> Sem<'m> {
                 let a = self.rd(&xs[0]);
                 let i = self.unshifted(&xs[1], b);
                 let t = self.fresh();
-                b.push_str(&format!("let {t} = arr_get_r({a} as u64, {i}) as i64;\n"));
+                match self.acc(&a) {
+                    Some(l) => b.push_str(&format!("let {t} = arr_get_n({a} as u64, {l}, {i}) as i64;\n")),
+                    None => b.push_str(&format!("let {t} = arr_get_r({a} as u64, {i}) as i64;\n")),
+                }
                 t
             }
             Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
                 let a = self.rd(&xs[0]);
-                format!("((arr_len_of({a} as u64) as i64) << 8)")
+                match self.acc(&a) {
+                    Some(l) => format!("(({l} as i64) << 8)"),
+                    None => format!("((arr_len_of({a} as u64) as i64) << 8)"),
+                }
             }
             Core::Var(i) => format!("v{i}"),
             Core::Proj(base, i) => match &**base {
@@ -1408,12 +1500,15 @@ impl<'m> Sem<'m> {
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
                 let before = self.live.clone();
+                let lens0 = self.lens.clone();
                 let mut bx = String::new();
                 let vx = self.val(x, &mut bx);
                 let after = std::mem::replace(&mut self.live, before);
+                self.lens = lens0.clone();
                 let mut by = String::new();
                 let vy = self.val(y, &mut by);
                 self.live = after;
+                self.lens = lens0;
                 let t = self.fresh();
                 b.push_str(&format!(
                     "let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"
@@ -1530,12 +1625,13 @@ impl<'m> Sem<'m> {
             }
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
-                let (live, arrs, tarr) = (self.live.clone(), self.arrs.clone(), self.tarr.clone());
+                let (live, arrs, tarr, lens) = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone());
                 b.push_str(&format!("if {ec} != 0 {{\n"));
                 self.tail(x, fid, lp, b);
-                (self.live, self.arrs, self.tarr) = (live, arrs, tarr);
+                (self.live, self.arrs, self.tarr, self.lens) = (live, arrs, tarr, lens.clone());
                 b.push_str("} else {\n");
                 self.tail(y, fid, lp, b);
+                self.lens = lens;
                 b.push_str("}\n");
             }
             Core::Call(g, args) if *g == fid && lp => {
@@ -1544,8 +1640,21 @@ impl<'m> Sem<'m> {
                     b.push_str(&format!("let n{i} = {ea};\n"));
                 }
                 self.drop_live(b);
+                let sig = self.sigs[fid as usize].clone().unwrap();
+                let mut nl = Vec::new();
+                for (p, pt) in sig.params.iter().enumerate() {
+                    if self.use_lens && matches!(pt, PTy::A | PTy::B) {
+                        // es is flattened; array params occupy one slot each
+                        let j = self.slot_names(fid).iter().position(|n| *n == format!("v{p}")).unwrap();
+                        let l = self.len_of(&es[j], b);
+                        nl.push((p, l));
+                    }
+                }
                 for (i, slot) in self.slot_names(fid).into_iter().enumerate() {
                     b.push_str(&format!("{slot} = n{i};\n"));
+                }
+                for (p, l) in nl {
+                    b.push_str(&format!("l_v{p} = {l};\n"));
                 }
                 b.push_str("continue 'l;\n");
             }
@@ -1608,6 +1717,8 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         live: Default::default(),
         fuel: !is_leaf(fid),
         shifted: shifted(fid),
+        lens: HashMap::new(),
+        use_lens: false,
     };
     for (p, pt) in sig.params.iter().enumerate() {
         match pt {
@@ -1625,15 +1736,44 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         }
     }
     let mut bb = String::new();
+    // loop-carried array params keep their length in a loop variable;
+    // elsewhere a length is read at its first use
+    // Length locals pay where the backend cannot keep a length itself: a
+    // loop that writes an array and also accesses another one (the write
+    // may alias the other's header, forcing a reload per access). With one
+    // array, or only reads, the header load is hoisted already, and a
+    // register length only obstructs the backend (e.g. vectorization).
+    let arr_params = sig.params.iter().filter(|t| matches!(t, PTy::A | PTy::B)).count();
+    let writes = sig.params.iter().any(|t| matches!(t, PTy::A));
+    // Only in a loop whose body calls nothing but itself: the lengths
+    // take registers, which a call-free loop body has to spare; a loop
+    // with inlined callees is register-bound and reloading is cheaper.
+    let leaf_loop = calls_fn(&f.body, fid) && !calls_other(&f.body, fid);
+    let looping = lp && leaf_loop && arr_params >= 2 && writes;
+    sem.use_lens = looping;
+    if looping {
+        for (p, pt) in sig.params.iter().enumerate() {
+            if matches!(pt, PTy::A | PTy::B) {
+                sem.lens.insert(format!("v{p}"), format!("l_v{p}"));
+            }
+        }
+    }
     sem.tail(&f.body, fid, lp, &mut bb);
     // one fuel unit per call and loop iteration, as in the dive form: native
     // code never suspends, but its work counts toward the enclosing dive's
     // budget (so parallel granularity tracks work, not dive calls). Counted
     // in a local and settled at each return, so it stays in a register.
+    let plens: String = sig
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| looping && matches!(t, PTy::A | PTy::B))
+        .map(|(p, _)| format!("let mut l_v{p} = arr_len_of(v{p} as u64);\n"))
+        .collect();
     let body = if lp {
-        format!("let mut fl: i64 = 1;\n'l: loop {{\nfl += 1;\n{bb}}}\n")
+        format!("{plens}let mut fl: i64 = 1;\n'l: loop {{\nfl += 1;\n{bb}}}\n")
     } else {
-        format!("let fl: i64 = 1;\n{bb}")
+        format!("{plens}let fl: i64 = 1;\n{bb}")
     };
 
     // bridge: unpack ports per param type, call, repack per return kind

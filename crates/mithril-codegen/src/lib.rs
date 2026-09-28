@@ -179,13 +179,28 @@ fn uniquify(m: &CoreModule) -> CoreModule {
     out
 }
 
+/// Native int representation override (tests): `None` = chosen per
+/// function by cost, `Some(false)` = all plain, `Some(true)` = all
+/// pre-shifted. Both representations must compute identical results.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EmitOpts {
+    pub int_rep: Option<bool>,
+}
+
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
+    emit_rust_opts(m, net, EmitOpts::default())
+}
+
+pub fn emit_rust_opts(m: &CoreModule, net: &Net, opts: EmitOpts) -> String {
     // the passes recurse along let chains, which compile-time unfolding
     // makes long: run on a stack sized for that, not the caller's
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(1 << 30)
-            .spawn_scoped(s, || emit_rust_inner(m, net))
+            .spawn_scoped(s, move || {
+                scalar::FORCE_REP.with(|f| f.set(opts.int_rep));
+                emit_rust_inner(m, net)
+            })
             .expect("spawn codegen thread")
             .join()
             .unwrap_or_else(|p| std::panic::resume_unwind(p))
@@ -1689,6 +1704,24 @@ fn arr_set_u(a: u64, i: i64, v: u64) -> u64 {
         arr_oob(i, n);
     }
     debug_assert!(arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1);
+    // SAFETY: bounds checked; `a` is unique (see arr_own)
+    unsafe { *arr_elems(a).add(i as usize) = v };
+    a
+}
+/// Native access with the length held in a local (see scalar.rs `lens`).
+#[inline(always)]
+fn arr_get_n(a: u64, n: usize, i: i64) -> u64 {
+    if (i as u64) >= n as u64 {
+        arr_oob(i, n);
+    }
+    // SAFETY: bounds checked against the array's length
+    unsafe { *arr_elems(a).add(i as usize) }
+}
+#[inline(always)]
+fn arr_set_n(a: u64, n: usize, i: i64, v: u64) -> u64 {
+    if (i as u64) >= n as u64 {
+        arr_oob(i, n);
+    }
     // SAFETY: bounds checked; `a` is unique (see arr_own)
     unsafe { *arr_elems(a).add(i as usize) = v };
     a

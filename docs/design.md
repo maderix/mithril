@@ -106,6 +106,21 @@ single-site `while`/`for` helpers (a function's own loop); without the
 latter, which member of a recursive cycle absorbs the other was an
 accident of ordering (queens 4.8 vs 5.3 s).
 
+Length locals (editdist 2.80 -> 2.27 s): in a call-free native loop that
+writes one array and also accesses another, each array's length is held
+in a loop variable, because the write may alias the other array's header
+and would force a length reload per access. Elsewhere the backend already
+hoists the header load, and a register length only obstructs it: it
+blocked vectorization of bfs's fill loop and caused spills in its BFS loop,
+which carries four inlined helpers. Measured, not assumed: every variant
+was built by hand first.
+
+Known inference weakness: ints are unified through arithmetic, so one
+heterogeneous array (ints and lists in the same array) poisons the element
+type and every int connected to it becomes `Dyn` (correct, tagged code;
+slower). No port does this; `tests/fixtures/hetero_array.py` covers the
+runtime conversion separately.
+
 Each step was first proven on hand-edited generated code (the same
 runtime helpers), then made a codegen rule; the final generated code
 matches the hand proof.
@@ -161,7 +176,7 @@ generated code exponential; all were found hours later by full runs.
 
 | bench | ours SEQ / PAR16 | reference SEQ / PAR16 | state |
 |---|---|---|---|
-| bfs | 4.48 / 0.45 | 4.75 / 0.555 | met |
+| bfs | 4.42 / 0.45 | 4.75 / 0.555 | met |
 | mandelbrot | 3.8 / 0.50 | 4.96 / 0.62 | met |
 | tree-radix | 4.3 / 0.70 | 4.84 / 0.75 | met |
 | lexer | 2.4 / 0.31 | 2.96 / 0.40 | met |
@@ -172,7 +187,7 @@ generated code exponential; all were found hours later by full runs.
 | queens | 4.73 / 0.47 | 8.32 / 1.23 | met |
 | tree-bitonic | 10.3 / 2.73 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
 | kmeans | 10.7 / 1.47 | 7.84 / 0.77 | needs lane-level (u32) vectorization; hand proof 5.81 |
-| editdist | 2.80 / 0.35 | 2.44 / 0.39 | PAR met; SEQ: bounds checks reload the length (next: length locals) |
+| editdist | 2.27 / 0.27 | 2.44 / 0.39 | met |
 | hashmap, terrain | | 3.22 / 0.40, 3.21 / 0.46 | being ported to arrays |
 | nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
 
