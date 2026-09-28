@@ -3,15 +3,13 @@
 //! policy, how builtins compute (or stay opaque), and where an op that
 //! cannot compute goes (the residual program).
 
-use crate::build::instantiate;
-use crate::{list_collect, op_port, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
+use crate::{instantiate, list_collect, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
 use mithril_core::net::Net;
 use mithril_core::port::{Port, Tag};
 use mithril_core::rules::{MatMeta, Prog};
 
 pub use mithril_core::rules::{link, process, resolve};
 
-const MASK56: u64 = (1u64 << 56) - 1;
 
 impl Prog<Net> for NetProg {
     /// REF-unfold: splice the entry's body, except that specialization
@@ -24,7 +22,7 @@ impl Prog<Net> for NetProg {
             return 0;
         }
         let args = list_collect(net, ref_head(r));
-        instantiate(net, self, entry, args, other);
+        instantiate(net, &self.entries, entry, args, other);
         1
     }
 
@@ -42,7 +40,6 @@ impl Prog<Net> for NetProg {
     /// Cannot fold at compile time: the op stays in the residual program
     /// as (op with cell [x, ret], y).
     fn park_op(&self, net: &mut Net, op: Port, y: Port) {
-        let _ = op_port;
         net.residual.push((op, y));
     }
 }
@@ -86,11 +83,6 @@ fn cmp_result(code: u16, ord: std::cmp::Ordering) -> Port {
 
 /// Boxed f64 helpers: the bit pattern is split across two `Num`-tagged
 /// ports so `Net::dump` never sees an invalid tag byte.
-pub(crate) fn flo_alloc(net: &mut Net, f: f64) -> Port {
-    let bits = f.to_bits();
-    let a = net.alloc(Port::new(Tag::Num, bits & MASK56), Port::new(Tag::Num, bits >> 56));
-    Port::new(Tag::Flo, a as u64)
-}
 
 pub(crate) fn flo_bits(cell: [u64; 2]) -> u64 {
     (Port(cell[0]).payload()) | (Port(cell[1]).payload() << 56)
@@ -155,7 +147,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
                 3 => a / b,
                 _ => panic!("ICE: opcode {} not defined on floats", code),
             };
-            Some(flo_alloc(net, r))
+            Some(mithril_core::agents::Cells::alloc_flo(net, r))
         }
         (tx, ty) => panic!("ICE: Op fold on mixed operand tags {:?}/{:?}", tx, ty),
     }

@@ -78,8 +78,6 @@ pub use rules::link;
 /// compile time (arrays are runtime heap values) and always stay residual.
 /// A unary builtin rides a binary Op with a `Num(0)` second operand; the
 /// ternary `array_set(a, i, v)` is `ARRSET(a, ARR_PAIR(i, v))`.
-pub(crate) const PRIM_BASE: u16 = 32;
-pub(crate) const ARR_PAIR: u16 = 44;
 
 pub(crate) fn prim_code(p: mithril_front::core::Prim) -> u16 {
     use mithril_front::core::Prim::*;
@@ -147,6 +145,7 @@ pub(crate) fn opcode_cmp(op: CmpOp) -> u16 {
 }
 
 pub use mithril_core::agents::*;
+pub use mithril_core::lower::{count_uses, instantiate, ClosureSpec, Entry, MatchMeta, NExpr, ARR_PAIR, PRIM_BASE};
 
 /// A fresh Dup label (a new sharing site).
 pub fn fresh_label(net: &mut Net) -> u32 {
@@ -154,49 +153,6 @@ pub fn fresh_label(net: &mut Net) -> u32 {
 }
 
 // ---- derived program: lambda-lifted Core ----
-
-/// A deferred branch/arm: `entry` to call, `caps` = free vars captured at
-/// the construction site (sorted; appended after any pattern binders in
-/// the entry's params).
-pub(crate) struct ClosureSpec {
-    pub entry: u16,
-    pub caps: Vec<u32>,
-}
-
-pub(crate) enum NExpr {
-    Num(i64),
-    Flo(f64),
-    Var(u32),
-    /// opcode (BinOp/CmpOp space), strict in both operands.
-    Op2(u16, Box<NExpr>, Box<NExpr>),
-    Let(u32, Box<NExpr>, Box<NExpr>),
-    /// Saturated call to an entry (strict in args, unfolds fuel-gated).
-    Call(u16, Vec<NExpr>),
-    /// 12-bit ctor tag.
-    Ctor(u16, Vec<NExpr>),
-    Tuple(Vec<NExpr>),
-    If(Box<NExpr>, ClosureSpec, ClosureSpec),
-    Match(Box<NExpr>, u16, Vec<ClosureSpec>),
-    Proj(Box<NExpr>, u16),
-    /// A builtin (opcode >= PRIM_BASE), strict in its arguments.
-    Prim(u16, Vec<NExpr>),
-    /// A closure: its body is instantiated eagerly as a net region whose
-    /// free variables are the enclosing wires (capture is wiring).
-    Lam(u32, Box<NExpr>),
-    App(Box<NExpr>, Box<NExpr>),
-}
-
-pub(crate) enum MatchMeta {
-    /// Ctor tag per arm, in arm order.
-    Arms(Vec<u16>),
-    /// Tuple projection index.
-    Proj(usize),
-}
-
-pub(crate) struct Entry {
-    pub params: Vec<u32>,
-    pub body: NExpr,
-}
 
 /// What the REF-unfold rule does with a call to a real function.
 #[derive(Clone, Copy, PartialEq)]

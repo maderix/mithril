@@ -277,7 +277,7 @@ fn settle(
                 if trace() {
                     eprintln!("{}arm {i} of agent {agent} -> entry {entry}", "  ".repeat(depth as usize + 1));
                 }
-                crate::build::instantiate(&mut fx.net, prog, entry, args, ret);
+                crate::instantiate(&mut fx.net, &prog.entries, entry, args, ret);
                 if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, f) || new_call(fx) {
                     return false;
                 }
@@ -429,7 +429,7 @@ fn unfold_call(
     let mut clone = fx.clone();
     clone.net.residual.swap_remove(idx);
     let args = crate::list_collect(&mut clone.net, crate::ref_head(r));
-    crate::build::instantiate(&mut clone.net, prog, entry, args, ret);
+    crate::instantiate(&mut clone.net, &prog.entries, entry, args, ret);
     // a top-level attempt has its own rewrite budget and growth ceiling;
     // the unfolds nested in it (its body's own calls) spend from the same
     // budget, and the attempt as a whole is charged to the function's
@@ -565,7 +565,7 @@ fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Option<Port> {
 fn alloc_val(net: &mut Net, v: &Val) -> Port {
     match v {
         Val::I(n) => Port::num(*n),
-        Val::F(f) => crate::rules::flo_alloc(net, *f),
+        Val::F(f) => mithril_core::agents::Cells::alloc_flo(net, *f),
         Val::C(cid, fields) => {
             let ps: Vec<Port> = fields.iter().map(|f| alloc_val(net, f)).collect();
             let tag = if *cid == mithril_front::core::UNREACHABLE_CTOR { CTAG_UNREACHABLE } else { *cid as u16 };

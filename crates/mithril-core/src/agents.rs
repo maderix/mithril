@@ -33,6 +33,8 @@ pub trait Cells {
     fn push_redex(&mut self, a: Port, b: Port);
     /// A fresh Dup label (a new sharing site).
     fn fresh_label(&mut self) -> u32;
+    /// A boxed float (each side has its own cell layout for it).
+    fn alloc_flo(&mut self, f: f64) -> Port;
 }
 
 impl Cells for Net {
@@ -58,6 +60,14 @@ impl Cells for Net {
             self.labels = 1;
         }
         l
+    }
+    /// The bit pattern split across two `Num`-tagged ports so `Net::dump`
+    /// never sees an invalid tag byte.
+    fn alloc_flo(&mut self, f: f64) -> Port {
+        let bits = f.to_bits();
+        let m56 = (1u64 << 56) - 1;
+        let a = Net::alloc(self, Port::new(Tag::Num, bits & m56), Port::new(Tag::Num, bits >> 56));
+        Port::new(Tag::Flo, a as u64)
     }
 }
 
