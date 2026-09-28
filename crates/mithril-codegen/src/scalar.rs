@@ -73,6 +73,7 @@ fn bare_uses(e: &Core, t: u32) -> usize {
 }
 
 struct Chk<'m> {
+    why: Option<String>,
     sigs: &'m [Option<Sig>],
     /// component vars: SK-destructured lets AND T(k) params -> arity
     tvars: HashMap<u32, usize>,
@@ -89,7 +90,7 @@ impl<'m> Chk<'m> {
             Core::Num(_) => {}
             Core::Var(i) => {
                 if self.tvars.contains_key(i) {
-                    self.ok = false; // tuple var escaping without Proj
+                    { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false }; // tuple var escaping without Proj
                 }
             }
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
@@ -108,14 +109,14 @@ impl<'m> Chk<'m> {
             Core::Call(g, args) => {
                 match &self.sigs[*g as usize] {
                     Some(sig) if sig.ret == Kind::S1 => self.args(sig.params.clone(), args),
-                    _ => self.ok = false,
+                    _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
                 }
             }
             Core::Proj(b, i) => match &**b {
                 Core::Var(t) if self.tvars.get(t).is_some_and(|k| i < k) => {}
-                _ => self.ok = false,
+                _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
             },
-            _ => self.ok = false,
+            _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
         }
     }
 
@@ -131,7 +132,7 @@ impl<'m> Chk<'m> {
                             self.expr(it);
                         }
                     }
-                    _ => self.ok = false,
+                    _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", a))); } self.ok = false },
                 },
             }
         }
@@ -167,9 +168,9 @@ impl<'m> Chk<'m> {
             }
             Core::Call(g, args) => match &self.sigs[*g as usize] {
                 Some(sig) if sig.ret == Kind::SK(k) => self.args(sig.params.clone(), args),
-                _ => self.ok = false,
+                _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
             },
-            _ => self.ok = false,
+            _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
         }
     }
 
@@ -192,7 +193,7 @@ impl<'m> Chk<'m> {
                 } else if a == Kind::No {
                     b
                 } else {
-                    self.ok = false;
+                    { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false };
                     Kind::No
                 }
             }
@@ -213,7 +214,7 @@ impl<'m> Chk<'m> {
                         }
                     }
                     None => {
-                        self.ok = false;
+                        { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false };
                         Kind::No
                     }
                 }
@@ -302,12 +303,13 @@ pub(crate) fn native_sig(g: u32) -> Option<Sig> {
 /// A tuple param's component count cannot be read off the body alone (a
 /// caller may pass a wider tuple); seed with maxproj+1 and demote on caller
 /// mismatch. Bare use of a param whose callers pass tuples also demotes.
-pub(crate) fn classify(m: &CoreModule) -> Vec<Option<Sig>> {
+pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig>> {
     let n = m.fns.len();
     let mut sigs: Vec<Option<Sig>> = m
         .fns
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(fi, f)| {
             let params = (0..f.arity as u32)
                 .map(|p| {
                     let (mut bare, mut mx) = (false, -1i64);
@@ -319,7 +321,13 @@ pub(crate) fn classify(m: &CoreModule) -> Vec<Option<Sig>> {
                     }
                 })
                 .collect();
-            Some(Sig { params, ret: Kind::S1 })
+            // seed the return kind from type inference: mutually recursive
+            // functions returning tuples cannot discover it from each other
+            let ret = match tys.ret.get(fi) {
+                Some(crate::ty::Ty::Tup(k)) => Kind::SK(*k as usize),
+                _ => Kind::S1,
+            };
+            Some(Sig { params, ret })
         })
         .collect();
     // Param types are body-derived and fixed; rets/eligibility are
@@ -339,7 +347,7 @@ pub(crate) fn classify(m: &CoreModule) -> Vec<Option<Sig>> {
                     tv.insert(p as u32, *k);
                 }
             }
-            let mut c = Chk { sigs: &sigs, tvars: tv, ok: true };
+            let mut c = Chk { why: None, sigs: &sigs, tvars: tv, ok: true };
             let tk = c.tail(&f.body, fid as u32);
             next[fid] = if !c.ok {
                 None
@@ -366,11 +374,20 @@ pub(crate) fn classify(m: &CoreModule) -> Vec<Option<Sig>> {
                 tv.insert(p as u32, *k);
             }
         }
-        let mut c = Chk { sigs: &snapshot, tvars: tv, ok: true };
+        let mut c = Chk { why: None, sigs: &snapshot, tvars: tv, ok: true };
         let tk = c.tail(&f.body, fid as u32);
         let consistent = c.ok && matches!(tk, Kind::No) || (c.ok && tk == sig.ret);
         if !consistent {
             sigs[fid] = None;
+        }
+    }
+    if std::env::var_os("MITHRIL_DEBUG_SCALAR").is_some() {
+        for (fid, f) in m.fns.iter().enumerate() {
+            if sigs[fid].is_none() {
+                let mut c = Chk { why: None, sigs: &sigs, tvars: HashMap::new(), ok: true };
+                let _ = c.tail(&f.body, fid as u32);
+                eprintln!("not scalar {fid} {}: {}", f.name, c.why.unwrap_or_else(|| "ret kind".into()));
+            }
         }
     }
     sigs

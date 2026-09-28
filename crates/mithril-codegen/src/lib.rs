@@ -243,14 +243,6 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         })
         .collect();
 
-    let scal = scalar::classify(m);
-    // native scalar code never suspends: calls to it are plain (unless the
-    // function forks, in which case its dive form is what callers use)
-    let native: Vec<bool> = (0..m.fns.len()).map(|f| scal[f].is_some() && !fork_recursive(f as u32, &m.fns[f])).collect();
-    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
-    scalar::SIGS.with(|s| {
-        *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
-    });
     // types of the bodies the emitters see: ANF introduces fresh vars (call
     // results, intermediate values) that must carry types too
     let tys = {
@@ -261,6 +253,40 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         ty::infer(&mn)
     };
     let unbox = unboxed_ctors(m, &tys);
+    let mut scal = scalar::classify(m, &tys);
+    // Native scalar code never suspends, so it cannot split work: a
+    // function that forks, and every function that (transitively) calls
+    // one, runs in dive form instead (its leaves still call native code).
+    {
+        let calls: Vec<std::collections::HashSet<u32>> = m.fns.iter().map(|f| callees(&f.body)).collect();
+        // parallel sources: forking recursion and proven folds (split
+        // across workers by their CALL rule)
+        let mut reach: Vec<bool> = (0..m.fns.len())
+            .map(|f| scal[f].is_some() && (fork_recursive(f as u32, &m.fns[f]) || folds[f].is_some()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for f in 0..m.fns.len() {
+                if !reach[f] && calls[f].iter().any(|g| reach[*g as usize]) {
+                    reach[f] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (f, r) in reach.iter().enumerate() {
+            if *r {
+                scal[f] = None;
+            }
+        }
+    }
+    let native: Vec<bool> = scal.iter().map(|s| s.is_some()).collect();
+    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
+    scalar::SIGS.with(|s| {
+        *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
+    });
     let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
     if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
         for (fid, f) in m.fns.iter().enumerate() {
@@ -322,13 +348,7 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         if trace {
             eprintln!("gen fn {} ({}) segs={} code={}B", fid, m.fns[fid].name, sq.q.len(), fns_code.len());
         }
-        if scal[fid].is_some() && fork_recursive(fid as u32, &m.fns[fid]) {
-            // native scalar form for scalar callers, and a real dive form so
-            // the fork's independent calls can split across workers (a
-            // native scalar call never suspends)
-            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, false));
-            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
-        } else if scal[fid].is_some() {
+        if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, true));
         } else {
@@ -602,6 +622,41 @@ pub(crate) fn is_bounded(g: u32) -> bool {
 
 /// Whether evaluating `e` may run a suspendable call (calls to bounded
 /// functions are plain expressions).
+/// Functions called anywhere in `e`.
+fn callees(e: &Core) -> std::collections::HashSet<u32> {
+    fn go(e: &Core, out: &mut std::collections::HashSet<u32>) {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Call(g, xs) => {
+                out.insert(*g);
+                xs.iter().for_each(|x| go(x, out));
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+                go(a, out);
+                go(b, out);
+            }
+            Core::If(a, b, c) => {
+                go(a, out);
+                go(b, out);
+                go(c, out);
+            }
+            Core::Let(_, r, b) => {
+                go(r, out);
+                go(b, out);
+            }
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| go(x, out)),
+            Core::Match(s, arms) => {
+                go(s, out);
+                arms.iter().for_each(|(_, _, b)| go(b, out));
+            }
+            Core::Proj(a, _) => go(a, out),
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    go(e, &mut out);
+    out
+}
+
 /// Two or more self calls, not all in tail position: recursion that forks.
 fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
     fn n(fid: u32, e: &Core) -> usize {

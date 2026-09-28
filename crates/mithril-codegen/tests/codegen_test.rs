@@ -451,3 +451,14 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     // a branch choosing between boxed subtrees is not if-converted
     assert_eq!(dive_form(&cm, &rs, "pick").matches("continue 'l").count(), 2, "pick's subtree choice became a select");
 }
+
+#[test]
+fn forks_reached_from_scalar_callers_stay_splittable() {
+    let (cm, rs) = trmc_golden("fork_reach.py");
+    let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
+    // the fork and its caller run in dive form (no native forms that would
+    // hide the fork from the scheduler); the leaf is native
+    assert!(!rs.contains(&format!("fn s_{}(", id("batch"))), "batch has a native form");
+    assert!(!rs.contains(&format!("fn s_{}(", id("run"))), "run calls the fork natively");
+    assert!(rs.contains(&format!("fn s_{}(", id("leafwork"))), "leafwork is not native");
+}

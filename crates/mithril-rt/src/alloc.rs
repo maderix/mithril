@@ -141,16 +141,19 @@ impl Arena {
         *self.has_result.get_mut() = false;
     }
 
-    /// Claim the next chunk `[lo, hi)`; `hi` may be 2^32, hence u64.
+    /// Claim the next chunk `[lo, hi)`; `hi` may be 2^32, hence u64. A
+    /// small arena hands out smaller chunks (1/256 of it, at least 64), so
+    /// several workers can share it.
     fn claim(bump: &AtomicU64, cap: usize, what: &str, env: &str) -> (u64, u64) {
-        let base = bump.fetch_add(CHUNK, Ordering::Relaxed);
+        let chunk = CHUNK.min(((cap as u64) / 256).max(64));
+        let base = bump.fetch_add(chunk, Ordering::Relaxed);
         if base >= cap as u64 {
             panic!(
                 "arena exhausted: {what} arena full at {cap} slots \
                  (raise {env}, max {MAX_SLOTS} = 2^32, e.g. {env}=1<<28)"
             );
         }
-        (base, (base + CHUNK).min(cap as u64))
+        (base, (base + chunk).min(cap as u64))
     }
 
     pub fn claim_cells(&self) -> (u64, u64) {
@@ -255,9 +258,21 @@ mod tests {
 
     #[test]
     fn claims_are_chunked_and_capped() {
-        let a = Arena::new(CHUNK as usize + 10, 3);
+        // a large arena hands out full chunks, the last one capped
+        let big = 256 * CHUNK as usize + 10;
+        let a = Arena::new(big, 3);
         assert_eq!(a.claim_cells(), (0, CHUNK));
-        assert_eq!(a.claim_cells(), (CHUNK, CHUNK + 10));
+        assert_eq!(a.claim_cells(), (CHUNK, 2 * CHUNK));
+        // a small arena hands out 1/256 of itself, at least 64 slots
+        let s = Arena::new(1000, 3);
+        assert_eq!(s.claim_cells(), (0, 64));
+        assert_eq!(s.claim_cells(), (64, 128));
+        let m = Arena::new(1 << 16, 3);
+        assert_eq!(m.claim_cells(), (0, 256));
+        // exhaustion (and the cap on the last chunk)
+        let a = Arena::new(64 + 10, 3);
+        assert_eq!(a.claim_cells(), (0, 64));
+        assert_eq!(a.claim_cells(), (64, 74));
         assert_eq!(a.claim_recs(), (1, 3));
         let r = std::panic::catch_unwind(|| a.claim_cells());
         let msg = *r.unwrap_err().downcast::<String>().unwrap();
