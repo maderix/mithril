@@ -10,7 +10,6 @@
 //! `mithril_rt` rlib (and its `mithril_core` dep) is cached under
 //! `target/mithril-cache/`, keyed by `rustc -V`.
 
-use mithril_core::net::Net;
 use mithril_front::ast::Module;
 use mithril_front::core::CoreModule;
 use mithril_front::Diag;
@@ -139,12 +138,6 @@ fn to_core(m: &Module) -> Result<CoreModule, CliErr> {
     Ok(mithril_front::desugar(m)?)
 }
 
-fn reduced_net(cm: &CoreModule) -> (Net, u64) {
-    let mut net = mithril_net::build(cm);
-    let rewrites = mithril_net::reduce(&mut net, cm, REDUCE_FUEL);
-    (net, rewrites)
-}
-
 // -------------------------------------------------------- paths and cache
 
 fn workspace_root() -> PathBuf {
@@ -259,9 +252,9 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
 
 // ----------------------------------------------------------- compile step
 
-/// Emit Rust for the module + residual net and `rustc -O` it to `out_bin`.
-fn compile_program(cm: &CoreModule, net: &Net, out_bin: &Path) -> Result<(), CliErr> {
-    let src = mithril_codegen::emit_rust(cm, net);
+/// Emit Rust for the specialized module and `rustc -O` it to `out_bin`.
+fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
+    let src = mithril_codegen::emit_rust(cm);
     let cache = rt_cache_dir()?;
     let tmp = make_temp_dir()?;
     fs::write(tmp.join("main.rs"), src)?;
@@ -288,10 +281,10 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
     if o.gpu {
         return run_gpu(&cm);
     }
-    let (net, _) = reduced_net(&cm);
+    let (sm, _) = mithril_net::specialize(&cm, REDUCE_FUEL);
     let tmp = make_temp_dir()?;
     let bin = tmp.join("prog");
-    compile_program(&cm, &net, &bin)?;
+    compile_program(&sm, &bin)?;
     let mut c = Command::new(&bin);
     if let Some(t) = o.threads {
         c.args(["--threads", &t.to_string()]);
@@ -306,8 +299,8 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
     let out = o.out.as_deref().ok_or("build requires -o <out>")?;
     let (m, _) = front(&o.file)?;
     let cm = to_core(&m)?;
-    let (net, _) = reduced_net(&cm);
-    compile_program(&cm, &net, out)?;
+    let (sm, _) = mithril_net::specialize(&cm, REDUCE_FUEL);
+    compile_program(&sm, out)?;
     println!("wrote {}", out.display());
     Ok(0)
 }
@@ -316,10 +309,16 @@ fn cmd_net(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
     let (m, _) = front(&o.file)?;
     let cm = to_core(&m)?;
-    let (net, rewrites) = reduced_net(&cm);
-    print!("{}", net.dump());
-    println!("rewrites: {}", rewrites);
-    println!("redexes remaining: {}", net.redexes.len());
+    let (sm, reports) = mithril_net::specialize(&cm, REDUCE_FUEL);
+    println!("{:<20} {:>9} {:>6} {:>5} {:>5} {:>7} {:>7}", "function", "rewrites", "calls", "ops", "evald", "before", "after");
+    for r in &reports {
+        println!("{:<20} {:>9} {:>6} {:>5} {:>5} {:>7} {:>7}", r.name, r.rewrites, r.calls_kept, r.ops_kept, r.calls_evaluated, r.size_before, r.size_after);
+    }
+    if std::env::var_os("MITHRIL_NET_CORE").is_some() {
+        for f in &sm.fns {
+            println!("{} = {:?}", f.name, f.body);
+        }
+    }
     Ok(0)
 }
 

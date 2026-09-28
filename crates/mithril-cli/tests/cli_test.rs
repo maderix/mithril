@@ -143,8 +143,8 @@ fn net_output_contains_redex() {
     let out = mithril(&["net", fixture("fact_while.py").to_str().unwrap()]);
     assert!(out.status.success(), "net failed: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(s.contains("redex"), "no 'redex' in net output:\n{}", s);
-    assert!(s.contains("rewrites:"), "no rewrite count in net output:\n{}", s);
+    assert!(s.contains("rewrites"), "no rewrite column in net output:\n{}", s);
+    assert!(s.contains("main"), "no per-function report in net output:\n{}", s);
 }
 
 // ----------------------------------------------------------------- prove

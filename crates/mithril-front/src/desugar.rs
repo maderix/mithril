@@ -353,18 +353,18 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
         }
         Stmt::While(cond, body) => {
             let (call, mutated) = compile_while(cond, body, scope, t, g)?;
-            bind_and_continue(call, &mutated, rest, scope, t, g, k)
+            bind_join_and_continue(call, &mutated, rest, scope, t, g, k)
         }
         Stmt::For(var, bound, body, fold) => {
             let (call, mutated) = compile_for(var, bound, body, fold, scope, t, g)?;
-            bind_and_continue(call, &mutated, rest, scope, t, g, k)
+            bind_join_and_continue(call, &mutated, rest, scope, t, g, k)
         }
         Stmt::Match(scrut, cases) => compile_match(scrut, cases, rest, scope, t, g, k),
     }
 }
 
-/// Bind an if/match join's result: a bare value for one name, a tuple
-/// otherwise (see `compile_dispatch_arms`).
+/// Bind an if/match join's or a loop's result: a bare value for one name,
+/// a tuple otherwise (see `compile_dispatch_arms`).
 fn bind_join_and_continue(
     producer: Core,
     names: &[String],
@@ -568,7 +568,8 @@ fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut 
             Ok(Core::Call(helper_id, params_cl.iter().map(|p| Core::Var(sc.vars[p])).collect()))
         })?
     };
-    let else_core = Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect());
+    // the loop state: a bare value for one variable, a tuple otherwise
+    let else_core = if mutated.len() == 1 { Core::Var(hscope.vars[&mutated[0]]) } else { Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect()) };
     let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(else_core));
     let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);
     g.out_fns[helper_id as usize] = CoreFn {
@@ -627,7 +628,8 @@ fn compile_for(
             Ok(Core::Call(helper_id, args))
         })?
     };
-    let else_core = Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect());
+    // the loop state: a bare value for one variable, a tuple otherwise
+    let else_core = if mutated.len() == 1 { Core::Var(hscope.vars[&mutated[0]]) } else { Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect()) };
     let hcond = Core::Cmp(CmpOp::Lt, Box::new(Core::Var(v_idx)), Box::new(Core::Var(bnd_idx)));
     let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(else_core));
     let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);

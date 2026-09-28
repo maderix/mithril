@@ -2,10 +2,15 @@
 
 use crate::port::Port;
 
+#[derive(Clone)]
 pub struct Net {
     pub cells: Vec<[u64; 2]>,
     pub free: Vec<u32>,
     pub redexes: Vec<(Port, Port)>,
+    /// Redexes no compile-time rule can fire (an opaque primitive, a
+    /// division whose divisor is zero, a call kept as a call): they stay
+    /// in the residual program instead of the worklist.
+    pub residual: Vec<(Port, Port)>,
 }
 
 impl Default for Net {
@@ -20,6 +25,7 @@ impl Net {
             cells: Vec::new(),
             free: Vec::new(),
             redexes: Vec::new(),
+            residual: Vec::new(),
         }
     }
 

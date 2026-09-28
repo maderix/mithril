@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 mithril-core = { path = "../mithril-core" }
 mithril-front = { path = "../mithril-front" }
+
+[dev-dependencies]
+mithril-reassoc = { path = "../mithril-reassoc" }

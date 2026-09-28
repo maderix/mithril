@@ -75,6 +75,7 @@ pub(crate) fn count_uses(v: u32, e: &NExpr) -> usize {
             count_uses(v, s) + specs.iter().filter(|sp| sp.caps.contains(&v)).count()
         }
         NExpr::Proj(e2, _) => count_uses(v, e2),
+        NExpr::Prim(_, args) => args.iter().map(|a| count_uses(v, a)).sum(),
     }
 }
 
@@ -188,5 +189,35 @@ fn inst(net: &mut Net, prog: &NetProg, env: &mut Env, e: &NExpr) -> Port {
             link(net, mat_port(m, *mid), pe);
             w
         }
+        NExpr::Prim(code, args) => {
+            let ps: Vec<Port> = args.iter().map(|a| inst(net, prog, env, a)).collect();
+            let binop = |net: &mut Net, code: u16, p1: Port, p2: Port| -> Port {
+                let w = wire(net);
+                let c = net.alloc(p2, w);
+                link(net, op_port(c, code), p1);
+                w
+            };
+            match ps.len() {
+                1 => binop(net, *code, ps[0], Port::num(0)),
+                2 => binop(net, *code, ps[0], ps[1]),
+                3 => {
+                    let pair = binop(net, crate::ARR_PAIR, ps[1], ps[2]);
+                    binop(net, *code, ps[0], pair)
+                }
+                n => panic!("ICE: builtin with {} arguments", n),
+            }
+        }
     }
+}
+
+/// A specialization net for real function `fid`: its parameters as fresh
+/// unfilled wires (returned in order), its body instantiated against the
+/// root wire (cell 0).
+pub(crate) fn build_fn(net: &mut Net, prog: &NetProg, fid: usize) -> Vec<Port> {
+    let root = net.alloc(EMPTY, EMPTY);
+    debug_assert_eq!(root, 0, "root wire must be cell 0");
+    let arity = prog.entries[fid].params.len();
+    let args: Vec<Port> = (0..arity).map(|_| wire(net)).collect();
+    instantiate(net, prog, fid, args.clone(), root_port());
+    args
 }

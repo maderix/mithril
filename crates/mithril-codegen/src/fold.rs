@@ -1,9 +1,9 @@
 //! Proven-fold parallel emission: a fold helper (`__forN`, shape
-//! `If(v0 < v1, ..tail self call.., Tuple([Var acc]))`) whose `CoreFn.fold`
+//! `If(v0 < v1, ..tail self call.., Var acc)`) whose `CoreFn.fold`
 //! carries a proven additive combiner gets a chunked par_fold: its CALL rule
 //! splits large ranges into a binary fork of net records and spawned CALL
 //! redexes (leaf chunks run the dive form under fuel), and a join rule
-//! combines the two 1-tuple partial results in place. Never OS threads: the
+//! combines the two partial results. Never OS threads: the
 //! engine provides the parallelism.
 //!
 //! Combiners: WrapAdd (mod 2^56), WrapAdd32 (join re-masks to the low 32
@@ -81,16 +81,13 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
     if ar < 3 || !f.self_tail_rec {
         return None;
     }
-    // Body shape: If(cond, then, Tuple([Var acc])).
+    // Body shape: If(cond, then, Var acc) (the loop's one state variable).
     let (th, el) = match &f.body {
         Core::If(_, t, e) => (t, e),
         _ => return None,
     };
     let acc = match el.as_ref() {
-        Core::Tuple(items) if items.len() == 1 => match &items[0] {
-            Core::Var(k) if (*k as usize) >= 2 && (*k as usize) < ar => *k as usize,
-            _ => return None,
-        },
+        Core::Var(k) if (*k as usize) >= 2 && (*k as usize) < ar => *k as usize,
         _ => return None,
     };
     // Every self call must pass the bound and all non-acc extras through.
@@ -188,9 +185,9 @@ pub(crate) fn est_update(fid: u32) -> String {
     )
 }
 
-/// The fold's join rule: combines the two 1-tuple partial results (each is
-/// `Tuple([acc])`) in place into the left one, frees the consumed right
-/// side, and delivers the left.
+/// The fold's join rule: combines the two partial results (each the
+/// loop's accumulator: an int, or an int tuple added elementwise in
+/// place into the left one, the right one freed) and delivers the sum.
 pub(crate) fn join_fn(fid: u32, pf: &ParFold) -> String {
     let combine = match pf.tuple {
         None => {
@@ -199,16 +196,11 @@ pub(crate) fn join_fn(fid: u32, pf: &ParFold) -> String {
             } else {
                 "wrap56(x.wrapping_add(y))".to_string()
             };
-            format!(
-                "let x = as_i(ctx.cell(ca)[0]);\nlet y = as_i(ctx.cell(cb)[0]);\nctx.set(ca, 0, num({s}));\n"
-            )
+            format!("let x = as_i(e.a);\nlet y = as_i(e.b);\nlet r = num({s});\n")
         }
-        Some(_) => format!(
-            "let ta = ctx.cell(ca)[0];\nlet tb = ctx.cell(cb)[0];\nlet s = tup_add(ctx, ta, tb, {});\nctx.set(ca, 0, s);\n",
-            pf.mask32
-        ),
+        Some(_) => format!("let r = tup_add(ctx, e.a, e.b, {});\n", pf.mask32),
     };
     format!(
-        "fn jn_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = ctx.rec(e.aux as u32).parent;\nlet ca = con_addr(e.a);\nlet cb = con_addr(e.b);\n{combine}ctx.free(cb);\nctx.deliver(parent, e.a);\n}}\n\n"
+        "fn jn_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = ctx.rec(e.aux as u32).parent;\n{combine}ctx.deliver(parent, r);\n}}\n\n"
     )
 }

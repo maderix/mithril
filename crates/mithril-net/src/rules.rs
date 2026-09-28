@@ -17,8 +17,8 @@
 use crate::build::instantiate;
 use crate::{
     con_alloc, con_collect, dup_addr, dup_label, dup_port, era, list_collect, mat_addr, mat_id,
-    op_addr, op_code, op_port, ref_entry, ref_head, wire, MatchMeta, NetProg, CTAG_TUPLE, EMPTY,
-    OP_FLIP,
+    op_addr, op_code, op_port, ref_entry, ref_head, wire, MatchMeta, Mode, NetProg, ARR_PAIR,
+    CTAG_TUPLE, EMPTY, OP_FLIP, PRIM_BASE,
 };
 use mithril_core::net::Net;
 use mithril_core::port::{Port, Tag};
@@ -77,14 +77,21 @@ pub(crate) fn process(net: &mut Net, prog: &NetProg, a: Port, b: Port) -> u64 {
         if other.tag() == Tag::Ref {
             panic!("ICE: no interaction rule for Ref–Ref (two producers head-on)");
         }
-        let args = list_collect(net, ref_head(r));
+        let entry = ref_entry(r) as usize;
         if other.tag() == Tag::Era {
-            for p in args {
+            for p in list_collect(net, ref_head(r)) {
                 link(net, era(), p);
             }
-        } else {
-            instantiate(net, prog, ref_entry(r) as usize, args, other);
+            return 1;
         }
+        // specialization keeps a call as a call unless the policy unfolds
+        // it (lifted branches and arms always unfold: they are bodies)
+        if prog.mode == Mode::Specialize && entry < prog.nfns && !prog.inline[entry] {
+            net.residual.push((r, other));
+            return 0;
+        }
+        let args = list_collect(net, ref_head(r));
+        instantiate(net, prog, entry, args, other);
         return 1;
     }
 
@@ -196,12 +203,21 @@ fn op_rule(net: &mut Net, op: Port, val: Port) {
     let c = net.cell(addr);
     let other = resolve(net, Port(c[0]));
     match other.tag() {
-        Tag::Num | Tag::Flo => {
-            let ret = Port(c[1]);
-            net.free_cell(addr);
+        Tag::Num | Tag::Flo | Tag::Con => {
             let (x, y) = if code & OP_FLIP != 0 { (other, val) } else { (val, other) };
-            let r = compute(net, code & 0xFF, x, y);
-            link(net, r, ret);
+            match compute(net, code & 0xFF, x, y) {
+                Some(r) => {
+                    let ret = Port(c[1]);
+                    net.free_cell(addr);
+                    link(net, r, ret);
+                }
+                None => {
+                    // cannot fold at compile time: the op stays in the
+                    // residual program as (op with cell [x, ret], y)
+                    net.set(addr, 0, x);
+                    net.residual.push((op_port(addr, code & !OP_FLIP), y));
+                }
+            }
         }
         Tag::Var => {
             net.set(addr, 0, val);
@@ -261,13 +277,30 @@ pub(crate) fn flo_bits(cell: [u64; 2]) -> u64 {
 }
 
 /// Numeric fold, mirroring `eval_core`'s semantics exactly (i56 wrapping
-/// ints, f64 floats boxed in cells, comparisons producing 0/1).
-fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Port {
+/// ints, f64 floats boxed in cells, comparisons producing 0/1). `None`
+/// where the op cannot fold at compile time: a failing evaluation (division
+/// by zero stays a runtime error), an array builtin (arrays are runtime
+/// values), or the pairing pseudo-op.
+fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
+    if code >= PRIM_BASE {
+        if code == ARR_PAIR {
+            return None;
+        }
+        let (p, unary) = crate::prim_of_code(code);
+        if !p.is_f32() || x.tag() != Tag::Num || (!unary && y.tag() != Tag::Num) {
+            return None;
+        }
+        let args: Vec<i64> = if unary { vec![x.as_i64()] } else { vec![x.as_i64(), y.as_i64()] };
+        return Some(Port::num(mithril_front::core::f32_prim(p, &args)));
+    }
     match (x.tag(), y.tag()) {
         (Tag::Num, Tag::Num) => {
             let (a, b) = (x.as_i64(), y.as_i64());
             if code >= 16 {
-                return cmp_result(code, a.cmp(&b));
+                return Some(cmp_result(code, a.cmp(&b)));
+            }
+            if matches!(code, 3 | 4 | 5) && b == 0 {
+                return None;
             }
             let r = match code {
                 0 => a.wrapping_add(b),
@@ -283,7 +316,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Port {
                 10 => a ^ b,
                 _ => panic!("ICE: unknown int opcode {}", code),
             };
-            Port::num(wrap56(r))
+            Some(Port::num(wrap56(r)))
         }
         (Tag::Flo, Tag::Flo) => {
             let (ax, ay) = (x.payload() as u32, y.payload() as u32);
@@ -293,7 +326,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Port {
             net.free_cell(ay);
             if code >= 16 {
                 let ord = a.partial_cmp(&b).expect("ICE: incomparable floats (NaN)");
-                return cmp_result(code, ord);
+                return Some(cmp_result(code, ord));
             }
             let r = match code {
                 0 => a + b,
@@ -302,7 +335,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Port {
                 3 => a / b,
                 _ => panic!("ICE: opcode {} not defined on floats", code),
             };
-            flo_alloc(net, r)
+            Some(flo_alloc(net, r))
         }
         (tx, ty) => panic!("ICE: Op fold on mixed operand tags {:?}/{:?}", tx, ty),
     }

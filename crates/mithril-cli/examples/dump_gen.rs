@@ -6,9 +6,8 @@ fn main() {
     let mut m = mithril_front::parse(&src).unwrap();
     let _ = mithril_reassoc::analyze(&mut m);
     let cm = mithril_front::desugar(&m).unwrap();
-    let mut net = mithril_net::build(&cm);
-    mithril_net::reduce(&mut net, &cm, 1 << 20);
-    let code = mithril_codegen::emit_rust(&cm, &net);
+    let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
+    let code = mithril_codegen::emit_rust(&sm);
     std::fs::write(&out, &code).unwrap();
     for (i, f) in cm.fns.iter().enumerate() {
         let s = if code.contains(&format!("fn s_{i}(")) { "SCALAR" } else { "dive" };

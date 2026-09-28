@@ -1,6 +1,6 @@
 //! Task 7 acceptance tests: golden pipeline tests for the dual-mode Rust
 //! emitter. For each fixture the test runs parse -> analyze -> desugar ->
-//! build -> reduce -> emit_rust, compiles the generated main.rs with rustc
+//! specialize -> emit_rust, compiles the generated main.rs with rustc
 //! against a pre-built mithril_rt rlib, executes it, and asserts stdout
 //! equals the `eval_core` oracle. The parallel fixtures additionally assert
 //! `--threads 8` output equals `--threads 1`.
@@ -47,14 +47,13 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e))
 }
 
-/// parse -> analyze -> desugar -> build -> reduce(fuel) -> emit_rust.
+/// parse -> analyze -> desugar -> specialize (by the net rules) -> emit_rust.
 fn pipeline(src: &str, reduce_fuel: u64) -> (CoreModule, String) {
     let mut m = mithril_front::parse(src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
     let _reports = mithril_reassoc::analyze(&mut m);
     let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
-    let mut net = mithril_net::build(&cm);
-    let _ = mithril_net::reduce(&mut net, &cm, reduce_fuel);
-    let rs = emit_rust(&cm, &net);
+    let (sm, _) = mithril_net::specialize(&cm, reduce_fuel.max(1 << 20));
+    let rs = emit_rust(&sm);
     (cm, rs)
 }
 
@@ -542,9 +541,12 @@ fn native_arrays_match_oracle_under_suspension() {
     assert!(w.contains("fl += 1;"), "caller does not count the leaf's fuel unit");
     // the if/else accumulator became mask selects
     assert!(rs.contains("& !m)"), "if-converted selects are not mask arithmetic");
-    // one array lent and moved into the same call is not native (the
-    // callee would read its own in-place write)
-    assert!(!rs.contains(&format!("fn s_{}(", id("alias"))), "aliasing call lowered natively");
+    // one array lent and moved into the same call: the net inlines the
+    // callee, and the native body must read the array before writing it
+    // in place (value semantics: the read sees the old element)
+    let al = native_form(&cm, &rs, "alias");
+    let (rd, wr) = (al.find("arr_get").expect("alias reads"), al.find("arr_set").expect("alias writes"));
+    assert!(rd < wr, "alias writes the array before reading it: {al}");
     // a dive-form function returning a tuple hands it back unboxed
     let sp = id("split");
     assert!(rs.contains(&format!("fn n_{sp}(")), "split has no native multi-value entry");
@@ -560,12 +562,11 @@ fn int_representations_agree_with_oracle() {
     let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
     let _ = mithril_reassoc::analyze(&mut m);
     let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
-    let mut net = mithril_net::build(&cm);
-    let _ = mithril_net::reduce(&mut net, &cm, 0);
+    let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
     let want = oracle(&cm);
     let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
     for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
-        let rs = mithril_codegen::emit_rust_opts(&cm, &net, mithril_codegen::EmitOpts { int_rep: rep });
+        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
         // the arithmetic, the DP rows and the recursion all run natively
         for f in ["mix", "dp", "walk"] {
             assert!(rs.contains(&format!("fn s_{}(", id(f))), "{tag}: {f} is not native");
@@ -629,11 +630,10 @@ fn f32_primitives_match_oracle_in_every_representation() {
     let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
     let _ = mithril_reassoc::analyze(&mut m);
     let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
-    let mut net = mithril_net::build(&cm);
-    let _ = mithril_net::reduce(&mut net, &cm, 0);
+    let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
     let want = oracle(&cm);
     for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
-        let rs = mithril_codegen::emit_rust_opts(&cm, &net, mithril_codegen::EmitOpts { int_rep: rep });
+        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
         // the arithmetic runs natively on hardware binary32
         let ops = cm.fns.iter().position(|f| f.name == "ops").unwrap();
         assert!(rs.contains(&format!("fn s_{ops}(")), "{tag}: ops is not native");

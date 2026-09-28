@@ -47,9 +47,11 @@ Python-subset source
   -> parse -> desugar (loops -> tail-recursive fns; if/match statements
      become one join continuation, not one copy of the rest per arm)
   -> Core IR (mithril-front::core; reference interpreter = oracle)
-  -> compile-time net reduction of everything static (a small program
-     folds to a constant; see tests/ci/fast.py's "lines=4" note)
-  -> Core->Core rewrites (mithril-codegen::rewrite)
+  -> specialization by the interaction rules (mithril-net::specialize):
+     every function's body is a net over unknown parameters, reduced to
+     quiescence; the residual net is read back as the new body (3b)
+  -> Core->Core shapes codegen owns (mithril-codegen::rewrite): mutual
+     tail recursion into loops, if-conversion of loop back-edges
   -> type inference (ty.rs, monomorphic) -> unboxing, linearity
   -> ANF normalize -> reuse marking
   -> dual-mode emission: native sequential "dive" form + net "rule" form
@@ -67,7 +69,7 @@ inspects a benchmark name or shape.
 | unboxed unary int ctors | `Leaf(v)`-style ctors ride in the port word; no cell | part of 762G -> 254G instr |
 | static linearity (`LIN`) | a type never shared anywhere in the program carries no refcount traffic | " |
 | in-place reuse (`mark_reuse`) | a ctor built on a call-free path after a match consumed a same-arity cell reuses that cell | " |
-| leaf inlining, join-point desugar | smaller hot functions (warp: 2235 -> 471 asm lines) | 254G -> 241G |
+| leaf inlining (now the net's inline policy, 3b), join-point desugar | smaller hot functions (warp: 2235 -> 471 asm lines) | 254G -> 241G |
 | bounded functions | a function on no call cycle can never run out of fuel: plain call, no capture | no cost on nbody-style helper chains |
 | register-returned dives, out-of-line cold capture | `Result<u64,u64>`; suspension code never bloats the hot frame | 257G -> 241G |
 | Lean-checked reassociation | fold combiners proven associative are split in parallel | (fold ports) |
@@ -128,6 +130,70 @@ matches the hand proof.
 Refcounting is Perceus-style (u8 saturating), used only where linearity
 cannot be proven; chained (arity > 2) constructors move their fields on
 consume like arity <= 2 ones do.
+
+## 3b. The net as the optimizer of record (`mithril-net::specialize`)
+
+Constant folding, inlining, branch selection, static evaluation and
+unrolling are not passes: they are the interaction rules firing early, on
+the redexes that do not depend on runtime input. `mithril net f.py` prints
+what reduction did per function (rewrites, calls kept, ops kept, calls
+evaluated, size before/after; `MITHRIL_NET_CORE=1` dumps the bodies,
+`MITHRIL_NET_TRACE=1` narrates). The Core rewrites that duplicated this
+(`inline_leaves`, `unfold_static`, constant folding) are deleted.
+
+How a function is specialized:
+
+* its body is built as a net whose parameters are unfilled wires; the
+  static gate lets a rule fire only between two non-variable ports, so
+  everything independent of the parameters reduces (ops on constants,
+  branches and matches on known values, sharing, calls the inline policy
+  unfolds: call-free callees of size <= 96);
+* a call the policy did not unfold is *settled*: all arguments known ->
+  evaluated in a scratch net (fuel 200k, value <= 4096 cells) and replaced
+  by its value; some known -> unfolded speculatively (below); else kept;
+* every branch parked on an unknown value has its arms instantiated (each
+  in its own scope frame, pattern binders as fresh unknown wires) and
+  reduced the same way, to a fixpoint: code under runtime branches is
+  specialized too;
+* the residual net is read back as Core: single-use scalar expressions
+  nest, calls / projections / data / matches are let-bound where used,
+  a value shared through `Dup` is bound once in the frame it was created
+  in (let-normal form only where sharing or evaluation order needs it,
+  because codegen's cost models read the shape: if-conversion measures
+  arm *work*, not bindings, for this reason).
+
+Speculative unfolding (the old `unfold_static`, as rules): a call with
+some known arguments is instantiated in a clone of the whole state and
+specialized to its fixpoint, its own calls unfolded in turn (a loop with
+a static bound unrolls as a chain, a branch inside it keeps both arms).
+It is accepted, replacing the state, only when its control was static:
+no call of its own remains, no match on a runtime value, no constructor
+over unknown fields (a data builder is not code to unroll: `symreg`'s
+`gen(5, ..)` doubled the program for no instruction gain), and the growth
+is within 2000 agents (ops, branches, data; wires are free — the old
+2000-binding limit). Budgets: 50k rewrites per top-level attempt shared
+by everything nested in it, 400k per function; a failed attempt is
+memoized by (callee, which-arguments-known) so it is not retried per
+arm; the growth ceiling is inherited by nested attempts so a 300-iteration
+chain stops at the ceiling, not at the depth limit (256). Inside a
+speculation only the branches the speculated body parked are
+instantiated, and the first new residual call aborts it (a rejected
+attempt used to instantiate every arm of its 2^k paths first).
+
+Evidence (tests/ci/fast.py vs the pre-specializer baseline): 16/16
+checksums; instructions within 3 % everywhere (gameoflife's `board_step`
+16-iteration unroll and merkle's `spk(22, ..)` chain recovered exactly
+the old numbers, 3.54G and 0.27G); code size within the gate. `alias`
+(one array lent and moved into the same call) is now inlined and lowered
+natively: the native body reads the array before the in-place write.
+A loop with one state variable returns the value itself (no 1-tuple, no
+`Proj`; the fold join combines bare partial results), which also made
+mandelbrot/terrain's loop helpers native-scalar.
+
+Oracle checks: `specialize_test.rs` (every fixture: specialized ==
+original under `eval_core`; the policy cases above) and
+`examples/spec_oracle.rs` (bisects a whole program to the function whose
+specialization changed its value).
 
 ## 4. Runtime: waves, dives, records
 
