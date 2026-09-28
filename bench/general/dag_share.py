@@ -50,4 +50,4 @@ def run(n):
 
 
 def main():
-    return run(40)
+    return run(4000)

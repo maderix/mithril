@@ -396,6 +396,13 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         .collect();
     seq::NTUP.with(|n| *n.borrow_mut() = ntup);
     seq::FOLDS.with(|f| *f.borrow_mut() = folds.iter().map(|p| p.is_some()).collect());
+    seq::FOLD_SPLIT.with(|f| {
+        *f.borrow_mut() = folds
+            .iter()
+            .enumerate()
+            .map(|(fid, p)| p.as_ref().map(|pf| fold::split_snippet_dive(fid as u32, m.fns[fid].arity, pf, join_rule[fid])))
+            .collect()
+    });
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {

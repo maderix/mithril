@@ -114,6 +114,18 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
 
 /// The range-split preamble of the fold fn's CALL rule (before the dive).
 pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -> String {
+    split_code(fid, ar, pf, join_rule, "parent", "return;", "ctx.fuel().max(256)")
+}
+
+/// The same split inside the fold's dive, at each loop head: the remaining
+/// range [v0, v1) splits once its measured work exceeds a budget; the dive
+/// suspends to the join record, whose parent the caller attaches (the
+/// accumulator so far rides in the left half).
+pub(crate) fn split_snippet_dive(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -> String {
+    split_code(fid, ar, pf, join_rule, "NONE", "return Err(j as u64);", "ctx.fuel().max(256)")
+}
+
+fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: &str, exit: &str, budget: &str) -> String {
     let rc = 1 + fid;
     let zline = match pf.tuple {
         None => "let tz = num(0i64);".to_string(),
@@ -147,7 +159,7 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
     // per iteration (set when a chunk's dive runs out of fuel; 1 until
     // then), so a range splits while its estimated work exceeds one budget
     format!(
-        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nlet est = FOLD_EST_{fid}.load(std::sync::atomic::Ordering::Relaxed).max(1);\nif hi - lo >= 2 && (hi - lo).saturating_mul(est) > ctx.fuel().max(256) {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, parent);\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\nreturn;\n}}\n}}\n",
+        "// par-fold split: proven fold, chunked binary fork over [v0, v1)\n{{\nlet lo = as_i(v0);\nlet hi = as_i(v1);\nlet est = FOLD_EST_{fid}.load(std::sync::atomic::Ordering::Relaxed).max(1);\nif hi - lo >= 2 && (hi - lo).saturating_mul(est) > {budget} {{\nlet mid = lo + (hi - lo) / 2;\nlet tmid = num(mid);\n{zline}\n{dups}let j = ctx.alloc_rec({join_rule}u16, 2, 0, 0, {parent});\nspawn_call(ctx, {rc}u16, &[{}], (j as u64) << 3);\nspawn_call(ctx, {rc}u16, &[{}], ((j as u64) << 3) | 1);\n{exit}\n}}\n}}\n",
         left.join(", "),
         right.join(", ")
     )
@@ -156,12 +168,23 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
 /// The per-fold work estimate and the dive-side measurement: at a fuel-out
 /// the chunk has run `v0 - fold_start` iterations on one budget.
 pub(crate) fn est_static(fid: u32) -> String {
-    format!("static FOLD_EST_{fid}: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);\n")
+    format!(
+        "static FOLD_EST_{fid}: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);\nstatic FOLD_MEAS_{fid}: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\n"
+    )
+}
+
+/// The fold dive's entry: a dive that suspended inside a callee before any
+/// loop-head measurement ran more than a budget within one iteration, so
+/// its iterations are at least that heavy.
+pub(crate) fn heavy_wrapper(fid: u32, cparams: &str, argl: &str) -> String {
+    format!(
+        "#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{cparams}) -> R {{\nlet r = dd_{fid}(ctx, fuel, {argl});\nif r.is_err() && !FOLD_MEAS_{fid}.load(std::sync::atomic::Ordering::Relaxed) {{\nFOLD_EST_{fid}.fetch_max(ctx.fuel(), std::sync::atomic::Ordering::Relaxed);\n}}\nr\n}}\n\n"
+    )
 }
 
 pub(crate) fn est_update(fid: u32) -> String {
     format!(
-        "{{ let it = (as_i(v0) - as_i(fold_start)).max(1); FOLD_EST_{fid}.store((ctx.fuel() / it).max(1), std::sync::atomic::Ordering::Relaxed); }}\n"
+        "{{ let it = (as_i(v0) - as_i(fold_start)).max(1); FOLD_EST_{fid}.store((ctx.fuel() / it).max(1), std::sync::atomic::Ordering::Relaxed); FOLD_MEAS_{fid}.store(true, std::sync::atomic::Ordering::Relaxed); }}\n"
     )
 }
 

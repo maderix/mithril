@@ -359,8 +359,12 @@ fn dive_suspend_resume_deep_list() {
     assert_eq!(r8, r1);
     // Fuel 1000 really suspended: ~1000 BUILD + ~1000 SUM resumptions and a
     // 10^6-long chain of CONS records, each activated by a non-recursive deliver.
-    for st in [e1.stats(), e8.stats()] {
-        assert!(st.rewrites > n + 1900, "rewrites {}", st.rewrites);
+    let (s1, s8) = (e1.stats(), e8.stats());
+    assert!(s1.rewrites > n + 1900, "rewrites {}", s1.rewrites);
+    // With a pool, a chain whose suspensions expose no new work gets a
+    // growing budget (engine `boost`): same result, far fewer suspensions.
+    assert!(s8.rewrites < s1.rewrites, "rewrites {} vs {}", s8.rewrites, s1.rewrites);
+    for st in [s1, s8] {
         assert_eq!(st.peak_cells, n as usize);
     }
 }

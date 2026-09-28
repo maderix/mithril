@@ -133,6 +133,8 @@ thread_local! {
     /// `FOLDS[g]`: `g` is a proven fold split by its CALL rule (its dive
     /// form measures fuel per iteration, see fold.rs).
     pub(crate) static FOLDS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the in-dive split code of each proven fold (see fold.rs)
+    pub(crate) static FOLD_SPLIT: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1618,17 +1620,22 @@ pub(crate) fn dive_fn<'m>(
             "#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{cparams}) -> R {{\nmatch n_{fid}(ctx, fuel, {argl}) {{\nOk(a) => Ok(mk_con(ctx, 4095u16, &a)),\nErr(r) => Err(r),\n}}\n}}\n\n{inl}#[allow(clippy::too_many_arguments)]\nfn n_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> Result<[u64; {nret}], u64> {{\n"
         )
     } else {
-        format!("{inl}#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n")
+        if is_fold {
+            format!("{}{inl}#[allow(clippy::too_many_arguments)]\nfn dd_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n", crate::fold::heavy_wrapper(fid, &cparams, &argl))
+        } else {
+            format!("{inl}#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n")
+        }
     };
     if trmc.is_some() {
         s.push_str("let mut th_head: u64 = 0;\nlet mut th_hole: u32 = NOHOLE;\n");
     }
     if lp {
         let fc = if leafy { String::new() } else { fuel_check.clone() };
+        let split = if is_fold { FOLD_SPLIT.with(|f| f.borrow().get(fid as usize).cloned().flatten()).unwrap_or_default() } else { String::new() };
         if is_fold {
             s.push_str("let fold_start = v0;\n");
         }
-        s.push_str(&format!("'l: loop {{\n{fc}{bb}}}\n"));
+        s.push_str(&format!("'l: loop {{\n{fc}{split}{bb}}}\n"));
     } else if leafy {
         s.push_str(&format!("let _ = fuel;\n{bb}unreachable!()\n"));
     } else {

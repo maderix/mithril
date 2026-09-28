@@ -543,3 +543,49 @@ fn lean_obligations_check_with_lean() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- per-iteration locals and addition chains ----
+
+const LOCALS_CHAIN: &str = "def g(x):\n    return x * 3 + 1\n\ndef f(n):\n    s = 0\n    for i in range(n):\n        a = g(i)\n        b = a * a\n        s = (s + g(a) + b + i) & 4294967295\n    return s\n";
+
+#[test]
+fn fold_with_local_prefix_and_add_chain_proven() {
+    let (m, reports) = analyzed(LOCALS_CHAIN);
+    assert!(report(&reports, "f").proven, "{:?}", report(&reports, "f"));
+    assert!(matches!(fold_of(&m, "f"), Some(FoldInfo { combiner: Combiner::WrapAdd32, proven: true })));
+    // sequential semantics unchanged
+    let cm = desugar(&m).unwrap();
+    let f = fn_id(&cm, "f");
+    let want: i64 = (0..50i64).fold(0, |s, i| {
+        let a = i * 3 + 1;
+        (s + (a * 3 + 1) + a * a + i) & 4294967295
+    });
+    assert_eq!(eval_core(&cm, f, &[Val::I(50)]), Val::I(want));
+}
+
+#[test]
+fn fold_prefix_reading_the_accumulator_declined() {
+    let src = "def f(n):\n    s = 0\n    for i in range(n):\n        a = s + i\n        s = s + a\n    return s\n";
+    let (m, reports) = analyzed(src);
+    assert!(!report(&reports, "f").proven);
+    assert!(fold_of(&m, "f").is_none());
+}
+
+#[test]
+fn fold_loop_carried_local_declined() {
+    // `t` is read before it is assigned in the body: it carries a value
+    // from the previous iteration, so iterations are not independent
+    let src = "def f(n):\n    s = 0\n    t = 1\n    for i in range(n):\n        u = t * 2\n        t = i\n        s = s + u\n    return s\n";
+    let (m, reports) = analyzed(src);
+    assert!(!report(&reports, "f").proven);
+    assert!(fold_of(&m, "f").is_none());
+}
+
+#[test]
+fn fold_chain_with_two_accumulator_leaves_declined() {
+    // s + s + i is 2s + i: not an accumulation of per-iteration data
+    let src = "def f(n):\n    s = 0\n    for i in range(n):\n        s = s + s + i\n    return s\n";
+    let (m, reports) = analyzed(src);
+    assert!(!report(&reports, "f").proven);
+    assert!(fold_of(&m, "f").is_none());
+}

@@ -60,4 +60,4 @@ def run(k):
 
 
 def main():
-    return run(40)
+    return run(600)

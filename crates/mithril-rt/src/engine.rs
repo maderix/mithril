@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread;
 
+/// Cap of the sequential-chain budget boost (x base fuel).
+const MAX_BOOST: i64 = 64;
 /// A bucket is drained in parallel when `entries x cost` reaches this.
 const PAR_WORK: u128 = 1 << 14;
 /// Stack for pool workers (native recursion inside fuel-bounded dives).
@@ -74,6 +76,11 @@ impl Engine {
         let mut buckets: Vec<Vec<Redex>> = vec![Vec::new(); n_rules];
         let mut recs: Vec<Vec<u32>> = vec![Vec::new(); n_rules];
         let mut parallel_waves = 0;
+        // Budget boost while suspensions expose no new work (a sequential
+        // chain): doubles each wave whose frontier did not grow, capped;
+        // any growth resets it. See `wave_fuel`.
+        let mut boost: i64 = 1;
+        let mut prev_n: usize = 0;
         ctx0.spawn(0, boot);
 
         thread::scope(|sc| {
@@ -83,8 +90,15 @@ impl Engine {
                 ctx0.merge_into(&mut buckets, &mut recs);
                 let Some((rule, work)) = pick(&buckets, &recs, &costs) else { break };
                 let k = rule as usize;
-                if threads == 1 || work < PAR_WORK {
-                    ctx0.set_fuel(fuel);
+                let n = buckets[k].len() + recs[k].len();
+                if threads > 1 {
+                    boost = if n > prev_n || n >= threads { 1 } else { (boost * 2).min(MAX_BOOST) };
+                    prev_n = n;
+                }
+                // a single entry cannot use the pool: run it here (waking the
+                // pool would just move the work, and its caches, to another core)
+                if threads == 1 || work < PAR_WORK || n < 2 {
+                    ctx0.set_fuel(fuel.saturating_mul(boost));
                     // single-threaded drain on the coordinator; buffers keep capacity
                     let mut rx = mem::take(&mut buckets[k]);
                     let mut rr = mem::take(&mut recs[k]);
@@ -123,7 +137,7 @@ impl Engine {
                     // proportionally larger budget, so the frontier stops
                     // growing (every split costs a record and locality); a
                     // thin frontier keeps the base budget and splits often.
-                    let f = wave_fuel(fuel, n, threads);
+                    let f = wave_fuel(fuel, n, threads).saturating_mul(boost);
                     ctx0.set_fuel(f);
                     for w in &workers {
                         lock(w).set_fuel(f);

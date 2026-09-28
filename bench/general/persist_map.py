@@ -58,4 +58,4 @@ def run(n):
 
 
 def main():
-    return run(400000)
+    return run(1600000)

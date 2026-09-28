@@ -15,4 +15,4 @@ def run(n):
 
 
 def main():
-    return run(3000000)
+    return run(300000000)

@@ -50,12 +50,33 @@ pub fn strip_top_mask(e: &Expr) -> Option<&Expr> {
 /// mask if present (the returned bool: the combiner's result is masked,
 /// so the proof runs in Z_2^32). `None` = not an accumulation loop.
 pub fn detect<'a>(var: &str, body: &'a [Stmt]) -> Option<(Cand<'a>, bool)> {
-    let (acc, val0) = match body {
-        [Stmt::Assign(acc, val)] => (acc.as_str(), val),
+    let (acc, val0) = match body.last() {
+        Some(Stmt::Assign(acc, val)) => (acc.as_str(), val),
         _ => return None,
     };
     if acc == var {
         return None; // "accumulating" into the induction variable
+    }
+    // A prefix of per-iteration locals: plain assignments that never read
+    // the accumulator, to names other than the accumulator and the
+    // induction variable, each assigned before any read of it in the body
+    // (so none is loop-carried). A local that is live after the loop makes
+    // it loop state, and the fold's helper-shape check declines that later.
+    let prefix = &body[..body.len() - 1];
+    let mut assigned: Vec<&str> = Vec::new();
+    let locals: Vec<&str> = prefix
+        .iter()
+        .filter_map(|st| if let Stmt::Assign(x, _) = st { Some(x.as_str()) } else { None })
+        .collect();
+    for st in prefix {
+        let Stmt::Assign(x, e) = st else { return None };
+        if x == acc || x == var || uses_var(e, acc) {
+            return None;
+        }
+        if locals.iter().any(|y| !assigned.contains(y) && uses_var(e, y)) {
+            return None; // read before its assignment: loop-carried
+        }
+        assigned.push(x.as_str());
     }
     let (val, top_masked) = match strip_top_mask(val0) {
         Some(inner) => (inner, true),
@@ -74,10 +95,31 @@ pub fn detect<'a>(var: &str, body: &'a [Stmt]) -> Option<(Cand<'a>, bool)> {
     }
     if let Expr::Bin(op, left, right) = val {
         if uses_var(left, acc) && !uses_var(right, acc) {
+            // an addition chain with exactly one accumulator leaf is
+            // `acc + (the other, acc-free, terms)`
+            if *op == BinOp::Add {
+                let mut leaves = Vec::new();
+                add_leaves(val, &mut leaves);
+                let hits: Vec<&&Expr> = leaves.iter().filter(|l| uses_var(l, acc)).collect();
+                if hits.len() == 1 && matches!(hits[0], Expr::Var(n) if n == acc) {
+                    return Some((Cand::Expr { acc, op: BinOp::Add, left: hits[0] }, top_masked));
+                }
+            }
             return Some((Cand::Expr { acc, op: *op, left }, top_masked));
         }
     }
     None
+}
+
+/// The leaves of a `+` chain.
+fn add_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Bin(BinOp::Add, a, b) => {
+            add_leaves(a, out);
+            add_leaves(b, out);
+        }
+        other => out.push(other),
+    }
 }
 
 pub fn uses_var(e: &Expr, name: &str) -> bool {
