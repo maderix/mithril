@@ -62,7 +62,6 @@ pub mod residual;
 pub mod rules;
 
 use mithril_core::net::Net;
-use mithril_core::port::{Port, Tag};
 use mithril_front::ast::{BinOp, CmpOp};
 use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
 use mithril_front::Diag;
@@ -72,32 +71,7 @@ pub use build::{build, root_port};
 pub use reduce::{readback, reduce, specialize, SpecReport};
 pub use rules::link;
 
-/// Sentinel port marking (a) an unfilled wire-cell slot and (b) the end of
-/// an argument/arm list chain. Encoded as `Ext` with an all-ones payload so
-/// it cannot collide with a real `Ext(addr)` chain pointer (addresses are
-/// 40-bit) and stays printable by `Net::dump`.
-pub const EMPTY: Port = Port(((Tag::Ext as u64) << 56) | ((1u64 << 56) - 1));
-
-/// 12-bit constructor tag reserved for tuples.
-pub const CTAG_TUPLE: u16 = 0xFFF;
-/// 12-bit constructor tag for desugar's unreachable-match sentinel.
-pub const CTAG_UNREACHABLE: u16 = 0xFFE;
-
-/// Erasure port.
-pub(crate) fn era() -> Port {
-    Port::new(Tag::Era, 0)
-}
-
-/// Allocate a fresh wire cell and return one of its (interchangeable) ends.
-pub fn wire(net: &mut Net) -> Port {
-    let w = net.alloc(EMPTY, EMPTY);
-    Port::new(Tag::Var, w as u64)
-}
-
 // ---- opcode space (Op payload low 16 bits) ----
-
-/// "Operands swapped" flag: slot 0 holds the *first* operand.
-pub(crate) const OP_FLIP: u16 = 1 << 8;
 
 /// Opcodes from here up are the builtins (`Core::Prim`), strict agents like
 /// the arithmetic ops: binary32 ops fold on numbers; array ops are opaque at
@@ -172,161 +146,11 @@ pub(crate) fn opcode_cmp(op: CmpOp) -> u16 {
     }
 }
 
-// ---- payload packing helpers ----
+pub use mithril_core::agents::*;
 
-pub fn op_port(addr: u32, code: u16) -> Port {
-    Port::new(Tag::Op, ((addr as u64) << 16) | code as u64)
-}
-pub(crate) fn op_addr(p: Port) -> u32 {
-    (p.payload() >> 16) as u32
-}
-pub(crate) fn op_code(p: Port) -> u16 {
-    (p.payload() & 0xFFFF) as u16
-}
-
-/// `Dup(addr, label)` — payload `addr:32|label:24`.
-pub fn dup_port(addr: u32, label: u32) -> Port {
-    Port::new(Tag::Dup, ((addr as u64) << 24) | (label & 0xFF_FFFF) as u64)
-}
-pub(crate) fn dup_addr(p: Port) -> u32 {
-    (p.payload() >> 24) as u32
-}
-pub(crate) fn dup_label(p: Port) -> u32 {
-    (p.payload() & 0xFF_FFFF) as u32
-}
-/// A fresh label for a new sharing site.
+/// A fresh Dup label (a new sharing site).
 pub fn fresh_label(net: &mut Net) -> u32 {
-    let l = net.labels;
-    net.labels = net.labels.wrapping_add(1) & 0xFF_FFFF;
-    if net.labels == 0 {
-        net.labels = 1;
-    }
-    l
-}
-
-pub(crate) fn mat_port(addr: u32, match_id: u16) -> Port {
-    Port::new(Tag::Mat, ((addr as u64) << 16) | match_id as u64)
-}
-pub(crate) fn mat_addr(p: Port) -> u32 {
-    (p.payload() >> 16) as u32
-}
-pub(crate) fn mat_id(p: Port) -> u16 {
-    (p.payload() & 0xFFFF) as u16
-}
-
-/// `head` is a list head (`Ext(addr)` or `EMPTY`); stored biased by one so
-/// that 0 means "no args".
-pub fn ref_port(head: Port, entry: u16) -> Port {
-    let h = if head == EMPTY { 0 } else { head.payload() + 1 };
-    Port::new(Tag::Ref, (h << 16) | entry as u64)
-}
-pub(crate) fn ref_head(p: Port) -> Port {
-    let h = p.payload() >> 16;
-    if h == 0 {
-        EMPTY
-    } else {
-        Port::new(Tag::Ext, h - 1)
-    }
-}
-pub(crate) fn ref_entry(p: Port) -> u16 {
-    (p.payload() & 0xFFFF) as u16
-}
-
-// ---- list chains ([item, Ext(next)|EMPTY] cells) ----
-
-pub fn list_alloc(net: &mut Net, items: &[Port]) -> Port {
-    let mut head = EMPTY;
-    for &it in items.iter().rev() {
-        let a = net.alloc(it, head);
-        head = Port::new(Tag::Ext, a as u64);
-    }
-    head
-}
-
-/// The items of a list chain, without freeing it.
-pub(crate) fn list_items(net: &Net, mut head: Port) -> Vec<Port> {
-    let mut out = Vec::new();
-    while head != EMPTY {
-        debug_assert_eq!(head.tag(), Tag::Ext);
-        let c = net.cell(head.payload() as u32);
-        out.push(Port(c[0]));
-        head = Port(c[1]);
-    }
-    out
-}
-
-/// Walk and free a list chain, returning the items in order.
-pub(crate) fn list_collect(net: &mut Net, mut head: Port) -> Vec<Port> {
-    let mut out = Vec::new();
-    while head != EMPTY {
-        debug_assert_eq!(head.tag(), Tag::Ext);
-        let a = head.payload() as u32;
-        let c = net.cell(a);
-        net.free_cell(a);
-        out.push(Port(c[0]));
-        head = Port(c[1]);
-    }
-    out
-}
-
-// ---- constructor chains ----
-
-/// The 4-bit arity field is the *remaining* field count of a chain,
-/// saturating at 15 (as in the runtime's `mk_con`): a cell with count 15
-/// holds one field and a continuation; the count becomes exact once it
-/// drops below 15, so a chain of any length reads back by following
-/// continuations while the count exceeds 2.
-pub(crate) fn con_alloc(net: &mut Net, ctag: u16, fields: &[Port]) -> Port {
-    let n = fields.len();
-    match n {
-        0 => Port::con(0, ctag, 0),
-        1 => {
-            let a = net.alloc(fields[0], EMPTY);
-            Port::con(a as u64, ctag, 1)
-        }
-        2 => {
-            let a = net.alloc(fields[0], fields[1]);
-            Port::con(a as u64, ctag, 2)
-        }
-        _ => {
-            let rest = con_alloc(net, ctag, &fields[1..]);
-            let a = net.alloc(fields[0], rest);
-            Port::con(a as u64, ctag, n.min(15) as u8)
-        }
-    }
-}
-
-/// Walk and free a constructor chain, returning the field ports in order.
-pub(crate) fn con_collect(net: &mut Net, mut p: Port) -> Vec<Port> {
-    let mut out = Vec::new();
-    loop {
-        let n = p.con_arity();
-        let a = p.con_addr() as u32;
-        match n {
-            0 => break,
-            1 => {
-                let c = net.cell(a);
-                net.free_cell(a);
-                out.push(Port(c[0]));
-                break;
-            }
-            2 => {
-                let c = net.cell(a);
-                net.free_cell(a);
-                out.push(Port(c[0]));
-                out.push(Port(c[1]));
-                break;
-            }
-            _ => {
-                let c = net.cell(a);
-                net.free_cell(a);
-                out.push(Port(c[0]));
-                p = Port(c[1]);
-                debug_assert_eq!(p.tag(), Tag::Con);
-            }
-        }
-    }
-    out
+    mithril_core::agents::Cells::fresh_label(net)
 }
 
 // ---- derived program: lambda-lifted Core ----
