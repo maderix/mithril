@@ -496,7 +496,13 @@ fn arrays_match_oracle_in_place_and_shared() {
     let (cm, rs) = trmc_golden("arrays.py");
     // in-place updates and copy-on-write both live in arr_set
     assert!(rs.contains("arr_set(ctx"), "no array updates emitted");
-    let _ = cm;
+    // an int array filled in a loop: native, unchecked in-place writes
+    native_form(&cm, &rs, "fill");
+    assert!(rs.contains("arr_set_u("), "int array writes are not native");
+    // an array of lists keeps refcounted element handling in dive form
+    let lp = cm.fns.iter().position(|f| f.name.starts_with("__for") && rs[rs.find(&format!("fn d_{}(", cm.fns.iter().position(|g| g.name == f.name).unwrap())).unwrap()..].split("\nfn ").next().unwrap().contains("arr_set(ctx")).expect("buckets' loop keeps refcounted updates");
+    assert!(!rs.contains(&format!("fn s_{lp}(")), "boxed array loop went native");
+    assert!(!rs.contains(&format!("fn s_{}(", cm.fns.iter().position(|f| f.name == "buckets").unwrap())), "boxed array went native");
 }
 
 // ---- native code over int arrays, native multi-value returns ----
@@ -514,7 +520,7 @@ fn native_arrays_match_oracle_under_suspension() {
     let (cm, rs) = trmc_golden("native_arrays.py");
     let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
     // loops and helpers over int arrays run natively
-    for f in ["step", "fill", "score", "walk", "upd2", "pick"] {
+    for f in ["step", "fill", "score", "walk", "upd2", "pick", "sum_pair", "swaps"] {
         native_form(&cm, &rs, f);
     }
     // writes in native code need no refcount check: arrays there are
@@ -545,14 +551,3 @@ fn native_arrays_match_oracle_under_suspension() {
     assert!(dive_form(&cm, &rs, "listy").contains(&format!("n_{sp}(ctx, fuel")) || rs.contains(&format!("n_{sp}(ctx, fuel")), "listy does not take split's components natively");
 }
 
-#[test]
-fn int_arrays_go_native_boxed_arrays_keep_refcounts() {
-    let (cm, rs) = trmc_golden("arrays.py");
-    // an int array filled in a loop: native, unchecked in-place writes
-    native_form(&cm, &rs, "fill");
-    assert!(rs.contains("arr_set_u("), "int array writes are not native");
-    // an array of lists keeps refcounted element handling in dive form
-    let lp = cm.fns.iter().position(|f| f.name.starts_with("__for") && rs[rs.find(&format!("fn d_{}(", cm.fns.iter().position(|g| g.name == f.name).unwrap())).unwrap()..].split("\nfn ").next().unwrap().contains("arr_set(ctx")).expect("buckets' loop keeps refcounted updates");
-    assert!(!rs.contains(&format!("fn s_{lp}(")), "boxed array loop went native");
-    assert!(!rs.contains(&format!("fn s_{}(", cm.fns.iter().position(|f| f.name == "buckets").unwrap())), "boxed array went native");
-}

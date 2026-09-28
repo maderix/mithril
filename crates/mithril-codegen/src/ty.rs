@@ -84,7 +84,8 @@ enum Node {
     Free,
     Int,
     Flo,
-    Tup(u32),
+    /// a k-tuple; its component tyvars are `Inf::tups[.1]`
+    Tup(u32, u32),
     Adt(u32),
     /// an array; its element type is the tyvar
     Arr(u32),
@@ -138,7 +139,7 @@ impl Uf {
         match self.n[r as usize] {
             Node::Int => Ty::Int,
             Node::Flo => Ty::Flo,
-            Node::Tup(k) => Ty::Tup(k),
+            Node::Tup(k, _) => Ty::Tup(k),
             Node::Adt(u32::MAX) => Ty::Dyn,
             Node::Adt(c) => Ty::Adt(c),
             Node::Arr(e) => Ty::Arr(self.read(e) == Ty::Int),
@@ -158,6 +159,11 @@ struct Inf<'m> {
     cfield: Vec<Vec<u32>>,
     /// ctor -> class representative (union-find over ctor ids)
     cclass: Vec<u32>,
+    /// component tyvars of each tuple node
+    tups: Vec<Vec<u32>>,
+    /// projections whose base was not yet known to be a tuple: (base, i,
+    /// result), resolved after each pass
+    pending: Vec<(u32, usize, u32)>,
 }
 
 impl<'m> Inf<'m> {
@@ -197,16 +203,53 @@ impl<'m> Inf<'m> {
 
     fn unify(&mut self, a: u32, b: u32) {
         self.merge_adts(a, b);
-        // arrays unify their element types
+        // arrays unify their element types, tuples their components
         let (ra, rb) = (self.uf.find(a), self.uf.find(b));
-        if let (Node::Arr(x), Node::Arr(y)) = (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
-            if ra != rb {
-                self.uf.n[ra as usize] = Node::Link(rb);
-                self.unify(x, y);
-                return;
+        if ra != rb {
+            match (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
+                (Node::Arr(x), Node::Arr(y)) => {
+                    self.uf.n[ra as usize] = Node::Link(rb);
+                    self.unify(x, y);
+                    return;
+                }
+                (Node::Tup(k, c), Node::Tup(l, d)) if k == l => {
+                    self.uf.n[ra as usize] = Node::Link(rb);
+                    for i in 0..k as usize {
+                        let (x, y) = (self.tups[c as usize][i], self.tups[d as usize][i]);
+                        self.unify(x, y);
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
         self.uf.union(a, b);
+    }
+
+    /// The tyvar of component `i` of a value typed `tb`.
+    fn proj(&mut self, tb: u32, i: usize) -> u32 {
+        let r = self.uf.find(tb);
+        if let Node::Tup(k, c) = self.uf.n[r as usize] {
+            if i < k as usize {
+                return self.tups[c as usize][i];
+            }
+        }
+        let res = self.uf.fresh();
+        self.pending.push((tb, i, res));
+        res
+    }
+
+    /// Resolve projections recorded before their base was known.
+    fn settle(&mut self) {
+        for (b, i, res) in std::mem::take(&mut self.pending) {
+            let r = self.uf.find(b);
+            if let Node::Tup(k, c) = self.uf.n[r as usize] {
+                if i < k as usize {
+                    let t = self.tups[c as usize][i];
+                    self.unify(res, t);
+                }
+            }
+        }
     }
 
     /// A fresh array node with element tyvar `e`.
@@ -304,16 +347,15 @@ impl<'m> Inf<'m> {
                 // element types tracked through cfield of the pseudo-ctor?
                 // tuples are structural; track only arity here, element types
                 // flow through Proj on the same var below when resolvable.
-                for a in xs {
-                    self.walk(fid, a, env);
-                }
+                let comps: Vec<u32> = xs.iter().map(|a| self.walk(fid, a, env)).collect();
+                self.tups.push(comps);
                 let t = self.uf.fresh();
-                self.uf.set(t, Node::Tup(xs.len() as u32));
+                self.uf.n[t as usize] = Node::Tup(xs.len() as u32, (self.tups.len() - 1) as u32);
                 t
             }
-            Core::Proj(b, _) => {
-                let _ = self.walk(fid, b, env);
-                self.uf.fresh() // element type unknown structurally
+            Core::Proj(b, i) => {
+                let tb = self.walk(fid, b, env);
+                self.proj(tb, *i)
             }
             Core::Prim(p, args) => {
                 use mithril_front::core::Prim;
@@ -401,6 +443,8 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
         fret: Vec::new(),
         cfield: Vec::new(),
         cclass: (0..m.ctors.len() as u32).collect(),
+        tups: Vec::new(),
+        pending: Vec::new(),
     };
     for f in &m.fns {
         let ps = (0..f.arity).map(|_| inf.uf.fresh()).collect();
@@ -418,6 +462,7 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
             let fr = inf.fret[fid];
             inf.unify(tr, fr);
         }
+        inf.settle();
     }
     // readout (locals need a third walk capturing every Let/binder var)
     let mut locals: Vec<Vec<Ty>> = Vec::with_capacity(nf);

@@ -141,6 +141,8 @@ struct Chk<'m> {
     live: std::collections::BTreeSet<u64>,
     /// borrowed params this body consumes (they must become owned)
     demote: Vec<u32>,
+    /// borrowed alias -> the parameter it names
+    root: HashMap<u32, u32>,
 }
 
 impl<'m> Chk<'m> {
@@ -178,7 +180,7 @@ impl<'m> Chk<'m> {
         if let Core::Var(v) = e {
             if self.arrs.get(v) == Some(&true) {
                 // a borrowed param handed on as owned: it must be owned
-                self.demote.push(*v);
+                self.demote.push(self.root.get(v).copied().unwrap_or(*v));
                 return self.fail(e);
             }
         }
@@ -200,7 +202,7 @@ impl<'m> Chk<'m> {
         }
         match e {
             Core::Var(v) if self.arrs.get(v) == Some(&true) => {
-                self.demote.push(*v);
+                self.demote.push(self.root.get(v).copied().unwrap_or(*v));
                 self.fail(e);
             }
             Core::Prim(Prim::ArrNew, xs) => {
@@ -368,6 +370,8 @@ impl<'m> Chk<'m> {
             if let Core::Var(v) = r {
                 if self.arrs.get(v) == Some(&true) {
                     self.arrs.insert(x, true); // alias of a borrowed array
+                    let r = self.root.get(v).copied().unwrap_or(*v);
+                    self.root.insert(x, r);
                     return;
                 }
             }
@@ -655,6 +659,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             tarr: HashMap::new(),
             live: Default::default(),
             demote: Vec::new(),
+            root: HashMap::new(),
         };
         for (p, pt) in params.iter().enumerate() {
             match pt {

@@ -116,6 +116,35 @@ def listy(k):
     return (total(l, 0) + n) & 1048575
 
 
+# an array taken back out of a tuple keeps its int element type
+def mkpair(n, k):
+    a = array_new(n, 0)
+    for i in range(n):
+        a = array_set(a, i, i * 3 + k)
+    return (a, n)
+
+
+def sum_pair(n, k):
+    r = mkpair(n, k)
+    a = r[0]
+    s = 0
+    for i in range(r[1]):
+        s = (s * 3 + array_get(a, i)) & 1048575
+    return s
+
+
+# rolling rows: the swap goes through aliases of the loop's own params
+def swaps(n, k):
+    p = array_new(4, 1)
+    c = array_new(4, 2)
+    for i in range(n):
+        c = array_set(c, 0, array_get(p, 0) + i + k)
+        t = p
+        p = c
+        c = t
+    return (array_get(p, 0) * 7 + array_get(c, 0)) & 1048575
+
+
 def work(k):
     g = fill(array_new(64, 0), 64, k)
     s = walk(g, 64)
@@ -124,7 +153,8 @@ def work(k):
     t = (pick(g, k & 1) + pick(g, 1 - (k & 1))) & 1048575
     base = fill(array_new(8, 1), 8, k)
     u = (alias(base) + shared(base) + score(base, 8)) & 1048575
-    return (s * 3 + t * 5 + u + listy(k & 15) + array_len(g)) & 1048575
+    v = (sum_pair(16, k) + swaps(9, k)) & 1048575
+    return (s * 3 + t * 5 + u + v + listy(k & 15) + array_len(g)) & 1048575
 
 
 def batch(d, k):
