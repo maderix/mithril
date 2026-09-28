@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""GPU lane of the gate: every port at its small size, run on the device
-through `mithril run --gpu` (the same lowering as the CPU program, printed
-as CUDA), must print the same checksum fast.py expects from the CPU build.
+"""GPU lane of the gate: every port at its small size, and the closure
+corpus at run.py's small sizes, run on the device through `mithril run
+--gpu` (the same lowering as the CPU program, printed as CUDA), must print
+the same result the CPU build prints (the port checksums of fast.py; the
+CPU program's own output for the corpus).
 
 Needs the 4090 and the docker nvcc image (blaze-ptx:cu13x). Programs are
 compiled once per source hash (cached under target/mithril-cache/gpu), so a
@@ -36,9 +38,22 @@ def main():
     tmp = tempfile.mkdtemp(prefix="mithril-gpu-")
     fails = 0
     print(f"{'bench':13} {'time':>7}  status")
+    jobs = []
     for name in names:
         subs, expect = SMALL[name]
-        src = variant(name, subs, tmp, "gpu")
+        jobs.append((name, variant(name, subs, tmp, "gpu"), expect))
+    if a.only is None:
+        # the closure corpus: the CPU program's output is the expectation
+        general = os.path.join(ROOT, "bench", "general")
+        for name, small in [("stage_closure", 50), ("pipeline_cfg", 20), ("interp_closure", 200)]:
+            text = open(os.path.join(general, f"{name}.py")).read()
+            at = text.rfind("return run(")
+            end = text.index(")", at)
+            src = os.path.join(tmp, f"{name}_gpu.py")
+            open(src, "w").write(text[:at] + f"return run({small}" + text[end:])
+            r = subprocess.run([BIN, "run", src], capture_output=True, text=True, timeout=RUN_CAP_S)
+            jobs.append((name, src, r.stdout.strip().split("\n")[-1]))
+    for name, src, expect in jobs:
         t0 = time.time()
         try:
             r = subprocess.run([BIN, "run", src, "--gpu"], capture_output=True, text=True, timeout=RUN_CAP_S)

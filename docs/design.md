@@ -437,11 +437,41 @@ native scalar), is deleted.
   runs the 22 closure-free codegen fixtures against the oracle plus the
   capacity/abort tests. All pass on the RTX 4090. A cold run is dominated
   by nvcc (5-77 s per port); warm runs are cached by source hash.
-* Known limits (stage 3): closures (the net region) abort with a clear
-  error; the array heap is a bump allocator (blocks are never freed);
-  per-dive fuel is 64 by default (device stack), so the device suspends
-  far more often than the CPU (fuel 4096+), which is the parallelism the
-  wave engine wants but also more records per program.
+* Known limits after stage 2: the array heap is a bump allocator (blocks
+  are never freed); per-dive fuel is 64 by default (device stack), so the
+  device suspends far more often than the CPU (fuel 4096+), which is the
+  parallelism the wave engine wants but also more records per program.
+
+### 3e. Stage 3: the net region on the device (e6638ed)
+
+The rule table runs on the device: `cuda/engine.cu` carries
+`mithril_core::rules` rule for rule (REF unfold / erase / closure copy,
+wiring as the static gate, Kont delivery, beta, OP with the operand-swap
+half-step and OP-SUP, SWI, MAT with projections and unboxed constructors,
+DUP of values and lambdas, the DUP commutations, DUP-DUP) over per-lane
+redex worklists that spill to the program's net rule, and the closure
+bridge compiled code uses (`build_closure`, `apply`, `apply_spawn`,
+`dup_closure`, `drop_closure`). A generated program supplies its entries
+as straight-line net builders (`inst_<e>`) printed from the same `NExpr`
+bodies the CPU interprets with `instantiate`, its match tables, and the
+FILL/NET rule ids. The CPU and the device are now checked against each
+other on every closure program: the third implementation of the rules is
+held to the first two by the oracle, as the core constraint asks.
+
+Numbers: 24/24 codegen fixtures (closures and W2 sharing included), the
+closure corpus (stage_closure, pipeline_cfg, interp_closure at run.py's
+small sizes) and 16/16 ports print the CPU's result on the 4090. The GPU
+gate (`tests/ci/gpu.py`, ports + corpus) runs in about two minutes warm.
+
+Found on the way: the device compiler inlined the rule table into every
+caller (437K lines of PTX and a 5-minute ptxas for a 3-function
+program); every non-trivial runtime function is `__noinline__` now (29K
+lines, 4 s). Performance of the device path is not measured yet: that is
+the next use case to prove, not a number to tune (the runtime helpers as
+calls, the 64-fuel dives, the bump heap are the known costs).
+
+Open after stage 3: device-side memory for arrays is never reclaimed;
+`interp_closure` remains the closure-copying case on both backends.
 
 ## 4. Runtime: waves, dives, records
 
