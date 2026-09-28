@@ -380,7 +380,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         .collect();
     seq::DPS.with(|d| *d.borrow_mut() = dps.clone());
     // base-case wrappers for recursive dive functions (see fast.rs)
-    let fast_code: Vec<Option<String>> = (0..nf)
+    let fast_code: Vec<Option<lir::FnDef>> = (0..nf)
         .map(|fid| {
             if scal[fid].is_some() {
                 return None;
@@ -447,12 +447,12 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         }
         if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
-            fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, true));
+            emit(scalar::scalar_fn(m, fid as u32, &scal, &bor, true), &mut fns_code);
         } else {
             emit(seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared), &mut fns_code);
         }
         if let Some(q) = &fast_code[fid] {
-            fns_code.push_str(q);
+            emit(vec![q.clone()], &mut fns_code);
         }
         if let Some((p, c)) = dps[fid] {
             emit(vec![seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);

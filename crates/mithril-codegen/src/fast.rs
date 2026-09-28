@@ -14,8 +14,9 @@
 //! fallback happens before any side effect, so it is always valid; call
 //! sites in dive forms call `q_f` instead of `d_f`.
 
-use crate::seq::{bin_code, cmp_code};
-use crate::ty::{Ty, Types};
+use crate::lir::{as_i, bin, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, u32_, u64_, u8_, v, Bop, FnDef, Inline, Ty, E, S};
+use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
+use crate::ty::{Ty as CTy, Types};
 use mithril_front::core::{Core, CoreModule};
 use std::collections::{HashMap, HashSet};
 
@@ -41,6 +42,7 @@ struct Fp<'m> {
     imm: Vec<u32>,
     tails: usize,
     falls: usize,
+    tmp: u32,
 }
 
 impl Fp<'_> {
@@ -53,154 +55,164 @@ impl Fp<'_> {
     }
 
     fn int_param(&self, v: u32) -> bool {
-        self.is_param(v) && self.tys.var(self.fid as usize, v) == Ty::Int
+        self.is_param(v) && self.tys.var(self.fid as usize, v) == CTy::Int
     }
 
-    fn fallback(&mut self, b: &mut String) {
+    fn fallback(&mut self, b: &mut Vec<S>) {
         self.falls += 1;
-        let args: String = (0..self.arity()).map(|i| format!(", v{i}")).collect();
-        b.push_str(&format!("return d_{}(ctx, fuel{args});\n", self.fid));
+        let mut args = vec![v("fuel")];
+        args.extend((0..self.arity()).map(|i| v(vn(i as u32))));
+        b.push(ret(E::Call { f: format!("d_{}", self.fid), ctx: true, args }));
     }
 
-    /// A pure int expression as raw i64 Rust, or None.
-    fn pexpr(&self, e: &Core) -> Option<String> {
-        self.pexpr_low(e, false)
+    /// Whether `e` is a pure int expression.
+    fn pure(&self, e: &Core) -> bool {
+        match e {
+            Core::Num(_) => true,
+            Core::Var(i) => self.ints.contains(i) || self.int_param(*i),
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => self.pure(a) && self.pure(b),
+            Core::If(c, t, f) => self.pure(c) && self.pure(t) && self.pure(f),
+            _ => false,
+        }
     }
 
-    fn pexpr_low(&self, e: &Core, low: bool) -> Option<String> {
-        Some(match e {
-            Core::Num(n) => format!("{n}i64"),
-            Core::Var(i) if self.ints.contains(i) => format!("w{i}"),
-            Core::Var(i) if self.int_param(*i) => format!("as_i(v{i})"),
-            Core::Op2(op, a, b) => {
-                let (x, y) = (self.pexpr_low(a, crate::range::feeds_mask(op, b))?, self.pexpr(b)?);
-                let body = match bin_code(op) {
-                    0 => format!("{x}.wrapping_add({y})"),
-                    1 => format!("{x}.wrapping_sub({y})"),
-                    2 => format!("{x}.wrapping_mul({y})"),
-                    3 => format!("{x}.wrapping_div({y})"),
-                    4 => format!("floor_div({x}, {y})"),
-                    5 => format!("py_mod({x}, {y})"),
-                    6 => format!("{x}.wrapping_shl({y} as u32)"),
-                    7 => format!("{x}.wrapping_shr({y} as u32)"),
-                    8 => format!("({x} & {y})"),
-                    9 => format!("({x} | {y})"),
-                    _ => format!("({x} ^ {y})"),
-                };
-                if self.ranges.wrap(op, a, b, low) {
-                    format!("wrap56({body})")
+    /// A pure int expression as raw i64 (statements for value branches
+    /// into `b`); `low` = only its low bits are observed.
+    fn pexpr(&mut self, e: &Core, low: bool, b: &mut Vec<S>) -> E {
+        match e {
+            Core::Num(n) => i64_(*n),
+            Core::Var(i) if self.ints.contains(i) => v(format!("w{i}")),
+            Core::Var(i) => as_i(v(vn(*i))),
+            Core::Op2(op, x, y) => {
+                let (ex, ey) = (self.pexpr(x, crate::range::feeds_mask(op, y), b), self.pexpr(y, false, b));
+                let body = arith(bin_code(op), ex, ey);
+                if self.ranges.wrap(op, x, y, low) {
+                    p("wrap56", vec![body])
                 } else {
                     body
                 }
             }
-            Core::Cmp(op, a, b) => {
-                let (x, y) = (self.pexpr(a)?, self.pexpr(b)?);
-                let o = ["<", "<=", ">", ">=", "==", "!="][cmp_code(op) as usize];
-                format!("(({x} {o} {y}) as i64)")
+            Core::Cmp(op, x, y) => {
+                let (ex, ey) = (self.pexpr(x, false, b), self.pexpr(y, false, b));
+                cast(compare(cmp_code(op), ex, ey), Ty::I64)
             }
-            Core::If(c, t, f) => {
-                format!("(if {} != 0 {{ {} }} else {{ {} }})", self.pexpr(c)?, self.pexpr(t)?, self.pexpr(f)?)
+            Core::If(cd, t, f) => {
+                let ec = self.pexpr(cd, false, b);
+                self.tmp += 1;
+                let tn = format!("x{}", self.tmp);
+                let mut bt = Vec::new();
+                let et = self.pexpr(t, false, &mut bt);
+                bt.push(set(&tn, et));
+                let mut bf = Vec::new();
+                let ef = self.pexpr(f, false, &mut bf);
+                bf.push(set(&tn, ef));
+                b.push(S::Decl(tn.clone(), Ty::I64));
+                b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bt, bf));
+                v(tn)
             }
-            _ => return None,
-        })
+            _ => unreachable!("fast: non-pure int expression"),
+        }
     }
 
     /// Release owned boxed params this committed path does not return.
-    fn frees(&self, keep: Option<u32>, b: &mut String) {
-        for p in 0..self.arity() as u32 {
-            if Some(p) != keep && !self.int_param(p) && !self.bor[p as usize] && !self.imm.contains(&p) {
-                b.push_str(&format!("free_val(ctx, v{p});\n"));
+    fn frees(&self, keep: Option<u32>, b: &mut Vec<S>) {
+        for pp in 0..self.arity() as u32 {
+            if Some(pp) != keep && !self.int_param(pp) && !self.bor[pp as usize] && !self.imm.contains(&pp) {
+                b.push(free(v(vn(pp))));
             }
         }
     }
 
-    fn tail(&mut self, e: &Core, b: &mut String) {
+    fn tail(&mut self, e: &Core, b: &mut Vec<S>) {
         match e {
-            Core::Let(x, r, bo) => match self.pexpr(r) {
-                Some(_) => {
-                    let s = self.pexpr_low(r, self.ranges.masked(*x)).unwrap();
-                    b.push_str(&format!("let w{x}: i64 = {s};\n"));
-                    self.ints.insert(*x);
-                    self.tail(bo, b);
-                }
-                None => self.fallback(b),
-            },
-            Core::If(c, t, f) => match self.pexpr(c) {
-                Some(s) => {
-                    b.push_str(&format!("if {s} != 0 {{\n"));
-                    let saved = (self.ints.clone(), self.imm.clone());
-                    self.tail(t, b);
-                    (self.ints, self.imm) = saved.clone();
-                    b.push_str("} else {\n");
-                    self.tail(f, b);
-                    (self.ints, self.imm) = saved;
-                    b.push_str("}\n");
-                }
-                None => self.fallback(b),
-            },
+            Core::Let(x, r, bo) if self.pure(r) => {
+                let low = self.ranges.masked(*x);
+                let s = self.pexpr(r, low, b);
+                b.push(let_(format!("w{x}"), Ty::I64, s));
+                self.ints.insert(*x);
+                self.tail(bo, b);
+            }
+            Core::Let(..) => self.fallback(b),
+            Core::If(cd, t, f) if self.pure(cd) => {
+                let s = self.pexpr(cd, false, b);
+                let saved = (self.ints.clone(), self.imm.clone());
+                let mut bt = Vec::new();
+                self.tail(t, &mut bt);
+                (self.ints, self.imm) = saved.clone();
+                let mut bf = Vec::new();
+                self.tail(f, &mut bf);
+                (self.ints, self.imm) = saved;
+                b.push(S::If(bin(Bop::Ne, s, i64_(0)), bt, bf));
+            }
+            Core::If(..) => self.fallback(b),
             Core::Match(s, arms) => {
-                let Core::Var(v) = **s else { return self.fallback(b) };
-                if !self.is_param(v) || self.int_param(v) {
+                let Core::Var(x) = **s else { return self.fallback(b) };
+                if !self.is_param(x) || self.int_param(x) {
                     return self.fallback(b);
                 }
-                let mut first = true;
-                for (c, binders, body) in arms {
-                    let cond = if let Some(slot) = self.unbox.get(c) {
-                        format!("tag(v{v}) == TU + {slot}")
-                    } else if self.m.ctors.get(*c as usize).is_some_and(|x| x.1 == 0) {
-                        format!("v{v} == con(0, {c}u16, 0)")
+                // an if/else chain over the cell-free arms; boxed arms (whose
+                // cell would be consumed) fall back
+                let mut chain: Vec<(E, Vec<S>)> = Vec::new();
+                for (cid, binders, body) in arms {
+                    let cond = if let Some(slot) = self.unbox.get(cid) {
+                        bin(Bop::Eq, p("tag", vec![v(vn(x))]), bin(Bop::Add, E::Const("TU".into()), u64_(*slot as u64)))
+                    } else if self.m.ctors.get(*cid as usize).is_some_and(|c| c.1 == 0) {
+                        bin(Bop::Eq, v(vn(x)), p("con", vec![u32_(0), u16_(*cid as u64), u8_(0)]))
                     } else {
-                        continue; // a boxed arm: its cell would be consumed
+                        continue;
                     };
-                    b.push_str(&format!("{}if {cond} {{\n", if first { "" } else { "} else " }));
-                    first = false;
                     let saved = (self.ints.clone(), self.imm.clone());
-                    self.imm.push(v);
-                    if let (Some(_), Some(bv)) = (self.unbox.get(c), binders.first()) {
-                        b.push_str(&format!("let w{bv}: i64 = as_i(v{v});\n"));
+                    self.imm.push(x);
+                    let mut ab = Vec::new();
+                    if let (Some(_), Some(bv)) = (self.unbox.get(cid), binders.first()) {
+                        ab.push(let_(format!("w{bv}"), Ty::I64, as_i(v(vn(x)))));
                         self.ints.insert(*bv);
                     }
-                    self.tail(body, b);
+                    self.tail(body, &mut ab);
                     (self.ints, self.imm) = saved;
+                    chain.push((cond, ab));
                 }
-                if first {
+                if chain.is_empty() {
                     return self.fallback(b);
                 }
-                b.push_str("} else {\n");
-                self.fallback(b);
-                b.push_str("}\n");
+                let mut rest = Vec::new();
+                self.fallback(&mut rest);
+                for (cond, ab) in chain.into_iter().rev() {
+                    rest = vec![S::If(cond, ab, rest)];
+                }
+                b.extend(rest);
             }
-            Core::Ctor(c, args) | Core::Reuse(_, c, args) => {
-                if let (Some(slot), [a]) = (self.unbox.get(c), args.as_slice()) {
-                    if let Some(s) = self.pexpr(a) {
+            Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => {
+                if let (Some(slot), [a]) = (self.unbox.get(cid), args.as_slice()) {
+                    if self.pure(a) {
+                        let s = self.pexpr(a, false, b);
                         self.frees(None, b);
                         self.tails += 1;
-                        return b.push_str(&format!("return Ok(ic({slot}u64, {s}));\n"));
+                        return b.push(ret(ok(p("ic", vec![u64_(*slot as u64), s]))));
                     }
                 } else if args.is_empty() {
                     self.frees(None, b);
                     self.tails += 1;
-                    return b.push_str(&format!("return Ok(con(0, {c}u16, 0));\n"));
+                    return b.push(ret(ok(p("con", vec![u32_(0), u16_(*cid as u64), u8_(0)]))));
                 }
                 self.fallback(b)
             }
-            Core::Var(p) if self.is_param(*p) && !self.int_param(*p) => {
-                self.frees(Some(*p), b);
+            Core::Var(pp) if self.is_param(*pp) && !self.int_param(*pp) => {
+                self.frees(Some(*pp), b);
                 self.tails += 1;
-                if self.bor[*p as usize] {
-                    b.push_str(&format!("return Ok(dup_val(ctx, v{p}));\n"));
+                if self.bor[*pp as usize] {
+                    b.push(ret(ok(c("dup_val", vec![v(vn(*pp))]))));
                 } else {
-                    b.push_str(&format!("return Ok(v{p});\n"));
+                    b.push(ret(ok(v(vn(*pp)))));
                 }
             }
-            other => match self.pexpr(other) {
-                Some(s) => {
-                    self.frees(None, b);
-                    self.tails += 1;
-                    b.push_str(&format!("return Ok(num({s}));\n"));
-                }
-                None => self.fallback(b),
-            },
+            other if self.pure(other) => {
+                let s = self.pexpr(other, false, b);
+                self.frees(None, b);
+                self.tails += 1;
+                b.push(ret(ok(num(s))));
+            }
+            _ => self.fallback(b),
         }
     }
 }
@@ -211,27 +223,19 @@ fn calls_self(fid: u32, e: &Core) -> bool {
 
 /// The `q_<fid>` wrapper, when `fid` is self-recursive and has both an
 /// inlinable base case and a fallback.
-pub(crate) fn fast_fn(
-    m: &CoreModule,
-    fid: u32,
-    body: &Core,
-    tys: &Types,
-    unbox: &HashMap<u32, u8>,
-    bor: &[bool],
-) -> Option<String> {
+pub(crate) fn fast_fn(m: &CoreModule, fid: u32, body: &Core, tys: &Types, unbox: &HashMap<u32, u8>, bor: &[bool]) -> Option<FnDef> {
     if !calls_self(fid, body) {
         return None;
     }
     let ranges = crate::range::Ranges::of(body);
-    let mut fp = Fp { m, fid, tys, unbox, bor, ints: HashSet::new(), ranges, imm: Vec::new(), tails: 0, falls: 0 };
-    let mut b = String::new();
+    let mut fp = Fp { m, fid, tys, unbox, bor, ints: HashSet::new(), ranges, imm: Vec::new(), tails: 0, falls: 0, tmp: 0 };
+    let mut b = Vec::new();
     fp.tail(body, &mut b);
     if fp.tails == 0 || fp.falls == 0 {
         return None;
     }
-    let ar = m.fns[fid as usize].arity;
-    let params: String = (0..ar).map(|i| format!(", v{i}: u64")).collect();
-    Some(format!(
-        "#[inline(always)]\n#[allow(clippy::too_many_arguments)]\nfn q_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n{b}unreachable!()\n}}\n\n"
-    ))
+    b.push(S::Unreachable);
+    let mut params = vec![("fuel".to_string(), Ty::RefI64)];
+    params.extend(vparams(m.fns[fid as usize].arity));
+    Some(FnDef { name: format!("q_{fid}"), ctx: true, params, ret: Ty::Res, body: b, inline: Inline::Always, cold: false })
 }
