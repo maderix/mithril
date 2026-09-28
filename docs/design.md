@@ -375,20 +375,33 @@ dependency the net does not have, and one that stops the rule form from
 forking the pair. The specializer records the scope frame of each pending
 call, keyed by the call's result wire (unique per residual call; the Ref
 port is not, every nullary call to a function shares one), and the reader
-binds the call there. Two limits keep it exact: a call read under a
-closure never leaves the innermost closure on the stack (frames are
-recorded per settle and a closure body is not one), and a closure frame is
-peeled for any value only when the value reads nothing bound inside the
-closure (its parameter or its own bindings), which also fixed a
-pre-existing escape (`lambda x: fib(fib(x) + k) + 1`). A call created in
-the frame that uses it is read in place, so tail calls stay tail calls.
+binds the call there. Frames are recorded per settle and a closure body
+is not one, so the recorded frame alone cannot decide closures. One rule
+places every bound value, plain, shared (Dup) or a call (`place`): while
+a value created in an outer frame is read, the arms above that frame are
+skipped (the net made the value there, unconditionally), and a closure
+keeps the value exactly when the value reads something the closure binds
+(its parameter, a value bound in it or in a frame nested in it);
+otherwise the value moves out and every application shares it, which is
+the net's DUP sharing. A call created in the frame that uses it is read
+in place, so tail calls stay tail calls.
+
+Two independent reviews shaped this. The first found a closure escape
+and a key collision (nullary calls shared the Ref port as key; calls are
+now keyed by their result wire). The second found that the first fix
+still let a shared value escape a closure (`lambda x: sq(fib(x) + k)`,
+pre-existing) and, worse, rebuilt a call the net computes once outside a
+closure inside it, once per application (a sharing regression). Pushing
+the recorded frame on top of the reader's stack hid the closures between;
+reading "in frame F" is now a floor, not a push.
 
 Numbers: a 2^16-leaf warp on the GPU 1454 ms -> 12 ms; bitonic CPU
 instructions 0.965 G -> 0.912 G. Tests (specialize_test): independence of
 the pair (fails with the hoist disabled), tail calls, closure-body calls
 in scope (3 shapes), branch-only nullary call stays in its branch, shared
-call stays in its arm. An independent review of the first version found
-the closure escape and the nullary-key collision; both tests fail on it.
+call stays in its arm, shared values in closure bodies stay in scope (2
+shapes), a call outside a closure is shared by every application. Each
+bug test fails on the commit it guards.
 
 ### 3c. One lowering, printers per backend (stage 1 of the shared backend)
 

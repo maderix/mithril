@@ -15,9 +15,11 @@
 //! reorders unconditional pure work) and each output reads the variable.
 //! A pending call is placed the same way: bound in the frame the net
 //! created it in, not where its result is first used (two independent
-//! calls stay independent), never outside the innermost closure being read,
-//! and read in place when created where it is used (tail calls stay tail
-//! calls). Parked branch closures splice the original Core of their lifted
+//! calls stay independent), and read in place when created where it is
+//! used (tail calls stay tail calls). One rule places every bound value
+//! (`place`): arms above the frame a value was created in are skipped, and
+//! a closure keeps the value exactly when the value reads something the
+//! closure binds; otherwise every application shares it. Parked branch closures splice the original Core of their lifted
 //! entry under lets for the captured arguments.
 
 use crate::{dup_label,
@@ -442,6 +444,9 @@ pub(crate) struct Reader<'a> {
     arms: &'a HashMap<(u32, usize), ArmInfo>,
     /// active frames, innermost last
     stack: Vec<usize>,
+    /// while a value created in an outer frame is read: that frame's stack
+    /// position (values bind there, not in the arms above); usize::MAX = top
+    floor: usize,
     /// shared bindings per frame, in dependency order
     bindings: HashMap<usize, Vec<(u32, Core)>>,
     /// residual closures being read, innermost last: (frame, parameter var)
@@ -484,16 +489,19 @@ impl<'a> Reader<'a> {
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
-        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, ref_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
+        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, ref_frame, arms, stack: vec![0], floor: usize::MAX, bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
     }
 
     /// Read a frame's expression from `p` (its tail, compound) and wrap it
     /// in the frame's bindings: every compound value the frame computes is
     /// let-bound in evaluation order (let-normal form), shared values once.
     pub(crate) fn read_frame(&mut self, frame: usize, p: Port) -> Core {
+        // a new scope (an arm, a closure body): its own values bind in it
+        let floor = std::mem::replace(&mut self.floor, usize::MAX);
         self.stack.push(frame);
         let mut e = self.read(p);
         self.stack.pop();
+        self.floor = floor;
         for (v, b) in self.bindings.remove(&frame).unwrap_or_default().into_iter().rev() {
             e = Core::Let(v, Box::new(b), Box::new(e));
         }
@@ -524,28 +532,55 @@ impl<'a> Reader<'a> {
         if matches!(e, Core::Var(_) | Core::Num(_) | Core::Flo(_)) {
             return e;
         }
-        let frame = self.frame_for(&e);
+        let frame = self.place(&e);
         self.bind_in(frame, e)
     }
 
-    fn frame_for(&self, e: &Core) -> usize {
-        // a closure frame is peeled only when the value reads nothing the
-        // closure binds: its parameter, or any value bound inside it
-        for &fr in self.stack.iter().rev() {
+    /// The one placement rule for every let-bound value (a plain compound
+    /// value, a shared value, a pending call). Walk the active frames from
+    /// the innermost: a closure frame is kept exactly when the value reads
+    /// something the closure binds (its parameter, or a value bound in it or
+    /// in a frame nested in it), otherwise the value is shared by every
+    /// application and moves out (the net computed it once); a non-closure
+    /// frame (an arm, the function body) takes the value, except the frames
+    /// above `floor` while a value created in an outer frame is being read
+    /// (the net made it there, unconditionally).
+    fn place(&self, e: &Core) -> usize {
+        for (i, &fr) in self.stack.iter().enumerate().rev() {
             match self.lams.iter().find(|(lf, _)| *lf == fr) {
                 Some((_, x)) => {
                     let mut inside = vec![*x];
-                    if let Some(bs) = self.bindings.get(&fr) {
-                        inside.extend(bs.iter().map(|(v, _)| *v));
+                    for g in &self.stack[i..] {
+                        if let Some(bs) = self.bindings.get(g) {
+                            inside.extend(bs.iter().map(|(v, _)| *v));
+                        }
                     }
                     if mentions(e, &inside) {
                         return fr;
                     }
                 }
+                None if i > self.floor => continue,
                 None => return fr,
             }
         }
         0
+    }
+
+    /// Read with the stack position of frame `frame` as the floor: values
+    /// the read binds go to that frame (or a closure above it they need).
+    fn read_in<T>(&mut self, frame: usize, f: impl FnOnce(&mut Self) -> T) -> (T, usize) {
+        let pos = self.stack.iter().rposition(|g| *g == frame).unwrap_or_else(|| panic!("ICE: frame {frame} read outside its scope (stack {:?})", self.stack));
+        let target = pos.min(self.floor);
+        let saved = std::mem::replace(&mut self.floor, target);
+        let v = f(self);
+        let floor = self.floor;
+        self.floor = saved;
+        (v, floor)
+    }
+
+    /// The stack position values currently bind at (the floor, or the top).
+    fn here(&self) -> usize {
+        self.floor.min(self.stack.len() - 1)
     }
 
     fn bind_in(&mut self, frame: usize, e: Core) -> Core {
@@ -688,34 +723,27 @@ impl<'a> Reader<'a> {
                 // one, so a call read under a closure never leaves the
                 // innermost closure on the stack (its arguments may read
                 // the parameter, directly or through bindings).
-                let cur = *self.stack.last().unwrap();
-                let frame = self.call_frame(ret);
-                if frame == cur {
-                    // read where it is used: the caller binds it or keeps
-                    // it in tail position
-                    let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
-                    return Core::Call(entry as u32, args);
+                let created = self.ref_frame.get(&ret).map(|f| {
+                    self.stack.iter().rposition(|g| g == f).unwrap_or_else(|| panic!("ICE: a call's frame {f} is not active (stack {:?})", self.stack))
+                });
+                match created {
+                    Some(pos) if pos < self.here() => {
+                        let frame = self.stack[pos];
+                        let (call, _) = self.read_in(frame, |me| {
+                            let args: Vec<Core> = list_items(me.net, ref_head(r)).into_iter().map(|a| me.atom(a)).collect();
+                            Core::Call(entry as u32, args)
+                        });
+                        let (at, _) = self.read_in(frame, |me| me.place(&call));
+                        self.bind_in(at, call)
+                    }
+                    // created where it is used: read in place (the caller
+                    // binds it, or keeps it as a tail call)
+                    _ => {
+                        let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
+                        Core::Call(entry as u32, args)
+                    }
                 }
-                self.stack.push(frame);
-                let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
-                self.stack.pop();
-                self.bind_in(frame, Core::Call(entry as u32, args))
             }
-        }
-    }
-
-    /// The frame a pending call is bound in: the frame the specializer
-    /// created it in, clamped to the innermost closure frame on the stack.
-    fn call_frame(&self, ret: u32) -> usize {
-        let cur = *self.stack.last().unwrap();
-        let Some(&rec) = self.ref_frame.get(&ret) else { return cur };
-        let Some(at) = self.stack.iter().rposition(|f| *f == rec) else {
-            debug_assert!(false, "ICE: a call's frame {rec} is not active (stack {:?})", self.stack);
-            return cur;
-        };
-        match self.stack[at..].iter().rev().find(|f| self.lams.iter().any(|(lf, _)| lf == *f)) {
-            Some(lf) => *lf,
-            None => rec,
         }
     }
 
@@ -744,18 +772,10 @@ impl<'a> Reader<'a> {
         if let Some(x) = self.shared.get(&d) {
             return Core::Var(*x);
         }
-        let mut frame = *self.dup_frame.get(&d).unwrap_or(&0);
-        assert!(self.stack.contains(&frame), "ICE: shared value read outside its scope");
-        self.stack.push(frame);
-        let e = self.read_dup_input(d);
-        self.stack.pop();
-        for (lf, x) in self.lams.iter().rev() {
-            if mentions(&e, &[*x]) {
-                frame = *lf;
-                break;
-            }
-        }
-        let a = self.bind_in(frame, e);
+        let frame = *self.dup_frame.get(&d).unwrap_or(&0);
+        let (e, _) = self.read_in(frame, |me| me.read_dup_input(d));
+        let (at, _) = self.read_in(frame, |me| me.place(&e));
+        let a = self.bind_in(at, e);
         if let Core::Var(v) = a {
             self.shared.insert(d, v);
         }

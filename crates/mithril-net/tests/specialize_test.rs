@@ -543,3 +543,42 @@ fn shared_call_in_an_arm_stays_in_the_arm() {
         other => panic!("f is no longer a branch at the top: {other:?}"),
     }
 }
+
+/// A shared value computed inside a closure from its parameter stays in
+/// the closure, also under an arm (second review of the placement: a Dup
+/// inside a closure body is recorded in the enclosing settle frame, and
+/// reading it there used to hide the closure).
+#[test]
+fn shared_values_in_closure_bodies_stay_in_scope() {
+    for (mk, apply) in [
+        ("def mk(k):\n    return lambda x: sq(fib(x) + k)\n", "g = mk(1)\n    return g(5) + g(6)"),
+        ("def mk(k, c):\n    if c > 0:\n        return lambda x: sq(fib(x) + k)\n    return lambda x: x\n", "g = mk(1, 1)\n    h = mk(1, 0)\n    return g(5) + g(6) + h(7)"),
+    ] {
+        let src = format!("{FIB}def sq(y):\n    return y * y\n\n{mk}\ndef main():\n    {apply}\n");
+        let (m, s) = spec(&src);
+        assert_scoped(&s);
+        assert_eq!(oracle(&m), oracle(&s), "{mk}");
+    }
+}
+
+/// A call the net computes once outside a closure stays outside it, also
+/// when the closure uses it under an arm: every application shares it
+/// (the DUP sharing the language exists for; the second review found a
+/// clamp that rebuilt it inside the closure, once per application).
+#[test]
+fn a_call_outside_a_closure_is_shared_by_every_application() {
+    let src = format!("{FIB}def pick(x, k):\n    if x > 0:\n        return k + 1\n    return 0\n\ndef mk(n):\n    k = fib(n)\n    return lambda x: pick(x, k)\n\ndef main():\n    g = mk(12)\n    return g(1) + g(2) + g(0) + g(3)\n");
+    let (m, s) = spec(&src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+    let fb = fid(&s, "fib");
+    fn call_under_lam(e: &Core, g: u32, under: bool) -> bool {
+        match e {
+            Core::Call(f, _) if *f == g => under,
+            Core::Lam(_, b) => call_under_lam(b, g, true),
+            _ => e.kids().into_iter().any(|k| call_under_lam(k, g, under)),
+        }
+    }
+    let b = body(&s, "mk");
+    assert!(calls(b, fb) && !call_under_lam(b, fb, false), "fib(n) is recomputed per application: {b:?}");
+}
