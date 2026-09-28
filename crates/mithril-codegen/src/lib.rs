@@ -42,6 +42,7 @@
 
 mod fast;
 mod fold;
+mod lir;
 mod range;
 mod rewrite;
 mod rules;
@@ -431,6 +432,15 @@ fn emit_rust_inner(m: &CoreModule) -> String {
     });
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
+    // every IR function, in emission order (printed as it is produced so
+    // a function's forms stay adjacent in the text)
+    let mut fns: Vec<lir::FnDef> = Vec::new();
+    let mut emit = |defs: Vec<lir::FnDef>, code: &mut String| {
+        for d in defs {
+            lir::rust::func(&d, code);
+            fns.push(d);
+        }
+    };
     for fid in 0..nf {
         if trace {
             eprintln!("gen fn {} ({}) segs={} code={}B", fid, m.fns[fid].name, sq.q.len(), fns_code.len());
@@ -439,18 +449,17 @@ fn emit_rust_inner(m: &CoreModule) -> String {
             // native scalar form + bridging dive form (see scalar.rs)
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor, true));
         } else {
-            fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
+            emit(seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared), &mut fns_code);
         }
         if let Some(q) = &fast_code[fid] {
             fns_code.push_str(q);
         }
         if let Some((p, c)) = dps[fid] {
-            fns_code.push_str(&seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
+            emit(vec![seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
         }
-        fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
-        fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
+        emit(vec![rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared), call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid])], &mut fns_code);
         if let Some(pf) = &folds[fid] {
-            fns_code.push_str(&fold::join_fn(fid as u32, pf));
+            emit(vec![fold::join_fn(fid as u32, pf)], &mut fns_code);
             fns_code.push_str(&fold::est_static(fid as u32));
         }
     }
@@ -462,7 +471,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         if trace && done % 500 == 0 {
             eprintln!("gen seg {} of {} (fn {}) code={}B", done, sq.q.len(), seg.fid, fns_code.len());
         }
-        fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared));
+        emit(vec![rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
     }
 
     // the net region: generic redexes and the records that feed a call's
@@ -474,32 +483,28 @@ fn emit_rust_inner(m: &CoreModule) -> String {
     fire_arms.push_str(&format!("            {net_rule} => net_fire(ctx, e),
             {fill_rule} => fill_fire(ctx, e),
 "));
-    fire_arms.push_str(&format!(
-        "            0 => fc_{}(ctx, Redex {{ a: e.a, b: e.b, aux: ROOT }}),\n",
-        m.main
-    ));
+    fire_arms.push_str(&format!("            0 => fc_{}(ctx, e.a, e.b, ROOT),\n", m.main));
     for fid in 0..nf {
-        fire_arms.push_str(&format!("            {} => fc_{}(ctx, e),\n", 1 + fid, fid));
+        fire_arms.push_str(&format!("            {} => fc_{}(ctx, e.a, e.b, e.aux),\n", 1 + fid, fid));
     }
     for fid in 0..nf {
         if folds[fid].is_some() {
-            fire_arms.push_str(&format!("            {} => jn_{}(ctx, e),\n", join_rule[fid], fid));
+            fire_arms.push_str(&format!("            {} => jn_{}(ctx, e.a, e.b, e.aux),\n", join_rule[fid], fid));
         }
     }
     // rules whose firing may run a dive: CALL entries and segments with calls
     let mut diving: Vec<usize> = (1..=nf).collect();
     for seg in &sq.q {
-        fire_arms.push_str(&format!("            {} => sg_{}(ctx, e),\n", seg.id, seg.id));
+        fire_arms.push_str(&format!("            {} => sg_{}(ctx, e.a, e.b, e.aux),\n", seg.id, seg.id));
         if has_call(&seg.body) {
             diving.push(seg.id as usize);
         }
     }
     for (id, cid) in &sq.holes {
-        fire_arms.push_str(&format!("            {id} => hl_{id}(ctx, e),\n"));
-        fns_code.push_str(&format!(
-            "fn hl_{id}(ctx: &mut Wctx, e: Redex) {{\nlet inf = ctx.rec(e.aux as u32);\nctx.set(inf.s, 1, e.a);\nctx.deliver(inf.parent, con(inf.d, {cid}u16, 2));\n}}\n\n"
-        ));
+        fire_arms.push_str(&format!("            {id} => hl_{id}(ctx, e.a, e.b, e.aux),\n"));
+        emit(vec![hole_fn(*id, *cid)], &mut fns_code);
     }
+    let _ = &fns;
     let diving: String = diving.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
     let mut dive_arms = String::new();
     for fid in 0..nf {
@@ -897,37 +902,45 @@ fn apply_spawn(ctx: &mut Wctx, f: u64, a: u64, parent: u64) {{
     s
 }
 
-fn call_fn(
-    m: &CoreModule,
-    fid: u32,
-    pf: Option<&fold::ParFold>,
-    jr: u16,
-    bor: &[Vec<bool>],
-) -> String {
+fn call_fn(m: &CoreModule, fid: u32, pf: Option<&fold::ParFold>, jr: u16) -> lir::FnDef {
+    use lir::{c, do_, let_, u16_, v, Ty, E};
     let ar = m.fns[fid as usize].arity;
-    let mut s = format!("fn fc_{fid}(ctx: &mut Wctx, e: Redex) {{\nlet parent = e.aux;\n");
+    let mut s = vec![let_("parent", Ty::U64, v("aux"))];
     match ar {
         0 => {}
-        1 => s.push_str("let v0 = e.a;\n"),
-        2 => s.push_str("let v0 = e.a;\nlet v1 = e.b;\n"),
+        1 => s.push(let_("v0", Ty::U64, v("a"))),
+        2 => {
+            s.push(let_("v0", Ty::U64, v("a")));
+            s.push(let_("v1", Ty::U64, v("b")));
+        }
         _ => {
-            s.push_str("let v0 = e.a;\nlet mut ch = e.b;\n");
+            s.push(let_("v0", Ty::U64, v("a")));
+            s.push(let_("ch", Ty::U64, v("b")));
             for i in 1..ar {
-                s.push_str(&format!(
-                    "let v{i} = {{ let c = ctx.cell((ch - 1) as u32); ctx.free((ch - 1) as u32); ch = c[1]; c[0] }};\n"
-                ));
+                s.push(let_(seq::vn(i as u32), Ty::U64, c("pop_chain", vec![E::Ref("ch".into())])));
             }
         }
     }
     if let Some(pf) = pf {
-        s.push_str(&fold::split_snippet(fid, ar, pf, jr));
+        s.extend(fold::split_snippet(fid, ar, pf, jr));
     }
-    let args: String = (0..ar).map(|i| format!(", v{i}")).collect();
-    let _ = bor;
-    s.push_str(&format!(
-        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => ctx.deliver(parent, v),\nDiveResult::Suspended(_) => {{}}\n}}\n}}\n\n"
-    ));
-    s
+    let mut args = vec![v("parent")];
+    args.extend((0..ar).map(|i| v(seq::vn(i as u32))));
+    s.push(do_(c("dive_to", vec![u16_(fid as u64), E::Slice(args)])));
+    lir::FnDef { name: format!("fc_{fid}"), ctx: true, params: rules::rule_params(), ret: Ty::Unit, body: s, inline: lir::Inline::Default, cold: false }
+}
+
+/// The hole-fill rule of a TRMC ctor: the record holds the head cell
+/// (`d`) and the pending hole cell (`s`); its one input fills the hole.
+fn hole_fn(id: u16, cid: u32) -> lir::FnDef {
+    use lir::{c, cast, do_, let_, p, u16_, u8_, usize_, v, Ty};
+    let aux = || cast(v("aux"), Ty::U32);
+    let body = vec![
+        let_("s", Ty::U32, c("rec_s", vec![aux()])),
+        do_(c("cell_set", vec![v("s"), usize_(1), v("a")])),
+        do_(c("deliver", vec![c("rec_parent", vec![aux()]), p("con", vec![c("rec_d", vec![aux()]), u16_(cid as u64), u8_(2)])])),
+    ];
+    lir::FnDef { name: format!("hl_{id}"), ctx: true, params: rules::rule_params(), ret: Ty::Unit, body, inline: lir::Inline::Default, cold: false }
 }
 
 // ---- Core walkers shared by the emitters ----

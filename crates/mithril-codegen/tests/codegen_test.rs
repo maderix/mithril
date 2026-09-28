@@ -600,7 +600,7 @@ fn raw_int_array_converts_on_first_non_int_write() {
 fn heavy_fold_splits_by_measured_work() {
     let (_cm, rs) = trmc_golden("heavy_fold.py");
     assert!(rs.contains("FOLD_EST_"), "fold has no work estimate");
-    assert!(rs.contains("saturating_mul(est)"), "fold split ignores the estimate");
+    assert!(rs.contains("sat_mul(") && rs.contains("est)"), "fold split ignores the estimate");
 }
 
 #[test]

@@ -360,3 +360,56 @@ pub fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
 }
 
 
+
+// ---- the context vocabulary of the lowered IR (crates/mithril-codegen/src/lir.rs) ----
+//
+// Generated code names the worker context only through these free
+// functions, so a backend without a context object (the device) supplies
+// the same names over its own arena.
+
+#[inline] pub fn alloc2(ctx: &mut Wctx, a: u64, b: u64) -> u32 { ctx.alloc(a, b) }
+#[inline] pub fn cell_set(ctx: &Wctx, i: u32, slot: usize, v: u64) { ctx.set(i, slot, v) }
+#[inline] pub fn alloc_rec(ctx: &mut Wctx, rule: u16, pend: u32, d: u32, s: u32, parent: u64) -> u32 { ctx.alloc_rec(rule, pend, d, s, parent) }
+#[inline] pub fn set_parent(ctx: &mut Wctx, rec: u32, parent: u64) { ctx.set_parent(rec, parent) }
+#[inline] pub fn ready_rec(ctx: &mut Wctx, rec: u32) { ctx.ready_rec(rec) }
+#[inline] pub fn deliver(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver(parent, v) }
+#[inline] pub fn rec_parent(ctx: &Wctx, rec: u32) -> u64 { ctx.rec(rec).parent }
+#[inline] pub fn rec_d(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).d }
+#[inline] pub fn rec_s(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).s }
+#[inline] pub fn fuel_of(ctx: &Wctx) -> i64 { ctx.fuel() }
+/// The record address form of a record index (slot 0).
+#[inline] pub fn rec_addr(rec: u32) -> u64 { (rec as u64) << 3 }
+/// Pop the head value of a `[value, next]` spill chain (`ch` = addr + 1;
+/// 0 = end), freeing its cell.
+#[inline]
+pub fn pop_chain(ctx: &mut Wctx, ch: &mut u64) -> u64 {
+    let c = ctx.cell((*ch - 1) as u32);
+    ctx.free((*ch - 1) as u32);
+    *ch = c[1];
+    c[0]
+}
+/// Dive `f` (`args[0]` = the destination) and deliver its result there
+/// (a suspended dive has attached its residue to the destination itself).
+#[inline]
+pub fn dive_to(ctx: &mut Wctx, f: u16, args: &[u64]) {
+    if let crate::DiveResult::Done(v) = ctx.dive(f, args) {
+        ctx.deliver(args[0], v);
+    }
+}
+/// Dive `f` with no destination (`args[0]` = `NONE`): `Ok(value)`, or
+/// `Err(rec)` = the root record of its residue, whose parent the caller sets.
+#[inline]
+pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
+    match ctx.dive(f, args) {
+        crate::DiveResult::Done(v) => Ok(v),
+        crate::DiveResult::Suspended(rec) => Err(rec),
+    }
+}
+#[inline] pub fn imax(a: i64, b: i64) -> i64 { a.max(b) }
+#[inline] pub fn sat_mul(a: i64, b: i64) -> i64 { a.saturating_mul(b) }
+#[inline] pub fn is_err(r: &R) -> bool { r.is_err() }
+#[inline] pub fn atomic_load(a: &std::sync::atomic::AtomicI64) -> i64 { a.load(std::sync::atomic::Ordering::Relaxed) }
+#[inline] pub fn atomic_store(a: &std::sync::atomic::AtomicI64, v: i64) { a.store(v, std::sync::atomic::Ordering::Relaxed) }
+#[inline] pub fn atomic_max(a: &std::sync::atomic::AtomicI64, v: i64) { a.fetch_max(v, std::sync::atomic::Ordering::Relaxed); }
+#[inline] pub fn flag_load(a: &std::sync::atomic::AtomicBool) -> bool { a.load(std::sync::atomic::Ordering::Relaxed) }
+#[inline] pub fn flag_store(a: &std::sync::atomic::AtomicBool, v: bool) { a.store(v, std::sync::atomic::Ordering::Relaxed) }
