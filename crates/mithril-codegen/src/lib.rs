@@ -180,7 +180,7 @@ fn uniquify(m: &CoreModule) -> CoreModule {
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     let m_i = rewrite::inline_leaves(m);
     let m_s = rewrite::unfold_static(&m_i);
-    let m_u = uniquify(&m_s);
+    let m_u = rewrite::if_convert(&uniquify(&m_s));
     // records_to_tuples (rewrite.rs) is parked: without native multi-value
     // returns in the dive form it only trades ctor cells for tuple chains.
     let m = &m_u;
@@ -220,8 +220,14 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         })
         .collect();
 
-    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m));
     let scal = scalar::classify(m);
+    // native scalar code never suspends: calls to it are plain (unless the
+    // function forks, in which case its dive form is what callers use)
+    let native: Vec<bool> = (0..m.fns.len()).map(|f| scal[f].is_some() && !fork_recursive(f as u32, &m.fns[f])).collect();
+    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
+    scalar::SIGS.with(|s| {
+        *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
+    });
     // types of the bodies the emitters see: ANF introduces fresh vars (call
     // results, intermediate values) that must carry types too
     let tys = {

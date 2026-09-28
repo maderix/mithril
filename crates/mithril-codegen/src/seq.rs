@@ -109,6 +109,8 @@ pub(crate) struct Ex<'m> {
     pub captured: HashSet<u32>,
     /// Rule form: dives whose continuation is being emitted inline, nested.
     pub inline_calls: u32,
+    /// Vars holding a native scalar tuple result, as locals `q<var>_<i>`.
+    pub ntup: HashSet<u32>,
     /// Dive form of a TRMC function: (ctor id, hole-fill rule).
     pub trmc: Option<(u32, u16)>,
     /// The delayed self call being emitted: (its var, evaluated args).
@@ -188,7 +190,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -656,10 +658,15 @@ impl<'m> Ex<'m> {
                 t
             }
             Core::Let(x, r, bo) => {
+                if self.native_let(*x, r, bo, b) {
+                    return self.val(bo, esc, b);
+                }
                 if self.dive {
                     if let Core::Call(g, args) = &**r {
-                        self.let_call(*x, *g, args, bo, b);
-                        return self.val(bo, esc, b);
+                        if !crate::is_bounded(*g) {
+                            self.let_call(*x, *g, args, bo, b);
+                            return self.val(bo, esc, b);
+                        }
                     }
                     if has_call(r) {
                         self.kframes.push((*x, (**bo).clone()));
@@ -672,6 +679,16 @@ impl<'m> Ex<'m> {
                 let er = self.val(r, false, b);
                 self.emit_bind(*x, &er, b);
                 self.val(bo, esc, b)
+            }
+            Core::Call(g, args) if crate::scalar::native_sig(*g).is_some_and(|s| s.ret == crate::scalar::Kind::S1) => {
+                let es: Vec<String> = args.iter().map(|a| self.val(a, false, b)).collect();
+                let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
+                let t = self.fresh();
+                b.push_str(&format!(
+                    "let {t} = num(s_{g}({fuel}{}));\n",
+                    es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
+                ));
+                t
             }
             Core::Call(g, args) => {
                 let (call, post) = self.dive_call(*g, args, b);
@@ -731,6 +748,13 @@ impl<'m> Ex<'m> {
                 let t = self.fresh();
                 b.push_str(&mk_con_call(&t, 0xFFF, &es));
                 t
+            }
+            Core::Proj(x, i) if matches!(&**x, Core::Var(v) if self.ntup.contains(v)) => {
+                let Core::Var(v) = &**x else { unreachable!() };
+                if let Some(r) = self.rem.get_mut(v) {
+                    *r = (*r - 1).max(0);
+                }
+                format!("num(q{v}_{i})")
             }
             Core::Proj(x, i) => {
                 let (sv, hold) = self.scrutinee(x, b);
@@ -829,6 +853,9 @@ impl<'m> Ex<'m> {
                         self.pending = None;
                         return;
                     }
+                }
+                if self.native_let(*x, r, bo, b) {
+                    return self.dive_tail(bo, b);
                 }
                 if let Core::Call(g, args) = &**r {
                     if !crate::is_bounded(*g) {
@@ -973,6 +1000,27 @@ impl<'m> Ex<'m> {
                 b.push_str(&format!("return Ok({});\n", self.hole_value(&v)));
             }
         }
+    }
+
+    /// `x = g(..)` with `g` native scalar returning a tuple that `bo` only
+    /// projects: destructure the native result into locals instead of
+    /// packing it into a heap tuple.
+    fn native_let(&mut self, x: u32, r: &Core, bo: &Core, b: &mut String) -> bool {
+        let Core::Call(g, args) = r else { return false };
+        let Some(sig) = crate::scalar::native_sig(*g) else { return false };
+        let crate::scalar::Kind::SK(k) = sig.ret else { return false };
+        if !only_projected(x, bo) {
+            return false;
+        }
+        let es: Vec<String> = args.iter().map(|a| self.val(a, false, b)).collect();
+        let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
+        b.push_str(&format!(
+            "let ({}) = s_{g}({fuel}{});\n",
+            (0..k).map(|i| format!("q{x}_{i}")).collect::<Vec<_>>().join(", "),
+            es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
+        ));
+        self.ntup.insert(x);
+        true
     }
 
     /// Emit a delayed self call's continuation: the cell (tail case a) or
@@ -1427,4 +1475,18 @@ pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
         p_body = Core::Let(*v, Box::new((*r).clone()), Box::new(p_body));
     }
     Some((p_body, live[0], j_body))
+}
+
+/// Every occurrence of `x` in `e` is directly under a `Proj`.
+pub(crate) fn only_projected(x: u32, e: &Core) -> bool {
+    match e {
+        Core::Var(v) => *v != x,
+        Core::Proj(a, _) => matches!(&**a, Core::Var(_)) || only_projected(x, a),
+        Core::Num(_) | Core::Flo(_) => true,
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => only_projected(x, a) && only_projected(x, b),
+        Core::If(a, b, c) => only_projected(x, a) && only_projected(x, b) && only_projected(x, c),
+        Core::Let(_, r, b) => only_projected(x, r) && only_projected(x, b),
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().all(|a| only_projected(x, a)),
+        Core::Match(s, arms) => only_projected(x, s) && arms.iter().all(|(_, _, a)| only_projected(x, a)),
+    }
 }

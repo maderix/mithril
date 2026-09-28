@@ -594,3 +594,206 @@ pub(crate) fn unfold_static(m: &CoreModule) -> CoreModule {
     }
     out
 }
+
+// ---- if-conversion of same-call branches ----
+//
+// An if-tree in tail position whose every leaf is (pure bindings; call g)
+// with pure arguments becomes one call to g whose differing arguments are
+// selects, with the arms' bindings and the conditions computed up front.
+// Typical source: a loop body ending in if/elif that updates different
+// accumulators; each branch is the same back-edge. A branch on runtime
+// data costs a misprediction per iteration, a select does not. Everything
+// hoisted is pure and cannot fault (no calls; division only by nonzero
+// constants), so computing it speculatively preserves the semantics.
+
+const IFCONV_LETS: usize = 128;
+/// Bindings a single arm may speculate: only cheap arms are worth it.
+const IFCONV_ARM: usize = 8;
+
+fn pure_nofault(e: &Core) -> bool {
+    use mithril_front::ast::BinOp::*;
+    match e {
+        Core::Num(_) | Core::Var(_) => true,
+        Core::Op2(op, a, b) => {
+            let div_ok = !matches!(op, Div | FloorDiv | Mod) || matches!(**b, Core::Num(n) if n != 0);
+            div_ok && pure_nofault(a) && pure_nofault(b)
+        }
+        Core::Cmp(_, a, b) => pure_nofault(a) && pure_nofault(b),
+        Core::If(c, t, f) => pure_nofault(c) && pure_nofault(t) && pure_nofault(f),
+        _ => false,
+    }
+}
+
+/// A leaf of a qualifying tree: its path (hoisted condition var, taken
+/// branch) and its call arguments.
+type Leaf = (Vec<(u32, bool)>, Vec<Core>);
+
+/// (hoisted bindings, condition var -> condition, callee, leaves).
+fn ifconv(
+    e: &Core,
+    next: &mut u32,
+    budget: &mut usize,
+    path: &mut Vec<(u32, bool)>,
+    conds: &mut HashMap<u32, Core>,
+) -> Option<(Vec<(u32, Core)>, u32, Vec<Leaf>)> {
+    match e {
+        Core::Let(x, r, b) if pure_nofault(r) => {
+            *budget = budget.checked_sub(1)?;
+            let (mut lets, g, leaves) = ifconv(b, next, budget, path, conds)?;
+            lets.insert(0, (*x, (**r).clone()));
+            Some((lets, g, leaves))
+        }
+        Core::Call(g, args) if args.iter().all(pure_nofault) => Some((Vec::new(), *g, vec![(path.clone(), args.clone())])),
+        Core::If(c, t, f) if pure_nofault(c) => {
+            *budget = budget.checked_sub(1)?;
+            let cv = *next;
+            *next += 1;
+            conds.insert(cv, (**c).clone());
+            path.push((cv, true));
+            let (lt, g1, mut at) = ifconv(t, next, budget, path, conds)?;
+            path.pop();
+            path.push((cv, false));
+            let (lf, g2, af) = ifconv(f, next, budget, path, conds)?;
+            path.pop();
+            if g1 != g2 || at.iter().chain(&af).any(|(_, a)| a.len() != at[0].1.len()) {
+                return None;
+            }
+            let mut lets = vec![(cv, (**c).clone())];
+            lets.extend(lt);
+            lets.extend(lf);
+            at.extend(af);
+            Some((lets, g1, at))
+        }
+        _ => None,
+    }
+}
+
+/// `v == k` for the condition bound to `cv`.
+fn eq_test(conds: &HashMap<u32, Core>, cv: u32) -> Option<(u32, i64)> {
+    match conds.get(&cv)? {
+        Core::Cmp(mithril_front::ast::CmpOp::Eq, a, b) => match (&**a, &**b) {
+            (Core::Var(v), Core::Num(k)) | (Core::Num(k), Core::Var(v)) => Some((*v, *k)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The 0/1 condition of reaching a leaf along `path`. In a chain of
+/// equality tests of one variable against distinct constants, reaching a
+/// taken test implies every earlier test failed: its own test suffices.
+fn path_cond(path: &[(u32, bool)], conds: &HashMap<u32, Core>) -> Core {
+    if let Some((last, true)) = path.last() {
+        if let Some((v, k)) = eq_test(conds, *last) {
+            let mut ks = vec![k];
+            let chain = path[..path.len() - 1].iter().all(|(cv, taken)| {
+                !taken && eq_test(conds, *cv).is_some_and(|(w, j)| {
+                    ks.push(j);
+                    w == v
+                })
+            });
+            ks.sort_unstable();
+            ks.dedup();
+            if chain && ks.len() == path.len() {
+                return Core::Var(*last);
+            }
+        }
+    }
+    let lit = |(cv, taken): &(u32, bool)| {
+        if *taken {
+            Core::Var(*cv)
+        } else {
+            Core::Op2(mithril_front::ast::BinOp::BitXor, Box::new(Core::Var(*cv)), Box::new(Core::Num(1)))
+        }
+    };
+    let mut it = path.iter();
+    let first = it.next().map(lit).unwrap_or(Core::Num(1));
+    it.fold(first, |acc, l| Core::Op2(mithril_front::ast::BinOp::BitAnd, Box::new(acc), Box::new(lit(l))))
+}
+
+/// The select for one argument position across the leaves.
+fn select_arg(leaves: &[Leaf], j: usize, conds: &HashMap<u32, Core>) -> Core {
+    let first = &leaves[0].1[j];
+    if leaves.iter().all(|(_, a)| a[j] == *first) {
+        return first.clone();
+    }
+    // one leaf differs from a value shared by all the others
+    for (i, (p, a)) in leaves.iter().enumerate() {
+        let others: Vec<&Core> = leaves.iter().enumerate().filter(|(k, _)| *k != i).map(|(_, (_, b))| &b[j]).collect();
+        if others.iter().all(|o| **o == *others[0]) && *others[0] != a[j] {
+            return Core::If(Box::new(path_cond(p, conds)), Box::new(a[j].clone()), Box::new(others[0].clone()));
+        }
+    }
+    // general case: nest by leaf path conditions
+    let (last, rest) = leaves.split_last().unwrap();
+    rest.iter().rev().fold(last.1[j].clone(), |acc, (p, a)| {
+        Core::If(Box::new(path_cond(p, conds)), Box::new(a[j].clone()), Box::new(acc))
+    })
+}
+
+/// Bindings on the longest straight path from an arm's root to its call.
+fn arm_lets(e: &Core) -> usize {
+    match e {
+        Core::Let(_, _, b) => 1 + arm_lets(b),
+        Core::If(_, t, f) => arm_lets(t).max(arm_lets(f)),
+        _ => 0,
+    }
+}
+
+/// Apply if-conversion at every tail-position if-tree of every function
+/// whose leaves are the function's own loop back-edge (a self tail call)
+/// and whose arms are cheap: speculating a heavy arm, or converting a
+/// predictable branch outside a loop, costs more than the branch.
+pub(crate) fn if_convert(m: &CoreModule) -> CoreModule {
+    let tys = crate::ty::infer(m);
+    // selects are for plain ints: choosing between boxed values would
+    // need reference copies of both candidates
+    fn int_expr(e: &Core, fid: u32, tys: &crate::ty::Types) -> bool {
+        match e {
+            Core::Num(_) | Core::Cmp(..) => true,
+            Core::Var(v) => tys.var(fid as usize, *v) == crate::ty::Ty::Int,
+            Core::Op2(_, a, b) => int_expr(a, fid, tys) && int_expr(b, fid, tys),
+            Core::If(_, t, f) => int_expr(t, fid, tys) && int_expr(f, fid, tys),
+            _ => false,
+        }
+    }
+    fn tail(e: &Core, next: &mut u32, fid: u32, tys: &crate::ty::Types) -> Core {
+        let tail = |e: &Core, next: &mut u32| tail(e, next, fid, tys);
+        match e {
+            Core::Let(x, r, b) => Core::Let(*x, r.clone(), Box::new(tail(b, next))),
+            Core::If(c, t, f) => {
+                let mut budget = IFCONV_LETS;
+                let mut n2 = *next;
+                let mut conds = HashMap::new();
+                let cheap = arm_lets(t) <= IFCONV_ARM && arm_lets(f) <= IFCONV_ARM;
+                let conv = if cheap { ifconv(e, &mut n2, &mut budget, &mut Vec::new(), &mut conds) } else { None };
+                let ints_only = |leaves: &Vec<Leaf>| {
+                    (0..leaves[0].1.len()).all(|j| {
+                        leaves.iter().all(|(_, a)| a[j] == leaves[0].1[j])
+                            || leaves.iter().all(|(_, a)| int_expr(&a[j], fid, tys))
+                    })
+                };
+                if let Some((lets, g, leaves)) = conv.filter(|(_, g, l)| *g == fid && ints_only(l)) {
+                    *next = n2;
+                    let args: Vec<Core> = (0..leaves[0].1.len()).map(|j| select_arg(&leaves, j, &conds)).collect();
+                    let mut out = Core::Call(g, args);
+                    for (v, r) in lets.into_iter().rev() {
+                        out = Core::Let(v, Box::new(r), Box::new(out));
+                    }
+                    return out;
+                }
+                Core::If(c.clone(), Box::new(tail(t, next)), Box::new(tail(f, next)))
+            }
+            Core::Match(s, arms) => {
+                Core::Match(s.clone(), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), tail(b, next))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let mut out = m.clone();
+    for (fid, f) in out.fns.iter_mut().enumerate() {
+        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
+        f.body = tail(&f.body, &mut next, fid as u32, &tys);
+    }
+    out
+}

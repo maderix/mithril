@@ -32,18 +32,24 @@ pub(crate) struct Ranges {
     vars: HashMap<u32, Iv>,
     /// let-bound vars every use of which is `var & c` (small nonneg c)
     masked: HashSet<u32>,
+    /// ... with `c < 2^32`
+    masked32: HashSet<u32>,
 }
 
 impl Ranges {
     pub(crate) fn of(body: &Core) -> Ranges {
-        let mut r = Ranges { vars: HashMap::new(), masked: HashSet::new() };
+        let mut r = Ranges { vars: HashMap::new(), masked: HashSet::new(), masked32: HashSet::new() };
         r.collect(body);
         let mut all = HashMap::new();
         let mut under_mask = HashMap::new();
-        count(body, &mut all, &mut under_mask);
+        let mut under_mask32 = HashMap::new();
+        count(body, &mut all, &mut under_mask, &mut under_mask32);
         for (v, n) in all {
             if n > 0 && under_mask.get(&v) == Some(&n) {
                 r.masked.insert(v);
+            }
+            if n > 0 && under_mask32.get(&v) == Some(&n) {
+                r.masked32.insert(v);
             }
         }
         r
@@ -111,11 +117,27 @@ impl Ranges {
     pub(crate) fn masked(&self, x: u32) -> bool {
         self.masked.contains(&x)
     }
+
+    /// ... through masks below 2^32.
+    pub(crate) fn masked32(&self, x: u32) -> bool {
+        self.masked32.contains(&x)
+    }
 }
 
 /// `low` flag for the left operand of `Op2(op, _, b)`.
 pub(crate) fn feeds_mask(op: &BinOp, b: &Core) -> bool {
     *op == BinOp::BitAnd && low_mask(b)
+}
+
+/// The left operand of `Op2(op, _, b)` is only observed in its low 32 bits.
+pub(crate) fn feeds_mask32(op: &BinOp, b: &Core) -> bool {
+    *op == BinOp::BitAnd && matches!(b, Core::Num(c) if (0..=u32::MAX as i64).contains(c))
+}
+
+/// Ops whose low 32 result bits depend only on the low 32 bits of their
+/// operands (for `Shl`: of its left operand).
+pub(crate) fn low32_closed(op: &BinOp) -> bool {
+    matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
 }
 
 fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
@@ -175,7 +197,7 @@ fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
 }
 
 /// All uses of each var, and uses of the form `var & small_mask`.
-fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usize>) {
+fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usize>, m32: &mut HashMap<u32, usize>) {
     match e {
         Core::Var(i) => *all.entry(*i).or_insert(0) += 1,
         Core::Op2(op, a, b) => {
@@ -183,31 +205,34 @@ fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usiz
                 if feeds_mask(op, b) {
                     *masked.entry(*i).or_insert(0) += 1;
                 }
+                if feeds_mask32(op, b) {
+                    *m32.entry(*i).or_insert(0) += 1;
+                }
             }
-            count(a, all, masked);
-            count(b, all, masked);
+            count(a, all, masked, m32);
+            count(b, all, masked, m32);
         }
         Core::Cmp(_, a, b) => {
-            count(a, all, masked);
-            count(b, all, masked);
+            count(a, all, masked, m32);
+            count(b, all, masked, m32);
         }
         Core::If(c, t, f) => {
-            count(c, all, masked);
-            count(t, all, masked);
-            count(f, all, masked);
+            count(c, all, masked, m32);
+            count(t, all, masked, m32);
+            count(f, all, masked, m32);
         }
         Core::Let(_, r, b) => {
-            count(r, all, masked);
-            count(b, all, masked);
+            count(r, all, masked, m32);
+            count(b, all, masked, m32);
         }
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => {
-            xs.iter().for_each(|x| count(x, all, masked))
+            xs.iter().for_each(|x| count(x, all, masked, m32))
         }
         Core::Match(s, arms) => {
-            count(s, all, masked);
-            arms.iter().for_each(|(_, _, b)| count(b, all, masked));
+            count(s, all, masked, m32);
+            arms.iter().for_each(|(_, _, b)| count(b, all, masked, m32));
         }
-        Core::Proj(a, _) => count(a, all, masked),
+        Core::Proj(a, _) => count(a, all, masked, m32),
         Core::Num(_) | Core::Flo(_) => {}
     }
 }

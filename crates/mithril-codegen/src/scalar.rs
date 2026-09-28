@@ -286,6 +286,19 @@ fn proj_shape(e: &Core, p: u32, bare: &mut bool, max: &mut i64) {
     }
 }
 
+thread_local! {
+    /// Scalar signatures of the module being emitted, for direct calls
+    /// from dive code (`native_sig`).
+    pub(crate) static SIGS: std::cell::RefCell<Vec<Option<Sig>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The signature of `g` when dive code may call its native form directly:
+/// scalar-lowered, all-int parameters, and never suspending (a forking
+/// scalar function keeps a dive form of its own and is not included).
+pub(crate) fn native_sig(g: u32) -> Option<Sig> {
+    SIGS.with(|s| s.borrow().get(g as usize).cloned().flatten()).filter(|s| s.params.iter().all(|p| *p == PTy::I))
+}
+
 /// A tuple param's component count cannot be read off the body alone (a
 /// caller may pass a wider tuple); seed with maxproj+1 and demote on caller
 /// mismatch. Bare use of a param whose callers pass tuples also demotes.
@@ -370,6 +383,8 @@ struct Sem<'m> {
     ranges: crate::range::Ranges,
     /// the Op2 about to be emitted only has its low bits observed
     low: bool,
+    /// ... only its low 32 bits
+    low32: bool,
     tmp: u32,
     /// component vars (SK-destructured lets and T(k) params): var -> arity;
     /// components live as q<var>_<i>
@@ -435,6 +450,7 @@ impl<'m> Sem<'m> {
             return;
         }
         self.low = self.ranges.masked(x);
+        self.low32 = self.ranges.masked32(x);
         let er = self.val(r, b);
         b.push_str(&format!("let v{x} = {er};\n"));
     }
@@ -468,6 +484,7 @@ impl<'m> Sem<'m> {
 
     fn val(&mut self, e: &Core, b: &mut String) -> String {
         let low = std::mem::take(&mut self.low);
+        let low32 = std::mem::take(&mut self.low32);
         match e {
             Core::Num(n) => format!("{n}i64"),
             Core::Var(i) => format!("v{i}"),
@@ -475,8 +492,31 @@ impl<'m> Sem<'m> {
                 Core::Var(t) if self.tvars.contains_key(t) => format!("q{t}_{i}"),
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
+            Core::Op2(op, x, y) if low32 && crate::range::low32_closed(op) => {
+                // only the low 32 bits are observed: compute in u32 (the
+                // port's `& 0xFFFFFFFF` masks become free)
+                self.low32 = true;
+                self.low = true;
+                let ex = self.val(x, b);
+                self.low32 = *op != mithril_front::ast::BinOp::Shl;
+                self.low = *op != mithril_front::ast::BinOp::Shl;
+                let ey = self.val(y, b);
+                let t = self.fresh();
+                let body = match bin_code(op) {
+                    0 => format!("({ex} as u32).wrapping_add({ey} as u32)"),
+                    1 => format!("({ex} as u32).wrapping_sub({ey} as u32)"),
+                    2 => format!("({ex} as u32).wrapping_mul({ey} as u32)"),
+                    6 => format!("({ex} as u32).wrapping_shl({ey} as u32)"),
+                    8 => format!("({ex} as u32) & ({ey} as u32)"),
+                    9 => format!("({ex} as u32) | ({ey} as u32)"),
+                    _ => format!("({ex} as u32) ^ ({ey} as u32)"),
+                };
+                b.push_str(&format!("let {t} = ({body}) as i64;\n"));
+                t
+            }
             Core::Op2(op, x, y) => {
                 self.low = crate::range::feeds_mask(op, y);
+                self.low32 = crate::range::feeds_mask32(op, y);
                 let ex = self.val(x, b);
                 let ey = self.val(y, b);
                 let t = self.fresh();
@@ -613,7 +653,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             tv.insert(p as u32, *k);
         }
     }
-    let mut sem = Sem { sigs, ranges: crate::range::Ranges::of(&f.body), low: false, tmp: 0, tvars: tv };
+    let mut sem = Sem { sigs, ranges: crate::range::Ranges::of(&f.body), low: false, low32: false, tmp: 0, tvars: tv };
     let mut bb = String::new();
     sem.tail(&f.body, fid, lp, &mut bb);
     // one fuel unit per call and loop iteration, as in the dive form: native

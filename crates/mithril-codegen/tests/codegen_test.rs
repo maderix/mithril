@@ -422,3 +422,24 @@ fn unfolding_and_wrap_elision_match_oracle() {
     let ft = cm.fns.iter().position(|f| f.name == "ftree").unwrap();
     assert!(dive_form(&cm, &rs, "ftree").contains(&format!("d_{ft}(ctx, fuel")), "ftree has no splittable dive form");
 }
+
+// ---- if-conversion, native scalar calls, 32-bit narrowing ----
+
+#[test]
+fn ifconv_native_calls_and_narrowing_match_oracle() {
+    let (cm, rs) = trmc_golden("ifconv_native.py");
+    let bins = cm.fns.iter().position(|f| f.name.starts_with("__for")).expect("loop helper");
+    let s = &rs[rs.find(&format!("fn s_{bins}(")).expect("loop is scalar")..];
+    let s = &s[..s.find("\nfn ").unwrap_or(s.len())];
+    // the if/elif accumulator update became selects: one back-edge
+    assert_eq!(s.matches("continue 'l").count(), 1, "if/elif in the loop was not if-converted");
+    // masked arithmetic is computed in 32 bits
+    assert!(s.contains("as u32).wrapping_mul("), "masked products are not narrowed");
+    // the dive-form caller destructures the native tuple (no heap tuple)
+    let leaf = dive_form(&cm, &rs, "leaf");
+    let b = cm.fns.iter().position(|f| f.name == "bins").unwrap();
+    assert!(leaf.contains(&format!(") = s_{b}(fuel")), "leaf does not call bins natively");
+    assert!(!leaf.contains("field(ctx"), "leaf reads its tuple from the heap");
+    // a branch choosing between boxed subtrees is not if-converted
+    assert_eq!(dive_form(&cm, &rs, "pick").matches("continue 'l").count(), 2, "pick's subtree choice became a select");
+}
