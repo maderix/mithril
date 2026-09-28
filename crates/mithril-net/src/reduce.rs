@@ -575,7 +575,7 @@ fn alloc_val(net: &mut Net, v: &Val) -> Port {
             let ps: Vec<Port> = items.iter().map(|f| alloc_val(net, f)).collect();
             crate::con_alloc(net, CTAG_TUPLE, &ps)
         }
-        Val::A(_) => panic!("ICE: an array value at compile time"),
+        Val::A(_) | Val::L(..) => panic!("ICE: an array or closure value at compile time"),
     }
 }
 
@@ -605,5 +605,7 @@ fn max_var(e: &Core) -> u32 {
             m
         }
         Core::Proj(a, _) => max_var(a),
+        Core::Lam(x, b) => (*x).max(max_var(b)),
+        Core::App(f, a) => max_var(f).max(max_var(a)),
     }
 }

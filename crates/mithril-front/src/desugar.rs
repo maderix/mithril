@@ -250,7 +250,24 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         Expr::Int(n) => Ok(Core::Num(*n)),
         Expr::Float(n) => Ok(Core::Flo(*n)),
         Expr::Bool(b) => Ok(Core::Num(if *b { 1 } else { 0 })),
-        Expr::Var(n) => Ok(Core::Var(scope.get(n)?)),
+        Expr::Var(n) => match scope.get(n) {
+            Ok(v) => Ok(Core::Var(v)),
+            // a top-level function used as a value: eta-expanded to a
+            // (curried) closure over its arity
+            Err(e) => match t.fn_table.get(n) {
+                Some(&fid) => {
+                    let arity = t.fn_arity[fid as usize];
+                    let mut s = scope.clone();
+                    let params: Vec<u32> = (0..arity).map(|_| s.fresh_anon()).collect();
+                    let mut body = Core::Call(fid, params.iter().map(|p| Core::Var(*p)).collect());
+                    for p in params.into_iter().rev() {
+                        body = Core::Lam(p, Box::new(body));
+                    }
+                    Ok(body)
+                }
+                None => Err(e),
+            },
+        },
         Expr::Bin(op, a, b) => {
             Ok(Core::Op2(*op, Box::new(compile_expr(a, scope, t)?), Box::new(compile_expr(b, scope, t)?)))
         }
@@ -274,7 +291,15 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         }
         Expr::Call(name, args) => {
             let cargs: Vec<Core> = args.iter().map(|a| compile_expr(a, scope, t)).collect::<Result<_, _>>()?;
-            if let Some(&(cid, arity)) = t.ctor_table.get(name) {
+            if let Ok(f) = scope.get(name) {
+                // a local variable applied: a closure call, one argument
+                // at a time
+                let mut e = Core::Var(f);
+                for a in cargs {
+                    e = Core::App(Box::new(e), Box::new(a));
+                }
+                Ok(e)
+            } else if let Some(&(cid, arity)) = t.ctor_table.get(name) {
                 if cargs.len() != arity {
                     return Err(Diag::new(0, format!("constructor '{}' expects {} arg(s), got {}", name, arity, cargs.len())));
                 }
@@ -299,7 +324,16 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
             Expr::Int(n) if *n >= 0 => Ok(Core::Proj(Box::new(compile_expr(base, scope, t)?), *n as usize)),
             _ => Err(Diag::new(0, "tuple index must be a non-negative integer literal")),
         },
-        Expr::Lambda(..) => Err(Diag::new(0, "lambda expressions are not supported by desugar (reserved for a later task)")),
+        Expr::Lambda(params, body) => {
+            // curried: each parameter is a fresh variable of an inner scope
+            let mut s = scope.clone();
+            let idxs: Vec<u32> = params.iter().map(|p| { s.bool_vars.remove(p); s.fresh(p) }).collect();
+            let mut e = compile_expr(body, &s, t)?;
+            for i in idxs.into_iter().rev() {
+                e = Core::Lam(i, Box::new(e));
+            }
+            Ok(e)
+        }
     }
 }
 
@@ -724,5 +758,10 @@ fn walk_tail(fid: FnId, c: &Core, is_tail: bool, ok: &mut bool) {
             }
         }
         Core::Proj(e, _) => walk_tail(fid, e, false, ok),
+        Core::Lam(_, b) => walk_tail(fid, b, false, ok),
+        Core::App(f, a) => {
+            walk_tail(fid, f, false, ok);
+            walk_tail(fid, a, false, ok);
+        }
     }
 }

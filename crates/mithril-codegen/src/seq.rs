@@ -646,6 +646,7 @@ impl<'m> Ex<'m> {
     /// (temp name, local, or literal) holding the value.
     pub fn val(&mut self, e: &Core, esc: bool, b: &mut String) -> String {
         match e {
+            Core::Lam(..) | Core::App(..) => panic!("closures are not lowered to the dive form yet (Phase B)"),
             Core::Prim(p, args) => {
                 use mithril_front::core::Prim;
                 let t = self.fresh();
@@ -983,6 +984,8 @@ impl<'m> Ex<'m> {
                 }
                 Core::Proj(b, _) => binders(b, out),
                 Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+                Core::Lam(_, b) => binders(b, out),
+                Core::App(f_, a_) => { binders(f_, out); binders(a_, out); }
             }
         }
         let mut inner: HashSet<u32> = arm_binders.iter().copied().collect();
@@ -1473,6 +1476,8 @@ pub(crate) fn reuse_var(body: &Core, sv: &str) -> Option<u32> {
             Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| has(x, v)),
             Core::Proj(b, _) => has(b, v),
             Core::Match(s, arms) => has(s, v) || arms.iter().any(|(_, _, b)| has(b, v)),
+            Core::Lam(_, b) => has(b, v),
+            Core::App(f_, a_) => has(f_, v) || has(a_, v),
         }
     }
     if has(body, v) { Some(v) } else { None }
@@ -1723,6 +1728,8 @@ pub(crate) fn dps_param(fid: u32, f: &mut dyn FnMut(u32) -> bool, body: &Core, a
             Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|x| calls_ok(fid, x, f)),
             Core::Match(s, arms) => calls_ok(fid, s, f) && arms.iter().all(|(_, _, b)| calls_ok(fid, b, f)),
             Core::Proj(a, _) => calls_ok(fid, a, f),
+            Core::Lam(_, a) => calls_ok(fid, a, f),
+            Core::App(f_, a_) => calls_ok(fid, f_, f) || calls_ok(fid, a_, f),
         }
     }
     // tails: Var(p), or `x = self(.., Var(p), ..)` delayed
@@ -1899,5 +1906,7 @@ pub(crate) fn only_projected(x: u32, e: &Core) -> bool {
         Core::Let(_, r, b) => only_projected(x, r) && only_projected(x, b),
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|a| only_projected(x, a)),
         Core::Match(s, arms) => only_projected(x, s) && arms.iter().all(|(_, _, a)| only_projected(x, a)),
+        Core::Lam(_, a) => matches!(&**a, Core::Var(_)) || only_projected(x, a),
+        Core::App(f_, a_) => matches!(&**f_, Core::Var(_)) || only_projected(x, f_) || matches!(&**a_, Core::Var(_)) || only_projected(x, a_),
     }
 }

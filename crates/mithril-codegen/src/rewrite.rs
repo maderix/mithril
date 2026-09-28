@@ -29,6 +29,8 @@ pub(crate) fn size(e: &Core) -> usize {
         }
         Core::Proj(b, _) => 1 + size(b),
         Core::Match(s, arms) => 1 + size(s) + arms.iter().map(|(_, _, b)| size(b)).sum::<usize>(),
+        Core::Lam(_, b) => 1 + size(b),
+        Core::App(f_, a_) => 1 + size(a_) + size(f_),
     }
 }
 
@@ -60,6 +62,8 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
             }
             Core::Proj(b, _) => calls_of(b, out),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, b) => calls_of(b, out),
+            Core::App(f_, a_) => { calls_of(f_, out); calls_of(a_, out); }
         }
     }
     let leaf: Vec<bool> = m.fns.iter().map(|f| !has_call(&f.body)).collect();
@@ -139,6 +143,8 @@ fn shift_binders(e: &Core, shift: u32, arity: u32, map: &HashMap<u32, u32>) -> C
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
         Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(shift_binders(b, shift, arity, map)), *i),
+        Core::Lam(x, b) => Core::Lam(mv(*x), Box::new(shift_binders(b, shift, arity, map))),
+        Core::App(f, a) => Core::App(Box::new(shift_binders(f, shift, arity, map)), Box::new(shift_binders(a, shift, arity, map))),
         Core::Match(s, arms) => Core::Match(
             Box::new(shift_binders(s, shift, arity, map)),
             arms.iter()
@@ -177,6 +183,8 @@ fn count_uses(e: &Core, m: &mut HashMap<u32, u32>) {
             count_uses(s, m);
             arms.iter().for_each(|(_, _, b)| count_uses(b, m));
         }
+        Core::Lam(_, b) => count_uses(b, m),
+        Core::App(f_, a_) => { count_uses(f_, m); count_uses(a_, m); }
     }
 }
 
@@ -251,6 +259,9 @@ fn val(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
         Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| val(x, cx, avail)).collect()),
         Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| val(x, cx, avail)).collect()),
         Core::Proj(b, i) => Core::Proj(Box::new(val(b, cx, avail)), *i),
+        // a closure body is another scope: no reuse token crosses into it
+        Core::Lam(x, b) => Core::Lam(*x, Box::new(val(b, cx, &mut Vec::new()))),
+        Core::App(f, a) => Core::App(Box::new(val(f, cx, avail)), Box::new(val(a, cx, avail))),
         Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| val(x, cx, avail)).collect()),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
     }
@@ -455,6 +466,8 @@ fn tree_ops(e: &Core) -> usize {
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(tree_ops).sum::<usize>(),
         Core::Match(s, arms) => tree_ops(s) + arms.iter().map(|(_, _, b)| tree_ops(b)).sum::<usize>(),
         Core::Proj(a, _) => 1 + tree_ops(a),
+        Core::Lam(_, a) => 1 + tree_ops(a),
+        Core::App(f_, a_) => 1 + tree_ops(a_) + tree_ops(f_),
     }
 }
 

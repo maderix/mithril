@@ -74,6 +74,7 @@ impl Types {
                 }
             },
             Core::Match(..) => Ty::Dyn, // not needed by emitters (arms carry it)
+            Core::Lam(..) | Core::App(..) => Ty::Dyn,
         }
     }
 }
@@ -355,6 +356,22 @@ impl Inf {
             Core::Proj(b, i) => {
                 let tb = self.walk(fid, b, env);
                 self.proj(tb, *i)
+            }
+            // closures: untyped here (Dyn); the body is walked so its
+            // first-order parts get their types
+            Core::Lam(x, b) => {
+                let tx = self.uf.fresh();
+                if env.len() <= *x as usize {
+                    env.resize(*x as usize + 1, u32::MAX);
+                }
+                env[*x as usize] = tx;
+                let _ = self.walk(fid, b, env);
+                self.uf.fresh()
+            }
+            Core::App(f, a) => {
+                let _ = self.walk(fid, f, env);
+                let _ = self.walk(fid, a, env);
+                self.uf.fresh()
             }
             Core::Prim(p, args) => {
                 use mithril_front::core::Prim;

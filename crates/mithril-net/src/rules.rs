@@ -412,6 +412,7 @@ fn mat_rule(net: &mut Net, prog: &NetProg, mat: Port, con: Port) {
 /// kept only for net-level completeness.
 fn dup_rule(net: &mut Net, dup: Port, val: Port) {
     let d = dup_addr(dup);
+    let label = dup_label(dup);
     let c = net.cell(d);
     net.free_cell(d);
     let (o1, o2) = (Port(c[0]), Port(c[1]));
@@ -435,7 +436,7 @@ fn dup_rule(net: &mut Net, dup: Port, val: Port) {
                 let w1 = wire(net);
                 let w2 = wire(net);
                 let df = net.alloc(w1, w2);
-                link(net, dup_port(df), f);
+                link(net, dup_port(df, label), f);
                 fa.push(w1);
                 fb.push(w2);
             }
@@ -452,9 +453,9 @@ fn dup_rule(net: &mut Net, dup: Port, val: Port) {
             let l1 = net.alloc(wp1, wb1);
             let l2 = net.alloc(wp2, wb2);
             let db = net.alloc(wb1, wb2);
-            link(net, dup_port(db), Port(cl[1])); // copy the body
+            link(net, dup_port(db, label), Port(cl[1])); // copy the body
             let su = net.alloc(wp1, wp2);
-            link(net, dup_port(su), Port(cl[0])); // param superposition
+            link(net, dup_port(su, label), Port(cl[0])); // param superposition
             link(net, Port::new(Tag::Lam, l1 as u64), o1);
             link(net, Port::new(Tag::Lam, l2 as u64), o2);
         }
@@ -479,7 +480,7 @@ fn dup_commute(net: &mut Net, dup: Port, agent: Port) {
     let split = |net: &mut Net, p: Port| -> (Port, Port) {
         let (w1, w2) = (wire(net), wire(net));
         let nd = net.alloc(w1, w2);
-        link(net, Port::new(Tag::Dup, ((nd as u64) << 16) | label as u64), p);
+        link(net, dup_port(nd, label), p);
         (w1, w2)
     };
     match agent.tag() {
@@ -547,17 +548,30 @@ fn dup_commute(net: &mut Net, dup: Port, agent: Port) {
     }
 }
 
-/// DUP–DUP with the same label: annihilate (wires cross-connect). v1 has a
-/// single label class, so differing labels are an ICE, not a commute.
+/// DUP–DUP: the same label (the two halves of one copy meeting again)
+/// annihilate, wires cross-connect; different labels commute, each dup
+/// passing through the other (four dups, the copies of `a` carry b's
+/// label and vice versa).
 fn dup_dup(net: &mut Net, a: Port, b: Port) {
-    if dup_label(a) != dup_label(b) {
-        panic!("ICE: Dup–Dup with distinct labels {}/{} (no commute rule in v1)", dup_label(a), dup_label(b));
-    }
     let (ia, ib) = (dup_addr(a), dup_addr(b));
+    let (la, lb) = (dup_label(a), dup_label(b));
     let ca = net.cell(ia);
     let cb = net.cell(ib);
     net.free_cell(ia);
     net.free_cell(ib);
-    link(net, Port(ca[0]), Port(cb[0]));
-    link(net, Port(ca[1]), Port(cb[1]));
+    if la == lb {
+        link(net, Port(ca[0]), Port(cb[0]));
+        link(net, Port(ca[1]), Port(cb[1]));
+        return;
+    }
+    let w: Vec<Port> = (0..4).map(|_| wire(net)).collect();
+    // a's outputs each receive a b-labelled dup; b's outputs an a-labelled one
+    let b1 = net.alloc(w[0], w[1]);
+    let b2 = net.alloc(w[2], w[3]);
+    let a1 = net.alloc(w[0], w[2]);
+    let a2 = net.alloc(w[1], w[3]);
+    link(net, dup_port(b1, lb), Port(ca[0]));
+    link(net, dup_port(b2, lb), Port(ca[1]));
+    link(net, dup_port(a1, la), Port(cb[0]));
+    link(net, dup_port(a2, la), Port(cb[1]));
 }

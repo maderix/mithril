@@ -36,6 +36,11 @@ pub enum Core {
     Proj(Box<Core>, usize),
     /// A builtin with value semantics (see `Prim`).
     Prim(Prim, Vec<Core>),
+    /// A closure: one parameter (multi-parameter lambdas are curried by
+    /// desugar), free variables are the enclosing scope's `Var`s.
+    Lam(u32, Box<Core>),
+    /// Application of a closure value to one argument.
+    App(Box<Core>, Box<Core>),
 }
 
 /// Builtins. Arrays are values: `ArrSet` yields a new array (the compiled
@@ -159,6 +164,8 @@ pub enum Val {
     C(CtorId, Vec<Val>),
     T(Vec<Val>),
     A(Vec<Val>),
+    /// A closure value (oracle only): parameter, body, captured environment.
+    L(u32, Box<Core>, Vec<(u32, Val)>),
 }
 
 /// Wrap a 64-bit result down to the signed 56-bit `int` range, matching
@@ -287,6 +294,23 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
                 }
             }
             panic!("eval_core: no match arm for ctor {}", cid);
+        }
+        Core::Lam(x, body) => {
+            let mut captured: Vec<(u32, Val)> = env.iter().map(|(k, v)| (*k, v.clone())).collect();
+            captured.sort_by_key(|(k, _)| *k);
+            Val::L(*x, body.clone(), captured)
+        }
+        Core::App(f, a) => {
+            let fv = eval(m, env, f);
+            let av = eval(m, env, a);
+            match fv {
+                Val::L(x, body, captured) => {
+                    let mut env2: HashMap<u32, Val> = captured.into_iter().collect();
+                    env2.insert(x, av);
+                    eval(m, &env2, &body)
+                }
+                other => panic!("eval_core: application of a non-closure value {:?}", other),
+            }
         }
         Core::Tuple(items) => Val::T(items.iter().map(|it| eval(m, env, it)).collect()),
         Core::Proj(e, i) => match eval(m, env, e) {

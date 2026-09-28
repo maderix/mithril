@@ -46,7 +46,8 @@ fn has<F: Fn(&Core) -> bool + Copy>(e: &Core, p: F) -> bool {
         Core::If(a, b, c) => has(a, p) || has(b, p) || has(c, p),
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| has(x, p)),
         Core::Match(s, arms) => has(s, p) || arms.iter().any(|(_, _, b)| has(b, p)),
-        Core::Proj(a, _) => has(a, p),
+        Core::Proj(a, _) | Core::Lam(_, a) => has(a, p),
+        Core::App(f, a) => has(f, p) || has(a, p),
     }
 }
 
@@ -131,7 +132,8 @@ fn count<F: Fn(&Core) -> bool + Copy>(e: &Core, p: F) -> usize {
         Core::If(a, b, c) => count(a, p) + count(b, p) + count(c, p),
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| count(x, p)).sum(),
         Core::Match(s, arms) => count(s, p) + arms.iter().map(|(_, _, b)| count(b, p)).sum::<usize>(),
-        Core::Proj(a, _) => count(a, p),
+        Core::Proj(a, _) | Core::Lam(_, a) => count(a, p),
+        Core::App(f, a) => count(f, p) + count(a, p),
     }
 }
 
@@ -283,4 +285,45 @@ fn interpreter_over_a_static_program_specializes_to_its_arithmetic() {
     // the program's own branch on the runtime value is what is left
     assert!(has(r, |c| matches!(c, Core::If(..))), "the program's branch is gone: {r:?}");
     assert!(has(r, |c| matches!(c, Core::Op2(mithril_front::ast::BinOp::Mul, ..))), "the program's arithmetic is gone: {r:?}");
+}
+
+// ---- closures at compile time ----
+
+#[test]
+fn known_closures_apply_and_factories_specialize() {
+    let src = "def mk(k):\n    return lambda x: x * k + 1\n\ndef f(a):\n    g = mk(3)\n    return g(a) + g(2)\n\ndef main():\n    return f(4)\n";
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&s), oracle(&m));
+    let f = body(&s, "f");
+    // mk(3) unfolded, both applications reduced: no closure, no call left
+    assert!(!has(f, |c| matches!(c, Core::Lam(..) | Core::App(..) | Core::Call(..))), "{f:?}");
+    assert!(has(f, |c| matches!(c, Core::Num(7))), "g(2) = 7 not folded: {f:?}");
+}
+
+#[test]
+fn unknown_closure_stays_an_application_and_a_returned_closure_a_lambda() {
+    let src = "def apply(f, x):\n    return f(x) + f(1)\n\ndef adder(k):\n    return lambda x: x + k\n\ndef main():\n    return apply(adder(2), 3)\n";
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&s), oracle(&m));
+    let ap = body(&s, "apply");
+    assert!(has(ap, |c| matches!(c, Core::App(..))), "application of a parameter lost: {ap:?}");
+    let ad = body(&s, "adder");
+    assert!(matches!(ad, Core::Lam(..)), "returned closure not a lambda: {ad:?}");
+}
+
+#[test]
+fn work_free_of_the_parameter_is_bound_outside_the_residual_closure() {
+    // mk(k) with k unknown: heavy(k) stays a call, but it is bound once
+    // outside the lambda (shared by every application), not inside it
+    let src = "def heavy(k):\n    if k < 2:\n        return k\n    return heavy(k - 1) + heavy(k - 2)\n\ndef mk(k):\n    return lambda x: x + heavy(k)\n\ndef main():\n    g = mk(10)\n    return g(1) + g(2)\n";
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&s), oracle(&m));
+    let mk = body(&s, "mk");
+    match mk {
+        Core::Let(_, r, b) => {
+            assert!(matches!(&**r, Core::Call(..)), "heavy not bound outside: {mk:?}");
+            assert!(matches!(&**b, Core::Lam(_, lb) if !has(lb, |c| matches!(c, Core::Call(..)))), "heavy inside the closure: {mk:?}");
+        }
+        other => panic!("expected let heavy in lambda, got {other:?}"),
+    }
 }

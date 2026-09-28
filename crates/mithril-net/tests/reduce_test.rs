@@ -204,17 +204,14 @@ fn shared_ctor_value_dup_con_matches_oracle() {
 // ---- clone discipline ----
 
 #[test]
-fn clone_restriction_lambda_rejected_by_front() {
-    // v1: lambdas are parse-only; desugar rejects them before the net tier,
-    // so the `lambda g: g(g)` double-clone program dies with a front Diag.
+fn clone_restriction_self_application_rejected() {
+    // `lambda g: g(g)` duplicates a value and applies it to itself: the
+    // clone discipline rejects it before the net tier (desugar accepts
+    // lambdas since Phase B)
     let src = "def main():\n    h = lambda g: g(g)\n    return 0\n";
-    let m = parse(src).expect("lambda must parse");
-    let err = desugar(&m).expect_err("desugar must reject lambdas in v1");
-    assert!(
-        err.msg.contains("lambda"),
-        "diag must name the lambda restriction, got: {}",
-        err.msg
-    );
+    let m = cm(src);
+    let err = check_clone_discipline(&m).expect_err("self-application must be rejected");
+    assert!(err.msg.contains("clone"), "diag must name the clone discipline, got: {}", err.msg);
 }
 
 #[test]
@@ -313,7 +310,7 @@ fn dup_num_net_level() {
     let w2 = net.alloc(EMPTY, EMPTY);
     let d = net.alloc(Port::new(Tag::Var, w1 as u64), Port::new(Tag::Var, w2 as u64));
     // Dup payload: addr:40 | label:16 (single label class, label 0).
-    net.redexes.push((Port::new(Tag::Dup, (d as u64) << 16), Port::num(21)));
+    net.redexes.push((mithril_net::dup_port(d, 1), Port::num(21)));
     let n = reduce(&mut net, &m, 10);
     assert_eq!(n, 1);
     assert_eq!(readback(&net, Port::new(Tag::Var, w1 as u64)), Some(Val::I(21)));
@@ -328,7 +325,7 @@ fn dup_dup_same_label_annihilates_net_level() {
     let w2 = net.alloc(EMPTY, EMPTY);
     let d1 = net.alloc(Port::new(Tag::Var, w1 as u64), Port::new(Tag::Var, w2 as u64));
     let d2 = net.alloc(Port::num(7), Port::num(8));
-    net.redexes.push((Port::new(Tag::Dup, (d1 as u64) << 16), Port::new(Tag::Dup, (d2 as u64) << 16)));
+    net.redexes.push((mithril_net::dup_port(d1, 1), mithril_net::dup_port(d2, 1)));
     let n = reduce(&mut net, &m, 10);
     assert_eq!(n, 1, "annihilation is one rewrite");
     assert_eq!(readback(&net, Port::new(Tag::Var, w1 as u64)), Some(Val::I(7)));
@@ -381,7 +378,7 @@ fn unlisted_pair_is_a_named_ice() {
 #[test]
 fn shared_closure_computes_its_free_work_once() {
     use mithril_front::ast::BinOp;
-    use mithril_net::{dup_port, link, list_alloc, op_port, opcode_bin, ref_port, wire};
+    use mithril_net::{dup_port, fresh_label, link, list_alloc, op_port, opcode_bin, ref_port, wire};
     fn fib(k: i64) -> i64 {
         if k < 2 { k } else { fib(k - 1) + fib(k - 2) }
     }
@@ -405,7 +402,8 @@ fn shared_closure_computes_its_free_work_once() {
             let f = if i + 1 < n {
                 let (w1, w2) = (wire(&mut net), wire(&mut net));
                 let d = net.alloc(w1, w2);
-                link(&mut net, dup_port(d), cur);
+                let lbl = fresh_label(&mut net);
+                link(&mut net, dup_port(d, lbl), cur);
                 cur = w2;
                 w1
             } else {
@@ -439,6 +437,49 @@ fn shared_closure_computes_its_free_work_once() {
             let (done, v) = run(n, late);
             assert_eq!(v, Some(Val::I((0..n as i64).map(|i| i + fib(12)).sum())), "n={n} late={late}");
             assert_eq!(done, w + 8 * (n as u64 - 1), "n={n} late={late}: not W + 8(N-1) rewrites");
+        }
+    }
+}
+
+// ---- lambdas from source, through desugar and the net ----
+
+#[test]
+fn source_closures_reduce_to_the_oracle_value() {
+    let srcs = [
+        "def mk(k):\n    return lambda x: x + k\n\ndef main():\n    a = mk(10)\n    b = mk(20)\n    return a(1) + b(2) + a(3)\n",
+        "def sq(x):\n    return x * x\n\ndef twice(f, x):\n    return f(f(x))\n\ndef main():\n    return twice(sq, 3) + twice(lambda y: y + 1, 5)\n",
+        "def compose(f, g):\n    return lambda x: f(g(x))\n\ndef inc(x):\n    return x + 1\n\ndef dbl(x):\n    return x * 2\n\ndef main():\n    h = compose(inc, dbl)\n    return h(h(4))\n",
+        "@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\ndef map(f, l):\n    match l:\n        case Nil():\n            return Nil()\n        case Cons(h, t):\n            return Cons(f(h), map(f, t))\n\ndef sum(l):\n    match l:\n        case Nil():\n            return 0\n        case Cons(h, t):\n            return h + sum(t)\n\ndef main():\n    k = 7\n    return sum(map(lambda x: x * k, Cons(1, Cons(2, Cons(3, Nil())))))\n",
+    ];
+    for src in srcs {
+        let m = cm(src);
+        let want = eval_core(&m, m.main, &[]);
+        let mut net = build(&m);
+        reduce(&mut net, &m, 1 << 22);
+        assert!(net.redexes.is_empty(), "did not quiesce: {src}");
+        assert_eq!(readback(&net, root_port()), Some(want), "{src}");
+    }
+}
+
+#[test]
+fn shared_closure_from_source_computes_its_free_work_once() {
+    // spike-5's W2 from source: heavy(k) under the closure is computed once
+    let src = |n: usize| format!("def heavy(k):\n    if k < 2:\n        return k\n    return heavy(k - 1) + heavy(k - 2)\n\ndef mk(k):\n    return lambda x: x + heavy(k)\n\ndef loop(g, i, acc):\n    if i == 0:\n        return acc\n    return loop(g, i - 1, acc + g(i))\n\ndef main():\n    return loop(mk(12), {n}, 0)\n");
+    fn fib(k: i64) -> i64 {
+        if k < 2 { k } else { fib(k - 1) + fib(k - 2) }
+    }
+    let mut w = 0;
+    for (n, i) in [(1usize, 0), (50, 1), (500, 2)] {
+        let m = cm(&src(n));
+        let mut net = build(&m);
+        let done = reduce(&mut net, &m, 1 << 24);
+        assert!(net.redexes.is_empty());
+        assert_eq!(readback(&net, root_port()), Some(Val::I((1..=n as i64).map(|i| i + fib(12)).sum())));
+        if i == 0 {
+            w = done;
+        } else {
+            // linear in n, far below n * W (heavy once)
+            assert!(done < w + 40 * n as u64, "n={n}: {done} rewrites vs W={w}");
         }
     }
 }

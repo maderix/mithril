@@ -75,6 +75,7 @@ pub fn fmt_val(v: &Val) -> String {
         }
         Val::T(fs) => format!("({})", fs.iter().map(fmt_val).collect::<Vec<_>>().join(", ")),
         Val::A(fs) => format!("[{}]", fs.iter().map(fmt_val).collect::<Vec<_>>().join(", ")),
+        Val::L(..) => "<closure>".to_string(),
     }
 }
 
@@ -120,6 +121,18 @@ fn uniquify(m: &CoreModule) -> CoreModule {
             Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
             Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
             Core::If(c, t, f) => Core::If(Box::new(go(c, env, next)), Box::new(go(t, env, next)), Box::new(go(f, env, next))),
+            Core::Lam(x, b) => {
+                let nx = *next;
+                *next += 1;
+                let saved = env.insert(*x, nx);
+                let b2 = go(b, env, next);
+                match saved {
+                    Some(v) => env.insert(*x, v),
+                    None => env.remove(x),
+                };
+                Core::Lam(nx, Box::new(b2))
+            }
+            Core::App(f, a) => Core::App(Box::new(go(f, env, next)), Box::new(go(a, env, next))),
             Core::Let(x, r, b) => {
                 let r2 = go(r, env, next);
                 let nx = *next;
@@ -663,6 +676,8 @@ pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
                 arms.iter().for_each(|(_, _, b)| callees(b, out));
             }
             Core::Proj(a, _) => callees(a, out),
+            Core::Lam(_, a) => callees(a, out),
+            Core::App(f_, a_) => { callees(f_, out); callees(a_, out); }
         }
     }
     let cs: Vec<std::collections::HashSet<u32>> = m
@@ -718,6 +733,8 @@ pub(crate) fn any_call(e: &Core) -> bool {
         Core::Match(sc, arms) => any_call(sc) || arms.iter().any(|(_, _, b)| any_call(b)),
         Core::Proj(b, _) => any_call(b),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+        Core::Lam(_, b) => any_call(b),
+        Core::App(f_, a_) => any_call(f_) || any_call(a_),
     }
 }
 
@@ -766,6 +783,8 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
             }
             Core::Proj(b, _) => count(b, g, n),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, b) => count(b, g, n),
+            Core::App(f_, a_) => { count(f_, g, n); count(a_, g, n); }
         }
     }
     if !(f.name.starts_with("__while") || f.name.starts_with("__for")) {
@@ -834,6 +853,8 @@ fn callees(e: &Core) -> std::collections::HashSet<u32> {
                 arms.iter().for_each(|(_, _, b)| go(b, out));
             }
             Core::Proj(a, _) => go(a, out),
+            Core::Lam(_, a) => go(a, out),
+            Core::App(f_, a_) => { go(f_, out); go(a_, out); }
         }
     }
     let mut out = std::collections::HashSet::new();
@@ -853,6 +874,8 @@ fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
             Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| n(fid, x)).sum(),
             Core::Match(s, arms) => n(fid, s) + arms.iter().map(|(_, _, b)| n(fid, b)).sum::<usize>(),
             Core::Proj(a, _) => n(fid, a),
+            Core::Lam(_, a) => n(fid, a),
+            Core::App(f_, a_) => n(fid, a_) + n(fid, f_),
         }
     }
     !f.self_tail_rec && n(fid, &f.body) >= 2
@@ -868,6 +891,8 @@ pub(crate) fn has_call(e: &Core) -> bool {
         Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
+        Core::Lam(_, a) => has_call(a),
+        Core::App(f_, a_) => has_call(f_) || has_call(a_),
     }
 }
 
@@ -903,6 +928,8 @@ pub(crate) fn max_var(e: &Core) -> u32 {
                 }
             }
             Core::Proj(a, _) => go(a, m),
+            Core::Lam(_, a) => go(a, m),
+            Core::App(f_, a_) => { go(f_, m); go(a_, m); }
         }
     }
     let mut m = 0;
@@ -949,6 +976,8 @@ pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
                 }
             }
             Core::Proj(a, _) => go(a, bound, out),
+            Core::Lam(_, a) => go(a, bound, out),
+            Core::App(f_, a_) => { go(f_, bound, out); go(a_, bound, out); }
         }
     }
     let mut out = BTreeSet::new();
@@ -989,6 +1018,8 @@ pub(crate) fn cnt_expr(e: &Core, m: &mut Cnt) {
             }
         }
         Core::Proj(a, _) => cnt_expr(a, m),
+        Core::Lam(_, a) => cnt_expr(a, m),
+        Core::App(f_, a_) => { cnt_expr(f_, m); cnt_expr(a_, m); }
     }
 }
 
@@ -1090,6 +1121,8 @@ fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::H
             Core::Call(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| builds(x, ar, m)),
             Core::Match(s, arms) => builds(s, ar, m) || arms.iter().any(|(_, _, b)| builds(b, ar, m)),
             Core::Proj(a, _) => builds(a, ar, m),
+            Core::Lam(_, a) => builds(a, ar, m),
+            Core::App(f_, a_) => builds(f_, ar, m) || builds(a_, ar, m),
         }
     }
     fn go(e: &Core, p: u32, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
@@ -1112,6 +1145,8 @@ fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::H
             Core::Let(_, r, b) => go(r, p, m) || go(b, p, m),
             Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| go(x, p, m)),
             Core::Proj(a, _) => go(a, p, m),
+            Core::Lam(_, a) => go(a, p, m),
+            Core::App(f_, a_) => go(f_, p, m) || go(a_, p, m),
         }
     }
     go(body, p, m, unbox)
@@ -1232,6 +1267,8 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                 }
             }
             Core::Proj(a, _) => walk(a, mask, esc, bor),
+            Core::Lam(_, a) => walk(a, mask, esc, bor),
+            Core::App(f_, a_) => { walk(f_, mask, esc, bor); walk(a_, mask, esc, bor); }
         }
     }
     walk(body, &mut mask, &mut esc, bor);
@@ -1279,6 +1316,8 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
                 }
             }
             Core::Proj(a, _) => walk(a, s),
+            Core::Lam(_, a) => walk(a, s),
+            Core::App(f_, a_) => { walk(f_, s); walk(a_, s); }
         }
     }
     walk(body, &mut s);

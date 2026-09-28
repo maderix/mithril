@@ -198,6 +198,7 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
             Core::Tuple(items.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
         Core::Proj(a, i) => Core::Proj(Box::new(norm_pure(a, c, lets)), *i),
+        Core::Lam(..) | Core::App(..) => panic!("closures are not lowered to the rule form yet (Phase B)"),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
     }
 }

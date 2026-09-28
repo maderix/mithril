@@ -76,6 +76,8 @@ fn has_call(e: &Core) -> bool {
         Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => args.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
+        Core::Lam(_, a) => has_call(a),
+        Core::App(f_, a_) => has_call(f_) || has_call(a_),
     }
 }
 
@@ -117,6 +119,8 @@ fn free_vars(e: &Core, bound: &mut Vec<u32>, acc: &mut BTreeSet<u32>) {
             }
         }
         Core::Proj(a, _) => free_vars(a, bound, acc),
+        Core::Lam(_, a) => free_vars(a, bound, acc),
+        Core::App(f_, a_) => { free_vars(f_, bound, acc); free_vars(a_, bound, acc); }
     }
 }
 
@@ -153,6 +157,8 @@ fn max_var(e: &Core, mx: &mut u32) {
             }
         }
         Core::Proj(a, _) => max_var(a, mx),
+        Core::Lam(_, a) => max_var(a, mx),
+        Core::App(f_, a_) => { max_var(f_, mx); max_var(a_, mx); }
     }
 }
 
@@ -272,6 +278,7 @@ impl Em {
                 tv
             }
             Core::Prim(..) => panic!("gpu: array primitives are not supported yet"),
+            Core::Lam(..) | Core::App(..) => panic!("gpu: closures are not supported yet"),
             Core::Proj(e1, i) => {
                 let te = self.gen_val(e1, out, dive, bail);
                 let ak = self.t();
@@ -499,6 +506,7 @@ impl Em {
                 self.gen_fire(&hoisted, dest, out);
             }
             Core::Prim(..) => panic!("gpu: array primitives are not supported yet"),
+            Core::Lam(..) | Core::App(..) => panic!("gpu: closures are not supported yet"),
             Core::Proj(e1, i) => {
                 let wv = self.fresh_var();
                 let hoisted = Core::Let(

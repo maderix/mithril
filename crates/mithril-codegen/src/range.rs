@@ -81,6 +81,8 @@ impl Ranges {
             }
             Core::Proj(a, _) => self.collect(a),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, a) => self.collect(a),
+            Core::App(f_, a_) => { self.collect(f_); self.collect(a_); }
         }
     }
 
@@ -234,5 +236,7 @@ fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usiz
         }
         Core::Proj(a, _) => count(a, all, masked, m32),
         Core::Num(_) | Core::Flo(_) => {}
+        Core::Lam(_, a) => count(a, all, masked, m32),
+        Core::App(f_, a_) => { count(f_, all, masked, m32); count(a_, all, masked, m32); }
     }
 }

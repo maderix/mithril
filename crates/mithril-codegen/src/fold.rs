@@ -58,6 +58,8 @@ fn collect_self_calls<'e>(e: &'e Core, fid: u32, out: &mut Vec<&'e Vec<Core>>) {
             }
         }
         Core::Proj(a, _) => collect_self_calls(a, fid, out),
+        Core::Lam(_, a) => collect_self_calls(a, fid, out),
+        Core::App(f_, a_) => { collect_self_calls(f_, fid, out); collect_self_calls(a_, fid, out); }
     }
 }
 

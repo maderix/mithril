@@ -62,6 +62,10 @@ pub(crate) enum Producer {
     Ref(Port),
     /// an op that cannot fold at compile time: (op with cell [x, ret], y)
     ResOp(Port, Port),
+    /// the parameter wire of a residual closure (the Lam cell)
+    LamParam(u32),
+    /// an application parked on an unknown function: the App cell
+    App(u32),
 }
 
 /// Dense per-cell tables (the scan runs thousands of times per function).
@@ -108,7 +112,7 @@ impl Index {
 }
 
 fn is_consumer(p: Port) -> bool {
-    matches!(p.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup)
+    matches!(p.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup | Tag::App)
 }
 
 fn agent_addr(p: Port) -> u32 {
@@ -116,7 +120,7 @@ fn agent_addr(p: Port) -> u32 {
         Tag::Op => op_addr(p),
         Tag::Mat => mat_addr(p),
         Tag::Dup => dup_addr(p),
-        Tag::Swi => p.payload() as u32,
+        Tag::Swi | Tag::App => p.payload() as u32,
         t => panic!("ICE: agent_addr of {:?}", t),
     }
 }
@@ -251,7 +255,31 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
                     }
                 }
             }
-            Tag::Lam | Tag::App => panic!("ICE: lambda agent in a first-order residual net"),
+            Tag::Lam => {
+                // [param, body]: the parameter is an unknown input of the
+                // body, the body a value read under the closure's frame
+                let l = p.payload() as u32;
+                let c = net.cell(l);
+                if Port(c[0]).tag() == Tag::Var {
+                    ix.producer[Port(c[0]).payload() as usize] = Some(Producer::LamParam(l));
+                }
+                work.push(Port(c[0]));
+                work.push(Port(c[1]));
+            }
+            Tag::App => {
+                // [arg, ret], parked on the function's wire
+                let a = p.payload() as u32;
+                let c = net.cell(a);
+                let ret = Port(c[1]);
+                if ret.tag() == Tag::Var {
+                    let r = &mut ix.producer[ret.payload() as usize];
+                    if r.is_none() {
+                        *r = Some(Producer::App(a));
+                    }
+                }
+                work.push(Port(c[0]));
+                work.push(ret);
+            }
         }
     }
     for (a, b) in pending_unions {
@@ -328,6 +356,28 @@ pub(crate) struct Reader<'a> {
     stack: Vec<usize>,
     /// shared bindings per frame, in dependency order
     bindings: HashMap<usize, Vec<(u32, Core)>>,
+    /// residual closures being read, innermost last: (frame, parameter var)
+    lams: Vec<(usize, u32)>,
+    /// parameter var per Lam cell
+    lam_param: HashMap<u32, u32>,
+}
+
+/// The frame of a residual closure's body (disjoint from arm frames).
+fn lam_frame(l: u32) -> usize {
+    (1usize << 40) + l as usize
+}
+
+/// Whether `e` reads any of `vars`.
+fn mentions(e: &Core, vars: &[u32]) -> bool {
+    match e {
+        Core::Var(v) => vars.contains(v),
+        Core::Num(_) | Core::Flo(_) => false,
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) | Core::App(a, b) => mentions(a, vars) || mentions(b, vars),
+        Core::If(a, b, c) => mentions(a, vars) || mentions(b, vars) || mentions(c, vars),
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| mentions(x, vars)),
+        Core::Match(s, arms) => mentions(s, vars) || arms.iter().any(|(_, _, b)| mentions(b, vars)),
+        Core::Proj(a, _) | Core::Lam(_, a) => mentions(a, vars),
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -341,7 +391,7 @@ impl<'a> Reader<'a> {
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
-        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, arms, stack: vec![0], bindings: HashMap::new() }
+        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new() }
     }
 
     /// Read a frame's expression from `p` (its tail, compound) and wrap it
@@ -372,13 +422,34 @@ impl<'a> Reader<'a> {
         self.bind(e)
     }
 
-    /// Let-bind a value in the current frame.
+    /// Let-bind a value in the innermost active frame that needs it: a
+    /// closure frame whose parameter the value does not read is peeled
+    /// (the value is computed once outside the closure and shared by every
+    /// call, which is what the net did); a branch frame never is (its
+    /// work is conditional).
     fn bind(&mut self, e: Core) -> Core {
         if matches!(e, Core::Var(_) | Core::Num(_) | Core::Flo(_)) {
             return e;
         }
+        let frame = self.frame_for(&e);
+        self.bind_in(frame, e)
+    }
+
+    fn frame_for(&self, e: &Core) -> usize {
+        for &fr in self.stack.iter().rev() {
+            match self.lams.iter().find(|(lf, _)| *lf == fr) {
+                Some((_, x)) if !mentions(e, &[*x]) => continue,
+                _ => return fr,
+            }
+        }
+        0
+    }
+
+    fn bind_in(&mut self, frame: usize, e: Core) -> Core {
+        if matches!(e, Core::Var(_) | Core::Num(_) | Core::Flo(_)) {
+            return e;
+        }
         let x = self.fresh();
-        let frame = *self.stack.last().unwrap();
         self.bindings.entry(frame).or_default().push((x, e));
         Core::Var(x)
     }
@@ -404,6 +475,15 @@ impl<'a> Reader<'a> {
                 }
             }
             Tag::Var => self.read_wire(p.payload() as u32),
+            Tag::Lam => {
+                let l = p.payload() as u32;
+                let x = self.param_var(l);
+                let frame = lam_frame(l);
+                self.lams.push((frame, x));
+                let body = self.read_frame(frame, Port(self.net.cell(l)[1]));
+                self.lams.pop();
+                Core::Lam(x, Box::new(body))
+            }
             t => panic!("ICE: readback of a {:?} port as a value", t),
         }
     }
@@ -423,6 +503,13 @@ impl<'a> Reader<'a> {
         let prod = self.producer_of(r);
         match prod {
             Producer::Free(v) => Core::Var(v),
+            Producer::LamParam(l) => Core::Var(self.param_var(l)),
+            Producer::App(a) => {
+                let f = self.read_input(a);
+                let f = self.bind_atom(f);
+                let arg = self.atom(Port(self.net.cell(a)[0]));
+                Core::App(Box::new(f), Box::new(arg))
+            }
             Producer::Op(a) => {
                 let code = op_code(self.stored_op(a));
                 self.read_op(a, code)
@@ -473,12 +560,21 @@ impl<'a> Reader<'a> {
                 // the shared value belongs to the frame the Dup was created
                 // in (an active one: arms never share with siblings); it and
                 // what it depends on are bound there
-                let frame = *self.dup_frame.get(&d).unwrap_or(&0);
+                let mut frame = *self.dup_frame.get(&d).unwrap_or(&0);
                 assert!(self.stack.contains(&frame), "ICE: shared value read outside its scope");
                 self.stack.push(frame);
                 let e = self.read_input(d);
-                let a = self.bind(e);
                 self.stack.pop();
+                // a shared value that reads a closure's parameter lives in
+                // that closure's body (the innermost such: every consumer
+                // is inside it); otherwise in the frame it was created in
+                for (lf, x) in self.lams.iter().rev() {
+                    if mentions(&e, &[*x]) {
+                        frame = *lf;
+                        break;
+                    }
+                }
+                let a = self.bind_in(frame, e);
                 if let Core::Var(v) = a {
                     self.shared.insert(d, v);
                 }
@@ -491,6 +587,15 @@ impl<'a> Reader<'a> {
                 Core::Call(entry as u32, args)
             }
         }
+    }
+
+    fn param_var(&mut self, l: u32) -> u32 {
+        if let Some(x) = self.lam_param.get(&l) {
+            return *x;
+        }
+        let x = self.fresh();
+        self.lam_param.insert(l, x);
+        x
     }
 
     fn producer_of(&mut self, r: u32) -> Producer {

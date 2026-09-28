@@ -233,6 +233,42 @@ runtime claim is a property of the rules, not of the spike's evaluator,
 and the constant per shared application is 8 rewrites. Regression:
 `reduce_test::shared_closure_computes_its_free_work_once`.
 
+### Phase B, steps 1–2: closures in Core and in the net
+
+`Core::Lam(x, body)` / `Core::App(f, a)`; desugar curries `lambda a, b:`,
+compiles a call on a local variable to `App`s, and eta-expands a
+top-level function used as a value. Capture is wiring: a closure's free
+variables are the enclosing `Var`s, lowered to the wires they already
+flow through (dup-fanned by the same `bind` as every other shared value).
+`eval_core` gets closure values (parameter, body, captured env) for the
+oracle only.
+
+Net: `Lam` cells `[param, body]` built eagerly (the body is a net region;
+work in it that does not depend on the parameter fires when the closure is
+built — once), `App` cells `[arg, ret]`; beta was there. Dup labels are
+dynamic: every sharing site takes a fresh 24-bit label, a copy of a dup
+(through a constructor, a lambda, a commutation) carries the copier's
+label; same label = the two halves of one copy meeting = annihilate,
+different = commute (Dup–Dup, Dup–Op/App/Swi/Mat). A single label class
+was wrong the moment a copied closure shared its own parameter
+(`twice(sq, 3)`). Clone discipline (`check_clone_discipline`): no closure
+applied to itself (`App(f, Var v)` with `v` free in `f`, through `Let`
+aliases) — the oracle-needing cases; `f(f(x))`, factories, closures
+capturing closures, `map` with a lambda are in.
+
+Readback: a residual `Lam` reads as `Core::Lam` with its own frame; a
+compound read inside a closure is bound in the innermost frame that needs
+it — closure frames whose parameter it does not mention are peeled (so
+`mk(k) = λx. x + heavy(k)` reads back as `let h = heavy(k) in λx. x + h`:
+the sharing the net computed survives into the residual program), branch
+frames never are. A parked `App` on an unknown function reads as `App`.
+
+Evidence: source programs (factory, `twice`, `compose`, `map` with a
+capturing lambda) reduce to the oracle value; W2 from source is linear in
+N (`reduce_test`); `mk(3)` applied twice specializes to a constant; a
+returned closure specializes to a lambda; fast.py unchanged (first-order
+paths untouched). Codegen refuses `Lam`/`App` until step 3.
+
 Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose

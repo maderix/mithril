@@ -381,3 +381,42 @@ fn two_argument_range() {
     let g = dm("def g(n):\n    s = 0\n    for i in range(n):\n        s = s + i\n    return s\n");
     assert_eq!(eval_core(&g, fid(&g, "g"), &[Val::I(5)]), Val::I(10));
 }
+
+// ---- lambdas ----
+
+#[test]
+fn lambda_desugars_to_curried_lam_and_local_calls_to_app() {
+    use mithril_front::core::Core;
+    let m = parse("def f(k):\n    g = lambda x, y: x * k + y\n    return g(2, 3)\n\ndef main():\n    return f(5)\n").unwrap();
+    let cm = desugar(&m).unwrap();
+    let f = &cm.fns[0].body;
+    // g is bound to Lam(x, Lam(y, ..)); the call is App(App(g, 2), 3)
+    let is_lam2 = |c: &Core| matches!(c, Core::Let(_, r, _) if matches!(&**r, Core::Lam(_, b) if matches!(&**b, Core::Lam(..))));
+    assert!(is_lam2(f), "{f:?}");
+    fn has_app2(c: &Core) -> bool {
+        match c {
+            Core::App(f, a) => matches!(&**f, Core::App(..)) && matches!(&**a, Core::Num(3)) || has_app2(f) || has_app2(a),
+            Core::Let(_, r, b) => has_app2(r) || has_app2(b),
+            _ => false,
+        }
+    }
+    assert!(has_app2(f), "{f:?}");
+    assert_eq!(eval_core(&cm, cm.main, &[]), Val::I(13));
+}
+
+#[test]
+fn top_level_function_as_a_value_is_eta_expanded() {
+    use mithril_front::core::Core;
+    let m = parse("def sq(x):\n    return x * x\n\ndef twice(f, x):\n    return f(f(x))\n\ndef main():\n    return twice(sq, 3)\n").unwrap();
+    let cm = desugar(&m).unwrap();
+    let main = &cm.fns[2].body;
+    assert!(matches!(main, Core::Call(_, args) if matches!(&args[0], Core::Lam(_, b) if matches!(&**b, Core::Call(0, _)))), "{main:?}");
+    assert_eq!(eval_core(&cm, cm.main, &[]), Val::I(81));
+}
+
+#[test]
+fn closures_capture_by_scope_and_factories_work_in_the_oracle() {
+    let m = parse("def mk(k):\n    return lambda x: x + k\n\ndef main():\n    a = mk(10)\n    b = mk(20)\n    return a(1) + b(2) + a(3)\n").unwrap();
+    let cm = desugar(&m).unwrap();
+    assert_eq!(eval_core(&cm, cm.main, &[]), Val::I(11 + 22 + 13));
+}

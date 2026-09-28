@@ -215,6 +215,8 @@ fn calls_self(fid: u32, e: &Core) -> bool {
         Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_self(fid, x)),
         Core::Match(s, arms) => calls_self(fid, s) || arms.iter().any(|(_, _, b)| calls_self(fid, b)),
         Core::Proj(a, _) => calls_self(fid, a),
+        Core::Lam(_, a) => calls_self(fid, a),
+        Core::App(f_, a_) => calls_self(fid, f_) || calls_self(fid, a_),
     }
 }
 

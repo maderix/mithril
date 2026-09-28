@@ -11,6 +11,9 @@ pub struct Net {
     /// division whose divisor is zero, a call kept as a call): they stay
     /// in the residual program instead of the worklist.
     pub residual: Vec<(Port, Port)>,
+    /// Next Dup label: every sharing site gets a fresh one (two dups meet
+    /// as siblings only when they carry the same label). 24 bits, wraps.
+    pub labels: u32,
 }
 
 impl Default for Net {
@@ -26,6 +29,7 @@ impl Net {
             free: Vec::new(),
             redexes: Vec::new(),
             residual: Vec::new(),
+            labels: 1,
         }
     }
 

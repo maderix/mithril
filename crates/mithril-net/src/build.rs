@@ -76,6 +76,8 @@ pub(crate) fn count_uses(v: u32, e: &NExpr) -> usize {
         }
         NExpr::Proj(e2, _) => count_uses(v, e2),
         NExpr::Prim(_, args) => args.iter().map(|a| count_uses(v, a)).sum(),
+        NExpr::Lam(u, b) => if *u == v { 0 } else { count_uses(v, b) },
+        NExpr::App(f, a) => count_uses(v, f) + count_uses(v, a),
     }
 }
 
@@ -88,10 +90,11 @@ fn bind(net: &mut Net, env: &mut Env, v: u32, port: Port, k: usize) {
         1 => env.give(v, vec![port]),
         _ => {
             let outs: Vec<Port> = (0..k).map(|_| wire(net)).collect();
+            let label = crate::fresh_label(net);
             let mut next = outs[k - 1];
             for j in (0..k - 1).rev() {
                 let d = net.alloc(outs[j], next);
-                next = dup_port(d);
+                next = dup_port(d, label);
             }
             link(net, next, port);
             env.give(v, outs);
@@ -206,6 +209,27 @@ fn inst(net: &mut Net, prog: &NetProg, env: &mut Env, e: &NExpr) -> Port {
                 }
                 n => panic!("ICE: builtin with {} arguments", n),
             }
+        }
+        NExpr::Lam(x, body) => {
+            // Lam cell [param, body]: the parameter is a wire the body reads
+            // (dup-fanned for several uses), the body's value flows to the
+            // body wire; beta links the argument to the one and the return
+            // to the other
+            let p = wire(net);
+            let b = wire(net);
+            bind(net, env, *x, p, count_uses(*x, body));
+            let out = inst(net, prog, env, body);
+            link(net, out, b);
+            let l = net.alloc(p, b);
+            Port::new(Tag::Lam, l as u64)
+        }
+        NExpr::App(f, a) => {
+            let pf = inst(net, prog, env, f);
+            let pa = inst(net, prog, env, a);
+            let w = wire(net);
+            let c = net.alloc(pa, w);
+            link(net, Port::new(Tag::App, c as u64), pf);
+            w
         }
     }
 }

@@ -33,8 +33,11 @@
 //!   saturated call: `h` heads a chain of argument list cells, `f` indexes
 //!   the derived entry table (real fns first, then lifted If branches and
 //!   Match arms). `head+1 == 0` means "no args".
-//! - `Dup(a,l)` — payload `addr:40|label:16` (single label class, 0);
-//!   cell = the two copy targets.
+//! - `Dup(a,l)` — payload `addr:32|label:24`; cell = the two copy targets.
+//!   Every sharing site gets a fresh label; a copy of a dup (through a
+//!   constructor, a lambda, a commutation) carries the copier's label, so
+//!   two dups that meet face to face annihilate exactly when they are the
+//!   two halves of one copy and commute otherwise.
 //! - `Era`, `Lam(a)`, `App(a)` — standard; `Lam`/`App` cells are
 //!   `[param, body]` / `[arg, ret]`. LAM/APP are unreachable from Core v1
 //!   (desugar rejects lambdas) but APP-LAM beta is implemented.
@@ -63,7 +66,7 @@ use mithril_core::port::{Port, Tag};
 use mithril_front::ast::{BinOp, CmpOp};
 use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
 use mithril_front::Diag;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use build::{build, root_port};
 pub use reduce::{readback, reduce, specialize, SpecReport};
@@ -181,14 +184,24 @@ pub(crate) fn op_code(p: Port) -> u16 {
     (p.payload() & 0xFFFF) as u16
 }
 
-pub fn dup_port(addr: u32) -> Port {
-    Port::new(Tag::Dup, (addr as u64) << 16) // label 0: single label class
+/// `Dup(addr, label)` — payload `addr:32|label:24`.
+pub fn dup_port(addr: u32, label: u32) -> Port {
+    Port::new(Tag::Dup, ((addr as u64) << 24) | (label & 0xFF_FFFF) as u64)
 }
 pub(crate) fn dup_addr(p: Port) -> u32 {
-    (p.payload() >> 16) as u32
+    (p.payload() >> 24) as u32
 }
-pub(crate) fn dup_label(p: Port) -> u16 {
-    (p.payload() & 0xFFFF) as u16
+pub(crate) fn dup_label(p: Port) -> u32 {
+    (p.payload() & 0xFF_FFFF) as u32
+}
+/// A fresh label for a new sharing site.
+pub fn fresh_label(net: &mut Net) -> u32 {
+    let l = net.labels;
+    net.labels = net.labels.wrapping_add(1) & 0xFF_FFFF;
+    if net.labels == 0 {
+        net.labels = 1;
+    }
+    l
 }
 
 pub(crate) fn mat_port(addr: u32, match_id: u16) -> Port {
@@ -343,6 +356,10 @@ pub(crate) enum NExpr {
     Proj(Box<NExpr>, u16),
     /// A builtin (opcode >= PRIM_BASE), strict in its arguments.
     Prim(u16, Vec<NExpr>),
+    /// A closure: its body is instantiated eagerly as a net region whose
+    /// free variables are the enclosing wires (capture is wiring).
+    Lam(u32, Box<NExpr>),
+    App(Box<NExpr>, Box<NExpr>),
 }
 
 pub(crate) enum MatchMeta {
@@ -445,6 +462,11 @@ fn nexpr_calls(e: &NExpr, prog: &NetProg, out: &mut BTreeSet<u32>) {
             specs.iter().for_each(|sp| nexpr_calls(&prog.entries[sp.entry as usize].body, prog, out));
         }
         NExpr::Proj(a, _) => nexpr_calls(a, prog, out),
+        NExpr::Lam(_, b) => nexpr_calls(b, prog, out),
+        NExpr::App(f, a) => {
+            nexpr_calls(f, prog, out);
+            nexpr_calls(a, prog, out);
+        }
     }
 }
 
@@ -487,7 +509,8 @@ fn calls_of(c: &Core, out: &mut BTreeSet<u32>) {
         Core::If(a, b, c2) => { calls_of(a, out); calls_of(b, out); calls_of(c2, out); }
         Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| calls_of(x, out)),
         Core::Match(s, arms) => { calls_of(s, out); arms.iter().for_each(|(_, _, b)| calls_of(b, out)); }
-        Core::Proj(a, _) => calls_of(a, out),
+        Core::Proj(a, _) | Core::Lam(_, a) => calls_of(a, out),
+        Core::App(f, a) => { calls_of(f, out); calls_of(a, out); }
     }
 }
 
@@ -499,7 +522,8 @@ fn count_calls(c: &Core, g: u32) -> usize {
         Core::If(a, b, c2) => count_calls(a, g) + count_calls(b, g) + count_calls(c2, g),
         Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| count_calls(x, g)).sum(),
         Core::Match(s, arms) => count_calls(s, g) + arms.iter().map(|(_, _, b)| count_calls(b, g)).sum::<usize>(),
-        Core::Proj(a, _) => count_calls(a, g),
+        Core::Proj(a, _) | Core::Lam(_, a) => count_calls(a, g),
+        Core::App(f, a) => count_calls(f, g) + count_calls(a, g),
     }
 }
 
@@ -510,7 +534,8 @@ pub(crate) fn core_size(c: &Core) -> usize {
         Core::If(a, b, c2) => 1 + core_size(a) + core_size(b) + core_size(c2),
         Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => 1 + xs.iter().map(core_size).sum::<usize>(),
         Core::Match(s, arms) => 1 + core_size(s) + arms.iter().map(|(_, _, b)| core_size(b)).sum::<usize>(),
-        Core::Proj(a, _) => 1 + core_size(a),
+        Core::Proj(a, _) | Core::Lam(_, a) => 1 + core_size(a),
+        Core::App(f, a) => 1 + core_size(f) + core_size(a),
     }
 }
 
@@ -578,6 +603,8 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
             NExpr::Proj(Box::new(lower(e, prog)), mid as u16)
         }
         Core::Prim(p, args) => NExpr::Prim(prim_code(*p), args.iter().map(|a| lower(a, prog)).collect()),
+        Core::Lam(x, b) => NExpr::Lam(*x, Box::new(lower(b, prog))),
+        Core::App(f, a) => NExpr::App(Box::new(lower(f, prog)), Box::new(lower(a, prog))),
     }
 }
 
@@ -626,25 +653,86 @@ fn fv(c: &Core, out: &mut BTreeSet<u32>) {
             }
         }
         Core::Proj(e, _) => fv(e, out),
+        Core::Lam(x, b) => {
+            let mut inner = BTreeSet::new();
+            fv(b, &mut inner);
+            inner.remove(x);
+            out.extend(inner);
+        }
+        Core::App(f, a) => {
+            fv(f, out);
+            fv(a, out);
+        }
     }
 }
 
 // ---- clone discipline ----
 
-/// v1 Core is first-order (desugar rejects lambdas with a Diag before the
-/// net tier), so every variable a `build`-inserted DUP duplicates is a
-/// *data* value — always sound to copy. This check verifies that
-/// structural precondition (every variable use is bound by a param, `Let`
-/// or match binder, i.e. every DUP target is a value produced in the same
-/// function) and returns `Ok`. When closures land in Core, this is where a
-/// lambda body using its parameter more than once under an enclosing DUP
-/// is rejected, naming the variable.
+/// Every variable use is bound (a param, `Let`, match binder or lambda
+/// parameter), and no closure is applied to itself: `App(f, Var v)` with
+/// `v` free in `f` (through `Let` aliases) is the self-duplicating clone
+/// that labelled dups cannot copy correctly (the interaction-combinator
+/// "oracle" cases). Everything else the labelled rules copy soundly: a
+/// value shared through a constructor, a closure applied to values
+/// computed from itself (`f(f(x))`), closures capturing closures.
 pub fn check_clone_discipline(m: &CoreModule) -> Result<(), Diag> {
     for f in &m.fns {
         let mut bound: BTreeSet<u32> = (0..f.arity as u32).collect();
         check_bound(&f.body, &mut bound, &f.name)?;
+        check_self_app(&f.body, &mut BTreeMap::new(), &f.name)?;
     }
     Ok(())
+}
+
+/// Reject `App(f, Var v)` where `v` (or a `Let` alias of it) occurs in `f`.
+fn check_self_app(c: &Core, alias: &mut BTreeMap<u32, u32>, fname: &str) -> Result<(), Diag> {
+    let canon = |v: u32, alias: &BTreeMap<u32, u32>| *alias.get(&v).unwrap_or(&v);
+    match c {
+        Core::App(f, a) => {
+            check_self_app(f, alias, fname)?;
+            check_self_app(a, alias, fname)?;
+            if let Core::Var(v) = &**a {
+                let v = canon(*v, alias);
+                let fvs: BTreeSet<u32> = free_vars(f).into_iter().map(|u| canon(u, alias)).collect();
+                if fvs.contains(&v) {
+                    return Err(Diag::new(0, format!("clone discipline: closure v{} is applied to itself in function '{}'", v, fname)));
+                }
+            }
+            Ok(())
+        }
+        Core::Let(x, r, b) => {
+            check_self_app(r, alias, fname)?;
+            if let Core::Var(v) = &**r {
+                let v = canon(*v, alias);
+                alias.insert(*x, v);
+            }
+            check_self_app(b, alias, fname)
+        }
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => Ok(()),
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+            check_self_app(a, alias, fname)?;
+            check_self_app(b, alias, fname)
+        }
+        Core::If(a, b, c2) => {
+            check_self_app(a, alias, fname)?;
+            check_self_app(b, alias, fname)?;
+            check_self_app(c2, alias, fname)
+        }
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
+            for x in xs {
+                check_self_app(x, alias, fname)?;
+            }
+            Ok(())
+        }
+        Core::Match(s, arms) => {
+            check_self_app(s, alias, fname)?;
+            for (_, _, b) in arms {
+                check_self_app(b, alias, fname)?;
+            }
+            Ok(())
+        }
+        Core::Proj(e, _) | Core::Lam(_, e) => check_self_app(e, alias, fname),
+    }
 }
 
 fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), Diag> {
@@ -688,5 +776,17 @@ fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), D
             Ok(())
         }
         Core::Proj(e, _) => check_bound(e, bound, fname),
+        Core::Lam(x, b) => {
+            let fresh = bound.insert(*x);
+            check_bound(b, bound, fname)?;
+            if fresh {
+                bound.remove(x);
+            }
+            Ok(())
+        }
+        Core::App(f, a) => {
+            check_bound(f, bound, fname)?;
+            check_bound(a, bound, fname)
+        }
     }
 }

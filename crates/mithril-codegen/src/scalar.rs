@@ -476,6 +476,8 @@ fn calls_fn(e: &Core, g: u32) -> bool {
         Core::Match(sc, arms) => calls_fn(sc, g) || arms.iter().any(|(_, _, b)| calls_fn(b, g)),
         Core::Proj(b, _) => calls_fn(b, g),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+        Core::Lam(_, b) => calls_fn(b, g),
+        Core::App(f_, a_) => calls_fn(f_, g) || calls_fn(a_, g),
     }
 }
 
@@ -491,6 +493,8 @@ fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
         Core::Match(sc, arms) => calls_other_real(m, sc, g) || arms.iter().any(|(_, _, b)| calls_other_real(m, b, g)),
         Core::Proj(b, _) => calls_other_real(m, b, g),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+        Core::Lam(_, b) => calls_other_real(m, b, g),
+        Core::App(f_, a_) => calls_other_real(m, f_, g) || calls_other_real(m, a_, g),
     }
 }
 
@@ -658,6 +662,8 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
             }
             Core::Proj(b, _) => prims(b, out, calls),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, b) => prims(b, out, calls),
+            Core::App(f_, a_) => { prims(f_, out, calls); prims(a_, out, calls); }
         }
     }
     let n = m.fns.len();
@@ -770,6 +776,8 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
             }
             Core::Proj(b, _) => walk(c, b, false, false),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, b) => walk(c, b, false, false),
+            Core::App(f_, a_) => { walk(c, f_, false, false); walk(c, a_, false, false); }
         }
     }
     let n = m.fns.len();
@@ -817,6 +825,8 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
             }
             Core::Proj(b, _) => calls(b, out),
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            Core::Lam(_, b) => calls(b, out),
+            Core::App(f_, a_) => { calls(f_, out); calls(a_, out); }
         }
     }
     let ints = |g: usize| -> usize {

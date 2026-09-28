@@ -13,7 +13,7 @@ use mithril_core::port::{Port, Tag};
 use mithril_net::EMPTY;
 use mithril_front::ast::BinOp;
 use mithril_front::{desugar, parse};
-use mithril_net::{dup_port, link, list_alloc, op_port, opcode_bin, readback, reduce, ref_port, wire};
+use mithril_net::{dup_port, fresh_label, link, list_alloc, op_port, opcode_bin, readback, reduce, ref_port, wire};
 
 fn fib(k: i64) -> i64 {
     if k < 2 { k } else { fib(k - 1) + fib(k - 2) }
@@ -44,7 +44,8 @@ fn build(k: i64, n: usize, late: bool) -> Net {
         if i + 1 < n {
             let (w1, w2) = (wire(&mut net), wire(&mut net));
             let d = net.alloc(w1, w2);
-            link(&mut net, dup_port(d), cur);
+            let lbl = fresh_label(&mut net);
+            link(&mut net, dup_port(d, lbl), cur);
             copies.push(w1);
             cur = w2;
         } else {
