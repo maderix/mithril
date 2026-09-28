@@ -67,6 +67,7 @@ use std::collections::BTreeSet;
 
 pub use build::{build, root_port};
 pub use reduce::{readback, reduce, specialize, SpecReport};
+pub use rules::link;
 
 /// Sentinel port marking (a) an unfilled wire-cell slot and (b) the end of
 /// an argument/arm list chain. Encoded as `Ext` with an all-ones payload so
@@ -85,7 +86,7 @@ pub(crate) fn era() -> Port {
 }
 
 /// Allocate a fresh wire cell and return one of its (interchangeable) ends.
-pub(crate) fn wire(net: &mut Net) -> Port {
+pub fn wire(net: &mut Net) -> Port {
     let w = net.alloc(EMPTY, EMPTY);
     Port::new(Tag::Var, w as u64)
 }
@@ -141,7 +142,7 @@ pub(crate) fn prim_of_code(code: u16) -> (mithril_front::core::Prim, bool) {
     }
 }
 
-pub(crate) fn opcode_bin(op: BinOp) -> u16 {
+pub fn opcode_bin(op: BinOp) -> u16 {
     match op {
         BinOp::Add => 0,
         BinOp::Sub => 1,
@@ -170,7 +171,7 @@ pub(crate) fn opcode_cmp(op: CmpOp) -> u16 {
 
 // ---- payload packing helpers ----
 
-pub(crate) fn op_port(addr: u32, code: u16) -> Port {
+pub fn op_port(addr: u32, code: u16) -> Port {
     Port::new(Tag::Op, ((addr as u64) << 16) | code as u64)
 }
 pub(crate) fn op_addr(p: Port) -> u32 {
@@ -180,7 +181,7 @@ pub(crate) fn op_code(p: Port) -> u16 {
     (p.payload() & 0xFFFF) as u16
 }
 
-pub(crate) fn dup_port(addr: u32) -> Port {
+pub fn dup_port(addr: u32) -> Port {
     Port::new(Tag::Dup, (addr as u64) << 16) // label 0: single label class
 }
 pub(crate) fn dup_addr(p: Port) -> u32 {
@@ -202,7 +203,7 @@ pub(crate) fn mat_id(p: Port) -> u16 {
 
 /// `head` is a list head (`Ext(addr)` or `EMPTY`); stored biased by one so
 /// that 0 means "no args".
-pub(crate) fn ref_port(head: Port, entry: u16) -> Port {
+pub fn ref_port(head: Port, entry: u16) -> Port {
     let h = if head == EMPTY { 0 } else { head.payload() + 1 };
     Port::new(Tag::Ref, (h << 16) | entry as u64)
 }
@@ -220,7 +221,7 @@ pub(crate) fn ref_entry(p: Port) -> u16 {
 
 // ---- list chains ([item, Ext(next)|EMPTY] cells) ----
 
-pub(crate) fn list_alloc(net: &mut Net, items: &[Port]) -> Port {
+pub fn list_alloc(net: &mut Net, items: &[Port]) -> Port {
     let mut head = EMPTY;
     for &it in items.iter().rev() {
         let a = net.alloc(it, head);

@@ -16,7 +16,7 @@
 
 use crate::build::instantiate;
 use crate::{
-    con_alloc, con_collect, dup_addr, dup_label, dup_port, era, list_collect, mat_addr, mat_id,
+    con_alloc, con_collect, dup_addr, dup_label, dup_port, era, list_collect, mat_addr, mat_id, mat_port,
     op_addr, op_code, op_port, ref_entry, ref_head, wire, MatchMeta, Mode, NetProg, ARR_PAIR,
     CTAG_TUPLE, EMPTY, OP_FLIP, PRIM_BASE,
 };
@@ -28,7 +28,7 @@ const MASK56: u64 = (1u64 << 56) - 1;
 /// Connect two ports. Wire cells hold the first arrival in slot 0; the
 /// second arrival takes it (freeing the cell) and the two ports meet. Two
 /// non-Var ports meeting becomes a redex. Never fires a rule itself.
-pub(crate) fn link(net: &mut Net, a: Port, b: Port) {
+pub fn link(net: &mut Net, a: Port, b: Port) {
     let (mut a, mut b) = (a, b);
     loop {
         if a.tag() != Tag::Var {
@@ -123,6 +123,8 @@ pub(crate) fn process(net: &mut Net, prog: &NetProg, a: Port, b: Port) -> u64 {
         (Tag::Num, Tag::Dup) | (Tag::Flo, Tag::Dup) | (Tag::Con, Tag::Dup) | (Tag::Lam, Tag::Dup) => {
             dup_rule(net, b, a)
         }
+        (Tag::Dup, Tag::Op) | (Tag::Dup, Tag::App) | (Tag::Dup, Tag::Swi) | (Tag::Dup, Tag::Mat) => dup_commute(net, a, b),
+        (Tag::Op, Tag::Dup) | (Tag::App, Tag::Dup) | (Tag::Swi, Tag::Dup) | (Tag::Mat, Tag::Dup) => dup_commute(net, b, a),
         (x, y) => panic!("ICE: no interaction rule for {:?}–{:?}", x, y),
     }
     1
@@ -457,6 +459,91 @@ fn dup_rule(net: &mut Net, dup: Port, val: Port) {
             link(net, Port::new(Tag::Lam, l2 as u64), o2);
         }
         t => panic!("ICE: no interaction rule for Dup–{:?}", t),
+    }
+}
+
+/// DUP–{OP, APP, SWI, MAT}: commute. The dup here is a superposition (its
+/// principal port faces a consumer, not a value: a duplicated lambda's
+/// parameter, or a shared value's consumer met before the value), so the
+/// consumer is copied once per side and every other port of it gets a
+/// same-label dup joining the two copies' ports: the consumer passes
+/// through the dup. What each copy then computes is its own; what they
+/// share (an operand already produced, a call's result) is shared.
+fn dup_commute(net: &mut Net, dup: Port, agent: Port) {
+    let d = dup_addr(dup);
+    let label = dup_label(dup);
+    let dc = net.cell(d);
+    net.free_cell(d);
+    let (o1, o2) = (Port(dc[0]), Port(dc[1]));
+    // a same-label dup whose outputs are fresh wires; its input is `p`
+    let split = |net: &mut Net, p: Port| -> (Port, Port) {
+        let (w1, w2) = (wire(net), wire(net));
+        let nd = net.alloc(w1, w2);
+        link(net, Port::new(Tag::Dup, ((nd as u64) << 16) | label as u64), p);
+        (w1, w2)
+    };
+    match agent.tag() {
+        Tag::Op => {
+            let a = op_addr(agent);
+            let code = op_code(agent);
+            let c = net.cell(a);
+            net.free_cell(a);
+            let (x1, x2) = split(net, Port(c[0]));
+            let (r1, r2) = split(net, Port(c[1]));
+            let a1 = net.alloc(x1, r1);
+            let a2 = net.alloc(x2, r2);
+            link(net, op_port(a1, code), o1);
+            link(net, op_port(a2, code), o2);
+        }
+        Tag::App => {
+            let a = agent.payload() as u32;
+            let c = net.cell(a);
+            net.free_cell(a);
+            let (x1, x2) = split(net, Port(c[0]));
+            let (r1, r2) = split(net, Port(c[1]));
+            let a1 = net.alloc(x1, r1);
+            let a2 = net.alloc(x2, r2);
+            link(net, Port::new(Tag::App, a1 as u64), o1);
+            link(net, Port::new(Tag::App, a2 as u64), o2);
+        }
+        Tag::Swi => {
+            let s = agent.payload() as u32;
+            let c = net.cell(s);
+            net.free_cell(s);
+            let s2 = Port(c[1]).payload() as u32;
+            let c2 = net.cell(s2);
+            net.free_cell(s2);
+            let (r1, r2) = split(net, Port(c[0]));
+            let (t1, t2) = split(net, Port(c2[0]));
+            let (e1, e2) = split(net, Port(c2[1]));
+            let arms1 = net.alloc(t1, e1);
+            let arms2 = net.alloc(t2, e2);
+            let n1 = net.alloc(r1, Port::new(Tag::Ext, arms1 as u64));
+            let n2 = net.alloc(r2, Port::new(Tag::Ext, arms2 as u64));
+            link(net, Port::new(Tag::Swi, n1 as u64), o1);
+            link(net, Port::new(Tag::Swi, n2 as u64), o2);
+        }
+        Tag::Mat => {
+            let m = mat_addr(agent);
+            let id = mat_id(agent);
+            let c = net.cell(m);
+            net.free_cell(m);
+            let (r1, r2) = split(net, Port(c[0]));
+            let arms = list_collect(net, Port(c[1]));
+            let (mut l1, mut l2) = (Vec::new(), Vec::new());
+            for r in arms {
+                let (a1, a2) = split(net, r);
+                l1.push(a1);
+                l2.push(a2);
+            }
+            let h1 = crate::list_alloc(net, &l1);
+            let h2 = crate::list_alloc(net, &l2);
+            let n1 = net.alloc(r1, h1);
+            let n2 = net.alloc(r2, h2);
+            link(net, mat_port(n1, id), o1);
+            link(net, mat_port(n2, id), o2);
+        }
+        t => panic!("ICE: Dup–{:?} has no commutation", t),
     }
 }
 

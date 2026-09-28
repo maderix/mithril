@@ -371,3 +371,74 @@ fn unlisted_pair_is_a_named_ice() {
     net.redexes.push((Port::num(1), Port::num(2)));
     reduce(&mut net, &m, 10);
 }
+
+// ---- sharing through DUP: spike 5's W2 shape on the real rule table ----
+
+/// `g = λx. x + heavy(k)` applied N times through a chain of DUPs: the
+/// rules compute heavy once and each application costs a constant number
+/// of rewrites (the Dup commutations pass the body's op through the
+/// superposition; the call result is shared by the wire the dups wait on).
+#[test]
+fn shared_closure_computes_its_free_work_once() {
+    use mithril_front::ast::BinOp;
+    use mithril_net::{dup_port, link, list_alloc, op_port, opcode_bin, ref_port, wire};
+    fn fib(k: i64) -> i64 {
+        if k < 2 { k } else { fib(k - 1) + fib(k - 2) }
+    }
+    let m = cm("def heavy(k):\n    if k < 2:\n        return k\n    return heavy(k - 1) + heavy(k - 2)\n\ndef main():\n    return 0\n");
+    let run = |n: usize, late: bool| -> (u64, Option<Val>) {
+        let mut net = Net::new();
+        assert_eq!(net.alloc(EMPTY, EMPTY), 0);
+        let hv = wire(&mut net);
+        let head = list_alloc(&mut net, &[Port::num(12)]);
+        let heavy = (ref_port(head, 0), hv);
+        if !late {
+            net.redexes.push(heavy);
+        }
+        let (p, b) = (wire(&mut net), wire(&mut net));
+        let add = net.alloc(hv, b);
+        link(&mut net, op_port(add, opcode_bin(BinOp::Add)), p);
+        let l = net.alloc(p, b);
+        let mut cur = Port::new(Tag::Lam, l as u64);
+        let mut acc: Option<Port> = None;
+        for i in 0..n {
+            let f = if i + 1 < n {
+                let (w1, w2) = (wire(&mut net), wire(&mut net));
+                let d = net.alloc(w1, w2);
+                link(&mut net, dup_port(d), cur);
+                cur = w2;
+                w1
+            } else {
+                cur
+            };
+            let t = wire(&mut net);
+            let app = net.alloc(Port::num(i as i64), t);
+            link(&mut net, Port::new(Tag::App, app as u64), f);
+            acc = Some(match acc {
+                None => t,
+                Some(s) => {
+                    let r = wire(&mut net);
+                    let a = net.alloc(s, r);
+                    link(&mut net, op_port(a, opcode_bin(BinOp::Add)), t);
+                    r
+                }
+            });
+        }
+        link(&mut net, acc.unwrap(), Port::new(Tag::Var, 0));
+        if late {
+            net.redexes.push(heavy);
+        }
+        let done = reduce(&mut net, &m, u64::MAX);
+        assert!(net.redexes.is_empty());
+        (done, readback(&net, root_port()))
+    };
+    for late in [false, true] {
+        let (w, v1) = run(1, late);
+        assert_eq!(v1, Some(Val::I(fib(12))));
+        for n in [2usize, 17, 300] {
+            let (done, v) = run(n, late);
+            assert_eq!(v, Some(Val::I((0..n as i64).map(|i| i + fib(12)).sum())), "n={n} late={late}");
+            assert_eq!(done, w + 8 * (n as u64 - 1), "n={n} late={late}: not W + 8(N-1) rewrites");
+        }
+    }
+}

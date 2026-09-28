@@ -210,6 +210,29 @@ reads it, and only the branch and ops on the input stay. Phase B
 (closures shared by `DUP` at runtime) extends the same mechanism to
 programs whose static part is only known at runtime.
 
+### Phase B derisk: sharing on the real rule table (`examples/spike_w2.rs`)
+
+Before building closures into the language, spike 5's W2 shape was run on
+the product's rules and reducer (not the spike's toy evaluator): `g = λx.
+x + heavy(k)` built once, copied through a chain of DUPs, applied N times.
+This needed the Dup commutations the first-order rule set lacked
+(Dup–Op/App/Swi/Mat: the consumer passes through the superposition; a
+Ref facing a Dup just unfolds once with the Dup as its ret). k = 24,
+W = 1,500,491 rewrites:
+
+| N | rewrites | strict N·W | per application | time |
+|---|---|---|---|---|
+| 1 | 1,500,491 | 1.5M | — | 0.094 s |
+| 256 | 1,502,531 | 384M | 8.0 | 0.111 s |
+| 4096 | 1,533,251 | 6.1G | 8.0 | 0.111 s |
+| 65536 | 2,024,771 | 98G | 8.0 | 0.135 s |
+
+Exactly W + 8N on both schedules (heavy before or after the copies are
+queued), values oracle-equal; the reducer runs ~16M rewrites/s. So the
+runtime claim is a property of the rules, not of the spike's evaluator,
+and the constant per shared application is 8 rewrites. Regression:
+`reduce_test::shared_closure_computes_its_free_work_once`.
+
 Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose
