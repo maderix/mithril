@@ -446,7 +446,7 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     // the dive-form caller destructures the native tuple (no heap tuple)
     let leaf = dive_form(&cm, &rs, "leaf");
     let b = cm.fns.iter().position(|f| f.name == "bins").unwrap();
-    assert!(leaf.contains(&format!(") = s_{b}(ctx, fuel")), "leaf does not call bins natively");
+    assert!(leaf.contains(&format!(") = s_{b}(fuel")) || leaf.contains(&format!(") = s_{b}(ctx, fuel")), "leaf does not call bins natively");
     assert!(!leaf.contains("field(ctx"), "leaf reads its tuple from the heap");
     // a branch choosing between boxed subtrees is not if-converted
     assert_eq!(dive_form(&cm, &rs, "pick").matches("continue 'l").count(), 2, "pick's subtree choice became a select");

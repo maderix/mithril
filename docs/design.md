@@ -88,6 +88,24 @@ value semantics, in place when unique). Measured on bfs, 2^19 mazes (reference
 | leaf fuel at the call site | a call-free native function settles no fuel through the pointer; its one unit is a register increment in the caller (fuel keeps measuring the same work, so parallel split granularity is unchanged) | 4.85 / 0.48 |
 | selects as mask arithmetic | an `if` choosing between computed atoms (what if-conversion leaves) is emitted as `(a & m) \| (b & !m)`, which the backend cannot turn back into a branch on a loop-carried chain | **4.48 / 0.45** |
 
+Native int representation (editdist, whose DP cell is a loop-carried
+add/min chain over array words: 4.05 s -> 2.80 s SEQ, 0.53 -> 0.35 s PAR):
+native functions hold ints either *plain* (canonical i56 in an i64; an op
+whose range is not proven re-wraps with two shifts; masked 32-bit
+arithmetic runs in u32) or *pre-shifted* (`x << 8`: i64 wrapping is i56
+wrapping, so add/sub/compare/min need no wrap; a var-by-var multiply, a
+right shift, an array index and division cost one op). Int arrays store
+the pre-shifted word (`ARR_RAW`), tagged <-> shifted is one op. Each
+function takes the representation with the lower static op count,
+charging the conversions on call edges to functions of the other
+representation (so a recursive pair never splits: queens stays all
+plain). The context argument is passed only to native functions that
+touch arrays (argument registers matter for recursive natives), and
+`#[inline(always)]` is decided on literally call-free bodies plus
+single-site `while`/`for` helpers (a function's own loop); without the
+latter, which member of a recursive cycle absorbs the other was an
+accident of ordering (queens 4.8 vs 5.3 s).
+
 Each step was first proven on hand-edited generated code (the same
 runtime helpers), then made a codegen rule; the final generated code
 matches the hand proof.
@@ -154,7 +172,8 @@ generated code exponential; all were found hours later by full runs.
 | queens | 4.73 / 0.47 | 8.32 / 1.23 | met |
 | tree-bitonic | 10.3 / 2.73 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
 | kmeans | 10.7 / 1.47 | 7.84 / 0.77 | needs lane-level (u32) vectorization; hand proof 5.81 |
-| hashmap, editdist, terrain | | 3.22 / 0.40, 2.44 / 0.39, 3.21 / 0.46 | being ported to arrays (the bfs mechanisms) |
+| editdist | 2.80 / 0.35 | 2.44 / 0.39 | PAR met; SEQ: bounds checks reload the length (next: length locals) |
+| hashmap, terrain | | 3.22 / 0.40, 3.21 / 0.46 | being ported to arrays |
 | nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
 
 ## 7. Process rules (from the user)

@@ -576,6 +576,261 @@ thread_local! {
     pub(crate) static LEAF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// `SHIFTED[g]`: native `g` holds its ints pre-shifted (`x << 8`); see
+    /// `choose_reps`.
+    pub(crate) static SHIFTED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `CTX[g]`: native `g` takes the worker context (it touches arrays,
+    /// itself or through a callee); the rest keep their argument registers.
+    pub(crate) static CTX: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The context argument of a call to native `g` (`"ctx, "` or nothing).
+pub(crate) fn ctx_arg(g: u32) -> &'static str {
+    if CTX.with(|c| c.borrow().get(g as usize).copied().unwrap_or(true)) {
+        "ctx, "
+    } else {
+        ""
+    }
+}
+
+/// Which native functions need the context: array prims or array params
+/// or results, or a call to one that does (fixpoint).
+pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
+    fn prims(e: &Core, out: &mut bool, calls: &mut Vec<u32>) {
+        match e {
+            Core::Prim(_, xs) => {
+                *out = true;
+                xs.iter().for_each(|x| prims(x, out, calls));
+            }
+            Core::Call(g, xs) => {
+                calls.push(*g);
+                xs.iter().for_each(|x| prims(x, out, calls));
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
+                prims(a, out, calls);
+                prims(b, out, calls);
+            }
+            Core::If(a, b, c) => {
+                prims(a, out, calls);
+                prims(b, out, calls);
+                prims(c, out, calls);
+            }
+            Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| prims(x, out, calls)),
+            Core::Match(sc, arms) => {
+                prims(sc, out, calls);
+                arms.iter().for_each(|(_, _, b)| prims(b, out, calls));
+            }
+            Core::Proj(b, _) => prims(b, out, calls),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+        }
+    }
+    let n = m.fns.len();
+    let mut calls = vec![Vec::new(); n];
+    let mut need: Vec<bool> = (0..n)
+        .map(|f| {
+            let Some(sig) = &sigs[f] else { return true };
+            let mut p = false;
+            prims(&m.fns[f].body, &mut p, &mut calls[f]);
+            p || sig.params.iter().any(|t| matches!(t, PTy::A | PTy::B)) || sig.ra.iter().any(|a| *a)
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for f in 0..n {
+            if !need[f] && calls[f].iter().any(|g| need[*g as usize]) {
+                need[f] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return need;
+        }
+    }
+}
+
+pub(crate) fn shifted(g: u32) -> bool {
+    SHIFTED.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
+}
+
+/// Integer representation of each native function, chosen by a static op
+/// count over its body. *Plain* ints are canonical i56 values in an i64: an
+/// op whose range is not proven re-wraps (two shifts), and masked 32-bit
+/// arithmetic runs in u32 for free; array elements (stored pre-shifted)
+/// cost a shift per access. *Shifted* ints are held as `x << 8`: i64
+/// wrapping is i56 wrapping, so add/sub/compare/min chains need no wrap,
+/// but a var-by-var multiply, a right shift, an array index and division
+/// each cost an op. The cheaper side wins; calls convert at the boundary.
+pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
+    use crate::range::{feeds_mask, feeds_mask32, low32_closed};
+    use mithril_front::ast::BinOp;
+    use mithril_front::core::Prim;
+    struct C<'a> {
+        r: &'a crate::range::Ranges,
+        plain: usize,
+        shf: usize,
+    }
+    fn nonconst(e: &Core) -> bool {
+        !matches!(e, Core::Num(_))
+    }
+    fn walk(c: &mut C, e: &Core, low: bool, low32: bool) {
+        match e {
+            Core::Op2(op, x, y) if low32 && low32_closed(op) => {
+                if *op == BinOp::Mul && nonconst(x) && nonconst(y) {
+                    c.shf += 1;
+                }
+                walk(c, x, true, true);
+                walk(c, y, *op != BinOp::Shl, *op != BinOp::Shl);
+            }
+            Core::Op2(op, x, y) => {
+                if c.r.wrap(op, x, y, low) {
+                    c.plain += 2;
+                }
+                c.shf += match op {
+                    BinOp::Mul if nonconst(x) && nonconst(y) => 1,
+                    BinOp::Shr => 1 + nonconst(y) as usize,
+                    BinOp::Shl => nonconst(y) as usize,
+                    BinOp::Div | BinOp::FloorDiv | BinOp::Mod => 2,
+                    _ => 0,
+                };
+                walk(c, x, feeds_mask(op, y), feeds_mask32(op, y));
+                walk(c, y, false, false);
+            }
+            Core::Let(x, r, b) => {
+                let (lo, lo32) = (c.r.masked(*x), c.r.masked32(*x));
+                walk(c, r, lo, lo32);
+                walk(c, b, low, low32);
+            }
+            Core::Prim(p, xs) => {
+                if matches!(p, Prim::ArrGet | Prim::ArrSet) {
+                    c.plain += 1;
+                    c.shf += nonconst(&xs[1]) as usize;
+                }
+                xs.iter().for_each(|x| walk(c, x, false, false));
+            }
+            Core::Cmp(_, a, b) => {
+                walk(c, a, false, false);
+                walk(c, b, false, false);
+            }
+            Core::If(a, t, f) => {
+                walk(c, a, false, false);
+                walk(c, t, low, low32);
+                walk(c, f, low, low32);
+            }
+            Core::Call(_, xs) | Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) => {
+                xs.iter().for_each(|x| walk(c, x, false, false))
+            }
+            Core::Match(sc, arms) => {
+                walk(c, sc, false, false);
+                arms.iter().for_each(|(_, _, b)| walk(c, b, low, low32));
+            }
+            Core::Proj(b, _) => walk(c, b, false, false),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+        }
+    }
+    let n = m.fns.len();
+    if std::env::var_os("MITHRIL_PLAIN_INTS").is_some() {
+        return vec![false; n];
+    }
+    // local op counts
+    let local: Vec<(usize, usize)> = (0..n)
+        .map(|f| {
+            if sigs[f].is_none() {
+                return (0, 0);
+            }
+            let r = crate::range::Ranges::of(&m.fns[f].body);
+            let mut c = C { r: &r, plain: 0, shf: 0 };
+            walk(&mut c, &m.fns[f].body, false, false);
+            (c.plain, c.shf)
+        })
+        .collect();
+    // call edges between native functions, weighted by the int values
+    // crossing them (args and results): each converts when the two sides
+    // differ
+    fn calls(e: &Core, out: &mut Vec<u32>) {
+        if let Core::Call(g, _) = e {
+            out.push(*g);
+        }
+        match e {
+            Core::Call(_, xs) | Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
+                xs.iter().for_each(|x| calls(x, out))
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
+                calls(a, out);
+                calls(b, out);
+            }
+            Core::If(a, b, c) => {
+                calls(a, out);
+                calls(b, out);
+                calls(c, out);
+            }
+            Core::Match(sc, arms) => {
+                calls(sc, out);
+                arms.iter().for_each(|(_, _, b)| calls(b, out));
+            }
+            Core::Proj(b, _) => calls(b, out),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+        }
+    }
+    let ints = |g: usize| -> usize {
+        let s = sigs[g].as_ref().unwrap();
+        let ps: usize = s.params.iter().map(|p| match p {
+            PTy::I => 1,
+            PTy::T(k) => *k,
+            _ => 0,
+        }).sum();
+        ps + s.ra.iter().filter(|a| !**a).count()
+    };
+    let mut edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for f in 0..n {
+        if sigs[f].is_none() {
+            continue;
+        }
+        let mut cs = Vec::new();
+        calls(&m.fns[f].body, &mut cs);
+        for g in cs {
+            let g = g as usize;
+            if g != f && sigs[g].is_some() {
+                let w = ints(g);
+                edges[f].push((g, w));
+                edges[g].push((f, w));
+            }
+        }
+    }
+    let mut rep = vec![false; n];
+    for _ in 0..2 * n + 2 {
+        let mut changed = false;
+        for f in 0..n {
+            if sigs[f].is_none() {
+                continue;
+            }
+            let (p, q) = local[f];
+            let cross = |sh: bool| -> usize { edges[f].iter().filter(|(g, _)| rep[*g] != sh).map(|(_, w)| w).sum() };
+            let want = q + cross(true) < p + cross(false);
+            if want != rep[f] {
+                rep[f] = want;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    rep
+}
+
+/// Convert a native int expression between representations.
+fn conv(e: &str, from_sh: bool, to_sh: bool) -> String {
+    match (from_sh, to_sh) {
+        (false, true) => format!("({e}).wrapping_shl(8)"),
+        (true, false) => format!("({e} >> 8)"),
+        _ => e.to_string(),
+    }
+}
+
 pub(crate) fn is_leaf(g: u32) -> bool {
     LEAF.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
 }
@@ -762,6 +1017,8 @@ struct Sem<'m> {
     /// the function counts fuel (it loops or calls); a call-free, loop-free
     /// body does bounded work and settles none
     fuel: bool,
+    /// this function's ints are pre-shifted (see `choose_reps`)
+    shifted: bool,
 }
 
 impl<'m> Sem<'m> {
@@ -786,6 +1043,22 @@ impl<'m> Sem<'m> {
         slot_key(e, &self.tarr, &self.arrs)
     }
 
+    /// An int operand as a plain (unshifted) i64: a constant as is,
+    /// anything else shifted down.
+    fn unshifted(&mut self, e: &Core, b: &mut String) -> String {
+        match e {
+            Core::Num(n) => format!("{n}i64"),
+            _ if !self.shifted => self.val(e, b),
+            _ => format!("({} >> 8)", self.val(e, b)),
+        }
+    }
+
+    /// An int value in the array storage form (pre-shifted).
+    fn stored(&mut self, e: &Core, b: &mut String) -> String {
+        let v = self.val(e, b);
+        conv(&v, self.shifted, true)
+    }
+
     /// Name of an array read in place (a live slot or a borrowed var).
     fn rd(&self, e: &Core) -> String {
         match e {
@@ -804,23 +1077,23 @@ impl<'m> Sem<'m> {
         let t = self.fresh();
         match e {
             Core::Prim(Prim::ArrNew, xs) => {
-                let n = self.val(&xs[0], b);
-                let v = self.val(&xs[1], b);
-                b.push_str(&format!("let {t} = arr_new_i({n}, num({v})) as i64;\n"));
+                let n = self.unshifted(&xs[0], b);
+                let v = self.stored(&xs[1], b);
+                b.push_str(&format!("let {t} = arr_new_raw({n}, {v}) as i64;\n"));
             }
             Core::Prim(Prim::ArrSet, xs) => {
                 let (a, d) = self.aval(&xs[0], b);
-                let i = self.val(&xs[1], b);
-                let v = self.val(&xs[2], b);
+                let i = self.unshifted(&xs[1], b);
+                let v = self.stored(&xs[2], b);
                 if let Some(k) = d {
                     self.live.remove(&k);
                 }
-                b.push_str(&format!("let {t} = arr_set_u({a} as u64, {i}, num({v})) as i64;\n"));
+                b.push_str(&format!("let {t} = arr_set_u({a} as u64, {i}, {v} as u64) as i64;\n"));
             }
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
                 b.push_str(leaf_unit(*g));
-                b.push_str(&format!("let {t} = s_{g}(ctx, fuel, {});\n", es.join(", ")));
+                b.push_str(&format!("let {t} = s_{g}({}fuel, {});\n", ctx_arg(*g), es.join(", ")));
             }
             Core::If(c, x, y) => {
                 let ec = self.val(c, b);
@@ -857,6 +1130,26 @@ impl<'m> Sem<'m> {
             self.aval(e, b)
         } else {
             (self.val(e, b), None)
+        }
+    }
+
+    /// A call's result in this function's representation (int components
+    /// convert; array components pass as they are).
+    fn call_result(&self, g: u32, call: &str) -> String {
+        if shifted(g) == self.shifted {
+            return call.to_string();
+        }
+        let sig = self.sigs[g as usize].as_ref().unwrap();
+        match sig.ret {
+            Kind::SK(k) => {
+                let rs: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
+                let cs: Vec<String> = (0..k)
+                    .map(|i| if sig.ra[i] { format!("r{i}") } else { conv(&format!("r{i}"), shifted(g), self.shifted) })
+                    .collect();
+                format!("{{ let ({}) = {call}; ({}) }}", rs.join(", "), cs.join(", "))
+            }
+            _ if sig.ra.first() == Some(&true) => call.to_string(),
+            _ => conv(call, shifted(g), self.shifted),
         }
     }
 
@@ -899,16 +1192,20 @@ impl<'m> Sem<'m> {
                     es.push(v);
                 }
                 PTy::B => es.push(self.rd(a)),
-                PTy::I => es.push(self.val(a, b)),
+                PTy::I => {
+                    let v = self.val(a, b);
+                    es.push(conv(&v, self.shifted, shifted(g)));
+                }
                 PTy::T(k) => match a {
                     Core::Var(t) if self.tvars.contains_key(t) => {
                         for i in 0..*k {
-                            es.push(format!("q{t}_{i}"));
+                            es.push(conv(&format!("q{t}_{i}"), self.shifted, shifted(g)));
                         }
                     }
                     Core::Tuple(items) => {
                         for it in items {
-                            es.push(self.val(it, b));
+                            let v = self.val(it, b);
+                            es.push(conv(&v, self.shifted, shifted(g)));
                         }
                     }
                     _ => unreachable!("non-idiom tuple arg in scalar emission"),
@@ -992,7 +1289,7 @@ impl<'m> Sem<'m> {
             Core::Call(g, args) => {
                 let es = self.call_args(*g, args, b);
                 b.push_str(leaf_unit(*g));
-                format!("s_{g}(ctx, fuel, {})", es.join(", "))
+                self.call_result(*g, &format!("s_{g}({}fuel, {})", ctx_arg(*g), es.join(", ")))
             }
             _ => unreachable!("non-tuple Core in scalar tuple emission"),
         }
@@ -1001,24 +1298,148 @@ impl<'m> Sem<'m> {
     fn val(&mut self, e: &Core, b: &mut String) -> String {
         let low = std::mem::take(&mut self.low);
         let low32 = std::mem::take(&mut self.low32);
+        if !self.shifted {
+            match e {
+                Core::Num(n) => return format!("{n}i64"),
+                Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
+                    let a = self.rd(&xs[0]);
+                    let i = self.val(&xs[1], b);
+                    let t = self.fresh();
+                    b.push_str(&format!("let {t} = (arr_get_r({a} as u64, {i}) as i64) >> 8;\n"));
+                    return t;
+                }
+                Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
+                    let a = self.rd(&xs[0]);
+                    return format!("(arr_len_of({a} as u64) as i64)");
+                }
+                Core::Op2(..) | Core::Cmp(..) => return self.plain_arith(e, low, low32, b),
+                _ => {}
+            }
+        }
         match e {
-            Core::Num(n) => format!("{n}i64"),
+            // native ints are pre-shifted (`x << 8`): i64 wrapping is i56
+            // wrapping, so no op needs a wrap fix-up
+            Core::Num(n) => format!("{}i64", (*n).wrapping_shl(8)),
             Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
                 let a = self.rd(&xs[0]);
-                let i = self.val(&xs[1], b);
+                let i = self.unshifted(&xs[1], b);
                 let t = self.fresh();
-                b.push_str(&format!("let {t} = as_i(arr_get_i({a} as u64, {i}));\n"));
+                b.push_str(&format!("let {t} = arr_get_r({a} as u64, {i}) as i64;\n"));
                 t
             }
             Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
                 let a = self.rd(&xs[0]);
-                format!("(arr_len_of({a} as u64) as i64)")
+                format!("((arr_len_of({a} as u64) as i64) << 8)")
             }
             Core::Var(i) => format!("v{i}"),
             Core::Proj(base, i) => match &**base {
                 Core::Var(t) if self.tvars.contains_key(t) => format!("q{t}_{i}"),
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
+            Core::Op2(op, x, y) => {
+                let t = self.fresh();
+                let k = |e: &Core| if let Core::Num(n) = e { Some(*n) } else { None };
+                let body = match bin_code(op) {
+                    0 | 1 | 8 | 9 | 10 => {
+                        let (ex, ey) = (self.val(x, b), self.val(y, b));
+                        match bin_code(op) {
+                            0 => format!("{ex}.wrapping_add({ey})"),
+                            1 => format!("{ex}.wrapping_sub({ey})"),
+                            8 => format!("{ex} & {ey}"),
+                            9 => format!("{ex} | {ey}"),
+                            _ => format!("{ex} ^ {ey}"),
+                        }
+                    }
+                    2 => match (k(x), k(y)) {
+                        // one factor unshifted: a constant as is
+                        (_, Some(c)) => format!("{}.wrapping_mul({c}i64)", self.val(x, b)),
+                        (Some(c), _) => format!("{}.wrapping_mul({c}i64)", self.val(y, b)),
+                        _ => {
+                            let (ex, ey) = (self.val(x, b), self.val(y, b));
+                            format!("{ex}.wrapping_mul({ey} >> 8)")
+                        }
+                    },
+                    6 | 7 => {
+                        let ex = self.val(x, b);
+                        let s = self.unshifted(y, b);
+                        if bin_code(op) == 6 {
+                            format!("{ex}.wrapping_shl({s} as u32)")
+                        } else {
+                            format!("({ex}.wrapping_shr({s} as u32) & -256i64)")
+                        }
+                    }
+                    c => {
+                        // division family: on unshifted values
+                        let ex = self.unshifted(x, b);
+                        let ey = self.unshifted(y, b);
+                        let q = match c {
+                            3 => format!("{ex}.wrapping_div({ey})"),
+                            4 => format!("floor_div({ex}, {ey})"),
+                            _ => format!("py_mod({ex}, {ey})"),
+                        };
+                        format!("({q}).wrapping_shl(8)")
+                    }
+                };
+                b.push_str(&format!("let {t} = {body};\n"));
+                t
+            }
+            Core::Cmp(op, x, y) => {
+                let (ex, ey) = (self.val(x, b), self.val(y, b));
+                let o = match cmp_code(op) {
+                    0 => "<",
+                    1 => "<=",
+                    2 => ">",
+                    3 => ">=",
+                    4 => "==",
+                    _ => "!=",
+                };
+                format!("((({ex} {o} {ey}) as i64) << 8)")
+            }
+            Core::If(c, x, y) if is_atom(x) && is_atom(y) => {
+                // a select of computed values (what if-conversion leaves):
+                // mask arithmetic, so the backend cannot turn it back into
+                // an unpredictable branch on a loop-carried chain
+                let ec = self.val(c, b);
+                let (vx, vy) = (self.val(x, b), self.val(y, b));
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = {{ let m = -(({ec} != 0) as i64); ({vx} & m) | ({vy} & !m) }};\n"));
+                t
+            }
+            Core::If(c, x, y) => {
+                let ec = self.val(c, b);
+                let before = self.live.clone();
+                let mut bx = String::new();
+                let vx = self.val(x, &mut bx);
+                let after = std::mem::replace(&mut self.live, before);
+                let mut by = String::new();
+                let vy = self.val(y, &mut by);
+                self.live = after;
+                let t = self.fresh();
+                b.push_str(&format!(
+                    "let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"
+                ));
+                t
+            }
+            Core::Let(x, r, bo) => {
+                self.bind(*x, r, b);
+                self.val(bo, b)
+            }
+            Core::Call(g, args) => {
+                let es = self.call_args(*g, args, b);
+                let t = self.fresh();
+                b.push_str(leaf_unit(*g));
+                let call = self.call_result(*g, &format!("s_{g}({}fuel, {})", ctx_arg(*g), es.join(", ")));
+                b.push_str(&format!("let {t} = {call};\n"));
+                t
+            }
+            _ => unreachable!("non-scalar Core in scalar emission"),
+        }
+    }
+
+    /// Plain-representation arithmetic: canonical i56 values, re-wrapped
+    /// where the range is not proven; masked 32-bit ops run in u32.
+    fn plain_arith(&mut self, e: &Core, low: bool, low32: bool, b: &mut String) -> String {
+        match e {
             Core::Op2(op, x, y) if low32 && crate::range::low32_closed(op) => {
                 // only the low 32 bits are observed: compute in u32 (the
                 // port's `& 0xFFFFFFFF` masks become free)
@@ -1080,43 +1501,7 @@ impl<'m> Sem<'m> {
                 };
                 format!("(({ex} {o} {ey}) as i64)")
             }
-            Core::If(c, x, y) if is_atom(x) && is_atom(y) => {
-                // a select of computed values (what if-conversion leaves):
-                // mask arithmetic, so the backend cannot turn it back into
-                // an unpredictable branch on a loop-carried chain
-                let ec = self.val(c, b);
-                let (vx, vy) = (self.val(x, b), self.val(y, b));
-                let t = self.fresh();
-                b.push_str(&format!("let {t} = {{ let m = -(({ec} != 0) as i64); ({vx} & m) | ({vy} & !m) }};\n"));
-                t
-            }
-            Core::If(c, x, y) => {
-                let ec = self.val(c, b);
-                let before = self.live.clone();
-                let mut bx = String::new();
-                let vx = self.val(x, &mut bx);
-                let after = std::mem::replace(&mut self.live, before);
-                let mut by = String::new();
-                let vy = self.val(y, &mut by);
-                self.live = after;
-                let t = self.fresh();
-                b.push_str(&format!(
-                    "let {t} = if {ec} != 0 {{\n{bx}{vx}\n}} else {{\n{by}{vy}\n}};\n"
-                ));
-                t
-            }
-            Core::Let(x, r, bo) => {
-                self.bind(*x, r, b);
-                self.val(bo, b)
-            }
-            Core::Call(g, args) => {
-                let es = self.call_args(*g, args, b);
-                let t = self.fresh();
-                b.push_str(leaf_unit(*g));
-                b.push_str(&format!("let {t} = s_{g}(ctx, fuel, {});\n", es.join(", ")));
-                t
-            }
-            _ => unreachable!("non-scalar Core in scalar emission"),
+            _ => unreachable!(),
         }
     }
 
@@ -1168,7 +1553,8 @@ impl<'m> Sem<'m> {
                 let es = self.call_args(*g, args, b);
                 self.drop_live(b);
                 b.push_str(leaf_unit(*g));
-                b.push_str(&format!("{}return s_{g}(ctx, fuel, {});\n", self.settle_fuel(), es.join(", ")));
+                let call = self.call_result(*g, &format!("s_{g}({}fuel, {})", ctx_arg(*g), es.join(", ")));
+                b.push_str(&format!("{}return {call};\n", self.settle_fuel()));
             }
             Core::Tuple(_) => {
                 let v = self.tval(e, b);
@@ -1221,6 +1607,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         tarr: HashMap::new(),
         live: Default::default(),
         fuel: !is_leaf(fid),
+        shifted: shifted(fid),
     };
     for (p, pt) in sig.params.iter().enumerate() {
         match pt {
@@ -1256,7 +1643,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     let mut after = String::new();
     for (p, pt) in sig.params.iter().enumerate() {
         match pt {
-            PTy::I => bargs.push(format!("as_i(v{p})")),
+            PTy::I => bargs.push(if shifted(fid) { format!("sh(v{p})") } else { format!("as_i(v{p})") }),
             // array ports pass as their bits; the dive side's borrow mode
             // for this param may differ from the native one
             PTy::A => {
@@ -1276,7 +1663,8 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             PTy::T(k) => {
                 needs_cell_read = true;
                 for i in 0..*k {
-                    unpack.push_str(&format!("let a{p}_{i} = as_i(field(ctx, v{p}, {i}));\n"));
+                    let f = if shifted(fid) { "sh" } else { "as_i" };
+                    unpack.push_str(&format!("let a{p}_{i} = {f}(field(ctx, v{p}, {i}));\n"));
                     bargs.push(format!("a{p}_{i}"));
                 }
                 if !bor[fid as usize][p] {
@@ -1287,15 +1675,16 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     }
     let owns_tuple = sig.params.iter().enumerate().any(|(p, pt)| matches!(pt, PTy::T(_)) && !bor[fid as usize][p]);
     let leafc = if is_leaf(fid) { "*fuel -= 1;\n" } else { "" };
-    let pack = |i: usize, r: &str| if sig.ra.get(i).copied().unwrap_or(false) { format!("{r} as u64") } else { format!("num({r})") };
+    let pack = |i: usize, r: &str| if sig.ra.get(i).copied().unwrap_or(false) { format!("{r} as u64") } else if shifted(fid) { format!("retag({r})") } else { format!("num({r})") };
     let bridge_body = match sig.ret {
-        Kind::S1 => format!("{unpack}{leafc}let r = s_{fid}(ctx, fuel, {});\n{after}Ok({})", bargs.join(", "), pack(0, "r")),
+        Kind::S1 => format!("{unpack}{leafc}let r = s_{fid}({}fuel, {});\n{after}Ok({})", ctx_arg(fid), bargs.join(", "), pack(0, "r")),
         Kind::SK(k) => {
             let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
             let packs: Vec<String> = (0..k).map(|i| pack(i, &format!("r{i}"))).collect();
             format!(
-                "{unpack}{leafc}let ({}) = s_{fid}(ctx, fuel, {});\n{after}Ok(mk_con(ctx, 0xFFFu16, &[{}]))",
+                "{unpack}{leafc}let ({}) = s_{fid}({}fuel, {});\n{after}Ok(mk_con(ctx, 0xFFFu16, &[{}]))",
                 comps.join(", "),
+                ctx_arg(fid),
                 bargs.join(", "),
                 packs.join(", ")
             )
@@ -1303,20 +1692,22 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         Kind::No => unreachable!(),
     };
     let _ = (needs_cell_read, owns_tuple);
-    let inl = crate::inline_attr(&f.body);
+    let inl = crate::inline_attr_fn(m, fid);
     if !bridge {
         return format!(
             "{inl}#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
-             fn s_{fid}(ctx: &mut Wctx, fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n",
+             fn s_{fid}({}fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n",
+            if ctx_arg(fid).is_empty() { "" } else { "ctx: &mut Wctx, " },
             params.join(", ")
         );
     }
     format!(
         "{inl}#[allow(unused_mut, unused_variables, clippy::let_and_return, clippy::too_many_arguments)]\n\
-         fn s_{fid}(ctx: &mut Wctx, fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n\
+         fn s_{fid}({}fuel: &mut i64, {}) -> {ret} {{\n{body}}}\n\n\
          #[allow(unused_variables, clippy::too_many_arguments)]\n\
          fn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{}) -> R {{\n\
          {bridge_body}\n}}\n\n",
+        if ctx_arg(fid).is_empty() { "" } else { "ctx: &mut Wctx, " },
         params.join(", "),
         (0..ar).map(|i| format!(", v{i}: u64")).collect::<String>(),
     )

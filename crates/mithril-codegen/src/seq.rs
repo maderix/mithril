@@ -111,6 +111,8 @@ pub(crate) struct Ex<'m> {
     pub inline_calls: u32,
     /// Vars holding a native scalar tuple result, as locals `q<var>_<i>`.
     pub ntup: HashSet<u32>,
+    /// ... of those, the ones whose callee holds shifted ints
+    pub ntup_sh: HashSet<u32>,
     /// The let binder whose right-hand side is being emitted.
     pub cur_let: Option<u32>,
     /// Dive form of a TRMC function: (ctor id, hole-fill rule).
@@ -226,7 +228,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -861,9 +863,11 @@ impl<'m> Ex<'m> {
                 let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
                 let t = self.fresh();
                 b.push_str(&format!(
-                    "{}let {t} = num(s_{g}(ctx, {fuel}{}));\n",
+                    "{}let {t} = {}(s_{g}({}{fuel}{}));\n",
                     if self.dive && crate::scalar::is_leaf(*g) { "*fuel -= 1;\n" } else { "" },
-                    es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
+                    if crate::scalar::shifted(*g) { "retag" } else { "num" },
+                    crate::scalar::ctx_arg(*g),
+                    es.iter().map(|e| format!(", {}({e})", if crate::scalar::shifted(*g) { "sh" } else { "as_i" })).collect::<String>()
                 ));
                 t
             }
@@ -931,7 +935,7 @@ impl<'m> Ex<'m> {
                 if let Some(r) = self.rem.get_mut(v) {
                     *r = (*r - 1).max(0);
                 }
-                format!("num(q{v}_{i})")
+                if self.ntup_sh.contains(v) { format!("retag(q{v}_{i})") } else { format!("num(q{v}_{i})") }
             }
             Core::Proj(x, i) => {
                 let (sv, hold) = self.scrutinee(x, b);
@@ -1185,6 +1189,29 @@ impl<'m> Ex<'m> {
                     self.hole_exit("r")
                 ));
             }
+            Core::Call(g, args)
+                if self.nret > 0
+                    && crate::scalar::native_sig(*g).is_some_and(|sig| sig.ret == crate::scalar::Kind::SK(self.nret)) =>
+            {
+                // the callee is native with this shape: its components come
+                // back in registers, no bridge tuple
+                let k = self.nret;
+                let es: Vec<String> = args.iter().map(|a| self.val(a, false, b)).collect();
+                let (to, from) = if crate::scalar::shifted(*g) { ("sh", "retag") } else { ("as_i", "num") };
+                let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
+                self.flush_toks(b);
+                if self.dive && crate::scalar::is_leaf(*g) {
+                    b.push_str("*fuel -= 1;\n");
+                }
+                let rs: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
+                b.push_str(&format!(
+                    "let ({}) = s_{g}({}{fuel}{});\nreturn Ok([{}]);\n",
+                    rs.join(", "),
+                    crate::scalar::ctx_arg(*g),
+                    es.iter().map(|e| format!(", {to}({e})")).collect::<String>(),
+                    rs.iter().map(|r| format!("{from}({r})")).collect::<Vec<_>>().join(", ")
+                ));
+            }
             Core::Call(g, args) if self.nret > 0 => {
                 // native multi-value form: a callee with the same native
                 // shape passes its components straight through; any other
@@ -1292,12 +1319,16 @@ impl<'m> Ex<'m> {
         let es: Vec<String> = args.iter().map(|a| self.val(a, false, b)).collect();
         let fuel = if self.dive { "fuel" } else { "&mut 0i64" };
         b.push_str(&format!(
-            "{}let ({}) = s_{g}(ctx, {fuel}{});\n",
+            "{}let ({}) = s_{g}({}{fuel}{});\n",
             if self.dive && crate::scalar::is_leaf(*g) { "*fuel -= 1;\n" } else { "" },
             (0..k).map(|i| format!("q{x}_{i}")).collect::<Vec<_>>().join(", "),
-            es.iter().map(|e| format!(", as_i({e})")).collect::<String>()
+            crate::scalar::ctx_arg(*g),
+            es.iter().map(|e| format!(", {}({e})", if crate::scalar::shifted(*g) { "sh" } else { "as_i" })).collect::<String>()
         ));
         self.ntup.insert(x);
+        if crate::scalar::shifted(*g) {
+            self.ntup_sh.insert(x);
+        }
         true
     }
 
@@ -1484,7 +1515,7 @@ pub(crate) fn dive_fn<'m>(
     // A call-free body does bounded work: no fuel check, and it inlines
     // into its (recursive) callers.
     let leafy = !has_call(body);
-    let inl = crate::inline_attr(body);
+    let inl = if crate::inline_attr(body).is_empty() { crate::inline_attr_fn(m, fid) } else { crate::inline_attr(body) };
     let mut s = if nret > 0 {
         // boxing entry for the runtime and callers outside the native shape
         format!(

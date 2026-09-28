@@ -285,8 +285,22 @@ fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
         }
     }
     let native: Vec<bool> = scal.iter().map(|s| s.is_some()).collect();
+    {
+        let sn: Vec<Option<scalar::Sig>> = scal.iter().zip(&native).map(|(s, n)| if *n { s.clone() } else { None }).collect();
+        let reps = scalar::choose_reps(m, &sn);
+        if std::env::var_os("MITHRIL_DEBUG_SCALAR").is_some() {
+            for (f, r) in reps.iter().enumerate() {
+                if native[f] {
+                    eprintln!("rep {f} {}: {}", m.fns[f].name, if *r { "shifted" } else { "plain" });
+                }
+            }
+        }
+        scalar::SHIFTED.with(|l| *l.borrow_mut() = reps);
+        let cx = scalar::needs_ctx(m, &sn);
+        scalar::CTX.with(|c| *c.borrow_mut() = cx);
+    }
     scalar::LEAF.with(|l| {
-        *l.borrow_mut() = (0..m.fns.len()).map(|f| native[f] && !has_call(&m.fns[f].body)).collect()
+        *l.borrow_mut() = (0..m.fns.len()).map(|f| native[f] && !any_call(&m.fns[f].body)).collect()
     });
     BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
     scalar::SIGS.with(|s| {
@@ -640,12 +654,80 @@ pub(crate) fn bounded_fns(m: &CoreModule) -> Vec<bool> {
     }
 }
 
+/// Whether `e` contains any call at all (`has_call` counts only calls
+/// that may suspend).
+pub(crate) fn any_call(e: &Core) -> bool {
+    match e {
+        Core::Call(..) => true,
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => any_call(a) || any_call(b),
+        Core::If(a, b, c) => any_call(a) || any_call(b) || any_call(c),
+        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(any_call),
+        Core::Match(sc, arms) => any_call(sc) || arms.iter().any(|(_, _, b)| any_call(b)),
+        Core::Proj(b, _) => any_call(b),
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+    }
+}
+
 /// Inlining attribute for an emitted function: a small call-free body
 /// (bounded work, typically a loop body helper) always inlines into its
 /// callers; rustc's heuristic declines multi-site helpers.
 pub(crate) fn inline_attr(body: &Core) -> &'static str {
     const MAX: usize = 192;
-    if !has_call(body) && rewrite::size(body) <= MAX {
+    let any = any_call(body);
+    if !any && rewrite::size(body) <= MAX {
+        "#[inline(always)]\n"
+    } else {
+        ""
+    }
+}
+
+/// `inline_attr` plus: a loop helper desugared from a `while`/`for` with a
+/// single call site from another function is that function's own loop, so
+/// it always inlines there (without this the backend picks which member of
+/// a recursive cycle absorbs the other by accident of ordering).
+pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
+    let f = &m.fns[fid as usize];
+    let a = inline_attr(&f.body);
+    if !a.is_empty() {
+        return a;
+    }
+    fn count(e: &Core, g: u32, n: &mut usize) {
+        match e {
+            Core::Call(h, xs) => {
+                *n += (*h == g) as usize;
+                xs.iter().for_each(|x| count(x, g, n));
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
+                count(a, g, n);
+                count(b, g, n);
+            }
+            Core::If(a, b, c) => {
+                count(a, g, n);
+                count(b, g, n);
+                count(c, g, n);
+            }
+            Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| count(x, g, n)),
+            Core::Match(sc, arms) => {
+                count(sc, g, n);
+                arms.iter().for_each(|(_, _, b)| count(b, g, n));
+            }
+            Core::Proj(b, _) => count(b, g, n),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+        }
+    }
+    if !(f.name.starts_with("__while") || f.name.starts_with("__for")) {
+        return "";
+    }
+    let mut n = 0;
+    for (h, other) in m.fns.iter().enumerate() {
+        if h as u32 != fid {
+            count(&other.body, fid, &mut n);
+        }
+    }
+    if std::env::var_os("MITHRIL_DEBUG_INLINE").is_some() {
+        eprintln!("loop helper {fid} {}: {n} call sites", f.name);
+    }
+    if n == 1 {
         "#[inline(always)]\n"
     } else {
         ""
@@ -1398,9 +1480,58 @@ fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
 // ---- arrays: a heap block [refcount, len, elements..] behind a T_ARR port;
 // value semantics, updated in place when this is the only reference. Bit 63
 // of the len word (ARR_BOXED) is set once the array has stored a heap value:
-// until then drop and copy need not visit the elements ----
+// until then drop and copy need not visit the elements. Bit 62 (ARR_RAW)
+// marks an all-int array stored as raw pre-shifted words (`x << 8`, the
+// native-code int representation): typed accessors and native code read and
+// write them with no tag work; generic accessors convert ----
 
 const ARR_BOXED: u64 = 1 << 63;
+const ARR_RAW: u64 = 1 << 62;
+/// Native int representation: an i56 value held as `x << 8`, so i64
+/// wrapping arithmetic is i56 wrapping arithmetic.
+#[inline(always)]
+fn sh(p: u64) -> i64 {
+    (p << 8) as i64
+}
+/// A native (pre-shifted) int back to a tagged port.
+#[inline(always)]
+fn retag(x: i64) -> u64 {
+    ((x as u64) >> 8) | (T_NUM << 56)
+}
+#[inline(always)]
+fn arr_raw(p: u64) -> bool {
+    // SAFETY: as arr_rc
+    unsafe { *arr_block(p).add(1) & ARR_RAW != 0 }
+}
+/// Element k as a tagged port (no reference taken).
+#[inline(always)]
+fn arr_elem(p: u64, k: usize) -> u64 {
+    // SAFETY: callers pass k < len
+    let e = unsafe { *arr_elems(p).add(k) };
+    if arr_raw(p) { retag(e as i64) } else { e }
+}
+/// An all-int array of n copies of the native int x.
+fn arr_new_raw(n: i64, x: i64) -> u64 {
+    if n < 0 {
+        panic!("negative array size {}", n);
+    }
+    let p = arr_alloc_fill(n as usize, x as u64);
+    // SAFETY: as arr_rc; fresh block
+    unsafe { *arr_block(p).add(1) |= ARR_RAW }
+    p
+}
+/// A raw array about to store a non-int: switch it to tagged elements.
+#[cold]
+#[inline(never)]
+fn arr_unraw(a: u64) {
+    let n = arr_len_of(a);
+    for k in 0..n {
+        // SAFETY: k < n; `a` uniquely ours
+        unsafe { *arr_elems(a).add(k) = retag(*arr_elems(a).add(k) as i64) }
+    }
+    // SAFETY: as above
+    unsafe { *arr_block(a).add(1) &= !ARR_RAW }
+}
 #[inline(always)]
 fn is_heap(v: u64) -> bool {
     let t = tag(v);
@@ -1432,7 +1563,7 @@ fn arr_rc(p: u64) -> &'static std::sync::atomic::AtomicU64 {
 #[inline(always)]
 fn arr_len_of(p: u64) -> usize {
     // SAFETY: as arr_rc; word 1 is the length
-    unsafe { (*arr_block(p).add(1) & !ARR_BOXED) as usize }
+    unsafe { (*arr_block(p).add(1) & !(ARR_BOXED | ARR_RAW)) as usize }
 }
 #[inline(always)]
 fn arr_elems(p: u64) -> *mut u64 {
@@ -1466,6 +1597,9 @@ fn arr_new(ctx: &mut Wctx, n: i64, v: u64) -> u64 {
     if n < 0 {
         panic!("negative array size {}", n);
     }
+    if tag(v) == T_NUM {
+        return arr_new_raw(n, sh(v));
+    }
     let n = n as usize;
     if !is_heap(v) {
         return arr_alloc_fill(n, v);
@@ -1489,6 +1623,9 @@ fn arr_get(ctx: &mut Wctx, a: u64, i: i64) -> u64 {
     if i < 0 || i as usize >= n {
         arr_oob(i, n);
     }
+    if arr_raw(a) {
+        return arr_elem(a, i as usize);
+    }
     // SAFETY: bounds checked
     dup_val(ctx, unsafe { *arr_elems(a).add(i as usize) })
 }
@@ -1499,6 +1636,14 @@ fn arr_set(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
         arr_oob(i, n);
     }
     let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) };
+    if arr_raw(a) {
+        if tag(v) == T_NUM {
+            // SAFETY: bounds checked; `a` is now uniquely ours
+            unsafe { *arr_elems(a).add(i as usize) = sh(v) as u64 };
+            return a;
+        }
+        arr_unraw(a);
+    }
     // SAFETY: bounds checked; `a` is now uniquely ours
     let slot = unsafe { arr_elems(a).add(i as usize) };
     free_val(ctx, unsafe { *slot });
@@ -1506,13 +1651,20 @@ fn arr_set(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
     arr_mark_boxed(a, v);
     a
 }
-/// Int-element arrays: elements are immediates, no element refcounting.
+/// Int-element arrays (typed `Arr(true)`, always raw): no element
+/// refcounting, one shift to or from the tagged form.
 #[inline(always)]
 fn arr_get_i(a: u64, i: i64) -> u64 {
+    retag(arr_get_r(a, i) as i64)
+}
+/// Native read: the raw (pre-shifted) element.
+#[inline(always)]
+fn arr_get_r(a: u64, i: i64) -> u64 {
     let n = arr_len_of(a);
     if i < 0 || i as usize >= n {
         arr_oob(i, n);
     }
+    debug_assert!(arr_raw(a) || n == 0);
     // SAFETY: bounds checked
     unsafe { *arr_elems(a).add(i as usize) }
 }
@@ -1523,8 +1675,9 @@ fn arr_set_i(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
         arr_oob(i, n);
     }
     let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) };
+    debug_assert!(arr_raw(a) || n == 0);
     // SAFETY: bounds checked; `a` is now uniquely ours
-    unsafe { *arr_elems(a).add(i as usize) = v };
+    unsafe { *arr_elems(a).add(i as usize) = sh(v) as u64 };
     a
 }
 /// Native code: arrays there are linear and made unique at the boundary
@@ -1546,10 +1699,7 @@ fn arr_own(ctx: &mut Wctx, a: u64) -> u64 {
     if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy(ctx, a) }
 }
 fn arr_new_i(n: i64, v: u64) -> u64 {
-    if n < 0 {
-        panic!("negative array size {}", n);
-    }
-    arr_alloc_fill(n as usize, v)
+    arr_new_raw(n, sh(v))
 }
 #[cold]
 #[inline(never)]
@@ -1566,6 +1716,10 @@ fn arr_copy(ctx: &mut Wctx, a: u64) -> u64 {
     } else {
         // SAFETY: n elements in both blocks, distinct allocations
         unsafe { std::ptr::copy_nonoverlapping(arr_elems(a), arr_elems(b), n) }
+        if arr_raw(a) {
+            // SAFETY: as arr_rc; `b` is ours
+            unsafe { *arr_block(b).add(1) |= ARR_RAW }
+        }
     }
     free_val(ctx, a);
     b
@@ -1825,7 +1979,7 @@ fn show(eng: &Engine, p: u64) -> String {
         }
         T_ARR => {
             let n = arr_len_of(p);
-            let fs: Vec<String> = (0..n).map(|k| show(eng, unsafe { *arr_elems(p).add(k) })).collect();
+            let fs: Vec<String> = (0..n).map(|k| show(eng, arr_elem(p, k))).collect();
             format!("[{}]", fs.join(", "))
         }
         _ => panic!("unprintable result port {:#x}", p),
