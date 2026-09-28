@@ -42,6 +42,7 @@
 mod alloc;
 mod engine;
 mod worker;
+pub mod prelude;
 
 pub use engine::Engine;
 pub use mithril_core::port::{Port, Tag};
