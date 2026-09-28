@@ -54,9 +54,12 @@ Python-subset source
      tail recursion into loops, if-conversion of loop back-edges
   -> type inference (ty.rs, monomorphic) -> unboxing, linearity
   -> ANF normalize -> reuse marking
-  -> dual-mode emission: native sequential "dive" form + net "rule" form,
-     plus the net region (closures) run by the same rule table (3b)
-  -> rustc -O against mithril-rt (CPU) / PTX via mithril-gpu
+  -> dual-mode lowering to `lir` (mithril-codegen::lir): native
+     sequential "dive" form + net "rule" form + native scalar form, one
+     statement IR over a fixed helper vocabulary (3c)
+  -> a printer per backend: `lir::rust` -> rustc -O against mithril-rt
+     (CPU); the CUDA printer is stage 2 (mithril-gpu today is a separate
+     v1 prototype)
 ```
 
 ## 3. General mechanisms (each applies to every program)
@@ -361,6 +364,51 @@ Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose
 specialization changed its value).
+
+### 3c. One lowering, printers per backend (stage 1 of the shared backend)
+
+Decided 2026-09-28, after Phase B. Every emitter used to print Rust text
+directly, and the GPU crate carried its own weaker lowering of Core. The
+three stages toward one backend: (1) pull the decisions out of the
+printers into an IR; (2) a device runtime and a CUDA printer of the same
+IR; (3) the rule table (closures, DUP) on the device, GPU lane in the gate.
+
+Stage 1, done (b890872..b1a8372):
+
+* `Core` carries its traversal once (`kids/any/walk/fold/rename/
+  free_vars/max_var`); 40 hand-written walkers across codegen, net and gpu
+  became one-line predicates.
+* `mithril-codegen::lir`: locals with declared types; `If`/`Switch`/`Loop`
+  at statement level (value branches lower to a declaration plus
+  assignments); `Try` = a call that may suspend, with the handler that
+  leaves the function; `Res` = a two-outcome match; nested cold functions
+  for suspension captures (their parameters come from `free_locals` on the
+  IR, not from scanning text). Every emitter (dive, rule/segment, fold
+  split/join, CALL and hole rules, base-case wrappers, native scalar)
+  builds it; `lir::rust::func` prints it. Generated code names the worker
+  context only through free functions of `mithril_rt::prelude` (`alloc2`,
+  `alloc_rec`, `deliver`, `dive_to`, `dive_res`, `pop_chain`, `rec_*`, ..),
+  so a backend without a context object supplies the same names over its
+  own arena. The IR's helper vocabulary is the device runtime contract of
+  stage 2.
+* The value helpers (`mk_con`, `consume*`, `dup_val`, `free_val`,
+  `take_field`, `untup`, `arr_*`, `bin`, `cmp`, `show`) left the generated
+  prelude for `mithril_rt::prelude`, generic over a `Tables` trait the
+  program implements (`lin`, `unbox_cid`, closure dup/drop). They were
+  pasted into every program only for `lin(k)` to constant-fold; it still
+  does, per instantiation.
+
+Numbers: oracle-equal on all 31 codegen tests and all 16 ports at every
+step; instruction counts identical to the baseline on every measured
+port (the moved helpers carry `#[inline]`; without it lexer/tree-radix
+ran 16-21% more instructions, i.e. it restores the previous placement,
+not a new choice). Language crates (front, core, net, reassoc, codegen,
+cli): 15,229 -> 14,798 lines; runtime 1,527 -> 2,093.
+
+Not done in stage 1: the net region (`net_region`), the `Program` impl
+and `main` are still Rust templates in lib.rs (program data + generic
+glue); `fold::est_static` is a text static. The CUDA printer decides
+their device form.
 
 ## 4. Runtime: waves, dives, records
 
