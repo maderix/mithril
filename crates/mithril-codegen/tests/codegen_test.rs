@@ -592,8 +592,10 @@ fn raw_int_array_converts_on_first_non_int_write() {
     // all-int arrays store pre-shifted words; storing a list converts the
     // array to tagged elements (and a shared copy keeps its raw words)
     let (_cm, rs) = trmc_golden("hetero_array.py");
-    // the write path converts (arr_unraw lives in mithril_rt::prelude)
-    assert!(rs.contains("arr_unraw(a)"), "the write path does not convert raw words to tagged");
+    // the write path converts (arr_set and arr_unraw live in mithril_rt::prelude)
+    assert!(rs.contains("arr_set(ctx"), "the boxed write path is not used");
+    let rt = std::fs::read_to_string(ws_root().join("crates/mithril-rt/src/prelude.rs")).unwrap();
+    assert!(rt.contains("arr_unraw(a)"), "the write path does not convert raw words to tagged");
 }
 
 #[test]
