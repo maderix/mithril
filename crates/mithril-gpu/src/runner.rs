@@ -91,6 +91,8 @@ struct Dev {
     nw: CUdeviceptr,
     nwn: CUdeviceptr,
     labels: CUdeviceptr,
+    rfree: CUdeviceptr,
+    rfreen: CUdeviceptr,
     ncap: u32,
     rcap: u32,
     bcap: u32,
@@ -101,6 +103,7 @@ struct Dev {
     net_fuel: i32,
 }
 const NWCAP: usize = 64;
+const RFREECAP: usize = 64;
 
 /// What a run delivered to ROOT: the port, and its printed form (the same
 /// text the CPU program prints).
@@ -234,6 +237,7 @@ unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Res
 }
 
 unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, String> {
+    let t0 = std::time::Instant::now();
     let stack = env_cap("MITHRIL_GPU_STACK", 32 * 1024) as usize;
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
@@ -286,7 +290,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         + 4 * ovfcap as u64
         + 8 * nrules as u64
         + 8 * hcap
-        + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4) as u64
+        + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4 + 4 * RFREECAP * MAXLANES + 4 * MAXLANES) as u64
         + (1 << 20);
     let slack: u64 = 1 << 30;
     let budget = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
@@ -326,6 +330,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         nw: alloc(16 * NWCAP * MAXLANES, "alloc nw")?,
         nwn: alloc(4 * MAXLANES, "alloc nwn")?,
         labels: alloc(4, "alloc labels")?,
+        rfree: alloc(4 * RFREECAP * MAXLANES, "alloc rfree")?,
+        rfreen: alloc(4 * MAXLANES, "alloc rfreen")?,
         ncap,
         rcap,
         bcap,
@@ -335,6 +341,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         fuel,
         net_fuel,
     };
+    if std::env::var_os("MITHRIL_GPU_DEBUG").is_some() {
+        eprintln!("mithril-gpu: nodes {:#x}+{:#x} rc {:#x}+{:#x} recs {:#x}+{:#x} ebuf {:#x}+{:#x} heap {:#x}+{:#x} nw {:#x}+{:#x} nfree {:#x}+{:#x}",
+            d.nodes, 16 * ncap as u64, d.rc, 4 * ncap as u64, d.recs, REC_SIZE as u64 * rcap as u64, d.ebuf, 24 * bcap as u64 * nrules as u64, d.heap, 8 * hcap, d.nw, (16 * NWCAP * MAXLANES) as u64, d.nfree, (4 * MAXLANES * FREECAP) as u64);
+    }
     cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?;
     cu(cuMemsetD8_v2(d.nfreen, 0, 4 * MAXLANES), "memset nfreen")?;
     cu(cuMemsetD8_v2(d.nchunk, 0, 8 * MAXLANES), "memset nchunk")?;
@@ -350,7 +360,16 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let one64: u64 = 1;
     cu(cuMemcpyHtoD_v2(d.hbump, (&one64 as *const u64).cast(), 8), "init hbump")?;
     cu(cuMemsetD8_v2(d.rc, 0, 4 * ncap as usize), "memset rc")?;
+    // MITHRIL_GPU_POISON=<buffers>: fill never-initialized buffers with a
+    // pattern so a read of unwritten memory is deterministic (a probe)
+    if let Ok(pz) = std::env::var("MITHRIL_GPU_POISON") {
+        if pz.contains("nodes") { cu(cuMemsetD8_v2(d.nodes, 0xCD, 16 * ncap as usize), "poison nodes")?; cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?; }
+        if pz.contains("recs") { cu(cuMemsetD8_v2(d.recs, 0xCD, REC_SIZE * rcap as usize), "poison recs")?; }
+        if pz.contains("ebuf") { cu(cuMemsetD8_v2(d.ebuf, 0xCD, 24 * bcap as usize * nrules), "poison ebuf")?; }
+        if pz.contains("heap") { cu(cuMemsetD8_v2(d.heap, 0xCD, 8 * hcap as usize), "poison heap")?; }
+    }
     cu(cuMemsetD8_v2(d.nwn, 0, 4 * MAXLANES), "memset nwn")?;
+    cu(cuMemsetD8_v2(d.rfreen, 0, 4 * MAXLANES), "memset rfreen")?;
     cu(cuMemcpyHtoD_v2(d.labels, (&one as *const u32).cast(), 4), "init labels")?;
 
     // publish Dev to the module global G
@@ -373,6 +392,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let mut k_pump: *mut c_void = std::ptr::null_mut();
     cu(cuModuleGetFunction(&mut k_pump, module, c"k_pump".as_ptr()), "get k_pump")?;
 
+    let t_setup = t0.elapsed();
     // boot fires rule 0 with the redex, parent = ROOT (aux)
     {
         let (mut a, mut b, mut c) = (boot.a, boot.b, boot.aux);
@@ -399,6 +419,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     const PUMP_STEPS: u32 = 1 << 16;
     let wave_limit = env_cap("MITHRIL_GPU_WAVES", 1 << 24);
     let mut waves: u64 = 0;
+    let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
+    let t_run = std::time::Instant::now();
+    let mut pumps: u64 = 0;
     loop {
         cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
         let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
@@ -408,12 +431,11 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
             3 => return Err("mithril-gpu: array index out of bounds".to_string()),
             4 => return Err("mithril-gpu: the program used an unsupported device feature".to_string()),
             5 => return Err("mithril-gpu: a cell walk did not terminate (corrupted arena)".to_string()),
-            _ => {
-                return Err(
-                    "mithril-gpu: arena exhausted (raise MITHRIL_GPU_NODES / MITHRIL_GPU_RECS / MITHRIL_GPU_BUCKET / MITHRIL_GPU_HEAP)"
-                        .to_string(),
-                )
-            }
+            6 => return Err(format!("mithril-gpu: arena exhausted: records ({rcap}; raise MITHRIL_GPU_RECS)")),
+            7 => return Err(format!("mithril-gpu: arena exhausted: rule bucket ({bcap} entries; raise MITHRIL_GPU_BUCKET)")),
+            8 => return Err(format!("mithril-gpu: arena exhausted: array heap ({hcap} words; raise MITHRIL_GPU_HEAP)")),
+            9 => return Err("mithril-gpu: a cell index outside the arena was read (corrupted port)".to_string()),
+            _ => return Err(format!("mithril-gpu: arena exhausted: cells ({ncap}; raise MITHRIL_GPU_NODES)")),
         }
         let mut lens = dtoh::<u32>(d.blen, nrules, "read blen")?;
         let mut dones = dtoh::<u32>(d.bdone, nrules, "read bdone")?;
@@ -459,6 +481,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
                 cuLaunchKernel(k_pump, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
                 "launch k_pump",
             )?;
+            pumps += 1;
             continue;
         }
         let (mut rule, mut start, mut count) = (best as u32, dones[best], best_n);
@@ -472,13 +495,25 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
             (&mut start as *mut u32).cast::<c_void>(),
             (&mut count as *mut u32).cast::<c_void>(),
         ];
-        let grid = count.div_ceil(TPB);
+        // MITHRIL_GPU_THREADS caps the threads per wave (1 = sequential device
+        // execution: a determinism probe)
+        let tpb = env_cap("MITHRIL_GPU_THREADS", MAXLANES as u64).clamp(1, TPB as u64) as u32;
+        let max_grid = (env_cap("MITHRIL_GPU_THREADS", MAXLANES as u64).clamp(1, MAXLANES as u64) as u32).div_ceil(tpb);
+        let grid = count.div_ceil(tpb).min(max_grid);
+        if std::env::var_os("MITHRIL_GPU_DEBUG").is_some() {
+            eprintln!("mithril-gpu: wave {waves}: rule {rule} count {count} grid {grid} x {tpb}");
+        }
         cu(
-            cuLaunchKernel(k_fire, grid, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
+            cuLaunchKernel(k_fire, grid, 1, 1, tpb, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
             "launch k_fire",
         )?;
     }
 
+    if stats {
+        let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
+        let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
+        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms, {waves} waves ({pumps} pumps), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3);
+    }
     let res = dtoh::<u64>(d.result, 2, "read result")?;
     if res[0] == 0 {
         return Err("mithril-gpu: run finished without delivering a result to ROOT".to_string());

@@ -36,6 +36,9 @@ typedef unsigned long long usize;
 #define AB_OOB 3u
 #define AB_UNSUPPORTED 4u
 #define AB_LOOP 5u
+#define AB_RECS 6u
+#define AB_BUCKET 7u
+#define AB_HEAP 8u
 // a walk over cells that never ends is a corrupted arena, not a hang
 #define GUARD(n) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return; } } while (0)
 #define GUARDV(n, v) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return v; } } while (0)
@@ -43,9 +46,9 @@ typedef unsigned long long usize;
 struct Rec {
   int pend;
   unsigned short rule;
-  unsigned short s;
-  u32 d;
-  u32 _pad;
+  unsigned short _pad;
+  u32 d; // a spill chain head, a FILL target's low word, a TRMC head cell
+  u32 s; // a FILL target's high word, a TRMC hole cell
   u64 parent; // rec_idx << 3 | slot
   u64 args[2];
 };
@@ -73,16 +76,20 @@ struct Dev {
   u64 *nw;     // MAXLANES * NWCAP * 2: per-lane net worklists (redex pairs)
   u32 *nwn;    // MAXLANES worklist lengths
   u32 *labels; // Dup label supply
+  u32 *rfree;  // MAXLANES * RFREECAP per-lane record free lists
+  u32 *rfreen; // MAXLANES record free-list lengths
   u32 ncap, rcap, bcap, ovfcap, chunksz, nrules;
   int fuel;    // per-dive budget
   int net_fuel; // rewrites per net reduction before spilling to the net rule
 };
 #define NWCAP 64
+#define RFREECAP 64
 
 extern "C" {
 __device__ Dev G;
 __device__ u32 g_nrules = PROG_NRULES;
 }
+
 
 struct R {
   u64 v; // the value, or the suspension record when !ok
@@ -95,6 +102,8 @@ struct P2R { u64 f0, f1; u32 f2; };
 // T<k> (native int tuples) are declared by the program for the widths it uses
 
 __device__ void prog_fire(u32 rule, u64 e0, u64 e1, u64 e2);
+// rule -> its entries carry a record index in their third word
+extern __device__ const bool REC_RULE[PROG_NRULES];
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
 __device__ u32 unbox_cid(u64 slot);
@@ -173,7 +182,18 @@ __device__ inline i64 f32_to_u32(i64 a) {
 
 // ---- clamped cell access (safe even on garbage after an abort) ----
 
-__device__ inline u32 nclamp(u32 i) { return i < G.ncap ? i : G.ncap - 1; }
+#include <cstdio>
+__device__ inline void expect_con(u64 p, const char *site) {
+  if (tag(p) != T_CON) { if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: %s on a non-constructor port %llx\n", site, p); }
+}
+__device__ inline u32 nclamp(u32 i) {
+  if (i >= G.ncap) {
+    // a cell index outside the arena is a corrupted port, never a valid read
+    if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: bad cell index %u\n", i);
+    return G.ncap - 1;
+  }
+  return i;
+}
 __device__ inline u64 cell0(u32 i) { return G.nodes[2 * (u64)nclamp(i)]; }
 __device__ inline u64 cell1(u32 i) { return G.nodes[2 * (u64)nclamp(i) + 1]; }
 __device__ inline void setcell(u32 i, u64 a, u64 b) {
@@ -242,22 +262,38 @@ __device__ inline void tok_free(u32 tok) { if (tok != NOTOK) free_node(tok); }
 __device__ inline void rc_inc(u32 i) { atomicAdd(&G.rc[nclamp(i)], 1u); }
 __device__ inline bool rc_dec(u32 i) { return atomicSub(&G.rc[nclamp(i)], 1u) == 1u; }
 __device__ inline void rc_set1(u32 i) { G.rc[nclamp(i)] = 1; }
-__device__ inline bool rc_unique(u32 i) { return G.rc[nclamp(i)] == 1; }
+// refcounts are shared across SMs within a wave: read them past L1
+__device__ inline bool rc_unique(u32 i) { return *(volatile u32 *)&G.rc[nclamp(i)] == 1; }
 
 // ---- records / buckets / delivery ----
 
+// records fired by a record-activated rule are dead: recycled per lane
+__device__ inline void rec_free(u32 i) {
+  if (i == 0 || i >= G.rcap) return;
+  u32 L = lane();
+  if (G.rfreen[L] < RFREECAP) G.rfree[L * RFREECAP + G.rfreen[L]++] = i;
+}
 __device__ __noinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
-  u32 i = atomicAdd(G.rbump, 1);
-  if (i >= G.rcap) {
-    g_abort(AB_ARENA);
-    return G.rcap - 1;
+  u32 L = lane();
+  u32 i;
+  if (G.rfreen[L]) {
+    i = G.rfree[L * RFREECAP + --G.rfreen[L]];
+  } else {
+    i = atomicAdd(G.rbump, 1);
+    if (i >= G.rcap) {
+      g_abort(AB_RECS);
+      return G.rcap - 1;
+    }
   }
   Rec &r = G.recs[i];
   r.pend = (int)pend;
   r.rule = (unsigned short)rule;
-  r.s = (unsigned short)s;
+  r._pad = 0;
+  r.s = s;
   r.d = d;
   r.parent = parent;
+  r.args[0] = 0;
+  r.args[1] = 0;
   return i;
 }
 
@@ -271,7 +307,7 @@ __device__ inline i64 fuel_of() { return (i64)G.fuel; }
 __device__ __noinline__ void spawn3(u32 rule, u64 a, u64 b, u64 c) {
   u32 i = atomicAdd(&G.blen[rule], 1);
   if (i >= G.bcap) {
-    g_abort(AB_ARENA);
+    g_abort(AB_BUCKET);
     return;
   }
   u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
@@ -299,8 +335,12 @@ __device__ __noinline__ void deliver(u64 parent, u64 val) {
   Rec &r = G.recs[ri];
   r.args[slot] = val;
   __threadfence();
-  if (atomicSub(&r.pend, 1) == 1)
-    spawn3(r.rule, r.args[0], r.args[1], (u64)ri);
+  if (atomicSub(&r.pend, 1) == 1) {
+    // the other slot was written by another SM in this wave: read it past L1
+    volatile u64 *args = (volatile u64 *)r.args;
+    __threadfence();
+    spawn3(r.rule, args[0], args[1], (u64)ri);
+  }
 }
 
 // Spawn a saturated call: arity <= 2 rides in (a, b); wider calls put
@@ -325,6 +365,7 @@ __device__ __noinline__ void spawn_call(u16 rule, const u64 *args, int n, u64 pa
 // Pop the head value of a `[value, next]` spill chain (`ch` = addr + 1;
 // 0 = end), freeing its cell.
 __device__ inline u64 pop_chain(u64 *ch) {
+  if (*ch == 0 || (*ch >> 32) != 0) { if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: pop_chain on %llx\n", *ch); }
   u32 i = (u32)(*ch - 1);
   u64 v = cell0(i);
   *ch = cell1(i);
@@ -420,6 +461,7 @@ __device__ inline u64 mk_con2r(u32 tok, u16 k, u64 f0, u64 f1) {
 }
 // field i of a constructor value (walks the >2-arity chain)
 __device__ __noinline__ u64 field(u64 p, usize i) {
+  expect_con(p, "field");
   u32 g = 0;
   for (;;) {
     GUARDV(g, 0);
@@ -435,6 +477,7 @@ __device__ __noinline__ u64 field(u64 p, usize i) {
   }
 }
 __device__ inline P2 consume2k(u64 p, u16 k) {
+  expect_con(p, "consume2k");
   u32 a = con_addr(p);
   u64 c0 = cell0(a), c1 = cell1(a);
   if (lin(k) || rc_unique(a)) {
@@ -446,6 +489,7 @@ __device__ inline P2 consume2k(u64 p, u16 k) {
   return P2{f0, f1};
 }
 __device__ inline P2R consume2r(u64 p, u16 k) {
+  expect_con(p, "consume2r");
   u32 a = con_addr(p);
   u64 c0 = cell0(a), c1 = cell1(a);
   if (lin(k) || rc_unique(a)) return P2R{c0, c1, a};
@@ -481,6 +525,7 @@ template <int N> __device__ A<N> consume_chain(u64 p, u16 k) {
 }
 // last use of a boxed value that is only projected: move field i out
 __device__ __noinline__ u64 take_field(u64 p, usize i) {
+  expect_con(p, "take_field");
   u32 root = con_addr(p);
   if (!lin(con_tag(p)) && !rc_unique(root)) {
     u64 f = dup_val(field(p, i));
@@ -553,7 +598,7 @@ __device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return
 __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
   u64 base = atomicAdd(G.hbump, n + 2);
   if (base + n + 2 > G.hcap) {
-    g_abort(AB_ARENA);
+    g_abort(AB_HEAP);
     return (T_ARR << 56) | 0;
   }
   u64 *b = &G.heap[base];
@@ -1557,14 +1602,17 @@ __device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
 
 extern "C" __global__ void k_boot(u64 a, u64 b, u64 c) { prog_fire(0, a, b, c); }
 
+// Grid-stride: the host launches at most MAXLANES threads, so a lane (its
+// free list, bump chunk and net worklist) belongs to exactly one thread.
 extern "C" __global__ void k_fire(u32 rule, u32 start, u32 count) {
-  u32 i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  if (*G.abortf >= AB_ARENA)
-    return; // poisoned: stop generating work
-  const u64 *e = &G.ebuf[((u64)rule * G.bcap + start + i) * 3];
-  prog_fire(rule, e[0], e[1], e[2]);
+  u32 stride = gridDim.x * blockDim.x;
+  for (u32 i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += stride) {
+    if (*G.abortf >= AB_ARENA)
+      return; // poisoned: stop generating work
+    const u64 *e = &G.ebuf[((u64)rule * G.bcap + start + i) * 3];
+    prog_fire(rule, e[0], e[1], e[2]);
+    if (REC_RULE[rule]) rec_free((u32)e[2]); // a fired record is dead
+  }
 }
 
 // Sequential-tail pump: when total pending work is tiny, one host wave per
@@ -1607,5 +1655,6 @@ extern "C" __global__ void k_pump(u32 max_steps) {
     u32 i = G.bdone[rule]++;
     const u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
     prog_fire(rule, e[0], e[1], e[2]);
+    if (REC_RULE[rule]) rec_free((u32)e[2]);
   }
 }
