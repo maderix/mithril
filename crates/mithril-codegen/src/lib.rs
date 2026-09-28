@@ -178,8 +178,31 @@ fn uniquify(m: &CoreModule) -> CoreModule {
 }
 
 pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
+    // the passes recurse along let chains, which compile-time unfolding
+    // makes long: run on a stack sized for that, not the caller's
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn_scoped(s, || emit_rust_inner(m, net))
+            .expect("spawn codegen thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
     let m_i = rewrite::inline_leaves(m);
-    let m_s = rewrite::unfold_static(&m_i);
+    // if-conversion first: a loop whose body ends in a branch becomes one
+    // back-edge, which unfolding then walks linearly (not per path)
+    let m_s = rewrite::unfold_static(&rewrite::if_convert(&uniquify(&m_i)));
+    if let Some(which) = std::env::var_os("MITHRIL_DUMP_CORE") {
+        let which = which.to_string_lossy().to_string();
+        for (fid, f) in m_s.fns.iter().enumerate() {
+            if f.name == which || which == "all" {
+                eprintln!("core {fid} {} = {:?}", f.name, f.body);
+            }
+        }
+    }
     let m_u = rewrite::if_convert(&uniquify(&m_s));
     // records_to_tuples (rewrite.rs) is parked: without native multi-value
     // returns in the dive form it only trades ctor cells for tuple chains.

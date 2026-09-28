@@ -34,6 +34,20 @@ def wraps(a, b):
     return (big ^ masked ^ neg ^ hi) & 36028797018963967
 
 
+# static loop bounds (reaching the loop through let-bound constants), a
+# runtime branch in the body, tuple loop state: unfolds to straight code
+# with residual branches
+def bitmix(b):
+    s = 0
+    for k in range(8):
+        bit = (b >> k) & 1
+        if bit == 1:
+            s = (s + k * 3) & 1048575
+        else:
+            s = s ^ (k + 1)
+    return s
+
+
 # fork recursion over ints: a scalar function that must still split
 def ftree(d, x):
     if d == 0:
@@ -44,7 +58,7 @@ def ftree(d, x):
 def loop(i, acc):
     if i == 0:
         return acc
-    return loop(i - 1, (acc + rounds(3, 0, i) + collatz(i + 1, 0) + wraps(i, acc & 1023)) & 36028797018963967)
+    return loop(i - 1, (acc + rounds(3, 0, i) + collatz(i + 1, 0) + wraps(i, acc & 1023) + bitmix(acc & 255)) & 36028797018963967)
 
 
 def main():

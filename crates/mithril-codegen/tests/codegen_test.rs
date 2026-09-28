@@ -418,6 +418,14 @@ fn unfolding_and_wrap_elision_match_oracle() {
     assert!(!s_loop.contains(&format!("s_{rounds}(")), "rounds(3, 0, i) was not unfolded");
     // collatz branches on a runtime value: still called
     assert!(s_loop.contains(&format!("s_{collatz}(")), "collatz must not be unfolded");
+    // bitmix's loop (bounds through let-bound constants, runtime branch,
+    // tuple state) unfolds: no loop helper remains in it
+    let bm = &rs[rs.find(&format!("fn s_{}(", cm.fns.iter().position(|f| f.name == "bitmix").unwrap())).unwrap()..];
+    let bm = &bm[..bm.find("\n}\n").unwrap()];
+    assert!(!bm.contains("continue 'l") && !bm.contains("s_") || !bm.contains("__for"), "bitmix's loop was not unfolded");
+    for f in cm.fns.iter().enumerate().filter(|(_, f)| f.name.starts_with("__for")) {
+        assert!(!bm.contains(&format!("s_{}(", f.0)), "bitmix still calls its loop helper");
+    }
     // ftree forks: it keeps a real (splittable) dive form, not a bridge
     let ft = cm.fns.iter().position(|f| f.name == "ftree").unwrap();
     assert!(dive_form(&cm, &rs, "ftree").contains(&format!("d_{ft}(ctx, fuel")), "ftree has no splittable dive form");

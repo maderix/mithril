@@ -384,6 +384,7 @@ const UNFOLD_WORK: usize = 200_000;
 enum Pv {
     K(i64),
     D(Core), // an atom: Num or Var of the caller
+    T(Vec<Pv>),
 }
 
 impl Pv {
@@ -391,6 +392,7 @@ impl Pv {
         match self {
             Pv::K(n) => Core::Num(*n),
             Pv::D(c) => c.clone(),
+            Pv::T(xs) => Core::Tuple(xs.iter().map(|x| x.core()).collect()),
         }
     }
 }
@@ -476,6 +478,9 @@ impl Pe<'_> {
             Core::Var(i) => env.get(i)?.clone(),
             Core::Op2(op, a, b) => {
                 let (x, y) = (self.val(a, env)?, self.val(b, env)?);
+                if matches!(x, Pv::T(_)) || matches!(y, Pv::T(_)) {
+                    return None;
+                }
                 match (&x, &y) {
                     (Pv::K(p), Pv::K(q)) => Pv::K(fold_op2(op, *p, *q)?),
                     _ => self.bind(Core::Op2(*op, Box::new(x.core()), Box::new(y.core()))),
@@ -483,6 +488,9 @@ impl Pe<'_> {
             }
             Core::Cmp(op, a, b) => {
                 let (x, y) = (self.val(a, env)?, self.val(b, env)?);
+                if matches!(x, Pv::T(_)) || matches!(y, Pv::T(_)) {
+                    return None;
+                }
                 match (&x, &y) {
                     (Pv::K(p), Pv::K(q)) => Pv::K(fold_cmp(op, *p, *q)),
                     _ => self.bind(Core::Cmp(*op, Box::new(x.core()), Box::new(y.core()))),
@@ -490,7 +498,26 @@ impl Pe<'_> {
             }
             Core::If(c, t, f) => match self.val(c, env)? {
                 Pv::K(k) => self.val(if k != 0 { t } else { f }, env)?,
-                Pv::D(_) => return None, // dynamic control
+                Pv::T(_) => return None,
+                Pv::D(cv) => {
+                    // a runtime branch: both sides unfold under their own
+                    // copy of the environment into a residual `if`
+                    let saved = std::mem::take(&mut self.lets);
+                    let mut et = env.clone();
+                    let vt = self.val(t, &mut et)?;
+                    let lt = std::mem::replace(&mut self.lets, Vec::new());
+                    let mut ef = env.clone();
+                    let vf = self.val(f, &mut ef)?;
+                    let lf = std::mem::replace(&mut self.lets, saved);
+                    let wrap = |lets: Vec<(u32, Core)>, v: Pv| {
+                        lets.into_iter().rev().fold(v.core(), |acc, (x, r)| Core::Let(x, Box::new(r), Box::new(acc)))
+                    };
+                    if matches!(vt, Pv::T(_)) || matches!(vf, Pv::T(_)) {
+                        return None;
+                    }
+                    let r = Core::If(Box::new(cv), Box::new(wrap(lt, vt)), Box::new(wrap(lf, vf)));
+                    self.bind(r)
+                }
             },
             Core::Let(x, r, b) => {
                 let v = self.val(r, env)?;
@@ -501,6 +528,16 @@ impl Pe<'_> {
                 let vs: Option<Vec<Pv>> = args.iter().map(|a| self.val(a, env)).collect();
                 self.call(*g, vs?)?
             }
+            // tuples (loop state) stay symbolic: built and projected here
+            Core::Tuple(xs) => {
+                let vs: Option<Vec<Pv>> = xs.iter().map(|a| self.val(a, env)).collect();
+                Pv::T(vs?)
+            }
+            Core::Proj(t, i) => match self.val(t, env)? {
+                Pv::T(xs) => xs.get(*i)?.clone(),
+                Pv::D(c) => self.bind(Core::Proj(Box::new(c), *i)),
+                Pv::K(_) => return None,
+            },
             _ => return None, // data: not unfolded
         })
     }
@@ -565,34 +602,100 @@ fn unfold_call(m: &CoreModule, g: u32, args: &[Core], next: &mut u32) -> Option<
 
 /// Unfold every call with static control in every function (see above).
 pub(crate) fn unfold_static(m: &CoreModule) -> CoreModule {
-    fn go(e: &Core, m: &CoreModule, next: &mut u32) -> Core {
-        let rec = |x: &Core, next: &mut u32| go(x, m, next);
+    fn go(e: &Core, m: &CoreModule, next: &mut u32, ks: &mut HashMap<u32, i64>) -> Core {
+        let rec = |x: &Core, next: &mut u32, ks: &mut HashMap<u32, i64>| go(x, m, next, ks);
         match e {
             Core::Call(g, args) => {
-                let args: Vec<Core> = args.iter().map(|a| rec(a, next)).collect();
-                unfold_call(m, *g, &args, next).unwrap_or(Core::Call(*g, args))
+                let args: Vec<Core> = args.iter().map(|a| rec(a, next, ks)).collect();
+                // let-bound constants are static at the call site
+                let sargs: Vec<Core> = args
+                    .iter()
+                    .map(|a| match a {
+                        Core::Var(v) => ks.get(v).map(|n| Core::Num(*n)).unwrap_or_else(|| a.clone()),
+                        _ => a.clone(),
+                    })
+                    .collect();
+                unfold_call(m, *g, &sargs, next).unwrap_or(Core::Call(*g, args))
+            }
+            Core::Let(x, r, b) => {
+                let r2 = rec(r, next, ks);
+                if let Core::Num(n) = r2 {
+                    ks.insert(*x, n);
+                }
+                Core::Let(*x, Box::new(r2), Box::new(rec(b, next, ks)))
             }
             Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
-            Core::Op2(o, a, b) => Core::Op2(*o, Box::new(rec(a, next)), Box::new(rec(b, next))),
-            Core::Cmp(o, a, b) => Core::Cmp(*o, Box::new(rec(a, next)), Box::new(rec(b, next))),
-            Core::If(c, t, f) => Core::If(Box::new(rec(c, next)), Box::new(rec(t, next)), Box::new(rec(f, next))),
-            Core::Let(x, r, b) => Core::Let(*x, Box::new(rec(r, next)), Box::new(rec(b, next))),
-            Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| rec(x, next)).collect()),
-            Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| rec(x, next)).collect()),
-            Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| rec(x, next)).collect()),
-            Core::Proj(a, i) => Core::Proj(Box::new(rec(a, next)), *i),
+            Core::Op2(o, a, b) => Core::Op2(*o, Box::new(rec(a, next, ks)), Box::new(rec(b, next, ks))),
+            Core::Cmp(o, a, b) => Core::Cmp(*o, Box::new(rec(a, next, ks)), Box::new(rec(b, next, ks))),
+            Core::If(c, t, f) => Core::If(Box::new(rec(c, next, ks)), Box::new(rec(t, next, ks)), Box::new(rec(f, next, ks))),
+            Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| rec(x, next, ks)).collect()),
+            Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| rec(x, next, ks)).collect()),
+            Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| rec(x, next, ks)).collect()),
+            Core::Proj(a, i) => Core::Proj(Box::new(rec(a, next, ks)), *i),
             Core::Match(s, arms) => Core::Match(
-                Box::new(rec(s, next)),
-                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), rec(b, next))).collect(),
+                Box::new(rec(s, next, ks)),
+                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), rec(b, next, ks))).collect(),
             ),
         }
     }
     let mut out = m.clone();
     for f in out.fns.iter_mut() {
         let mut next = max_var(&f.body).max(f.arity as u32) + 1;
-        f.body = go(&f.body, m, &mut next);
+        f.body = untuple(&go(&f.body, m, &mut next, &mut HashMap::new()));
     }
     out
+}
+
+/// `Let(x, Tuple(atoms), b)` where `b` only projects `x`: substitute the
+/// components (an unfolded loop's tuple state, which would otherwise keep
+/// its caller off the scalar path).
+fn untuple(e: &Core) -> Core {
+    fn atom(e: &Core) -> bool {
+        matches!(e, Core::Num(_) | Core::Var(_))
+    }
+    fn subst_proj(e: &Core, x: u32, xs: &[Core]) -> Core {
+        let r = |e: &Core| subst_proj(e, x, xs);
+        match e {
+            Core::Proj(t, i) if **t == Core::Var(x) => xs[*i].clone(),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
+            Core::Op2(o, a, b) => Core::Op2(*o, Box::new(r(a)), Box::new(r(b))),
+            Core::Cmp(o, a, b) => Core::Cmp(*o, Box::new(r(a)), Box::new(r(b))),
+            Core::If(c, t, f) => Core::If(Box::new(r(c)), Box::new(r(t)), Box::new(r(f))),
+            Core::Let(v, a, b) => Core::Let(*v, Box::new(r(a)), Box::new(r(b))),
+            Core::Call(g, xs2) => Core::Call(*g, xs2.iter().map(r).collect()),
+            Core::Ctor(c, xs2) => Core::Ctor(*c, xs2.iter().map(r).collect()),
+            Core::Reuse(v, c, xs2) => Core::Reuse(*v, *c, xs2.iter().map(r).collect()),
+            Core::Tuple(xs2) => Core::Tuple(xs2.iter().map(r).collect()),
+            Core::Proj(t, i) => Core::Proj(Box::new(r(t)), *i),
+            Core::Match(s, arms) => Core::Match(Box::new(r(s)), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), r(b))).collect()),
+        }
+    }
+    match e {
+        Core::Let(x, r, b) => {
+            let r2 = untuple(r);
+            let b2 = untuple(b);
+            // a let whose value is `Let*(.., Tuple(atoms))` hoists its lets
+            let mut lets = Vec::new();
+            let mut cur = &r2;
+            while let Core::Let(v, rr, bb) = cur {
+                lets.push((*v, (**rr).clone()));
+                cur = bb;
+            }
+            if let Core::Tuple(xs) = cur {
+                if xs.iter().all(atom) && crate::seq::only_projected(*x, &b2) {
+                    let mut out = subst_proj(&b2, *x, xs);
+                    for (v, rr) in lets.into_iter().rev() {
+                        out = Core::Let(v, Box::new(rr), Box::new(out));
+                    }
+                    return out;
+                }
+            }
+            Core::Let(*x, Box::new(r2), Box::new(b2))
+        }
+        Core::If(c, t, f) => Core::If(c.clone(), Box::new(untuple(t)), Box::new(untuple(f))),
+        Core::Match(s, arms) => Core::Match(s.clone(), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), untuple(b))).collect()),
+        other => other.clone(),
+    }
 }
 
 // ---- if-conversion of same-call branches ----
