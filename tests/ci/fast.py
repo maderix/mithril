@@ -55,7 +55,7 @@ SMALL = {
     "merkle": (["s/build(22, 0)/build(4, 0)/", "s/pgen(22, 1337, 0), leafh(1337)/pgen(4, 13, 0), leafh(13)/"], "524568222"),
     "nbody": (["s/run(17, 300)/run(7, 300)/"], "2215450620"),
     "queens": (["s/run(17, 17, 11730)/run(10, 5, 625)/"], "774553824"),
-    "raytrace": (["s/rowf(12, 0, 4095, 6000, 3000.0, 2048.0)/rowf(6, 0, 63, 80, 40.0, 32.0)/"], "402971"),
+    "raytrace": (["s/rowf(12, 0, 4095, 6000, 1161527296, 1157627904)/rowf(6, 0, 63, 80, 1109393408, 1107296256)/"], "402971"),
     "symreg": (["s/run(18, 42, 32, 110)/run(6, 42, 32, 16)/"], "2490246820"),
     "terrain": (["s/for t in range(65536):/for t in range(16):/"], "4236200168"),
     "tree-bitonic": (["s/bsort(23, 0, 0)/bsort(8, 0, 0)/"], "971629740"),
@@ -83,7 +83,7 @@ TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.5}
 SOFT = {"build_s"}
 # CPU lanes known to take minutes even at small size (float emulation);
 # code metrics still gated, runs reported but not counted as failures
-KNOWN_SLOW = {"raytrace"}
+KNOWN_SLOW = set()
 RUN_ENV = dict(os.environ, MITHRIL_NODES=str(1 << 28), MITHRIL_RECS=str(1 << 26))
 
 
