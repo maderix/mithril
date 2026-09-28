@@ -80,6 +80,9 @@ pub(crate) struct Ex<'m> {
     pub rem: Cnt,
     /// >0 inside value-position If/Match branches: reads dup, never move.
     pub pinned: u32,
+    /// the outer variables of the active value-position branches: only
+    /// these are pinned (arm-local binders are owned normally)
+    pub pinset: HashSet<u32>,
     /// Borrow-derived variables (dive mode only; empty in rule mode).
     pub bset: HashSet<u32>,
     /// Per-function parameter borrow modes.
@@ -234,7 +237,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -274,7 +277,7 @@ impl<'m> Ex<'m> {
     /// any other expression is evaluated to a temporary released after.
     fn borrow_read(&mut self, e: &Core, b: &mut String) -> (String, Option<String>) {
         if let Core::Var(i) = e {
-            if self.bset.contains(i) || self.pinned > 0 {
+            if self.bset.contains(i) || (self.pinned > 0 && self.pinset.contains(i)) {
                 return (format!("v{i}"), None);
             }
             match self.rem.get_mut(i) {
@@ -443,7 +446,7 @@ impl<'m> Ex<'m> {
             }
             return format!("v{i}");
         }
-        if self.pinned > 0 {
+        if self.pinned > 0 && self.pinset.contains(&i) {
             self.note_share(i);
             let t = self.fresh();
             b.push_str(&format!("let {t} = dup_val(ctx, v{i});\n"));
@@ -515,7 +518,7 @@ impl<'m> Ex<'m> {
             if self.dive && self.bset.contains(i) {
                 return (format!("v{i}"), Hold::BorrowRaw);
             }
-            if self.pinned > 0 {
+            if self.pinned > 0 && self.pinset.contains(i) {
                 self.note_share(*i);
                 return (format!("v{i}"), Hold::BorrowDup);
             }
@@ -605,7 +608,7 @@ impl<'m> Ex<'m> {
                 }
                 Hold::Consume => unreachable!(),
                 Hold::BorrowDup => {
-                    if cnt > 0 || self.pinned > 0 {
+                    if cnt > 0 {
                         b.push_str(&format!(
                             "let v{bv} = dup_val(ctx, field(ctx, {sv}, {i}));\n"
                         ));
@@ -651,7 +654,7 @@ impl<'m> Ex<'m> {
                 match a {
                     Core::Var(i) if self.bset.contains(i) => es.push(format!("v{i}")),
                     Core::Var(i) => {
-                        if self.pinned > 0 {
+                        if self.pinned > 0 && self.pinset.contains(i) {
                             es.push(format!("v{i}"));
                         } else {
                             match self.rem.get_mut(i) {
@@ -827,14 +830,14 @@ impl<'m> Ex<'m> {
             Core::If(c, th, el) => {
                 let ec = self.val(c, false, b);
                 self.flush_toks(b);
-                self.pinned += 1;
+                let outer = self.pin_enter(&[th, el], &[]);
                 let bt = self.block_val(th, esc);
                 let bf = self.block_val(el, esc);
-                self.pinned -= 1;
                 let t = self.fresh();
                 b.push_str(&format!(
                     "let {t} = if as_i({ec}) != 0 {{\n{bt}}} else {{\n{bf}}};\n"
                 ));
+                self.pin_leave(&[th, el], outer, b);
                 t
             }
             Core::Let(x, r, bo) => {
@@ -966,7 +969,9 @@ impl<'m> Ex<'m> {
                 let t = self.fresh();
                 let (open, plan, close) = plan_arms(&sv, arms, self.unbox);
                 let mut code = format!("let {t} = {open}");
-                self.pinned += 1;
+                let arm_refs: Vec<&Core> = arms.iter().map(|(_, _, b)| b).collect();
+                let arm_bs: Vec<u32> = arms.iter().flat_map(|(_, bs, _)| bs.iter().copied()).collect();
+                let outer = self.pin_enter(&arm_refs, &arm_bs);
                 for (i, pre, suf) in plan {
                     let (cid, binders, body) = &arms[i];
                     let mut ab = String::new();
@@ -983,10 +988,93 @@ impl<'m> Ex<'m> {
                     let bb = self.block_val(body, esc);
                     code.push_str(&format!("{pre}{ab}{bb}{suf}"));
                 }
-                self.pinned -= 1;
                 code.push_str(&format!("{close};\n"));
                 b.push_str(&code);
+                self.pin_leave(&arm_refs, outer, b);
                 t
+            }
+        }
+    }
+
+    /// Enter a value-position branch point over `arms`: pin the outer
+    /// variables they use (arms take their own references to those).
+    fn pin_enter(&mut self, arms: &[&Core], arm_binders: &[u32]) -> Vec<u32> {
+        fn binders(e: &Core, out: &mut HashSet<u32>) {
+            match e {
+                Core::Let(x, r, b) => {
+                    out.insert(*x);
+                    binders(r, out);
+                    binders(b, out);
+                }
+                Core::Match(sc, arms) => {
+                    binders(sc, out);
+                    for (_, bs, b) in arms {
+                        out.extend(bs.iter().copied());
+                        binders(b, out);
+                    }
+                }
+                Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
+                    binders(a, out);
+                    binders(b, out);
+                }
+                Core::If(a, b, c) => {
+                    binders(a, out);
+                    binders(b, out);
+                    binders(c, out);
+                }
+                Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
+                    xs.iter().for_each(|x| binders(x, out))
+                }
+                Core::Proj(b, _) => binders(b, out),
+                Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+            }
+        }
+        let mut inner: HashSet<u32> = arm_binders.iter().copied().collect();
+        for a in arms {
+            binders(a, &mut inner);
+        }
+        let mut outer: Vec<u32> = Vec::new();
+        for a in arms {
+            for v in free_vars(a) {
+                if !inner.contains(&v) && !self.pinset.contains(&v) && !outer.contains(&v) {
+                    outer.push(v);
+                }
+            }
+        }
+        for v in &outer {
+            self.pinset.insert(*v);
+        }
+        self.pinned += 1;
+        outer
+    }
+
+    /// Leave it: the arms' uses of the pinned outer variables are retired
+    /// (use counts include every arm), and an owned variable whose last
+    /// use was in the arms is released once, here.
+    fn pin_leave(&mut self, arms: &[&Core], outer: Vec<u32>, b: &mut String) {
+        self.pinned -= 1;
+        let mut used = Cnt::new();
+        for a in arms {
+            crate::cnt_expr(a, &mut used);
+        }
+        for v in outer {
+            self.pinset.remove(&v);
+            let k = used.get(&v).copied().unwrap_or(0);
+            if k == 0 {
+                continue;
+            }
+            if let Some(r) = self.rem.get_mut(&v) {
+                let before = *r;
+                *r = (*r - k).max(0);
+                if before > 0
+                    && *r == 0
+                    && self.pinned == 0
+                    && !self.ints.contains(&v)
+                    && !self.bset.contains(&v)
+                    && !self.ntup.contains(&v)
+                {
+                    b.push_str(&format!("free_val(ctx, v{v});\n"));
+                }
             }
         }
     }

@@ -365,3 +365,19 @@ fn single_function_module_defaults_to_that_function_as_main() {
     let cm = dm(src);
     assert_eq!(cm.fns[cm.main as usize].name, "only");
 }
+
+#[test]
+fn two_argument_range() {
+    let cm = dm("def f(a, b):\n    s = 0\n    for i in range(a, b):\n        s = s * 3 + i\n    return s\n");
+    let f = fid(&cm, "f");
+    // 2, 3, 4 -> ((0*3+2)*3+3)*3+4 = 31
+    assert_eq!(eval_core(&cm, f, &[Val::I(2), Val::I(5)]), Val::I(31));
+    // empty and inverted ranges run zero times
+    assert_eq!(eval_core(&cm, f, &[Val::I(5), Val::I(5)]), Val::I(0));
+    assert_eq!(eval_core(&cm, f, &[Val::I(9), Val::I(3)]), Val::I(0));
+    // negative bounds
+    assert_eq!(eval_core(&cm, f, &[Val::I(-2), Val::I(1)]), Val::I(((-2i64) * 3 - 1) * 3));
+    // single-argument form unchanged
+    let g = dm("def g(n):\n    s = 0\n    for i in range(n):\n        s = s + i\n    return s\n");
+    assert_eq!(eval_core(&g, fid(&g, "g"), &[Val::I(5)]), Val::I(10));
+}

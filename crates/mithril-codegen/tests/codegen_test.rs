@@ -599,3 +599,17 @@ fn heavy_fold_splits_by_measured_work() {
     assert!(rs.contains("FOLD_EST_"), "fold has no work estimate");
     assert!(rs.contains("saturating_mul(est)"), "fold split ignores the estimate");
 }
+
+#[test]
+fn value_branches_release_what_their_arms_skip() {
+    // A leak here grows with the loop: 200k iterations exhaust a small
+    // cell arena, and leaked arrays show in the live-array count.
+    let (cm, rs) = trmc_golden("value_branch_ownership.py");
+    let want = oracle(&cm);
+    let bin = compile(&rs, "value_branch_ownership_small_arena");
+    for t in ["1", "4"] {
+        let (out, err) = run_env(&bin, &[t], &[("MITHRIL_NODES", "65536"), ("MITHRIL_STATS", "1")]);
+        assert_eq!(out.trim(), want, "--threads {t} with a small arena");
+        assert!(err.contains("arrays_live=0"), "--threads {t}: arrays leaked: {err}");
+    }
+}

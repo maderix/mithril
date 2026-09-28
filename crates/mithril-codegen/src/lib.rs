@@ -1590,7 +1590,10 @@ fn arr_elems(p: u64) -> *mut u64 {
 fn arr_alloc(n: usize) -> u64 {
     arr_alloc_fill(n, 0)
 }
+/// Arrays currently allocated (reported by MITHRIL_STATS; a leak check).
+static ARR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 fn arr_alloc_fill(n: usize, fill: u64) -> u64 {
+    ARR_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut v: Vec<u64> = Vec::with_capacity(n + 2);
     v.push(1);
     v.push(n as u64);
@@ -1600,6 +1603,7 @@ fn arr_alloc_fill(n: usize, fill: u64) -> u64 {
     (T_ARR << 56) | (b as u64)
 }
 fn arr_free_block(p: u64) {
+    ARR_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let n = arr_len_of(p);
     // SAFETY: the block was made by arr_alloc with n + 2 words and this
     // was its last reference
@@ -2058,7 +2062,7 @@ fn main() {
             println!("{}", show(&eng, root));
             if std::env::var_os("MITHRIL_STATS").is_some() {
                 let st = eng.stats();
-                eprintln!("peak_cells={} live_peak={} waves={} rewrites={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites);
+                eprintln!("peak_cells={} live_peak={} waves={} rewrites={} arrays_live={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites, ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed));
             }
         })
         .expect("spawn main runner");

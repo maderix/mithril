@@ -235,11 +235,30 @@ impl<'a> Parser<'a> {
             ));
         }
         self.expect(TokKind::LParen)?;
-        let bound = self.expr()?;
+        let first = self.expr()?;
+        // `range(a, b)`: a loop over `range(b - a)` whose body first binds
+        // the variable to `counter + a` (empty when b <= a)
+        let start = if matches!(self.kind(), TokKind::Comma) {
+            self.bump();
+            let end = self.expr()?;
+            Some((first.clone(), end))
+        } else {
+            None
+        };
         self.expect(TokKind::RParen)?;
         self.expect(TokKind::Colon)?;
-        let body = self.suite()?;
-        Ok(Stmt::For(var, bound, body, None))
+        let mut body = self.suite()?;
+        match start {
+            None => Ok(Stmt::For(var, first, body, None)),
+            Some((a, b)) => {
+                let ctr = format!("__range_{var}");
+                body.insert(
+                    0,
+                    Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), Box::new(a.clone()))),
+                );
+                Ok(Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), Box::new(a)), body, None))
+            }
+        }
     }
 
     fn match_stmt(&mut self) -> Result<Stmt, Diag> {
