@@ -313,6 +313,9 @@ impl<'m> Ex<'m> {
         b.push_str(&format!(
             "let {t} = match {call} {{\nOk(v) => v,\nErr(r) => {{\n"
         ));
+        for p in &post {
+            b.push_str(&format!("free_val(ctx, {p});\n"));
+        }
         self.emit_capture("r", Some((x, bo)), b);
         b.push_str("}\n};\n");
         for p in post {
@@ -678,6 +681,9 @@ impl<'m> Ex<'m> {
                     // position, which ANF forbids; the tail/let paths own
                     // every real call site.
                     b.push_str(&format!("let {t} = match {call} {{\nOk(v) => v,\nErr(r) => {{\n"));
+                    for p in &post {
+                        b.push_str(&format!("free_val(ctx, {p});\n"));
+                    }
                     self.emit_capture("r", None, b);
                     b.push_str("}\n};\n");
                 }
@@ -934,12 +940,12 @@ impl<'m> Ex<'m> {
             }
             Core::Call(g, args) if self.trmc.is_some() => {
                 let (call, post) = self.dive_call(*g, args, b);
-                b.push_str(&format!("match {call} {{\nOk(v) => {{\n"));
+                b.push_str(&format!("let tr = {call};\n"));
                 for p in post {
                     b.push_str(&format!("free_val(ctx, {p});\n"));
                 }
                 b.push_str(&format!(
-                    "return Ok({});\n}}\nErr(r) => return Err({}),\n}}\n",
+                    "match tr {{\nOk(v) => return Ok({}),\nErr(r) => return Err({}),\n}}\n",
                     self.hole_value("v"),
                     self.hole_exit("r")
                 ));
@@ -951,11 +957,11 @@ impl<'m> Ex<'m> {
                 if post.is_empty() {
                     b.push_str(&format!("return {call};\n"));
                 } else {
-                    b.push_str(&format!("let tr = {call};\nif tr.is_ok() {{\n"));
+                    b.push_str(&format!("let tr = {call};\n"));
                     for p in post {
                         b.push_str(&format!("free_val(ctx, {p});\n"));
                     }
-                    b.push_str("}\nreturn tr;\n");
+                    b.push_str("return tr;\n");
                 }
             }
             other => {
@@ -1107,8 +1113,13 @@ pub(crate) fn dive_fn<'m>(
     // Fuel-out at entry / loop top: the pending call IS the continuation;
     // spawn it against a forwarding record whose parent the caller sets.
     let cparams: String = (0..ar).map(|i| format!(", v{i}: u64")).collect();
+    // the spawned call owns its arguments: borrowed params take a reference
+    let dups: String = (0..ar)
+        .filter(|&i| bor[fid as usize][i])
+        .map(|i| format!("let v{i} = dup_val(ctx, v{i});\n"))
+        .collect();
     let fuel_check = format!(
-        "*fuel -= 1;\nif *fuel < 0 {{\n#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\nlet r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err({});\n}}\n",
+        "*fuel -= 1;\nif *fuel < 0 {{\n#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\n{dups}let r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err({});\n}}\n",
         1 + fid,
         {
             let c = format!("cap(ctx{})", (0..ar).map(|i| format!(", v{i}")).collect::<String>());
@@ -1123,6 +1134,12 @@ pub(crate) fn dive_fn<'m>(
     let ints = crate::ints_of(tys, fid as usize);
     let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
     ex.trmc = trmc.zip(hole_rule);
+    // the fuel-out spawn takes references to borrowed params
+    for i in 0..ar as u32 {
+        if bor[fid as usize][i as usize] {
+            ex.note_share(i);
+        }
+    }
     let mut bb = String::new();
     if !lp || trmc.is_some() {
         // Owned parameters that the body never reads die immediately.

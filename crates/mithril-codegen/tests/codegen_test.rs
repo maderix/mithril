@@ -356,3 +356,32 @@ fn trmc_tree_builders_match_oracle_under_suspension() {
     assert!(d.contains("hole_link("), "swap_add's second call is not a TRMC site");
     assert!(dive_form(&cm, &rs, "mk").contains("hole_link("), "mk's second call is not a TRMC site");
 }
+
+// ---- borrowed parameters ----
+
+#[test]
+fn borrowed_shared_tree_matches_oracle_under_suspension() {
+    // ev/size/fit only read the tree, which fit shares across 40 calls:
+    // they borrow it. Low fuel makes the borrowers suspend mid-tree, so the
+    // capture-time references and the lender's release are exercised.
+    let (cm, rs) = trmc_golden("borrow_eval.py");
+    for name in ["ev", "size"] {
+        let fid = cm.fns.iter().position(|f| f.name == name).unwrap();
+        // the owned-argument entry releases the lent tree after the dive
+        assert!(
+            rs.contains(&format!("{fid} => {{\nlet r = d_{fid}(ctx, fuel, args[1]")),
+            "{name}: tree parameter is not borrowed"
+        );
+    }
+    // the match on a borrowed tree reads it without consuming it
+    assert!(!dive_form(&cm, &rs, "ev").contains("consume2k(ctx, v0"), "ev consumes its borrowed tree");
+}
+
+#[test]
+fn linear_list_is_not_borrowed() {
+    // total's list is never shared: it keeps moving ownership (no refcount
+    // on the type), so TRMC builders and the consumer stay linear.
+    let (cm, rs) = pipeline(&fixture("trmc_list.py"), 0);
+    let fid = cm.fns.iter().position(|f| f.name == "total").unwrap();
+    assert!(rs.contains(&format!("            {fid} => d_{fid}(ctx, fuel")), "total borrows a linear list");
+}

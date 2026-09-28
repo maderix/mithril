@@ -216,12 +216,31 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             rules::normalize(&f.body, &mut c)
         })
         .collect();
-    let (bor, bsets) = borrows(m, &bodies);
 
     BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m));
     let scal = scalar::classify(m);
-    let tys = ty::infer(m);
+    // types of the bodies the emitters see: ANF introduces fresh vars (call
+    // results, intermediate values) that must carry types too
+    let tys = {
+        let mut mn = m.clone();
+        for (f, b) in mn.fns.iter_mut().zip(&bodies) {
+            f.body = b.clone();
+        }
+        ty::infer(&mn)
+    };
+    let (bor, bsets) = borrows(m, &bodies, &tys);
+    if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
+        for (fid, f) in m.fns.iter().enumerate() {
+            eprintln!("bor {fid} {} {:?}", f.name, bor[fid]);
+        }
+    }
     let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
+    if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
+        for (fid, f) in m.fns.iter().enumerate() {
+            let ps: Vec<String> = (0..f.arity as u32).map(|p| format!("{:?}", tys.var(fid, p))).collect();
+            eprintln!("ty {fid} {}({}) -> {:?}  locals {:?}", f.name, ps.join(", "), tys.ret[fid], tys.locals[fid]);
+        }
+    }
     let unbox = unboxed_ctors(m, &tys);
     // static reuse rewrite: consumed same-arity cells are rebuilt in place
     let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
@@ -320,7 +339,18 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
     for fid in 0..nf {
         let ar = m.fns[fid].arity;
         let args: String = (0..ar).map(|i| format!(", args[{}]", i + 1)).collect();
-        dive_arms.push_str(&format!("            {fid} => d_{fid}(ctx, fuel{args}),\n"));
+        // the owned-argument entry: values lent to borrowed parameters are
+        // released once the dive returns, finished or suspended (a
+        // suspension took its own references to what it still reads)
+        let lent: String = (0..ar)
+            .filter(|&i| bor[fid][i])
+            .map(|i| format!("free_val(ctx, args[{}]);\n", i + 1))
+            .collect();
+        if lent.is_empty() {
+            dive_arms.push_str(&format!("            {fid} => d_{fid}(ctx, fuel{args}),\n"));
+        } else {
+            dive_arms.push_str(&format!("            {fid} => {{\nlet r = d_{fid}(ctx, fuel{args});\n{lent}r\n}}\n"));
+        }
     }
 
     let mut out = String::with_capacity(fns_code.len() + 8192);
@@ -444,13 +474,9 @@ fn call_fn(
         s.push_str(&fold::split_snippet(fid, ar, pf, jr));
     }
     let args: String = (0..ar).map(|i| format!(", v{i}")).collect();
-    let mut done_frees = String::new();
-    let lent: Vec<usize> = (0..ar).filter(|&i| bor[fid as usize][i]).collect();
-    for i in &lent {
-        done_frees.push_str(&format!("free_val(ctx, v{i});\n"));
-    }
+    let _ = bor;
     s.push_str(&format!(
-        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => {{\nctx.deliver(parent, v);\n{done_frees}}}\nDiveResult::Suspended(_) => {{}}\n}}\n}}\n\n"
+        "match ctx.dive({fid}u16, &[parent{args}]) {{\nDiveResult::Done(v) => ctx.deliver(parent, v),\nDiveResult::Suspended(_) => {{}}\n}}\n}}\n\n"
     ));
     s
 }
@@ -719,13 +745,59 @@ pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
 // so they do not force ownership. Fixpoint over the module, initialized
 // optimistically (everything borrowed).
 
-fn borrows(m: &CoreModule, bodies: &[Core]) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
-    // Reference counting made sharing O(1), so the borrowed/owned split (and
-    // the deep copies it forced at suspension boundaries) is gone: every
-    // parameter is owned, shared reads are increfs.
-    let _ = bodies;
-    let bor = m.fns.iter().map(|f| vec![false; f.arity]).collect();
-    let bsets = m.fns.iter().map(|_| std::collections::HashSet::new()).collect();
+/// ADT classes some value of which is used more than once (on one path)
+/// somewhere in the program: those carry refcounts regardless.
+fn shared_classes(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for (fid, b) in bodies.iter().enumerate() {
+        let mut uses = Cnt::new();
+        cnt_dive(b, &mut uses);
+        for (v, n) in uses {
+            if n >= 2 {
+                if let ty::Ty::Adt(c) = tys.var(fid, v) {
+                    out.insert(c);
+                }
+            }
+        }
+    }
+    let _ = m;
+    out
+}
+
+fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
+    // Only values of shared datatypes are lent. An int is an immediate, and
+    // a linear (never shared) type moves for free and carries no refcount,
+    // so a suspended borrower could not take a reference to it. For shared
+    // types an escaping read of a borrowed value is an O(1) increment, so a
+    // suspension that stores one just takes a reference.
+    let shared = shared_classes(m, bodies, tys);
+    let nf = m.fns.len();
+    let mut bor: Vec<Vec<bool>> = m
+        .fns
+        .iter()
+        .enumerate()
+        .map(|(fid, f)| {
+            (0..f.arity as u32)
+                .map(|p| f.arity <= 60 && matches!(tys.var(fid, p), ty::Ty::Adt(c) if shared.contains(&c)))
+                .collect()
+        })
+        .collect();
+    for _ in 0..32 {
+        let mut changed = false;
+        for f in 0..nf {
+            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor);
+            for (i, b) in bor[f].iter_mut().enumerate() {
+                if *b && esc & (1u64 << i) != 0 {
+                    *b = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let bsets = (0..nf).map(|f| derive_set(&bodies[f], &bor[f])).collect();
     (bor, bsets)
 }
 fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -> u64 {

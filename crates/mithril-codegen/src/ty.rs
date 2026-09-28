@@ -161,6 +161,39 @@ impl<'m> Inf<'m> {
         Node::Adt(r)
     }
 
+    /// Two ADT nodes meeting in one value: their ctors belong to one
+    /// datatype, so the classes merge (not a conflict).
+    fn merge_adts(&mut self, a: u32, b: u32) -> bool {
+        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
+        match (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
+            (Node::Adt(x), Node::Adt(y)) if x != u32::MAX && y != u32::MAX => {
+                self.cunion(x, y);
+                let k = self.adt(x);
+                self.uf.n[ra as usize] = k;
+                self.uf.n[rb as usize] = k;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn unify(&mut self, a: u32, b: u32) {
+        self.merge_adts(a, b);
+        self.uf.union(a, b);
+    }
+
+    fn set_adt(&mut self, t: u32, k: Node) {
+        let r = self.uf.find(t);
+        if let (Node::Adt(x), Node::Adt(y)) = (self.uf.n[r as usize], k) {
+            if x != u32::MAX && y != u32::MAX {
+                self.cunion(x, y);
+                self.uf.n[r as usize] = self.adt(x);
+                return;
+            }
+        }
+        self.uf.set(t, k);
+    }
+
     /// Type of expression `e`; unifies as it walks. `env[v]` = tyvar.
     fn walk(&mut self, fid: u32, e: &Core, env: &mut Vec<u32>) -> u32 {
         match e {
@@ -178,13 +211,13 @@ impl<'m> Inf<'m> {
             Core::Op2(_, a, b) => {
                 let ta = self.walk(fid, a, env);
                 let tb = self.walk(fid, b, env);
-                self.uf.union(ta, tb);
+                self.unify(ta, tb);
                 ta
             }
             Core::Cmp(_, a, b) => {
                 let ta = self.walk(fid, a, env);
                 let tb = self.walk(fid, b, env);
-                self.uf.union(ta, tb);
+                self.unify(ta, tb);
                 let t = self.uf.fresh();
                 self.uf.set(t, Node::Int);
                 t
@@ -194,7 +227,7 @@ impl<'m> Inf<'m> {
                 self.uf.set(tc, Node::Int);
                 let tx = self.walk(fid, x, env);
                 let ty = self.walk(fid, y, env);
-                self.uf.union(tx, ty);
+                self.unify(tx, ty);
                 tx
             }
             Core::Let(x, r, b) => {
@@ -209,7 +242,7 @@ impl<'m> Inf<'m> {
                 for (j, a) in args.iter().enumerate() {
                     let ta = self.walk(fid, a, env);
                     let pj = self.fparam[*g as usize][j];
-                    self.uf.union(ta, pj);
+                    self.unify(ta, pj);
                 }
                 self.fret[*g as usize]
             }
@@ -220,11 +253,11 @@ impl<'m> Inf<'m> {
                 for (j, a) in args.iter().enumerate() {
                     let ta = self.walk(fid, a, env);
                     let fj = self.cfield[*c as usize][j];
-                    self.uf.union(ta, fj);
+                    self.unify(ta, fj);
                 }
                 let t = self.uf.fresh();
                 let k = self.adt(*c);
-                self.uf.set(t, k);
+                self.set_adt(t, k);
                 t
             }
             Core::Tuple(xs) => {
@@ -259,7 +292,7 @@ impl<'m> Inf<'m> {
                 }
                 if let Some(f) = first {
                     let k = self.adt(f);
-                    self.uf.set(ts, k);
+                    self.set_adt(ts, k);
                 }
                 let mut tout: Option<u32> = None;
                 for (c, binders, body) in arms.iter() {
@@ -274,7 +307,7 @@ impl<'m> Inf<'m> {
                     }
                     let tb = self.walk(fid, body, env);
                     if let Some(o) = tout {
-                        self.uf.union(o, tb);
+                        self.unify(o, tb);
                     } else {
                         tout = Some(tb);
                     }
@@ -311,7 +344,7 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
             let mut env: Vec<u32> = inf.fparam[fid].clone();
             let tr = inf.walk(fid as u32, &f.body, &mut env);
             let fr = inf.fret[fid];
-            inf.uf.union(tr, fr);
+            inf.unify(tr, fr);
         }
     }
     // readout (locals need a third walk capturing every Let/binder var)
