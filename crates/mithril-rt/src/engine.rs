@@ -6,7 +6,9 @@
 //! on its own context (small waves) or across the pool (work >= 2^14). Pool
 //! workers are spawned at most once per run and park on a condvar between
 //! waves; within a parallel wave they claim blocks of entries from a shared
-//! atomic cursor.
+//! atomic cursor. A parallel wave's dives get a budget proportional to the
+//! entries per worker (`wave_fuel`): suspension splits work only while the
+//! frontier is thin.
 
 use crate::alloc::{cap_from_env, Arena};
 use crate::worker::Wctx;
@@ -82,6 +84,7 @@ impl Engine {
                 let Some((rule, work)) = pick(&buckets, &recs, &costs) else { break };
                 let k = rule as usize;
                 if threads == 1 || work < PAR_WORK {
+                    ctx0.set_fuel(fuel);
                     // single-threaded drain on the coordinator; buffers keep capacity
                     let mut rx = mem::take(&mut buckets[k]);
                     let mut rr = mem::take(&mut recs[k]);
@@ -115,6 +118,16 @@ impl Engine {
                     let n = wv.redexes.len() + wv.recs.len();
                     wv.block = (n / (threads * 8)).clamp(1, 256);
                     wv.next.store(0, Ordering::Relaxed);
+                    // Suspension exists to expose work to idle workers. With
+                    // several entries per worker already, a dive gets a
+                    // proportionally larger budget, so the frontier stops
+                    // growing (every split costs a record and locality); a
+                    // thin frontier keeps the base budget and splits often.
+                    let f = wave_fuel(fuel, n, threads);
+                    ctx0.set_fuel(f);
+                    for w in &workers {
+                        lock(w).set_fuel(f);
+                    }
                 }
                 {
                     let mut c = lock(&pool.ctrl);
@@ -155,6 +168,16 @@ impl Engine {
         self.stats = st;
         self.arena.result().expect("run finished without delivering a result to ROOT")
     }
+}
+
+/// Per-dive budget for a parallel wave of `n` entries: the base budget
+/// times the entries each worker will take (capped).
+fn wave_fuel(base: i64, n: usize, threads: usize) -> i64 {
+    if std::env::var_os("MITHRIL_FIXED_FUEL").is_some() {
+        return base;
+    }
+    let per = n.div_ceil(4 * threads.max(1)).clamp(1, 1 << 10) as i64;
+    base.saturating_mul(per)
 }
 
 /// Bucket with the largest `entries x cost`; `None` when all are empty.
@@ -263,4 +286,26 @@ fn read<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 
 fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     l.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod wave_fuel_tests {
+    use super::wave_fuel;
+
+    #[test]
+    fn thin_frontier_keeps_the_base_budget() {
+        // up to 4 entries per worker: split as often as before
+        assert_eq!(wave_fuel(16384, 1, 16), 16384);
+        assert_eq!(wave_fuel(16384, 16, 16), 16384);
+        assert_eq!(wave_fuel(16384, 64, 16), 16384);
+    }
+
+    #[test]
+    fn budget_grows_with_entries_per_worker_and_is_capped() {
+        assert_eq!(wave_fuel(16384, 65, 16), 2 * 16384);
+        assert_eq!(wave_fuel(16384, 64 * 8, 16), 8 * 16384);
+        assert_eq!(wave_fuel(16384, usize::MAX / 2, 16), 16384 << 10);
+        // no overflow on huge bases
+        assert_eq!(wave_fuel(i64::MAX, 1 << 20, 16), i64::MAX);
+    }
 }

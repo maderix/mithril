@@ -150,7 +150,14 @@ The runtime is one model on CPU and GPU:
   budget). Records whose last child delivers fire immediately on that
   worker (bounded nesting) instead of waiting for the next wave — this is
   part of the wave model, on every backend.
-* Sequential runs use fuel 2^40 (one dive); parallel runs 16384.
+* Sequential runs use fuel 2^40 (one dive); parallel runs 16384 per dive
+  while the frontier is thin, and `16384 x ceil(entries / (4 x workers))`
+  once a wave holds more than four entries per worker (`wave_fuel`):
+  suspension exists to expose work to idle workers, and splitting past
+  that only costs records and locality. hashmap PAR16 0.49 -> 0.23 s (every
+  suspension in the batch spine used to split off a sibling subtree until
+  all 2048 tables were in flight, 20M live cells, cache-bound even on one
+  worker); other ports within noise.
 
 Cost model, measured on tree-bitonic PAR16: per-wave barrier ~70 us;
 every dependency hop across a suspension is one wave; the frontier grows
@@ -188,7 +195,8 @@ generated code exponential; all were found hours later by full runs.
 | tree-bitonic | 10.3 / 2.73 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
 | kmeans | 10.7 / 1.47 | 7.84 / 0.77 | needs lane-level (u32) vectorization; hand proof 5.81 |
 | editdist | 2.27 / 0.27 | 2.44 / 0.39 | met |
-| hashmap, terrain | | 3.22 / 0.40, 3.21 / 0.46 | being ported to arrays |
+| hashmap | 1.82 / 0.23 | 3.22 / 0.40 | met |
+| terrain | | 3.21 / 0.46 | being ported to arrays |
 | nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
 
 ## 7. Process rules (from the user)

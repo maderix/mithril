@@ -288,6 +288,11 @@ impl<'e> Wctx<'e> {
         self.fuel
     }
 
+    /// Set the per-dive budget for the next wave (see `Engine::run`).
+    pub(crate) fn set_fuel(&mut self, f: i64) {
+        self.fuel = f;
+    }
+
     /// Run `prog.dive(f, args)` with a fresh budget of `self.fuel()`.
     pub fn dive(&mut self, f: u16, args: &[u64]) -> DiveResult {
         let mut fuel = self.fuel;
