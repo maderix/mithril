@@ -35,6 +35,10 @@ pub enum Tag {
     Kont = 13,
     /// Runtime only: an array block (a heap value the rules treat as opaque).
     Arr = 14,
+    /// Runtime only: any other value form (an unboxed constructor rides
+    /// tag bits 16.. with the field in the payload). The rules never
+    /// inspect it; the program copies/erases/matches it.
+    Other = 15,
 }
 
 impl Tag {
@@ -55,7 +59,7 @@ impl Tag {
             12 => Tag::Ext,
             13 => Tag::Kont,
             14 => Tag::Arr,
-            _ => unreachable!("invalid Port tag bits: {}", v),
+            _ => Tag::Other,
         }
     }
 }

@@ -665,7 +665,13 @@ fn net_region(m: &CoreModule, net_rule: u16, fill_rule: u16, fwd: u16) -> String
                 refs(a, out);
                 refs(b, out);
             }
-            Call(_, xs) | Ctor(_, xs) | Tuple(xs) | Prim(_, xs) => xs.iter().for_each(|x| refs(x, out)),
+            Call(f, xs) => {
+                // a call whose arguments are not all produced when it is
+                // met runs as a net: the callee's body must be shipped
+                out.push(*f as usize);
+                xs.iter().for_each(|x| refs(x, out));
+            }
+            Ctor(_, xs) | Tuple(xs) | Prim(_, xs) => xs.iter().for_each(|x| refs(x, out)),
             If(c, t, e2) => {
                 refs(c, out);
                 out.push(t.entry as usize);
@@ -694,7 +700,9 @@ fn net_region(m: &CoreModule, net_rule: u16, fill_rule: u16, fwd: u16) -> String
             s.push_str("        Entry { params: vec![], body: NExpr::Num(0) },\n");
         }
     }
-    s.push_str("    ]\n}\n\nfn net_metas() -> Vec<MatchMeta> {\n    vec![\n");
+    s.push_str("    ]\n}\n\n");
+    s.push_str(&format!("const NET_LIVE: [bool; {}] = [{}];\n\n", live.len(), live.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")));
+    s.push_str("fn net_metas() -> Vec<MatchMeta> {\n    vec![\n");
     for mm in &np.metas {
         match mm {
             mithril_net::MatchMeta::Proj(i) => s.push_str(&format!("        MatchMeta::Proj({i}),\n")),
@@ -710,16 +718,24 @@ impl<'e> Prog<Wctx<'e>> for Pg {{
     fn unfold(&self, ctx: &mut Wctx<'e>, r: Port, other: Port) -> u64 {{
         let entry = ref_entry(r) as usize;
         let args = net_list_collect(ctx, ref_head(r));
-        if entry < NFNS {{
-            // a compiled function: its CALL rule runs it; the result comes
-            // back through a FILL record that links it into `other`
+        if entry < NFNS && args.iter().all(|a| a.tag() != Tag::Var) {{
+            // a compiled function with every argument produced: its CALL
+            // rule runs it (strict, native); the result comes back through
+            // a FILL record that links it into `other`
             let ri = ctx.alloc_rec({fill_rule}u16, 1, other.0 as u32, (other.0 >> 32) as u32, NONE);
             let raw: Vec<u64> = args.iter().map(|p| p.0).collect();
             spawn_call(ctx, 1 + entry as u16, &raw, (ri as u64) << 3);
         }} else {{
+            // a lifted branch/arm, or a call met before its arguments are
+            // produced (inside a closure body being built): its body runs
+            // as a net and waits on the wires like any agent
+            assert!(entry < NET_LIVE.len() && NET_LIVE[entry], "ICE: entry {{}} is not shipped with the net region (ref {{:#x}}, other {{:?}})", entry, r.0, other.tag());
             ctx.instantiate(&self.entries, entry, args, other);
         }}
         1
+    }}
+    fn is_closure(&self, r: Port) -> bool {{
+        ref_entry(r) as usize >= NFNS
     }}
     fn mat_meta(&self, mid: u16) -> MatMeta<'_> {{
         match &self.metas[mid as usize] {{
@@ -852,6 +868,7 @@ fn build_closure(ctx: &mut Wctx, id: u16, caps: &[u64]) -> u64 {{
 /// in the net region; a result within budget is returned, otherwise the
 /// dive suspends on a forwarding record the result will be delivered to.
 fn apply(ctx: &mut Wctx, f: u64, a: u64) -> R {{
+    assert!(tag(f) == T_LAM, "apply: not a closure (tag {{}})", tag(f));
     let w = net_wire(ctx);
     let c = ctx.alloc(a, w.0);
     net_link(ctx, Port::new(Tag::App, c as u64), Port(f));
@@ -869,6 +886,7 @@ fn apply(ctx: &mut Wctx, f: u64, a: u64) -> R {{
 /// Apply a closure value from the rule form: the result is delivered to
 /// `parent` (a record slot) when the net produces it.
 fn apply_spawn(ctx: &mut Wctx, f: u64, a: u64, parent: u64) {{
+    assert!(tag(f) == T_LAM, "apply_spawn: not a closure (tag {{}})", tag(f));
     let c = ctx.alloc(a, Port::new(Tag::Kont, parent).0);
     net_link(ctx, Port::new(Tag::App, c as u64), Port(f));
     let budget = ctx.fuel();

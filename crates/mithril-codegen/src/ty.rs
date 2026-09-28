@@ -91,6 +91,9 @@ enum Node {
     Adt(u32),
     /// an array; its element type is the tyvar
     Arr(u32),
+    /// a closure (a tagged runtime value; never an immediate, never an
+    /// ADT: a field holding both ints and closures poisons to Dyn)
+    Fun,
     Link(u32),
 }
 
@@ -366,10 +369,15 @@ impl Inf {
                 }
                 env[*x as usize] = tx;
                 let _ = self.walk(fid, b, env);
-                self.uf.fresh()
+                let t = self.uf.fresh();
+                self.uf.set(t, Node::Fun);
+                t
             }
             Core::App(f, a) => {
-                let _ = self.walk(fid, f, env);
+                let tf = self.walk(fid, f, env);
+                let fun = self.uf.fresh();
+                self.uf.set(fun, Node::Fun);
+                self.unify(tf, fun);
                 let _ = self.walk(fid, a, env);
                 self.uf.fresh()
             }

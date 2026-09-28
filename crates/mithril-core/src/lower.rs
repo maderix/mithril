@@ -112,9 +112,11 @@ fn bind<C: Cells>(net: &mut C, env: &mut Env, v: u32, port: Port, k: usize) {
         1 => env.give(v, vec![port]),
         _ => {
             let outs: Vec<Port> = (0..k).map(|_| wire(net)).collect();
-            let label = net.fresh_label();
             let mut next = outs[k - 1];
             for j in (0..k - 1).rev() {
+                // one label per cell: every copy it makes is a binary
+                // superposition of its own
+                let label = net.fresh_label();
                 let d = net.alloc(outs[j], next);
                 next = dup_port(d, label);
             }
@@ -131,10 +133,11 @@ pub fn instantiate<C: Cells>(net: &mut C, entries: &[Entry], fid: usize, args: V
     assert_eq!(
         args.len(),
         entry.params.len(),
-        "ICE: entry {} expects {} arg(s), Ref carried {}",
+        "ICE: entry {} expects {} arg(s), Ref carried {} ({:?})",
         fid,
         entry.params.len(),
-        args.len()
+        args.len(),
+        args.iter().map(|a| (a.tag(), a.payload())).collect::<Vec<_>>()
     );
     let mut env = Env::default();
     for (p, a) in entry.params.iter().zip(args) {

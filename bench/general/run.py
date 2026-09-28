@@ -16,7 +16,8 @@ BIN = os.path.join(ROOT, "target", "release", "mithril")
 SHIM = os.path.join(ROOT, "bench", "ports", "_pyshim.py")
 # small sizes for the oracle check (the Python shim runs these)
 SMALL = {"collatz_mutual": 3000, "cow_versions": 3000, "dag_share": 3, "graph_dfs": 1,
-         "interp": 5, "persist_map": 2000, "sorts": 300}
+         "interp": 5, "persist_map": 2000, "sorts": 300,
+         "stage_closure": 50, "pipeline_cfg": 20, "interp_closure": 200}
 
 
 def timed(cmd, env=None):

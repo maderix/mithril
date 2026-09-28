@@ -38,6 +38,10 @@ pub trait Prog<C: Cells> {
     /// REF rule: `r` met `other` (never an Era, never a Ref). Returns the
     /// rewrites performed (0 when the call is kept as a call).
     fn unfold(&self, c: &mut C, r: Port, other: Port) -> u64;
+    /// Whether `r` is a closure (a lifted branch/arm carrying its captures,
+    /// applied by SWI/MAT) rather than a saturated call: a Dup copies it
+    /// instead of sharing a result.
+    fn is_closure(&self, r: Port) -> bool;
     fn mat_meta(&self, mid: u16) -> MatMeta<'_>;
     /// OP rule: compute `code` on two produced operands; `None` when it
     /// cannot (a division by zero, an opaque builtin at compile time).
@@ -125,6 +129,17 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
             for p in list_collect(c, ref_head(r)) {
                 link(c, era(), p);
             }
+            return 1;
+        }
+        if other.tag() == Tag::Dup && prog.is_closure(r) {
+            // DUP–closure: two closures over dup'd captures
+            let d = dup_addr(other);
+            let label = dup_label(other);
+            let dc = c.cell(d);
+            c.free_cell(d);
+            let (ra, rb) = copy_closure(c, r, label);
+            link(c, ra, Port(dc[0]));
+            link(c, rb, Port(dc[1]));
             return 1;
         }
         return prog.unfold(c, r, other);
@@ -229,6 +244,7 @@ fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
 fn beta<C: Cells>(c: &mut C, app: Port, lam: Port) {
     let ia = app.payload() as u32;
     let il = lam.payload() as u32;
+    debug_assert!(ia != il, "ICE: beta on one cell");
     let ca = c.cell(ia);
     let cl = c.cell(il);
     c.free_cell(ia);
@@ -247,6 +263,27 @@ fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Po
     if other.tag() == Tag::Var {
         c.set(addr, 0, val);
         link(c, op_port(addr, code | OP_FLIP), other);
+        return;
+    }
+    if other.tag() == Tag::Dup {
+        // OP–SUP: the other operand is a superposition (a copied closure's
+        // parameter): the op splits into one per side, the produced
+        // operand copied to both, the result superposed on the ret
+        let d = dup_addr(other);
+        let label = dup_label(other);
+        let dc = c.cell(d);
+        c.free_cell(d);
+        c.free_cell(addr);
+        let (v1, v2) = (wire(c), wire(c));
+        let dv = c.alloc(v1, v2);
+        link(c, dup_port(dv, label), val);
+        let (r1, r2) = (wire(c), wire(c));
+        let dr = c.alloc(r1, r2);
+        link(c, dup_port(dr, label), Port(cell[1]));
+        let a1 = c.alloc(Port(dc[0]), r1);
+        let a2 = c.alloc(Port(dc[1]), r2);
+        link(c, op_port(a1, code), v1);
+        link(c, op_port(a2, code), v2);
         return;
     }
     if !is_value(prog, other) {
@@ -317,7 +354,7 @@ fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: 
                 }
             }
             let rj = refs[j];
-            debug_assert_eq!(rj.tag(), Tag::Ref);
+            assert_eq!(rj.tag(), Tag::Ref, "ICE: match arm slot holds a {:?}, not a closure", rj.tag());
             let mut args = fields; // ctor fields = pattern binders
             args.extend(list_collect(c, ref_head(rj))); // then captured frees
             let head = list_alloc(c, &args);
@@ -378,6 +415,23 @@ fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: 
     }
 }
 
+/// The DUP–closure copy of an arm/branch closure `r`: two Refs to the
+/// same entry over dup'd captures (the copies carry the copier's label,
+/// like a constructor's fields).
+pub fn copy_closure<C: Cells>(c: &mut C, r: Port, label: u32) -> (Port, Port) {
+    let caps = list_collect(c, ref_head(r));
+    let (mut ca, mut cb) = (Vec::new(), Vec::new());
+    for p in caps {
+        let (w1, w2) = (wire(c), wire(c));
+        let nd = c.alloc(w1, w2);
+        link(c, dup_port(nd, label), p);
+        ca.push(w1);
+        cb.push(w2);
+    }
+    let entry = ref_entry(r);
+    (ref_port(list_alloc(c, &ca), entry), ref_port(list_alloc(c, &cb), entry))
+}
+
 /// The DUP–LAM copy of the closure in cell `l`: two lambdas, their bodies
 /// joined by a `label` dup on the old body wire, their parameters by a
 /// same-label dup acting as the superposition on the old parameter wire.
@@ -409,8 +463,13 @@ fn dup_commute<C: Cells>(c: &mut C, dup: Port, agent: Port) {
     let dc = c.cell(d);
     c.free_cell(d);
     let (o1, o2) = (Port(dc[0]), Port(dc[1]));
-    // a same-label dup whose outputs are fresh wires; its input is `p`
+    // a same-label dup whose outputs are fresh wires; its input is `p`.
+    // An arm closure (a Ref, a value) is copied right away: arm slots
+    // always hold closures, never wires a copy will arrive on later
     let split = |c: &mut C, p: Port| -> (Port, Port) {
+        if p.tag() == Tag::Ref {
+            return copy_closure(c, p, label);
+        }
         let (w1, w2) = (wire(c), wire(c));
         let nd = c.alloc(w1, w2);
         link(c, dup_port(nd, label), p);

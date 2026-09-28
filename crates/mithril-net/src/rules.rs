@@ -26,6 +26,10 @@ impl Prog<Net> for NetProg {
         1
     }
 
+    fn is_closure(&self, r: Port) -> bool {
+        ref_entry(r) as usize >= self.nfns
+    }
+
     fn mat_meta(&self, mid: u16) -> MatMeta<'_> {
         match &self.metas[mid as usize] {
             MatchMeta::Proj(i) => MatMeta::Proj(*i),

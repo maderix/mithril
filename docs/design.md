@@ -316,6 +316,47 @@ applications: 327,685 rewrites, 0.01 s. Same value and same rewrite
 count at 16 threads. fast.py: instruction counts unchanged; generated
 programs carry the region's fixed cost in rustc time (bfs 0.6 → 0.8 s).
 
+### Phase B, step 4: the proof programs (`bench/general`)
+
+Three closure programs joined the generality corpus, each with a Python
+oracle and an idiomatic Rust twin written the way the source is written
+(closures recompute what is under them; nobody hoists by hand):
+
+| program | shape | Rust twin | Mithril t1 / t16 | note |
+|---|---|---|---|---|
+| `stage_closure` | W2: `mk(k) = λx. x + heavy(k)`, 20k applications | 0.00 s | 0.00 / 0.00 s | LLVM hoists the pure call out of the loop inside one function; both do the work once |
+| `pipeline_cfg` | stage closures built from a runtime config, in a list, applied to 20k inputs | 0.29 s | **0.01 / 0.01 s** | closures stored in data: Rust cannot hoist across the `Box<dyn Fn>`; the net runs each stage's setup once (20–29× faster than the Rust program as written) |
+| `interp_closure` | closure compilation of a runtime AST, applied to 20k environments | 0.01 s | 5.8 / 6.1 s | no work to share (everything depends on the environment): every application copies the closure tree by the DUP rules — the cost of the model on closure-heavy code with no sharing win, ~450× |
+
+All oracle-equal, parallel == sequential. The first two are the thesis
+at runtime: work under a closure that does not depend on its parameter
+is done once by the rules, wherever the closure is composed. The third
+is the price: a closure whose whole body depends on its parameter gains
+nothing from lazy copying and pays the per-rewrite constant on every
+application. That is the next target (a closure body with no
+parameter-free work can be applied by compiled code directly, the same
+rule table deciding when), not a tuning question.
+
+reference on these shapes: its closures are affine (used once), so a
+closure applied n times must be rewritten to recompute — reference runs the
+strict twin, which is what the Rust column measures. A timed reference lane
+for the corpus is not set up (the reference toolchain lives in a container;
+see reference/reference-notes.md).
+
+Sound-ness notes from getting here (all in the rule table or the
+reader, none in a benchmark): a `Ref` to a compiled function waits for
+produced arguments (a call met inside a closure being built runs as a net
+instead); a `Dup` meeting an arm closure copies it (never unfolds it);
+`Dup–Mat/Swi` commutations copy the arm closures eagerly so arm slots
+always hold closures; `Op` with a superposed operand commutes (OP–SUP);
+each fan-out cell has its own label; the reader un-superposes lazily
+copied closures by selecting sides per copy label (sup/dup readback),
+with superpositions classified to a fixpoint; type inference has a
+function type so an ADT field holding both ints and closures poisons to
+Dyn (a closure is never an immediate); applying a closure consumes it,
+so one read from a borrowed structure is copied first (`dup_val` on a
+closure is the DUP–LAM rule with the original cell as the first copy).
+
 Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose

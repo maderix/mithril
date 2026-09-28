@@ -16,7 +16,7 @@
 //! Parked branch closures splice the original Core of their lifted entry
 //! under lets for the captured arguments.
 
-use crate::{
+use crate::{dup_label,
     dup_addr, list_items, mat_addr, mat_id, op_addr, op_code, ref_entry, ref_head, MatchMeta, NetProg,
     CTAG_TUPLE, CTAG_UNREACHABLE, EMPTY, OP_FLIP, PRIM_BASE,
 };
@@ -82,6 +82,15 @@ pub(crate) struct Index {
     pub(crate) parked: Vec<(u32, bool)>,
     /// every Ref port met (residual calls, parked arm closures): its entry
     pub(crate) refs: Vec<u16>,
+    /// label of every Dup cell met
+    pub(crate) dup_labels: HashMap<u32, u32>,
+    /// for a wire that is an output of a Dup cell: (cell, side)
+    pub(crate) dup_side: HashMap<u32, (u32, usize)>,
+    /// a chain link: the Dup cell it takes its input from, and the side
+    pub(crate) dup_parent: HashMap<u32, (u32, usize)>,
+    /// labels of dups met as superpositions (stored in a wire as the
+    /// consumer of nothing: their sides are the sources)
+    pub(crate) sup_labels: HashSet<u32>,
 }
 
 impl Index {
@@ -129,7 +138,7 @@ fn agent_addr(p: Port) -> u32 {
 /// input wires with their Core variables.
 pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[(Port, Port)]) -> Index {
     let n = net.cells.len();
-    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), refs: Vec::new() };
+    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), refs: Vec::new(), dup_labels: HashMap::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
     let params: Vec<Port> = free.iter().map(|(p, _)| *p).collect();
     for (p, v) in free {
         debug_assert_eq!(p.tag(), Tag::Var);
@@ -163,7 +172,7 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
         }
         match p.tag() {
             Tag::Num | Tag::Era | Tag::Flo | Tag::Ext => {}
-            Tag::Kont | Tag::Arr => panic!("ICE: runtime-only agent {:?} at compile time", p.tag()),
+            Tag::Kont | Tag::Arr | Tag::Other => panic!("ICE: runtime-only agent {:?} at compile time", p.tag()),
             Tag::Var => {
                 let w = p.payload() as u32;
                 let s = Port(net.cell(w)[0]);
@@ -176,6 +185,9 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
                     ix.stored[w as usize] = Some(s);
                     if is_consumer(s) {
                         ix.input_of[agent_addr(s) as usize] = Some(w);
+                    }
+                    if s.tag() == Tag::Dup {
+                        ix.dup_labels.insert(dup_addr(s), dup_label(s));
                     }
                 }
                 work.push(s);
@@ -235,18 +247,34 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
                 // a value shared k ways is a chain of k-1 Dup cells, each
                 // link's port sitting in the previous cell's second slot:
                 // every output of the chain is the one shared value
-                let root = dup_addr(p);
-                let mut d = root;
+                // a value shared k ways is a chain of k-1 Dup cells, each
+                // link's port sitting in the previous cell's second slot;
+                // every cell is its own dup (its own label) whose input is
+                // its parent's output
+                let mut d = dup_addr(p);
+                ix.dup_labels.insert(d, dup_label(p));
                 loop {
                     let c = net.cell(d);
                     let mut next = None;
-                    for o in [Port(c[0]), Port(c[1])] {
+                    for (side, o) in [Port(c[0]), Port(c[1])].into_iter().enumerate() {
                         match o.tag() {
                             Tag::Var => {
-                                ix.producer[o.payload() as usize] = Some(Producer::Dup(root));
+                                // a lambda copy's parameter wire keeps its
+                                // LamParam producer (the dup is the
+                                // superposition of the copies' parameters)
+                                let slot = &mut ix.producer[o.payload() as usize];
+                                if !matches!(slot, Some(Producer::LamParam(_))) {
+                                    *slot = Some(Producer::Dup(d));
+                                }
+                                ix.dup_side.insert(o.payload() as u32, (d, side));
                                 work.push(o);
                             }
-                            Tag::Dup => next = Some(dup_addr(o)),
+                            Tag::Dup => {
+                                let n = dup_addr(o);
+                                ix.dup_labels.insert(n, dup_label(o));
+                                ix.dup_parent.insert(n, (d, side));
+                                next = Some(n);
+                            }
                             _ => work.push(o),
                         }
                     }
@@ -301,6 +329,56 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
     for a in 0..n {
         if let Some(w) = ix.input_of[a] {
             ix.input_of[a] = Some(ix.find(w));
+        }
+    }
+    let sides: Vec<(u32, (u32, usize))> = ix.dup_side.iter().map(|(w, v)| (*w, *v)).collect();
+    for (w, v) in sides {
+        let r = ix.find(w);
+        ix.dup_side.entry(r).or_insert(v);
+    }
+    // orientation: a dup stored in a wire nothing produces is a
+    // superposition (a copied closure's parameter, or what commutations
+    // made of it): its slots are its sources, not outputs it produces.
+    // A wire between a superposition's slot and a fan-out's slot (the
+    // shape a DUP–DUP commutation leaves) is produced by the fan-out.
+    let dups: Vec<u32> = ix.dup_labels.keys().copied().collect();
+    let mut sups: HashSet<u32> = HashSet::new();
+    // to a fixpoint: a superposition's sources are its slots, so a dup
+    // whose input is one of those (a superposition of superpositions) is
+    // itself one
+    loop {
+        let mut changed = false;
+        for &d in &dups {
+            if sups.contains(&d) || ix.dup_parent.contains_key(&d) {
+                continue;
+            }
+            let Some(w) = ix.input_of[d as usize] else { continue };
+            if ix.producer[w as usize].is_none() {
+                sups.insert(d);
+                ix.sup_labels.insert(ix.dup_labels[&d]);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        for &d in &dups {
+            let c = net.cell(d);
+            for (side, o) in [Port(c[0]), Port(c[1])].into_iter().enumerate() {
+                if o.tag() != Tag::Var {
+                    continue;
+                }
+                let r = ix.find(o.payload() as u32);
+                if sups.contains(&d) {
+                    if matches!(ix.producer[r as usize], Some(Producer::Dup(x)) if x == d) {
+                        ix.producer[r as usize] = None;
+                        ix.dup_side.remove(&r);
+                    }
+                } else if ix.producer[r as usize].is_none() {
+                    ix.producer[r as usize] = Some(Producer::Dup(d));
+                    ix.dup_side.insert(r, (d, side));
+                }
+            }
         }
     }
     ix
@@ -361,6 +439,10 @@ pub(crate) struct Reader<'a> {
     lams: Vec<(usize, u32)>,
     /// parameter var per Lam cell
     lam_param: HashMap<u32, u32>,
+    /// superposition sides in effect: reading through side `side` of a
+    /// dup with a copy label selects, for every same-label dup met as a
+    /// superposition, its source of that side
+    sel: Vec<(u32, usize)>,
 }
 
 /// The frame of a residual closure's body (disjoint from arm frames).
@@ -392,7 +474,7 @@ impl<'a> Reader<'a> {
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
-        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new() }
+        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
     }
 
     /// Read a frame's expression from `p` (its tail, compound) and wrap it
@@ -495,8 +577,23 @@ impl<'a> Reader<'a> {
             if !is_consumer(s) {
                 return self.read(s);
             }
+            if s.tag() == Tag::Dup && self.ix.producer[r as usize].is_none() {
+                // a superposition feeding this use (a dup stored where
+                // nothing produces): its source of the side being read
+                if let Some(side) = self.selected(dup_addr(s)) {
+                    let src = Port(self.net.cell(dup_addr(s))[side]);
+                    return self.read(src);
+                }
+            }
         }
         self.read_producer(r)
+    }
+
+    /// The side selected for dup `d`'s label, if its label is a copy in
+    /// progress.
+    fn selected(&self, d: u32) -> Option<usize> {
+        let label = *self.ix.dup_labels.get(&d)?;
+        self.sel.iter().rev().find(|(l, _)| *l == label).map(|(_, s)| *s)
     }
 
     /// The expression of the agent producing the value of wire class `r`.
@@ -555,31 +652,8 @@ impl<'a> Reader<'a> {
                 }
             }
             Producer::Dup(d) => {
-                if let Some(x) = self.shared.get(&d) {
-                    return Core::Var(*x);
-                }
-                // the shared value belongs to the frame the Dup was created
-                // in (an active one: arms never share with siblings); it and
-                // what it depends on are bound there
-                let mut frame = *self.dup_frame.get(&d).unwrap_or(&0);
-                assert!(self.stack.contains(&frame), "ICE: shared value read outside its scope");
-                self.stack.push(frame);
-                let e = self.read_input(d);
-                self.stack.pop();
-                // a shared value that reads a closure's parameter lives in
-                // that closure's body (the innermost such: every consumer
-                // is inside it); otherwise in the frame it was created in
-                for (lf, x) in self.lams.iter().rev() {
-                    if mentions(&e, &[*x]) {
-                        frame = *lf;
-                        break;
-                    }
-                }
-                let a = self.bind_in(frame, e);
-                if let Core::Var(v) = a {
-                    self.shared.insert(d, v);
-                }
-                a
+                let side = self.ix.dup_side.get(&r).map(|x| x.1).unwrap_or(0);
+                self.read_dup(d, side)
             }
             Producer::Ref(r) => {
                 let entry = ref_entry(r) as usize;
@@ -599,10 +673,60 @@ impl<'a> Reader<'a> {
         x
     }
 
+    /// Output `side` of Dup cell `d`. A copy dup (its label also names
+    /// superpositions) fans out an open term: read once per side under
+    /// that side's selection, never shared. Any other dup shares one
+    /// value: bound once, in the frame it was created in (or the
+    /// innermost closure whose parameter it reads).
+    fn read_dup(&mut self, d: u32, side: usize) -> Core {
+        let label = self.ix.dup_labels[&d];
+        if self.ix.sup_labels.contains(&label) {
+            self.sel.push((label, side));
+            let e = self.read_dup_input(d);
+            self.sel.pop();
+            return e;
+        }
+        if let Some(x) = self.shared.get(&d) {
+            return Core::Var(*x);
+        }
+        let mut frame = *self.dup_frame.get(&d).unwrap_or(&0);
+        assert!(self.stack.contains(&frame), "ICE: shared value read outside its scope");
+        self.stack.push(frame);
+        let e = self.read_dup_input(d);
+        self.stack.pop();
+        for (lf, x) in self.lams.iter().rev() {
+            if mentions(&e, &[*x]) {
+                frame = *lf;
+                break;
+            }
+        }
+        let a = self.bind_in(frame, e);
+        if let Core::Var(v) = a {
+            self.shared.insert(d, v);
+        }
+        a
+    }
+
+    /// What flows into Dup cell `d`: its input wire, or its parent link's
+    /// output.
+    fn read_dup_input(&mut self, d: u32) -> Core {
+        if let Some((p, side)) = self.ix.dup_parent.get(&d).copied() {
+            return self.read_dup(p, side);
+        }
+        self.read_input(d)
+    }
+
     fn producer_of(&mut self, r: u32) -> Producer {
         match self.ix.producer[r as usize] {
             Some(p) => p,
-            None => panic!("ICE: residual wire class {} has no producer (stored: {:?})", r, self.ix.stored[r as usize]),
+            None => {
+                let st = self.ix.stored[r as usize];
+                let extra = match st {
+                    Some(p) if p.tag() == Tag::Dup => format!(" dup cell {} = {:?} label {:?} sel {:?} parent {:?} input_of {:?} sup_labels {:?} dup_side(slots) {:?}", dup_addr(p), self.net.cell(dup_addr(p)).map(|w| (Port(w).tag(), Port(w).payload())), self.ix.dup_labels.get(&dup_addr(p)), self.sel, self.ix.dup_parent.get(&dup_addr(p)), self.ix.input_of[dup_addr(p) as usize], self.ix.sup_labels, self.net.cell(dup_addr(p)).map(|w| self.ix.dup_side.get(&(Port(w).payload() as u32)).copied())),
+                    _ => String::new(),
+                };
+                panic!("ICE: residual wire class {} has no producer (stored: {:?}){}", r, st.map(|p| p.tag()), extra)
+            }
         }
     }
 
