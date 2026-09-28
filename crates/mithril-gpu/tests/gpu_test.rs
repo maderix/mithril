@@ -21,7 +21,11 @@ fn fixture(name: &str) -> String {
 
 /// parse -> analyze -> desugar -> specialize (by the net rules) -> emit_cuda.
 fn pipeline(name: &str) -> (CoreModule, Result<String, String>) {
-    let src = fixture(name);
+    pipeline_src(&fixture(name))
+}
+
+fn pipeline_src(src: &str) -> (CoreModule, Result<String, String>) {
+    let src = src.to_string();
     // the specializer recurses per net depth: a deep stack, as the CLI has
     std::thread::Builder::new()
         .stack_size(1 << 28)
@@ -60,8 +64,7 @@ fn cache_dir() -> PathBuf {
 /// `main()` takes no arguments: the boot redex carries nothing.
 const BOOT: Redex = Redex { a: 0, b: 0, aux: 0 };
 
-/// The closure-free fixtures: every shape the CPU backend is tested on
-/// except the net region (stage 3).
+/// Every fixture the CPU backend is tested on, closures included.
 const FIXTURES: &[&str] = &[
     "fact_while.py",
     "tree_sum.py",
@@ -85,6 +88,9 @@ const FIXTURES: &[&str] = &[
     "f32_ops.py",
     "heavy_fold.py",
     "fork_reach.py",
+    // the net region: closures built, shared and applied by compiled code
+    "closures.py",
+    "w2_runtime.py",
 ];
 
 // ---------------- pure emission tests (always run) ----------------
@@ -164,15 +170,38 @@ fn gpu_fixtures_match_the_oracle() {
     assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
 }
 
+/// The closure corpus (bench/general), at the sizes run.py uses for its
+/// small lane; the checksum is what the CPU program prints.
 #[test]
 #[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_closures_report_the_missing_net_region() {
+fn gpu_closure_corpus_matches_the_cpu() {
     if !gpu_on() {
         return;
     }
-    let (_, got) = run_fixture("closures.py");
-    let err = got.expect_err("closures need the net region (stage 3)");
-    assert!(err.contains("closures"), "wrong error: {err}");
+    let mut failed = Vec::new();
+    // run.py's small sizes: `return run(N)` in main
+    for (name, small) in [("stage_closure.py", 50), ("pipeline_cfg.py", 20), ("interp_closure.py", 200)] {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/general").join(name);
+        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
+        let at = text.rfind("return run(").expect("main returns run(N)");
+        let end = at + text[at..].find(')').unwrap();
+        let src = format!("{}return run({small}{}", &text[..at], &text[end..]);
+        let (cm, cu) = pipeline_src(&src);
+        let want = oracle(&cm);
+        match cu {
+            Err(v) => {
+                if v != want {
+                    failed.push(format!("{name}: constant {v} differs from the oracle {want}"));
+                }
+            }
+            Ok(cu) => match compile_and_run(&cu, BOOT, &cache_dir()) {
+                Ok(r) if r.text == want => {}
+                Ok(r) => failed.push(format!("{name}: device printed {} but the oracle says {want}", r.text)),
+                Err(e) => failed.push(format!("{name}: {e}")),
+            },
+        }
+    }
+    assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
 }
 
 #[test]

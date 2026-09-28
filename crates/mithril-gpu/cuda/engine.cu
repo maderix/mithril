@@ -35,6 +35,10 @@ typedef unsigned long long usize;
 #define AB_ARENA 2u
 #define AB_OOB 3u
 #define AB_UNSUPPORTED 4u
+#define AB_LOOP 5u
+// a walk over cells that never ends is a corrupted arena, not a hang
+#define GUARD(n) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return; } } while (0)
+#define GUARDV(n, v) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return v; } } while (0)
 
 struct Rec {
   int pend;
@@ -66,9 +70,14 @@ struct Dev {
   u64 *heap;   // array blocks: [rc, len|flags, elems..] (bump, never freed)
   u64 *hbump;
   u64 hcap;
+  u64 *nw;     // MAXLANES * NWCAP * 2: per-lane net worklists (redex pairs)
+  u32 *nwn;    // MAXLANES worklist lengths
+  u32 *labels; // Dup label supply
   u32 ncap, rcap, bcap, ovfcap, chunksz, nrules;
   int fuel;    // per-dive budget
+  int net_fuel; // rewrites per net reduction before spilling to the net rule
 };
+#define NWCAP 64
 
 extern "C" {
 __device__ Dev G;
@@ -176,7 +185,7 @@ __device__ inline void cell_set(u32 i, usize slot, u64 v) { G.nodes[2 * (u64)ncl
 
 // ---- node arena: lane free list -> global overflow ring -> checked bump ----
 
-__device__ u32 alloc_node(u64 a, u64 b) {
+__device__ __noinline__ u32 alloc_node(u64 a, u64 b) {
   u32 L = lane();
   if (G.nfreen[L]) {
     u32 i = G.nfree[L * FREECAP + --G.nfreen[L]];
@@ -211,7 +220,7 @@ __device__ u32 alloc_node(u64 a, u64 b) {
   return i;
 }
 
-__device__ void free_node(u32 i) {
+__device__ __noinline__ void free_node(u32 i) {
   if (i == 0 || i >= G.ncap)
     return;
   u32 L = lane();
@@ -237,7 +246,7 @@ __device__ inline bool rc_unique(u32 i) { return G.rc[nclamp(i)] == 1; }
 
 // ---- records / buckets / delivery ----
 
-__device__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
+__device__ __noinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
   u32 i = atomicAdd(G.rbump, 1);
   if (i >= G.rcap) {
     g_abort(AB_ARENA);
@@ -259,7 +268,7 @@ __device__ inline u32 rec_s(u32 rec) { return G.recs[rclamp(rec)].s; }
 __device__ inline void set_parent(u32 rec, u64 parent) { G.recs[rclamp(rec)].parent = parent; }
 __device__ inline i64 fuel_of() { return (i64)G.fuel; }
 
-__device__ void spawn3(u32 rule, u64 a, u64 b, u64 c) {
+__device__ __noinline__ void spawn3(u32 rule, u64 a, u64 b, u64 c) {
   u32 i = atomicAdd(&G.blen[rule], 1);
   if (i >= G.bcap) {
     g_abort(AB_ARENA);
@@ -276,7 +285,7 @@ __device__ inline void ready_rec(u32 rec) {
   spawn3(r.rule, r.args[0], r.args[1], (u64)rec);
 }
 
-__device__ void deliver(u64 parent, u64 val) {
+__device__ __noinline__ void deliver(u64 parent, u64 val) {
   u32 ri = (u32)(parent >> 3);
   u32 slot = (u32)parent & 1u;
   if (ri == 0) { // ROOT sink
@@ -296,7 +305,7 @@ __device__ void deliver(u64 parent, u64 val) {
 
 // Spawn a saturated call: arity <= 2 rides in (a, b); wider calls put
 // arg0 in `a` and chain args[1..] through cells in `b` (addr+1, 0 = end).
-__device__ void spawn_call(u16 rule, const u64 *args, int n, u64 parent) {
+__device__ __noinline__ void spawn_call(u16 rule, const u64 *args, int n, u64 parent) {
   u64 a = 0, b = 0;
   if (n == 1) {
     a = args[0];
@@ -325,7 +334,7 @@ __device__ inline u64 pop_chain(u64 *ch) {
 
 // Dive `f` (args[0] = the destination) and deliver its result there; a
 // suspended dive's residue root is attached to the destination.
-__device__ void dive_to(u16 f, const u64 *args, int n) {
+__device__ __noinline__ void dive_to(u16 f, const u64 *args, int n) {
   i64 fuel = (i64)G.fuel;
   R r = prog_dive(f, args, &fuel);
   if (r.ok)
@@ -336,7 +345,7 @@ __device__ void dive_to(u16 f, const u64 *args, int n) {
 
 // Dive `f` with no destination (args[0] = NONE): ok = the value, else the
 // root record of its residue, whose parent the caller sets.
-__device__ R dive_res(u16 f, const u64 *args, int n) {
+__device__ __noinline__ R dive_res(u16 f, const u64 *args, int n) {
   i64 fuel = (i64)G.fuel;
   return prog_dive(f, args, &fuel);
 }
@@ -355,7 +364,7 @@ __device__ inline u64 hole_fill(u64 head, u32 hole, u64 v) {
   cell_set(hole, 1, v);
   return head;
 }
-__device__ u64 hole_wrap(u64 r, u64 head, u32 hole, u16 rule) {
+__device__ __noinline__ u64 hole_wrap(u64 r, u64 head, u32 hole, u16 rule) {
   if (hole == NOHOLE) return r;
   u32 hr = alloc_rec(rule, 1, con_addr(head), hole, NONE);
   set_parent((u32)r, rec_addr(hr));
@@ -386,7 +395,7 @@ __device__ inline u64 mk_con1(u16 k, u64 f0) { u32 a = calloc(k, f0, 0); return 
 __device__ inline u64 mk_con2(u16 k, u64 f0, u64 f1) { u32 a = calloc(k, f0, f1); return con(a, k, 2); }
 // arity <= 2 direct, wider ctors chain cells (slot 0 = field, slot 1 =
 // continuation con); the arity nibble saturates at 15
-__device__ u64 mk_con(u16 k, const u64 *fs, int n) {
+__device__ __noinline__ u64 mk_con(u16 k, const u64 *fs, int n) {
   if (n == 0) return con(0, k, 0);
   if (n <= 2) {
     u32 a = calloc(k, fs[0], n == 2 ? fs[1] : 0);
@@ -410,8 +419,10 @@ __device__ inline u64 mk_con2r(u32 tok, u16 k, u64 f0, u64 f1) {
   return con(tok, k, 2);
 }
 // field i of a constructor value (walks the >2-arity chain)
-__device__ u64 field(u64 p, usize i) {
+__device__ __noinline__ u64 field(u64 p, usize i) {
+  u32 g = 0;
   for (;;) {
+    GUARDV(g, 0);
     u8 ar = con_ar(p);
     u32 a = con_addr(p);
     if (ar > 2) {
@@ -469,7 +480,7 @@ template <int N> __device__ A<N> consume_chain(u64 p, u16 k) {
   return out;
 }
 // last use of a boxed value that is only projected: move field i out
-__device__ u64 take_field(u64 p, usize i) {
+__device__ __noinline__ u64 take_field(u64 p, usize i) {
   u32 root = con_addr(p);
   if (!lin(con_tag(p)) && !rc_unique(root)) {
     u64 f = dup_val(field(p, i));
@@ -539,7 +550,7 @@ __device__ inline bool arr_boxed(u64 p) { return (arr_block(p)[1] & ARR_BOXED) !
 __device__ inline bool is_heap(u64 v) { u64 t = tag(v); return t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM; }
 __device__ inline void arr_mark_boxed(u64 a, u64 v) { if (is_heap(v)) arr_block(a)[1] |= ARR_BOXED; }
 __device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return arr_raw(p) ? retag((i64)e) : e; }
-__device__ u64 arr_alloc_fill(usize n, u64 fill) {
+__device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
   u64 base = atomicAdd(G.hbump, n + 2);
   if (base + n + 2 > G.hcap) {
     g_abort(AB_ARENA);
@@ -560,7 +571,7 @@ __device__ inline u64 arr_new_raw(i64 n, i64 x) {
   arr_block(p)[1] |= ARR_RAW;
   return p;
 }
-__device__ void arr_unraw(u64 a) {
+__device__ __noinline__ void arr_unraw(u64 a) {
   usize n = arr_len_of(a);
   for (usize k = 0; k < n; k++) arr_elems(a)[k] = retag((i64)arr_elems(a)[k]);
   arr_block(a)[1] &= ~ARR_RAW;
@@ -588,7 +599,7 @@ __device__ inline u64 arr_set_n(u64 a, usize n, i64 i, u64 v) {
 }
 __device__ inline u64 arr_new_i(i64 n, u64 v) { return arr_new_raw(n, sh(v)); }
 __device__ inline u64 arr_rc_load(u64 p) { return *(volatile u64 *)arr_block(p); }
-__device__ u64 arr_copy(u64 a) {
+__device__ __noinline__ u64 arr_copy(u64 a) {
   usize n = arr_len_of(a);
   u64 b = arr_alloc(n);
   if (arr_boxed(a)) {
@@ -602,7 +613,7 @@ __device__ u64 arr_copy(u64 a) {
   return b;
 }
 __device__ inline u64 arr_own(u64 a) { return arr_rc_load(a) == 1 ? a : arr_copy(a); }
-__device__ u64 arr_new(i64 n, u64 v) {
+__device__ __noinline__ u64 arr_new(i64 n, u64 v) {
   if (n < 0) { g_abort(AB_OOB); n = 0; }
   if (tag(v) == T_NUM) return arr_new_raw(n, sh(v));
   usize un = (usize)n;
@@ -618,7 +629,7 @@ __device__ inline u64 arr_get(u64 a, i64 i) {
   if (arr_raw(a)) return arr_elem(a, (usize)i);
   return dup_val(arr_elems(a)[i]);
 }
-__device__ u64 arr_set(u64 a, i64 i, u64 v) {
+__device__ __noinline__ u64 arr_set(u64 a, i64 i, u64 v) {
   usize n = arr_len_of(a);
   if (i < 0 || (usize)i >= n) { arr_oob(i, n); return a; }
   a = arr_rc_load(a) == 1 ? a : arr_copy(a);
@@ -641,7 +652,7 @@ __device__ inline u64 arr_set_i(u64 a, i64 i, u64 v) {
   arr_elems(a)[i] = (u64)sh(v);
   return a;
 }
-__device__ void arr_drop(u64 p) {
+__device__ __noinline__ void arr_drop(u64 p) {
   if (atomicAdd((unsigned long long *)arr_block(p), 0xffffffffffffffffull) != 1ull) return;
   if (arr_boxed(p)) {
     usize n = arr_len_of(p);
@@ -650,16 +661,16 @@ __device__ void arr_drop(u64 p) {
   arr_free_block(p);
 }
 
-// ---- closures: the net region runs on the device in stage 3 ----
+// ---- closures: the net region (below, after the value helpers) ----
 
-__device__ inline u64 dup_closure(u64 p) { g_abort(AB_UNSUPPORTED); return p; }
-__device__ inline void drop_closure(u64 p) { (void)p; g_abort(AB_UNSUPPORTED); }
-__device__ inline R apply(u64 f, u64 a) { (void)f; (void)a; g_abort(AB_UNSUPPORTED); return R{0, true}; }
-__device__ inline void apply_spawn(u64 f, u64 a, u64 parent) { (void)f; (void)a; (void)parent; g_abort(AB_UNSUPPORTED); }
-__device__ inline u64 build_closure(u16 id, const u64 *caps, int n) { (void)id; (void)caps; (void)n; g_abort(AB_UNSUPPORTED); return 0; }
+__device__ u64 dup_closure(u64 p);
+__device__ void drop_closure(u64 p);
+__device__ R apply(u64 f, u64 a);
+__device__ void apply_spawn(u64 f, u64 a, u64 parent);
+__device__ u64 build_closure(u16 id, const u64 *caps, int n);
 
 // share a value: O(1) refcount bump on the root cell
-__device__ u64 dup_val(u64 p) {
+__device__ __noinline__ u64 dup_val(u64 p) {
   u64 t = tag(p);
   if (t >= TU) return p;
   if (t == T_LAM) return dup_closure(p);
@@ -677,7 +688,8 @@ __device__ inline void free_val(u64 p) {
   if (t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM) return;
   free_val_slow(p);
 }
-__device__ void free_val_slow(u64 p) {
+__device__ __noinline__ void free_val_slow(u64 p) {
+  u32 g = 0;
   u64 t = tag(p);
   if (t == T_ARR) { arr_drop(p); return; }
   if (t == T_LAM) { drop_closure(p); return; }
@@ -692,6 +704,7 @@ __device__ void free_val_slow(u64 p) {
   if (!lin(con_tag(p)) && !rc_dec(root)) return;
   u64 q = p;
   for (;;) {
+    GUARD(g);
     u8 ar = con_ar(q);
     u32 ca = con_addr(q);
     u64 c0 = cell0(ca), c1 = cell1(ca);
@@ -708,7 +721,7 @@ __device__ void free_val_slow(u64 p) {
 }
 
 // dynamic arithmetic (ints, or boxed floats)
-__device__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
+__device__ __noinline__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
   if (tag(a) == T_NUM && tag(b) == T_NUM) {
     i64 x = as_i(a), y = as_i(b), r = 0;
     switch (op) {
@@ -738,7 +751,7 @@ __device__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
   }
   return flo(r);
 }
-__device__ u64 cmp(u8 op, u64 a, u64 b, u8 own) {
+__device__ __noinline__ u64 cmp(u8 op, u64 a, u64 b, u8 own) {
   bool r = false;
   if (tag(a) == T_NUM && tag(b) == T_NUM) {
     i64 x = as_i(a), y = as_i(b);
@@ -766,13 +779,13 @@ __device__ u64 cmp(u8 op, u64 a, u64 b, u8 own) {
   return num(r ? 1 : 0);
 }
 // n-tuple of int zeros (the identity of the additive fold combiners)
-__device__ u64 zeros(usize n) {
+__device__ __noinline__ u64 zeros(usize n) {
   u64 fs[16];
   for (usize k = 0; k < n && k < 16; k++) fs[k] = num(0);
   return mk_con(0xfff, fs, (int)(n < 16 ? n : 16));
 }
 // elementwise wrapping add of two equal-shape int tuples, in place into a
-__device__ u64 tup_add(u64 a, u64 b, bool mask32) {
+__device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
   u64 pa = a, pb = b;
   for (;;) {
     u8 n = con_ar(pa);
@@ -795,6 +808,749 @@ __device__ u64 tup_add(u64 a, u64 b, bool mask32) {
       return a;
     }
   }
+}
+
+// ======================================================================
+// The net region: the interaction rule table (mithril_core::rules) and
+// the instantiation of entries, on the device arena. Same rules, same
+// encodings as the CPU; `process` is the reference's shape line by line.
+// The program supplies NFNS, NET_RULE, FILL_RULE, FWD_RULE, prog_inst
+// (entry bodies as net builders) and the match tables.
+
+#define T_VAR 0ull
+#define T_ERA 1ull
+#define T_DUP 5ull
+#define T_APP 7ull
+#define T_OP 8ull
+#define T_SWI 9ull
+#define T_MAT 10ull
+#define T_REF 11ull
+#define T_EXT 12ull
+#define T_KONT 13ull
+#define EMPTY ((T_EXT << 56) | M56)
+#define OP_FLIP 0x100u
+#define CTAG_TUPLE 0xfffu
+#define ARR_PAIR 44u
+#define LISTCAP 64
+
+__device__ inline u64 payload(u64 p) { return p & M56; }
+__device__ inline u64 mkport(u64 t, u64 pl) { return (t << 56) | (pl & M56); }
+__device__ inline u64 era() { return mkport(T_ERA, 0); }
+__device__ inline u64 op_port(u32 addr, u16 code) { return mkport(T_OP, ((u64)addr << 16) | code); }
+__device__ inline u32 op_addr(u64 p) { return (u32)(payload(p) >> 16); }
+__device__ inline u16 op_code(u64 p) { return (u16)(payload(p) & 0xffff); }
+__device__ inline u64 dup_port(u32 addr, u32 label) { return mkport(T_DUP, ((u64)addr << 24) | (label & 0xffffffu)); }
+__device__ inline u32 dup_addr(u64 p) { return (u32)(payload(p) >> 24); }
+__device__ inline u32 dup_label(u64 p) { return (u32)(payload(p) & 0xffffffu); }
+__device__ inline u64 mat_port(u32 addr, u16 id) { return mkport(T_MAT, ((u64)addr << 16) | id); }
+__device__ inline u32 mat_addr(u64 p) { return (u32)(payload(p) >> 16); }
+__device__ inline u16 mat_id(u64 p) { return (u16)(payload(p) & 0xffff); }
+__device__ inline u64 ref_port(u64 head, u16 entry) {
+  u64 h = head == EMPTY ? 0 : payload(head) + 1;
+  return mkport(T_REF, (h << 16) | entry);
+}
+__device__ inline u64 ref_head(u64 p) {
+  u64 h = payload(p) >> 16;
+  return h == 0 ? EMPTY : mkport(T_EXT, h - 1);
+}
+__device__ inline u16 ref_entry(u64 p) { return (u16)(payload(p) & 0xffff); }
+__device__ inline u64 kont_port(u64 parent) { return mkport(T_KONT, parent); }
+
+__device__ inline u32 fresh_label() {
+  u32 l = atomicAdd(G.labels, 1u) & 0xffffffu;
+  return l == 0 ? 1 : l;
+}
+__device__ inline u64 wire() { return mkport(T_VAR, alloc_node(EMPTY, EMPTY)); }
+__device__ inline u64 alloc_flo(double f) { return mkport(T_FLO, alloc2(__double_as_longlong(f), 0)); }
+
+// the lane's worklist of generic redexes; overflow spills to the net rule
+__device__ inline void push_redex(u64 a, u64 b) {
+  u32 L = lane();
+  u32 n = G.nwn[L];
+  if (n < NWCAP) {
+    G.nw[(L * NWCAP + n) * 2] = a;
+    G.nw[(L * NWCAP + n) * 2 + 1] = b;
+    G.nwn[L] = n + 1;
+  } else {
+    spawn3(NET_RULE, a, b, 0);
+  }
+}
+__device__ inline bool pop_redex(u64 *a, u64 *b) {
+  u32 L = lane();
+  u32 n = G.nwn[L];
+  if (n == 0) return false;
+  n -= 1;
+  *a = G.nw[(L * NWCAP + n) * 2];
+  *b = G.nw[(L * NWCAP + n) * 2 + 1];
+  G.nwn[L] = n;
+  return true;
+}
+
+// ---- list chains ([item, Ext(next)|EMPTY] cells) and constructor chains ----
+
+__device__ __noinline__ u64 list_alloc(const u64 *items, int n) {
+  u64 head = EMPTY;
+  for (int i = n - 1; i >= 0; i--) head = mkport(T_EXT, alloc_node(items[i], head));
+  return head;
+}
+// walk and free a list chain into buf (at most LISTCAP items)
+__device__ __noinline__ int list_collect(u64 head, u64 *buf) {
+  int n = 0;
+  u32 g = 0;
+  while (head != EMPTY) {
+    GUARDV(g, n);
+    u32 a = (u32)payload(head);
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    if (n < LISTCAP) buf[n] = c0;
+    n++;
+    head = c1;
+  }
+  if (n > LISTCAP) { g_abort(AB_ARENA); return LISTCAP; }
+  return n;
+}
+__device__ __noinline__ u64 con_alloc(u16 ctag, const u64 *fields, int n) {
+  if (n == 0) return con(0, ctag, 0);
+  if (n == 1) return con(alloc2(fields[0], EMPTY), ctag, 1);
+  if (n == 2) return con(alloc2(fields[0], fields[1]), ctag, 2);
+  u64 rest = con_alloc(ctag, fields + 1, n - 1);
+  return con(alloc2(fields[0], rest), ctag, (u8)(n < 15 ? n : 15));
+}
+// walk and free a constructor chain into buf
+__device__ __noinline__ int con_collect(u64 p, u64 *buf) {
+  int n = 0;
+  for (;;) {
+    u8 ar = con_ar(p);
+    u32 a = con_addr(p);
+    if (ar == 0) return n;
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    if (ar == 1) { buf[n++] = c0; return n; }
+    if (ar == 2) { buf[n++] = c0; buf[n++] = c1; return n; }
+    buf[n++] = c0;
+    if (n >= LISTCAP - 2) { g_abort(AB_ARENA); return n; }
+    p = c1;
+  }
+}
+
+// ---- wiring ----
+
+// Connect two ports. Wire cells hold the first arrival in slot 0; the
+// second arrival takes it (freeing the cell) and the two ports meet.
+__device__ __noinline__ void link(u64 a, u64 b) {
+  u32 g = 0;
+  for (;;) {
+    GUARD(g);
+    if (tag(a) != T_VAR) {
+      if (tag(b) != T_VAR) { push_redex(a, b); return; }
+      u64 t = a; a = b; b = t;
+    }
+    u32 w = (u32)payload(a);
+    u64 c0 = cell0(w);
+    if (c0 == EMPTY) { cell_set(w, 0, b); return; }
+    free_node(w);
+    a = b;
+    b = c0;
+  }
+}
+// Follow filled wires (freeing them) until a non-Var port or an unfilled
+// wire end is reached.
+__device__ __noinline__ u64 resolve(u64 p) {
+  u32 g = 0;
+  while (tag(p) == T_VAR) {
+    GUARDV(g, p);
+    u32 w = (u32)payload(p);
+    u64 c0 = cell0(w);
+    if (c0 == EMPTY) return p;
+    free_node(w);
+    p = c0;
+  }
+  return p;
+}
+
+// ---- the program's half (prog_* supplied by program.cu) ----
+
+__device__ void prog_inst(u16 entry, const u64 *args, int n, u64 ret);
+__device__ bool prog_mat_proj(u16 mid, usize *i);
+__device__ const u16 *prog_mat_arms(u16 mid, int *n);
+
+__device__ inline bool is_ext_value(u64 p) { u64 t = tag(p); return t >= TU || t == T_ARR; }
+__device__ inline bool is_value(u64 p) {
+  u64 t = tag(p);
+  return t == T_NUM || t == T_FLO || t == T_CON || t == T_LAM || is_ext_value(p);
+}
+__device__ inline bool is_closure(u64 r) { return ref_entry(r) >= NFNS; }
+
+// REF rule: a compiled function with every argument produced runs by its
+// CALL rule and comes back through a FILL record; anything else (a lifted
+// branch/arm, a call met before its arguments) is instantiated as a net.
+__device__ __noinline__ void unfold(u64 r, u64 other) {
+  u64 args[LISTCAP];
+  int n = list_collect(ref_head(r), args);
+  u16 entry = ref_entry(r);
+  bool produced = true;
+  for (int i = 0; i < n; i++) if (tag(args[i]) == T_VAR) produced = false;
+  if (entry < NFNS && produced) {
+    u32 ri = alloc_rec(FILL_RULE, 1, (u32)other, (u32)(other >> 32), NONE);
+    spawn_call((u16)(1 + entry), args, n, rec_addr(ri));
+  } else {
+    prog_inst(entry, args, n, other);
+  }
+}
+
+// builtins on runtime values (codes as mithril_core::lower / net_compute)
+__device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
+  if (code >= 32) {
+    switch (code) {
+    case 32: *out = num(f32_add(as_i(x), as_i(y))); return true;
+    case 33: *out = num(f32_sub(as_i(x), as_i(y))); return true;
+    case 34: *out = num(f32_mul(as_i(x), as_i(y))); return true;
+    case 35: *out = num(f32_div(as_i(x), as_i(y))); return true;
+    case 36: *out = num(f32_sqrt(as_i(x))); return true;
+    case 37: *out = num(f32_lt(as_i(x), as_i(y))); return true;
+    case 38: *out = num(f32_from_u32(as_i(x))); return true;
+    case 39: *out = num(f32_to_u32(as_i(x))); return true;
+    case 40: *out = arr_new(as_i(x), y); return true;
+    case 41: *out = arr_get(x, as_i(y)); return true;
+    case 42: *out = num((i64)arr_len_of(x)); return true;
+    case 43: {
+      u64 i = field(y, 0), v = field(y, 1);
+      free_node(con_addr(y));
+      *out = arr_set(x, as_i(i), v);
+      return true;
+    }
+    case 44: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
+    default: g_abort(AB_UNREACHABLE); return false;
+    }
+  }
+  if (tag(x) == T_NUM && tag(y) == T_NUM) {
+    i64 a = as_i(x), b = as_i(y);
+    if (code >= 16) {
+      bool r = false;
+      switch (code) {
+      case 16: r = a < b; break;
+      case 17: r = a <= b; break;
+      case 18: r = a > b; break;
+      case 19: r = a >= b; break;
+      case 20: r = a == b; break;
+      default: r = a != b; break;
+      }
+      *out = num(r ? 1 : 0);
+      return true;
+    }
+    if ((code == 3 || code == 4 || code == 5) && b == 0) { g_abort(AB_OOB); return false; }
+    i64 r = 0;
+    switch (code) {
+    case 0: r = (i64)((u64)a + (u64)b); break;
+    case 1: r = (i64)((u64)a - (u64)b); break;
+    case 2: r = (i64)((u64)a * (u64)b); break;
+    case 3: r = idiv(a, b); break;
+    case 4: r = floor_div(a, b); break;
+    case 5: r = py_mod(a, b); break;
+    case 6: r = (i64)((u64)a << ((u32)b & 63u)); break;
+    case 7: r = a >> ((u32)b & 63u); break;
+    case 8: r = a & b; break;
+    case 9: r = a | b; break;
+    default: r = a ^ b; break;
+    }
+    *out = num(wrap56(r));
+    return true;
+  }
+  double a = flo_val(x), b = flo_val(y);
+  free_node((u32)(x & M56));
+  free_node((u32)(y & M56));
+  if (code >= 16) {
+    bool r = false;
+    switch (code) {
+    case 16: r = a < b; break;
+    case 17: r = a <= b; break;
+    case 18: r = a > b; break;
+    case 19: r = a >= b; break;
+    case 20: r = a == b; break;
+    default: r = a != b; break;
+    }
+    *out = num(r ? 1 : 0);
+    return true;
+  }
+  double r = 0.0;
+  switch (code) {
+  case 0: r = __dadd_rn(a, b); break;
+  case 1: r = __dsub_rn(a, b); break;
+  case 2: r = __dmul_rn(a, b); break;
+  case 3: r = __ddiv_rn(a, b); break;
+  default: g_abort(AB_UNREACHABLE); return false;
+  }
+  *out = flo(r);
+  return true;
+}
+
+// ---- the rules ----
+
+// ERA-anything: consume and erase the value/agent p
+__device__ __noinline__ void era_value(u64 p) {
+  u64 t = tag(p);
+  if (t == T_ERA || t == T_NUM) return;
+  if (t == T_FLO) { free_node((u32)payload(p)); return; }
+  if (t == T_CON) {
+    u64 fs[LISTCAP];
+    int n = con_collect(p, fs);
+    for (int i = 0; i < n; i++) link(era(), fs[i]);
+    return;
+  }
+  if (t == T_DUP) {
+    u32 d = dup_addr(p);
+    u64 c0 = cell0(d), c1 = cell1(d);
+    free_node(d);
+    link(era(), c0);
+    link(era(), c1);
+    return;
+  }
+  if (t == T_LAM || t == T_APP) {
+    u32 a = (u32)payload(p);
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    link(era(), c0);
+    link(era(), c1);
+    return;
+  }
+  if (t == T_OP) {
+    u32 a = op_addr(p);
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    link(era(), c0);
+    link(era(), c1);
+    return;
+  }
+  if (t == T_SWI) {
+    u32 s = (u32)payload(p);
+    u64 c0 = cell0(s), c1 = cell1(s);
+    free_node(s);
+    link(era(), c0);
+    u32 s2 = (u32)payload(c1);
+    u64 d0 = cell0(s2), d1 = cell1(s2);
+    free_node(s2);
+    link(era(), d0);
+    link(era(), d1);
+    return;
+  }
+  if (t == T_MAT) {
+    u32 m = mat_addr(p);
+    u64 c0 = cell0(m), c1 = cell1(m);
+    free_node(m);
+    link(era(), c0);
+    u64 rs[LISTCAP];
+    int n = list_collect(c1, rs);
+    for (int i = 0; i < n; i++) link(era(), rs[i]);
+    return;
+  }
+  if (is_ext_value(p)) { free_val(p); return; }
+  g_abort(AB_UNREACHABLE);
+}
+
+// APP-LAM beta: arg meets param, body meets ret
+__device__ __noinline__ void beta(u64 app, u64 lam) {
+  u32 ia = (u32)payload(app), il = (u32)payload(lam);
+  u64 a0 = cell0(ia), a1 = cell1(ia), l0 = cell0(il), l1 = cell1(il);
+  free_node(ia);
+  free_node(il);
+  link(a0, l0);
+  link(a1, l1);
+}
+
+// OP-value: compute if the other operand has been produced, otherwise
+// store this one and re-arm the op (flipped) against the missing operand
+__device__ __noinline__ void op_rule(u64 op, u64 val) {
+  u32 addr = op_addr(op);
+  u16 code = op_code(op);
+  u64 c0 = cell0(addr), c1 = cell1(addr);
+  u64 other = resolve(c0);
+  if (tag(other) == T_VAR) {
+    cell_set(addr, 0, val);
+    link(op_port(addr, code | OP_FLIP), other);
+    return;
+  }
+  if (tag(other) == T_DUP) {
+    // OP-SUP: the other operand is a superposition: one op per side
+    u32 d = dup_addr(other);
+    u32 label = dup_label(other);
+    u64 d0 = cell0(d), d1 = cell1(d);
+    free_node(d);
+    free_node(addr);
+    u64 v1 = wire(), v2 = wire();
+    u32 dv = alloc_node(v1, v2);
+    link(dup_port(dv, label), val);
+    u64 r1 = wire(), r2 = wire();
+    u32 dr = alloc_node(r1, r2);
+    link(dup_port(dr, label), c1);
+    u32 a1 = alloc_node(d0, r1);
+    u32 a2 = alloc_node(d1, r2);
+    link(op_port(a1, code), v1);
+    link(op_port(a2, code), v2);
+    return;
+  }
+  if (!is_value(other)) { g_abort(AB_UNREACHABLE); return; }
+  u64 x = (code & OP_FLIP) ? other : val;
+  u64 y = (code & OP_FLIP) ? val : other;
+  u64 r;
+  if (net_compute(code & 0xff, x, y, &r)) {
+    free_node(addr);
+    link(r, c1);
+  } else {
+    g_abort(AB_UNREACHABLE); // runtime: a builtin could not compute
+  }
+}
+
+// SWI-NUM: fire the taken branch closure at the return port, erase the other
+__device__ __noinline__ void swi_rule(u64 swi, u64 n) {
+  u32 s = (u32)payload(swi);
+  u64 ret = cell0(s), arms = cell1(s);
+  free_node(s);
+  u32 s2 = (u32)payload(arms);
+  u64 t = cell0(s2), e = cell1(s2);
+  free_node(s2);
+  u64 taken = as_i(n) != 0 ? t : e;
+  u64 dead = as_i(n) != 0 ? e : t;
+  link(era(), dead);
+  push_redex(taken, ret);
+}
+
+// MAT-constructor: select the arm whose ctor tag matches the scrutinee,
+// prepend the fields to the arm closure's captures and fire it
+__device__ __noinline__ void mat_rule(u64 mat, u64 val) {
+  u32 m = mat_addr(mat);
+  u16 mid = mat_id(mat);
+  u64 ret = cell0(m), armlist = cell1(m);
+  free_node(m);
+  u64 fields[LISTCAP];
+  int nf;
+  u16 ct;
+  if (tag(val) == T_CON) {
+    ct = con_tag(val);
+    nf = con_collect(val, fields);
+  } else {
+    // an unboxed constructor: its tag byte names the ctor, its field rides the payload
+    u64 t = tag(val);
+    if (t < TU) { g_abort(AB_UNREACHABLE); return; }
+    ct = (u16)unbox_cid(t - TU);
+    fields[0] = num(as_i(val));
+    nf = 1;
+  }
+  usize pi;
+  if (prog_mat_proj(mid, &pi)) {
+    if (ct != CTAG_TUPLE || (int)pi >= nf) { g_abort(AB_UNREACHABLE); return; }
+    for (int j = 0; j < nf; j++) {
+      if ((usize)j == pi) link(fields[j], ret); else link(era(), fields[j]);
+    }
+    return;
+  }
+  int ntags;
+  const u16 *tags = prog_mat_arms(mid, &ntags);
+  u64 refs[LISTCAP];
+  int nr = list_collect(armlist, refs);
+  int j = -1;
+  for (int i = 0; i < ntags; i++) if (tags[i] == ct) { j = i; break; }
+  if (j < 0 || j >= nr) { g_abort(AB_UNREACHABLE); return; }
+  for (int i = 0; i < nr; i++) if (i != j) link(era(), refs[i]);
+  u64 rj = refs[j];
+  if (tag(rj) != T_REF) { g_abort(AB_UNREACHABLE); return; }
+  u64 args[LISTCAP];
+  int na = 0;
+  for (int i = 0; i < nf; i++) args[na++] = fields[i];
+  u64 caps[LISTCAP];
+  int nc = list_collect(ref_head(rj), caps);
+  for (int i = 0; i < nc && na < LISTCAP; i++) args[na++] = caps[i];
+  u64 head = list_alloc(args, na);
+  push_redex(ref_port(head, ref_entry(rj)), ret);
+}
+
+// The DUP-LAM copy of the closure in cell l: two lambdas, their bodies
+// joined by a label dup on the old body wire, their parameters by a
+// same-label dup acting as the superposition. The first copy keeps cell l.
+__device__ __noinline__ void copy_lam(u32 l, u32 label, u64 *l1, u64 *l2) {
+  u64 c0 = cell0(l), c1 = cell1(l);
+  u64 wp1 = wire(), wp2 = wire(), wb1 = wire(), wb2 = wire();
+  u32 db = alloc_node(wb1, wb2);
+  link(dup_port(db, label), c1);
+  u32 su = alloc_node(wp1, wp2);
+  link(dup_port(su, label), c0);
+  cell_set(l, 0, wp1);
+  cell_set(l, 1, wb1);
+  u32 n2 = alloc_node(wp2, wb2);
+  *l1 = mkport(T_LAM, l);
+  *l2 = mkport(T_LAM, n2);
+}
+
+// The DUP-closure copy of an arm/branch closure r: two Refs to the same
+// entry over dup'd captures
+__device__ __noinline__ void copy_closure(u64 r, u32 label, u64 *ra, u64 *rb) {
+  u64 caps[LISTCAP];
+  int n = list_collect(ref_head(r), caps);
+  u64 ca[LISTCAP], cb[LISTCAP];
+  for (int i = 0; i < n; i++) {
+    u64 w1 = wire(), w2 = wire();
+    u32 nd = alloc_node(w1, w2);
+    link(dup_port(nd, label), caps[i]);
+    ca[i] = w1;
+    cb[i] = w2;
+  }
+  u16 entry = ref_entry(r);
+  *ra = ref_port(list_alloc(ca, n), entry);
+  *rb = ref_port(list_alloc(cb, n), entry);
+}
+
+// DUP-value: copy
+__device__ __noinline__ void dup_rule(u64 dup, u64 val) {
+  u32 d = dup_addr(dup);
+  u32 label = dup_label(dup);
+  u64 o1 = cell0(d), o2 = cell1(d);
+  free_node(d);
+  u64 t = tag(val);
+  if (t == T_NUM) {
+    link(val, o1);
+    link(val, o2);
+  } else if (t == T_FLO) {
+    u32 a = (u32)payload(val);
+    u32 copy = alloc_node(cell0(a), cell1(a));
+    link(val, o1);
+    link(mkport(T_FLO, copy), o2);
+  } else if (t == T_CON) {
+    u16 ctag = con_tag(val);
+    u64 fs[LISTCAP], fa[LISTCAP], fb[LISTCAP];
+    int n = con_collect(val, fs);
+    for (int i = 0; i < n; i++) {
+      u64 w1 = wire(), w2 = wire();
+      u32 df = alloc_node(w1, w2);
+      link(dup_port(df, label), fs[i]);
+      fa[i] = w1;
+      fb[i] = w2;
+    }
+    link(con_alloc(ctag, fa, n), o1);
+    link(con_alloc(ctag, fb, n), o2);
+  } else if (t == T_LAM) {
+    u64 l1, l2;
+    copy_lam((u32)payload(val), label, &l1, &l2);
+    link(l1, o1);
+    link(l2, o2);
+  } else {
+    u64 copy = dup_val(val);
+    link(val, o1);
+    link(copy, o2);
+  }
+}
+
+// a same-label dup whose outputs are fresh wires (an arm closure is copied
+// right away)
+__device__ __noinline__ void split(u64 p, u32 label, u64 *a, u64 *b) {
+  if (tag(p) == T_REF) { copy_closure(p, label, a, b); return; }
+  u64 w1 = wire(), w2 = wire();
+  u32 nd = alloc_node(w1, w2);
+  link(dup_port(nd, label), p);
+  *a = w1;
+  *b = w2;
+}
+
+// DUP-{OP, APP, SWI, MAT}: commute, the consumer passes through the dup
+__device__ __noinline__ void dup_commute(u64 dup, u64 agent) {
+  u32 d = dup_addr(dup);
+  u32 label = dup_label(dup);
+  u64 o1 = cell0(d), o2 = cell1(d);
+  free_node(d);
+  u64 t = tag(agent);
+  if (t == T_OP) {
+    u32 a = op_addr(agent);
+    u16 code = op_code(agent);
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    u64 x1, x2, r1, r2;
+    split(c0, label, &x1, &x2);
+    split(c1, label, &r1, &r2);
+    u32 a1 = alloc_node(x1, r1), a2 = alloc_node(x2, r2);
+    link(op_port(a1, code), o1);
+    link(op_port(a2, code), o2);
+  } else if (t == T_APP) {
+    u32 a = (u32)payload(agent);
+    u64 c0 = cell0(a), c1 = cell1(a);
+    free_node(a);
+    u64 x1, x2, r1, r2;
+    split(c0, label, &x1, &x2);
+    split(c1, label, &r1, &r2);
+    u32 a1 = alloc_node(x1, r1), a2 = alloc_node(x2, r2);
+    link(mkport(T_APP, a1), o1);
+    link(mkport(T_APP, a2), o2);
+  } else if (t == T_SWI) {
+    u32 s = (u32)payload(agent);
+    u64 c0 = cell0(s), c1 = cell1(s);
+    free_node(s);
+    u32 s2 = (u32)payload(c1);
+    u64 d0 = cell0(s2), d1 = cell1(s2);
+    free_node(s2);
+    u64 r1, r2, t1, t2, e1, e2;
+    split(c0, label, &r1, &r2);
+    split(d0, label, &t1, &t2);
+    split(d1, label, &e1, &e2);
+    u32 arms1 = alloc_node(t1, e1), arms2 = alloc_node(t2, e2);
+    u32 n1 = alloc_node(r1, mkport(T_EXT, arms1)), n2 = alloc_node(r2, mkport(T_EXT, arms2));
+    link(mkport(T_SWI, n1), o1);
+    link(mkport(T_SWI, n2), o2);
+  } else if (t == T_MAT) {
+    u32 m = mat_addr(agent);
+    u16 id = mat_id(agent);
+    u64 c0 = cell0(m), c1 = cell1(m);
+    free_node(m);
+    u64 r1, r2;
+    split(c0, label, &r1, &r2);
+    u64 arms[LISTCAP], l1[LISTCAP], l2[LISTCAP];
+    int n = list_collect(c1, arms);
+    for (int i = 0; i < n; i++) split(arms[i], label, &l1[i], &l2[i]);
+    u64 h1 = list_alloc(l1, n), h2 = list_alloc(l2, n);
+    u32 n1 = alloc_node(r1, h1), n2 = alloc_node(r2, h2);
+    link(mat_port(n1, id), o1);
+    link(mat_port(n2, id), o2);
+  } else {
+    g_abort(AB_UNREACHABLE);
+  }
+}
+
+// DUP-DUP: same label annihilate, different labels commute
+__device__ __noinline__ void dup_dup(u64 a, u64 b) {
+  u32 ia = dup_addr(a), ib = dup_addr(b);
+  u32 la = dup_label(a), lb = dup_label(b);
+  u64 a0 = cell0(ia), a1 = cell1(ia), b0 = cell0(ib), b1 = cell1(ib);
+  free_node(ia);
+  free_node(ib);
+  if (la == lb) {
+    link(a0, b0);
+    link(a1, b1);
+    return;
+  }
+  u64 w0 = wire(), w1 = wire(), w2 = wire(), w3 = wire();
+  u32 bb1 = alloc_node(w0, w1), bb2 = alloc_node(w2, w3);
+  u32 aa1 = alloc_node(w0, w2), aa2 = alloc_node(w1, w3);
+  link(dup_port(bb1, lb), a0);
+  link(dup_port(bb2, lb), a1);
+  link(dup_port(aa1, la), b0);
+  link(dup_port(aa2, la), b1);
+}
+
+// Process one redex: 0 for pure wiring, 1 for a rule firing
+__device__ __noinline__ int process(u64 a, u64 b) {
+  u64 ta = tag(a), tb = tag(b);
+  if (ta == T_REF || tb == T_REF) {
+    u64 r = ta == T_REF ? a : b, other = ta == T_REF ? b : a;
+    if (tag(other) == T_REF) { g_abort(AB_UNREACHABLE); return 1; }
+    if (tag(other) == T_ERA) {
+      u64 ps[LISTCAP];
+      int n = list_collect(ref_head(r), ps);
+      for (int i = 0; i < n; i++) link(era(), ps[i]);
+      return 1;
+    }
+    if (tag(other) == T_DUP && is_closure(r)) {
+      u32 d = dup_addr(other);
+      u32 label = dup_label(other);
+      u64 d0 = cell0(d), d1 = cell1(d);
+      free_node(d);
+      u64 ra, rb;
+      copy_closure(r, label, &ra, &rb);
+      link(ra, d0);
+      link(rb, d1);
+      return 1;
+    }
+    unfold(r, other);
+    return 1;
+  }
+  if (ta == T_VAR || tb == T_VAR) { link(a, b); return 0; }
+  if (ta == T_KONT || tb == T_KONT) {
+    u64 k = ta == T_KONT ? a : b, v = ta == T_KONT ? b : a;
+    if (!is_value(v)) { g_abort(AB_UNREACHABLE); return 1; }
+    deliver(payload(k), v);
+    return 1;
+  }
+  if (ta == T_ERA || tb == T_ERA) {
+    era_value(ta == T_ERA ? b : a);
+    return 1;
+  }
+  if (ta == T_APP && tb == T_LAM) beta(a, b);
+  else if (ta == T_LAM && tb == T_APP) beta(b, a);
+  else if (ta == T_OP && is_value(b)) op_rule(a, b);
+  else if (tb == T_OP && is_value(a)) op_rule(b, a);
+  else if (ta == T_SWI && tb == T_NUM) swi_rule(a, b);
+  else if (ta == T_NUM && tb == T_SWI) swi_rule(b, a);
+  else if (ta == T_MAT && is_value(b)) mat_rule(a, b);
+  else if (tb == T_MAT && is_value(a)) mat_rule(b, a);
+  else if (ta == T_DUP && tb == T_DUP) dup_dup(a, b);
+  else if (ta == T_DUP && is_value(b)) dup_rule(a, b);
+  else if (tb == T_DUP && is_value(a)) dup_rule(b, a);
+  else if (ta == T_DUP && (tb == T_OP || tb == T_APP || tb == T_SWI || tb == T_MAT)) dup_commute(a, b);
+  else if (tb == T_DUP && (ta == T_OP || ta == T_APP || ta == T_SWI || ta == T_MAT)) dup_commute(b, a);
+  else g_abort(AB_UNREACHABLE);
+  return 1;
+}
+
+// Fire the rule table on the lane's queued redexes until none is left or
+// the budget is spent; the rest is spawned to the net rule (a later wave)
+__device__ __noinline__ void reduce_net() {
+  int budget = G.net_fuel;
+  int done = 0;
+  u64 a, b;
+  while (done < budget) {
+    if (!pop_redex(&a, &b)) return;
+    done += process(a, b);
+  }
+  while (pop_redex(&a, &b)) spawn3(NET_RULE, a, b, 0);
+}
+__device__ inline void net_push(u64 a, u64 b) { push_redex(a, b); }
+
+// NET_RULE: a generic redex spilled to the engine
+__device__ __noinline__ void net_fire(u64 a, u64 b) {
+  net_push(a, b);
+  reduce_net();
+}
+// FILL_RULE: a compiled call's result links into the wire the net waits on
+__device__ __noinline__ void fill_fire(u64 a, u64 aux) {
+  u32 ri = (u32)aux;
+  u64 target = (u64)rec_d(ri) | ((u64)rec_s(ri) << 32);
+  link(a, target);
+  reduce_net();
+}
+
+// ---- the bridge compiled code uses ----
+
+__device__ __noinline__ u64 dup_closure(u64 p) {
+  u32 label = fresh_label();
+  u64 l1, l2;
+  copy_lam((u32)(p & M56), label, &l1, &l2);
+  reduce_net();
+  return l2;
+}
+__device__ __noinline__ void drop_closure(u64 p) {
+  link(era(), p);
+  reduce_net();
+}
+__device__ __noinline__ u64 build_closure(u16 id, const u64 *caps, int n) {
+  u64 w = wire();
+  prog_inst(id, caps, n, w);
+  reduce_net();
+  return resolve(w);
+}
+// Apply a closure value from compiled code: a result within budget is
+// returned, otherwise the dive suspends on a forwarding record
+__device__ __noinline__ R apply(u64 f, u64 a) {
+  if (tag(f) != T_LAM) { g_abort(AB_UNREACHABLE); return R{0, true}; }
+  u64 w = wire();
+  u32 c = alloc_node(a, w);
+  link(mkport(T_APP, c), f);
+  reduce_net();
+  u64 v = resolve(w);
+  if (tag(v) != T_VAR) return R{v, true};
+  u32 r = alloc_rec(FWD_RULE, 1, 0, 0, NONE);
+  link(kont_port(rec_addr(r)), v);
+  return R{(u64)r, false};
+}
+__device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
+  if (tag(f) != T_LAM) { g_abort(AB_UNREACHABLE); return; }
+  u32 c = alloc_node(a, kont_port(parent));
+  link(mkport(T_APP, c), f);
+  reduce_net();
 }
 
 // ---- kernels (host wave loop launches these via the driver API) ----

@@ -88,6 +88,9 @@ struct Dev {
     heap: CUdeviceptr,
     hbump: CUdeviceptr,
     hcap: u64,
+    nw: CUdeviceptr,
+    nwn: CUdeviceptr,
+    labels: CUdeviceptr,
     ncap: u32,
     rcap: u32,
     bcap: u32,
@@ -95,7 +98,9 @@ struct Dev {
     chunksz: u32,
     nrules: u32,
     fuel: i32,
+    net_fuel: i32,
 }
+const NWCAP: usize = 64;
 
 /// What a run delivered to ROOT: the port, and its printed form (the same
 /// text the CPU program prints).
@@ -261,6 +266,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let ovfcap: u32 = 1 << 20;
     let hcap = env_cap("MITHRIL_GPU_HEAP", 1 << 26);
     let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
+    let net_fuel = env_cap("MITHRIL_GPU_NET_FUEL", 4096).clamp(1, i32::MAX as u64) as i32;
 
     // Cap the cell arena to what this device can actually serve: free VRAM
     // minus the fixed buffers, the driver's local-memory (stack) reserve for
@@ -280,6 +286,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         + 4 * ovfcap as u64
         + 8 * nrules as u64
         + 8 * hcap
+        + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4) as u64
         + (1 << 20);
     let slack: u64 = 1 << 30;
     let budget = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
@@ -316,6 +323,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         heap: alloc(8 * hcap as usize, "alloc heap")?,
         hbump: alloc(8, "alloc hbump")?,
         hcap,
+        nw: alloc(16 * NWCAP * MAXLANES, "alloc nw")?,
+        nwn: alloc(4 * MAXLANES, "alloc nwn")?,
+        labels: alloc(4, "alloc labels")?,
         ncap,
         rcap,
         bcap,
@@ -323,6 +333,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         chunksz,
         nrules: nrules as u32,
         fuel,
+        net_fuel,
     };
     cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?;
     cu(cuMemsetD8_v2(d.nfreen, 0, 4 * MAXLANES), "memset nfreen")?;
@@ -339,6 +350,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let one64: u64 = 1;
     cu(cuMemcpyHtoD_v2(d.hbump, (&one64 as *const u64).cast(), 8), "init hbump")?;
     cu(cuMemsetD8_v2(d.rc, 0, 4 * ncap as usize), "memset rc")?;
+    cu(cuMemsetD8_v2(d.nwn, 0, 4 * MAXLANES), "memset nwn")?;
+    cu(cuMemcpyHtoD_v2(d.labels, (&one as *const u32).cast(), 4), "init labels")?;
 
     // publish Dev to the module global G
     let mut g_ptr: CUdeviceptr = 0;
@@ -393,7 +406,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
             0 => {}
             1 => return Err("mithril-gpu: unreachable match arm reached".to_string()),
             3 => return Err("mithril-gpu: array index out of bounds".to_string()),
-            4 => return Err("mithril-gpu: closures (the net region) run on the device in stage 3".to_string()),
+            4 => return Err("mithril-gpu: the program used an unsupported device feature".to_string()),
+            5 => return Err("mithril-gpu: a cell walk did not terminate (corrupted arena)".to_string()),
             _ => {
                 return Err(
                     "mithril-gpu: arena exhausted (raise MITHRIL_GPU_NODES / MITHRIL_GPU_RECS / MITHRIL_GPU_BUCKET / MITHRIL_GPU_HEAP)"
