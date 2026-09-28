@@ -385,3 +385,21 @@ fn linear_list_is_not_borrowed() {
     let fid = cm.fns.iter().position(|f| f.name == "total").unwrap();
     assert!(rs.contains(&format!("            {fid} => d_{fid}(ctx, fuel")), "total borrows a linear list");
 }
+
+// ---- partial inlining of base cases ----
+
+#[test]
+fn base_case_wrappers_match_oracle_under_suspension() {
+    let (cm, rs) = trmc_golden("fast_leaf.py");
+    for name in ["zipsum", "inc"] {
+        let fid = cm.fns.iter().position(|f| f.name == name).unwrap();
+        assert!(rs.contains(&format!("fn q_{fid}(")), "{name} has no base-case wrapper");
+        // recursive call sites go through the wrapper
+        assert!(dive_form(&cm, &rs, name).contains(&format!("q_{fid}(ctx, fuel")), "{name} does not call q_{fid}");
+    }
+    // zipsum's leaf arm drops the owned, unmatched tree u
+    let fid = cm.fns.iter().position(|f| f.name == "zipsum").unwrap();
+    let q = &rs[rs.find(&format!("fn q_{fid}(")).unwrap()..];
+    let q = &q[..q.find("\n}\n").unwrap()];
+    assert!(q.contains("free_val(ctx, v1)"), "zipsum's base case leaks u");
+}

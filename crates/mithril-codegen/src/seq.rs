@@ -568,7 +568,8 @@ impl<'m> Ex<'m> {
         }
         self.flush_toks(b);
         let argl: String = es.iter().map(|e| format!(", {e}")).collect();
-        (format!("d_{g}(ctx, {fuel}{argl})"), post)
+        let entry = if self.dive && crate::fast::has_fast(g) { "q" } else { "d" };
+        (format!("{entry}_{g}(ctx, {fuel}{argl})"), post)
     }
 
     /// Emit statements computing `e` into `b`; returns a Rust expression
@@ -1269,7 +1270,7 @@ pub(crate) fn dps_param(fid: u32, f: &mut dyn FnMut(u32) -> bool, body: &Core, a
                 *n += 1;
                 *v == p
             }
-            Core::Let(x, r, bo) => {
+            Core::Let(_, r, bo) => {
                 if let Core::Call(g, a) = &**r {
                     if *g == fid && a.get(p as usize) == Some(&Core::Var(p)) {
                         *n += 1;

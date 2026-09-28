@@ -36,6 +36,7 @@
 //! v1 memory note: generated code never frees cells (values may be shared
 //! after `Let`; the arena is sized for it). Records are engine-recycled.
 
+mod fast;
 mod fold;
 mod rewrite;
 mod rules;
@@ -228,7 +229,8 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         }
         ty::infer(&mn)
     };
-    let (bor, bsets) = borrows(m, &bodies, &tys);
+    let unbox = unboxed_ctors(m, &tys);
+    let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
     if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
         for (fid, f) in m.fns.iter().enumerate() {
             eprintln!("bor {fid} {} {:?}", f.name, bor[fid]);
@@ -241,7 +243,6 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             eprintln!("ty {fid} {}({}) -> {:?}  locals {:?}", f.name, ps.join(", "), tys.ret[fid], tys.locals[fid]);
         }
     }
-    let unbox = unboxed_ctors(m, &tys);
     // static reuse rewrite: consumed same-arity cells are rebuilt in place
     let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
     let shared = std::cell::RefCell::new(seq::Shared::default());
@@ -274,6 +275,16 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         })
         .collect();
     seq::DPS.with(|d| *d.borrow_mut() = dps.clone());
+    // base-case wrappers for recursive dive functions (see fast.rs)
+    let fast_code: Vec<Option<String>> = (0..nf)
+        .map(|fid| {
+            if scal[fid].is_some() {
+                return None;
+            }
+            fast::fast_fn(m, fid as u32, &bodies[fid], &tys, &unbox, &scal, &bor[fid])
+        })
+        .collect();
+    fast::FAST.with(|f| *f.borrow_mut() = fast_code.iter().map(|c| c.is_some()).collect());
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {
@@ -285,6 +296,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
         } else {
             fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
+        }
+        if let Some(q) = &fast_code[fid] {
+            fns_code.push_str(q);
         }
         if let Some((p, c)) = dps[fid] {
             fns_code.push_str(&seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, fwd, &unbox, &tys, &iret, &shared));
@@ -764,7 +778,53 @@ fn shared_classes(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> std::coll
     out
 }
 
-fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
+/// The function matches on parameter `p` and, in that match, builds a
+/// constructor with the same number of fields as the matched one: owning
+/// `p` lets the cell be rebuilt in place (Perceus/Koka: borrowing would
+/// trade that reuse for a later teardown by the lender).
+fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
+    fn builds(e: &Core, ar: usize, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
+        let builds = |e: &Core, ar: usize, m: &CoreModule| builds(e, ar, m, unbox);
+        match e {
+            Core::Ctor(c, xs) | Core::Reuse(_, c, xs) => {
+                (*c as usize) < m.ctors.len() && m.ctors[*c as usize].1 == ar && ar > 0 && !unbox.contains_key(c)
+                    || xs.iter().any(|x| builds(x, ar, m))
+            }
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => builds(a, ar, m) || builds(b, ar, m),
+            Core::If(a, b, c) => builds(a, ar, m) || builds(b, ar, m) || builds(c, ar, m),
+            Core::Let(_, r, b) => builds(r, ar, m) || builds(b, ar, m),
+            Core::Call(_, xs) | Core::Tuple(xs) => xs.iter().any(|x| builds(x, ar, m)),
+            Core::Match(s, arms) => builds(s, ar, m) || arms.iter().any(|(_, _, b)| builds(b, ar, m)),
+            Core::Proj(a, _) => builds(a, ar, m),
+        }
+    }
+    fn go(e: &Core, p: u32, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
+        let go = |e: &Core, p: u32, m: &CoreModule| go(e, p, m, unbox);
+        match e {
+            Core::Match(s, arms) => {
+                if **s == Core::Var(p) {
+                    for (c, _, body) in arms {
+                        let ar = m.ctors.get(*c as usize).map(|x| x.1).unwrap_or(0);
+                        if ar > 0 && !unbox.contains_key(c) && builds(body, ar, m, unbox) {
+                            return true;
+                        }
+                    }
+                }
+                go(s, p, m) || arms.iter().any(|(_, _, b)| go(b, p, m))
+            }
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => go(a, p, m) || go(b, p, m),
+            Core::If(a, b, c) => go(a, p, m) || go(b, p, m) || go(c, p, m),
+            Core::Let(_, r, b) => go(r, p, m) || go(b, p, m),
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(|x| go(x, p, m)),
+            Core::Proj(a, _) => go(a, p, m),
+        }
+    }
+    go(body, p, m, unbox)
+}
+
+fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collections::HashMap<u32, u8>) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
     // Only values of shared datatypes are lent. An int is an immediate, and
     // a linear (never shared) type moves for free and carries no refcount,
     // so a suspended borrower could not take a reference to it. For shared
@@ -778,7 +838,11 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> (Vec<Vec<bool>>,
         .enumerate()
         .map(|(fid, f)| {
             (0..f.arity as u32)
-                .map(|p| f.arity <= 60 && matches!(tys.var(fid, p), ty::Ty::Adt(c) if shared.contains(&c)))
+                .map(|p| {
+                    f.arity <= 60
+                        && matches!(tys.var(fid, p), ty::Ty::Adt(c) if shared.contains(&c))
+                        && !reuses_param(&bodies[fid], p, m, unbox)
+                })
                 .collect()
         })
         .collect();
