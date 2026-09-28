@@ -473,6 +473,63 @@ calls, the 64-fuel dives, the bump heap are the known costs).
 Open after stage 3: device-side memory for arrays is never reclaimed;
 `interp_closure` remains the closure-copying case on both backends.
 
+### 3f. The device path measured, and a cost model of the slowdown
+
+`bench/gpu_vs_cpu.py`: every port at fast.py's mid size, CPU binary vs
+the device, results equal on all 16 (two device bugs that only showed at
+this size were fixed first: a 16-bit record field truncating the TRMC
+hole cell, and records never recycled). Wall times: the device is
+10-1000x slower. tree-bitonic (CPU t1 0.04 s, device 9.0 s) traced:
+
+* host loop and launches 15 ms; kernels 9 s;
+* the 680 parallel waves: 0.4 ms each, 0.27 s in all;
+* the 7 sequential-tail pumps (one device thread while the frontier is
+  under 128 entries): 8.7 s = 409,599 fires of `warp`/`flow` segments at
+  ~49k cycles each. Per fire (profiled on the pump lane): ~24 cell allocs
+  at 730 cycles, ~24 frees at 485, ~31 cell reads at 160, a record, a
+  spawn and a delivery at 700-3,000 (atomics). Bucket scanning: 2%.
+* per-dive fuel cannot rise: the driver reserves the stack for every
+  resident thread (`cuCtxSetLimit` fails at 128 KiB), so 32 KiB and fuel
+  64 are the ceiling: 64x more fires than the CPU's fuel 4096.
+
+The model, replicated standalone (`bench/gpu/fire_cost.cu`, the real
+`engine.cu` with a stub program, a synthetic fire with the mix above,
+each component priced alone; cycles per fire):
+
+| component (one thread) | engine (V0) | no ring atomics (V1) | counters in shared (V2) | lane state in registers (V3) |
+|---|---|---|---|---|
+| 24 cell allocs | 23,300 | 18,900 | 9,900 | 7,800 |
+| 24 allocs + 24 frees | 18,300 | 17,100 | 15,600 | 7,900 |
+| 62 cell reads | 5,000 | | | |
+| record alloc/free | 1,050 | | | |
+| record + spawn | 1,600 | | | |
+| record + deliver | 3,800 | | | |
+| the whole fire | 29,500 | 28,000 | 26,500 | 24,300 |
+
+Same fire on the full grid (65,536 threads): 3.5-4.2 ns amortized. So:
+
+* T(program) = T(wide waves) + T(narrow phases); wide waves cost
+  ~4 ns/fire plus a ~0.4 ms per-wave floor; narrow phases cost
+  25-50k cycles per fire on one thread: 409,599 x 49k / 2.5 GHz = 8 s,
+  which is the 8.7 s measured.
+* A single device thread pays 80 cycles per cell read (L2) and 325-970
+  per allocation (two stores plus lane bookkeeping in global memory); a
+  CPU core pays 1-10. The allocator is 78% of a synthetic fire, and even
+  with all lane state in registers a fire stays at ~24k cycles: the floor
+  is the memory round-trips, not the bookkeeping. The best allocator gives
+  the tail ~2x, not 100x.
+* Conclusion (a property of the model): sequential phases cannot run on
+  the device. The fix is structural, not an allocator tweak: narrow
+  frontiers must run on the host, i.e. the same rule engine on the CPU
+  continuing on the same arena (one arena format for both engines), or
+  the program must be made wide (the split mechanisms). Not started;
+  the user decides which.
+
+Runtime changes made while measuring, all gated: the runtime descriptor
+`G` in constant memory (9.0 -> 7.8 s on bitonic: each field read was two
+dependent global loads); named abort codes and traps for corrupted ports;
+`MITHRIL_GPU_STATS` / `MITHRIL_GPU_TRACE` reporting.
+
 ## 4. Runtime: waves, dives, records
 
 The runtime is one model on CPU and GPU:

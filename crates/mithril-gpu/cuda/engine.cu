@@ -86,8 +86,14 @@ struct Dev {
 #define RFREECAP 64
 
 extern "C" {
-__device__ Dev G;
+// the runtime descriptor is written once by the host: constant memory, so
+// a field read is a cached broadcast, not a dependent global load
+__constant__ Dev G;
 __device__ u32 g_nrules = PROG_NRULES;
+// [0] pump steps, [1] pump scan iterations, [2] pump cycles in prog_fire, [3] pump cycles scanning
+__device__ unsigned long long g_stat[4];
+__device__ unsigned long long g_rule_steps[PROG_NRULES];
+__device__ unsigned long long g_rule_cycles[PROG_NRULES];
 }
 
 
@@ -103,7 +109,7 @@ struct P2R { u64 f0, f1; u32 f2; };
 
 __device__ void prog_fire(u32 rule, u64 e0, u64 e1, u64 e2);
 // rule -> its entries carry a record index in their third word
-extern __device__ const bool REC_RULE[PROG_NRULES];
+__device__ bool prog_rec_rule(u32 rule);
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
 __device__ u32 unbox_cid(u64 slot);
@@ -1611,7 +1617,7 @@ extern "C" __global__ void k_fire(u32 rule, u32 start, u32 count) {
       return; // poisoned: stop generating work
     const u64 *e = &G.ebuf[((u64)rule * G.bcap + start + i) * 3];
     prog_fire(rule, e[0], e[1], e[2]);
-    if (REC_RULE[rule]) rec_free((u32)e[2]); // a fired record is dead
+    if (prog_rec_rule(rule)) rec_free((u32)e[2]); // a fired record is dead
   }
 }
 
@@ -1635,7 +1641,9 @@ extern "C" __global__ void k_pump(u32 max_steps) {
         return; // wide again: let the host drain it in parallel
     }
     u32 rule = G.nrules;
+    long long c0 = clock64();
     for (u32 k = 0; k < G.nrules; k++) {
+      g_stat[1]++;
       u32 r = (r0 + k) % G.nrules;
       u32 len = G.blen[r] > G.bcap ? G.bcap : G.blen[r];
       u32 d = G.bdone[r];
@@ -1654,7 +1662,13 @@ extern "C" __global__ void k_pump(u32 max_steps) {
     r0 = rule;
     u32 i = G.bdone[rule]++;
     const u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
+    long long c1 = clock64();
+    g_stat[3] += c1 - c0;
     prog_fire(rule, e[0], e[1], e[2]);
-    if (REC_RULE[rule]) rec_free((u32)e[2]);
+    if (prog_rec_rule(rule)) rec_free((u32)e[2]);
+    g_stat[2] += clock64() - c1;
+    g_rule_cycles[rule] += clock64() - c1;
+    g_rule_steps[rule]++;
+    g_stat[0]++;
   }
 }

@@ -508,7 +508,7 @@ pub fn print(prog: &LirProgram) -> String {
     let _ = writeln!(out, "__device__ const u32 UNBOX_CID[{}] = {{{}}};", prog.unbox_cid.len().max(1), if cids.is_empty() { "0".to_string() } else { cids.join(", ") });
     let _ = writeln!(out, "__device__ u32 unbox_cid(u64 slot) {{ return UNBOX_CID[slot]; }}");
     let rr: Vec<&str> = prog.rules.iter().map(|r| if matches!(r, Rule::Seg(_) | Rule::Join(_) | Rule::Hole(_) | Rule::Fill) { "true" } else { "false" }).collect();
-    let _ = writeln!(out, "__device__ const bool REC_RULE[PROG_NRULES] = {{{}}};", rr.join(", "));
+    let _ = writeln!(out, "__device__ const bool REC_RULE[PROG_NRULES] = {{{}}};\n__device__ bool prog_rec_rule(u32 rule) {{ return REC_RULE[rule]; }}", rr.join(", "));
     for f in &prog.folds {
         let _ = writeln!(out, "__device__ i64 FOLD_EST_{f} = 1;\n__device__ int FOLD_MEAS_{f} = 0;");
     }

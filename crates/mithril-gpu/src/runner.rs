@@ -420,10 +420,23 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let wave_limit = env_cap("MITHRIL_GPU_WAVES", 1 << 24);
     let mut waves: u64 = 0;
     let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
+    let trace = std::env::var_os("MITHRIL_GPU_TRACE").is_some();
     let t_run = std::time::Instant::now();
     let mut pumps: u64 = 0;
+    let mut t_kernel = std::time::Duration::ZERO;
+    let mut t_host = std::time::Duration::ZERO;
+    let mut t_wave = std::time::Instant::now();
+    let mut last: Option<(u32, u32, bool)> = None;
     loop {
         cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
+        let tk = t_wave.elapsed();
+        t_kernel += tk;
+        if let Some((rule, count, pump)) = last.take() {
+            if trace {
+                eprintln!("mithril-gpu: wave {waves}: {} rule {rule} count {count}: {:.2} ms", if pump { "pump" } else { "fire" }, tk.as_secs_f64() * 1e3);
+            }
+        }
+        t_wave = std::time::Instant::now();
         let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
         match ab {
             0 => {}
@@ -482,6 +495,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
                 "launch k_pump",
             )?;
             pumps += 1;
+            last = Some((0, total as u32, true));
+            t_host += t_wave.elapsed();
+            t_wave = std::time::Instant::now();
             continue;
         }
         let (mut rule, mut start, mut count) = (best as u32, dones[best], best_n);
@@ -507,12 +523,31 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
             cuLaunchKernel(k_fire, grid, 1, 1, tpb, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
             "launch k_fire",
         )?;
+        last = Some((rule, count, false));
+        t_host += t_wave.elapsed();
+        t_wave = std::time::Instant::now();
     }
 
     if stats {
+        let mut st_ptr: CUdeviceptr = 0;
+        let mut st_sz = 0usize;
+        cu(cuModuleGetGlobal_v2(&mut st_ptr, &mut st_sz, module, c"g_stat".as_ptr()), "cuModuleGetGlobal(g_stat)")?;
+        let st = dtoh::<u64>(st_ptr, 4, "read g_stat")?;
+        eprintln!("mithril-gpu: pump: {} steps, {} scan iterations, {:.0} M cycles firing, {:.0} M cycles scanning", st[0], st[1], st[2] as f64 / 1e6, st[3] as f64 / 1e6);
+        let mut rs_ptr: CUdeviceptr = 0;
+        let mut rs_sz = 0usize;
+        cu(cuModuleGetGlobal_v2(&mut rs_ptr, &mut rs_sz, module, c"g_rule_steps".as_ptr()), "cuModuleGetGlobal(g_rule_steps)")?;
+        let steps = dtoh::<u64>(rs_ptr, nrules, "read g_rule_steps")?;
+        cu(cuModuleGetGlobal_v2(&mut rs_ptr, &mut rs_sz, module, c"g_rule_cycles".as_ptr()), "cuModuleGetGlobal(g_rule_cycles)")?;
+        let cyc = dtoh::<u64>(rs_ptr, nrules, "read g_rule_cycles")?;
+        let mut rows: Vec<(usize, u64, u64)> = (0..nrules).filter(|r| steps[*r] > 0).map(|r| (r, steps[r], cyc[r])).collect();
+        rows.sort_by_key(|(_, _, c)| std::cmp::Reverse(*c));
+        for (r, n, c) in rows.iter().take(6) {
+            eprintln!("mithril-gpu: pump rule {r}: {n} steps, {} cycles each", c / n.max(&1));
+        }
         let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
-        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms, {waves} waves ({pumps} pumps), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3);
+        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms (kernels {:.0} ms, host {:.0} ms), {waves} waves ({pumps} pumps), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, t_kernel.as_secs_f64() * 1e3, t_host.as_secs_f64() * 1e3);
     }
     let res = dtoh::<u64>(d.result, 2, "read result")?;
     if res[0] == 0 {
