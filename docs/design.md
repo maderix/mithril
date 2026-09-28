@@ -410,6 +410,39 @@ and `main` are still Rust templates in lib.rs (program data + generic
 glue); `fold::est_static` is a text static. The CUDA printer decides
 their device form.
 
+### 3d. Stage 2: the device runtime and the CUDA printer (25b156d)
+
+`mithril_codegen::lower` returns the program as data (`LirProgram`:
+functions, rule table, dive table, linearity and unbox tables); the CPU
+`emit_rust` prints it, and `mithril_gpu::emit_cuda` prints the same value
+as `program.cu`. Nothing decides anything twice: the v1 GPU prototype,
+which lowered Core on its own (no arrays, no ownership, no TRMC, no
+native scalar), is deleted.
+
+* `crates/mithril-gpu/cuda/engine.cu` is the device runtime: the IR's
+  helper vocabulary over the wave engine (cells with a refcount array,
+  records and delivery, dives under a per-dive fuel with `R`/`RA<k>`
+  suspension results, constructors and sharing, arrays on a device bump
+  heap, TRMC holes, dynamic and native arithmetic). Float arithmetic uses
+  the `_rn` intrinsics so the device never contracts into fma: nbody
+  printed a different checksum until it did.
+* The printer (`mithril_gpu::cuda`): tuples are `T<k>`/`P2` structs
+  (declared per width used), capture functions are lambdas, slice
+  arguments are hoisted to local arrays, a `Let` of a name already in
+  scope prints as assignment (Rust shadowing), operand widths for C's
+  arithmetic come from the IR's declared local types.
+* Gate: `tests/ci/gpu.py` runs all 16 ports at their small size through
+  `mithril run --gpu` and checks the CPU checksum; `MITHRIL_GPU=1 cargo
+  test -p mithril-gpu --release -- --include-ignored --test-threads=1`
+  runs the 22 closure-free codegen fixtures against the oracle plus the
+  capacity/abort tests. All pass on the RTX 4090. A cold run is dominated
+  by nvcc (5-77 s per port); warm runs are cached by source hash.
+* Known limits (stage 3): closures (the net region) abort with a clear
+  error; the array heap is a bump allocator (blocks are never freed);
+  per-dive fuel is 64 by default (device stack), so the device suspends
+  far more often than the CPU (fuel 4096+), which is the parallelism the
+  wave engine wants but also more records per program.
+
 ## 4. Runtime: waves, dives, records
 
 The runtime is one model on CPU and GPU:
