@@ -119,7 +119,11 @@ fn free_vars(e: &Core, bound: &mut Vec<u32>, acc: &mut BTreeSet<u32>) {
             }
         }
         Core::Proj(a, _) => free_vars(a, bound, acc),
-        Core::Lam(_, a) => free_vars(a, bound, acc),
+        Core::Lam(x, a) => {
+            bound.push(*x);
+            free_vars(a, bound, acc);
+            bound.pop();
+        }
         Core::App(f_, a_) => { free_vars(f_, bound, acc); free_vars(a_, bound, acc); }
     }
 }

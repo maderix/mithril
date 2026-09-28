@@ -156,7 +156,7 @@ pub fn fresh_label(net: &mut Net) -> u32 {
 
 /// What the REF-unfold rule does with a call to a real function.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Mode {
+pub enum Mode {
     /// evaluation: unfold every call
     Eval,
     /// specialization: unfold a call only where `NetProg::inline` allows;
@@ -164,7 +164,7 @@ pub(crate) enum Mode {
     Specialize,
 }
 
-pub(crate) struct NetProg {
+pub struct NetProg {
     pub entries: Vec<Entry>,
     pub metas: Vec<MatchMeta>,
     /// real functions are entries 0..nfns; lifted branches/arms follow
@@ -175,6 +175,8 @@ pub(crate) struct NetProg {
     pub inline: Vec<bool>,
     /// per real function: the real functions it can (transitively) call
     pub reach: Vec<BTreeSet<u32>>,
+    /// entries registered by compiled code (`add_entry`)
+    pub closures: Vec<usize>,
     /// per entry (lifted ones included): the real functions its body calls
     /// directly, closures' bodies included
     pub direct: Vec<BTreeSet<u32>>,
@@ -183,9 +185,9 @@ pub(crate) struct NetProg {
 impl NetProg {
     /// Deterministically derived from the module alone, so `build` and
     /// `reduce` agree on entry ids without storing the table in the `Net`.
-    pub(crate) fn new(m: &CoreModule) -> NetProg {
+    pub fn new(m: &CoreModule) -> NetProg {
         let nfns = m.fns.len();
-        let mut prog = NetProg { entries: Vec::new(), metas: Vec::new(), nfns, mode: Mode::Eval, inline: vec![false; nfns], reach: Vec::new(), direct: Vec::new() };
+        let mut prog = NetProg { entries: Vec::new(), metas: Vec::new(), nfns, mode: Mode::Eval, inline: vec![false; nfns], reach: Vec::new(), closures: Vec::new(), direct: Vec::new() };
         for f in &m.fns {
             prog.entries.push(Entry { params: (0..f.arity as u32).collect(), body: NExpr::Num(0) });
         }
@@ -316,6 +318,21 @@ pub(crate) fn core_size(c: &Core) -> usize {
         Core::Match(s, arms) => 1 + core_size(s) + arms.iter().map(|(_, _, b)| core_size(b)).sum::<usize>(),
         Core::Proj(a, _) | Core::Lam(_, a) => 1 + core_size(a),
         Core::App(f, a) => 1 + core_size(f) + core_size(a),
+    }
+}
+
+impl NetProg {
+    /// Lower `body` as a new entry over `params` (its free variables, in
+    /// this order): how compiled code registers the closures it builds.
+    pub fn add_entry(&mut self, params: Vec<u32>, body: &Core) -> u16 {
+        let id = lift(self, params, body);
+        self.closures.push(id as usize);
+        id
+    }
+
+    /// Whether entry `e` was registered by compiled code (`add_entry`).
+    pub fn closure_entry(&self, e: usize) -> bool {
+        self.closures.contains(&e)
     }
 }
 

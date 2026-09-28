@@ -121,6 +121,12 @@ fn norm_tail(e: &Core, c: &mut u32) -> Core {
             let r2 = norm_bind(r, c, &mut lets);
             wrap(lets, Core::Let(*x, Box::new(r2), Box::new(norm_tail(bo, c))))
         }
+        Core::App(f, a) => {
+            let mut lets = Vec::new();
+            let f2 = norm_pure(f, c, &mut lets);
+            let a2 = norm_pure(a, c, &mut lets);
+            wrap(lets, Core::App(Box::new(f2), Box::new(a2)))
+        }
         _ => {
             let mut lets = Vec::new();
             let p = norm_pure(e, c, &mut lets);
@@ -139,6 +145,7 @@ fn norm_bind(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         Core::Call(f, args) => {
             Core::Call(*f, args.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
+        Core::App(f, a) => Core::App(Box::new(norm_pure(f, c, lets)), Box::new(norm_pure(a, c, lets))),
         Core::If(cd, t, f) => {
             let c2 = norm_pure(cd, c, lets);
             Core::If(Box::new(c2), Box::new(norm_tail(t, c)), Box::new(norm_tail(f, c)))
@@ -166,7 +173,7 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         return e.clone();
     }
     match e {
-        Core::Call(..) | Core::If(..) | Core::Match(..) => {
+        Core::Call(..) | Core::If(..) | Core::Match(..) | Core::App(..) => {
             let r = norm_bind(e, c, lets);
             let x = fresh(c);
             lets.push((x, r));
@@ -198,7 +205,8 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
             Core::Tuple(items.iter().map(|a| norm_pure(a, c, lets)).collect())
         }
         Core::Proj(a, i) => Core::Proj(Box::new(norm_pure(a, c, lets)), *i),
-        Core::Lam(..) | Core::App(..) => panic!("closures are not lowered to the rule form yet (Phase B)"),
+        // a closure's body is not compiled here: it is built as a net
+        Core::Lam(x, b) => Core::Lam(*x, b.clone()),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
     }
 }
@@ -354,6 +362,20 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
                     let p2 = format!("(({rn} as u64) << 3)");
                     rtail(ex, r, &p2, b, sq);
                 }
+                Core::App(f, a) => {
+                    // a closure application runs in the net region: the
+                    // continuation waits in a record the result is
+                    // delivered to through a Kont port
+                    let ef = ex.val(f, true, b);
+                    let ea = ex.val(a, true, b);
+                    let mut env = free_vars(bo);
+                    env.remove(x);
+                    let env: Vec<u32> = env.into_iter().collect();
+                    let sid = sq.add(ex.self_fid, vec![*x], env.clone(), (**bo).clone());
+                    let rn = emit_rec(ex, &env, sid, 1, par, bo, b);
+                    b.push_str(&format!("apply_spawn(ctx, {ef}, {ea}, (({rn} as u64) << 3));
+"));
+                }
                 _ => unreachable!("codegen bug: non-normalized let RHS carrying a call"),
             }
         }
@@ -411,6 +433,11 @@ fn rtail(ex: &mut Ex, e: &Core, par: &str, b: &mut String, sq: &mut SegQ) {
                 "match ctx.dive({g}u16, &[{par}, {}]) {{\nDiveResult::Done(v) => ctx.deliver({par}, v),\nDiveResult::Suspended(_) => {{}}\n}}\n",
                 es.join(", ")
             ));
+        }
+        Core::App(f, a) => {
+            let ef = ex.val(f, true, b);
+            let ea = ex.val(a, true, b);
+            b.push_str(&format!("apply_spawn(ctx, {ef}, {ea}, {par});\n"));
         }
         other => {
             let v = ex.val(other, true, b);

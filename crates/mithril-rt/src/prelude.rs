@@ -16,7 +16,8 @@ pub const M56: u64 = (1u64 << 56) - 1;
 pub const T_NUM: u64 = 2;
 pub const T_FLO: u64 = 3;
 pub const T_CON: u64 = 4;
-pub const T_ARR: u64 = 5;
+pub const T_ARR: u64 = 14; // mithril_core::port::Tag::Arr
+pub const T_LAM: u64 = 6; // mithril_core::port::Tag::Lam
 #[inline] pub fn tag(p: u64) -> u64 { p >> 56 }
 pub const TU: u64 = 16;
 #[inline] pub fn ic(slot: u64, v: i64) -> u64 { ((TU + slot) << 56) | ((v as u64) & M56) }
@@ -180,7 +181,7 @@ pub fn arr_unraw(a: u64) {
 #[inline(always)]
 pub fn is_heap(v: u64) -> bool {
     let t = tag(v);
-    t == T_CON || t == T_FLO || t == T_ARR
+    t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM
 }
 
 #[inline(always)]

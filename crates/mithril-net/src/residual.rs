@@ -163,6 +163,7 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
         }
         match p.tag() {
             Tag::Num | Tag::Era | Tag::Flo | Tag::Ext => {}
+            Tag::Kont | Tag::Arr => panic!("ICE: runtime-only agent {:?} at compile time", p.tag()),
             Tag::Var => {
                 let w = p.payload() as u32;
                 let s = Port(net.cell(w)[0]);

@@ -59,6 +59,10 @@ pub trait Prog<C: Cells> {
     fn ext_ctor(&self, _c: &mut C, p: Port) -> (u16, Vec<Port>) {
         panic!("ICE: no match on value {:?}", p.tag())
     }
+    /// A value met a continuation (runtime only): hand it over.
+    fn deliver(&self, _c: &mut C, kont: Port, _val: Port) {
+        panic!("ICE: continuation {:?} at compile time", kont.tag())
+    }
 }
 
 /// Connect two ports. Wire cells hold the first arrival in slot 0; the
@@ -102,13 +106,13 @@ pub fn resolve<C: Cells>(c: &mut C, mut p: Port) -> Port {
     p
 }
 
-fn is_value<C: Cells, P: Prog<C>>(prog: &P, p: Port) -> bool {
+fn is_value<C: Cells, P: Prog<C> + ?Sized>(prog: &P, p: Port) -> bool {
     matches!(p.tag(), Tag::Num | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
 }
 
 /// Process one redex; returns the number of rewrites performed (0 for pure
 /// wiring, 1 for a rule firing).
-pub fn process<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, a: Port, b: Port) -> u64 {
+pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: Port) -> u64 {
     let (ta, tb) = (a.tag(), b.tag());
 
     // REF first: a Ref against a Var must unfold, never park in the wire.
@@ -130,6 +134,14 @@ pub fn process<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, a: Port, b: Port) -> u
     if ta == Tag::Var || tb == Tag::Var {
         link(c, a, b);
         return 0;
+    }
+
+    // A produced value meets its continuation (runtime): delivered.
+    if ta == Tag::Kont || tb == Tag::Kont {
+        let (k, v) = if ta == Tag::Kont { (a, b) } else { (b, a) };
+        assert!(is_value(prog, v), "ICE: continuation met a {:?}, not a value", v.tag());
+        prog.deliver(c, k, v);
+        return 1;
     }
 
     if ta == Tag::Era || tb == Tag::Era {
@@ -158,7 +170,7 @@ pub fn process<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, a: Port, b: Port) -> u
 }
 
 /// ERA–anything: consume and erase the value/agent `p`.
-fn era_value<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, p: Port) {
+fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
     match p.tag() {
         Tag::Era | Tag::Num => {}
         Tag::Flo => c.free_cell(p.payload() as u32),
@@ -227,7 +239,7 @@ fn beta<C: Cells>(c: &mut C, app: Port, lam: Port) {
 
 /// OP–value: compute if the other operand has been produced, otherwise
 /// store this one and re-arm the op (flipped) against the missing operand.
-fn op_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, op: Port, val: Port) {
+fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Port) {
     let addr = op_addr(op);
     let code = op_code(op);
     let cell = c.cell(addr);
@@ -273,7 +285,7 @@ fn swi_rule<C: Cells>(c: &mut C, swi: Port, num: Port) {
 /// MAT–constructor: select the arm whose ctor tag matches the scrutinee,
 /// prepend the constructor's fields to the arm closure's captured args and
 /// fire it; erase the other arms. A projection is the 1-way special case.
-fn mat_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, mat: Port, val: Port) {
+fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: Port) {
     let m = mat_addr(mat);
     let mid = mat_id(mat);
     let cell = c.cell(m);
@@ -318,7 +330,7 @@ fn mat_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, mat: Port, val: Port) {
 /// of cells and pushes DUPs onto its fields (lazy recursion); LAM is
 /// HVM-style (two lams, body dup, params joined by a same-label dup acting
 /// as the superposition). Copies carry the copier's label.
-fn dup_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, dup: Port, val: Port) {
+fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: Port) {
     let d = dup_addr(dup);
     let label = dup_label(dup);
     let cell = c.cell(d);
@@ -354,18 +366,9 @@ fn dup_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, dup: Port, val: Port) {
             link(c, cb, o2);
         }
         Tag::Lam => {
-            let l = val.payload() as u32;
-            let cl = c.cell(l);
-            c.free_cell(l);
-            let (wp1, wp2, wb1, wb2) = (wire(c), wire(c), wire(c), wire(c));
-            let l1 = c.alloc(wp1, wb1);
-            let l2 = c.alloc(wp2, wb2);
-            let db = c.alloc(wb1, wb2);
-            link(c, dup_port(db, label), Port(cl[1])); // copy the body
-            let su = c.alloc(wp1, wp2);
-            link(c, dup_port(su, label), Port(cl[0])); // param superposition
-            link(c, Port::new(Tag::Lam, l1 as u64), o1);
-            link(c, Port::new(Tag::Lam, l2 as u64), o2);
+            let (l1, l2) = copy_lam(c, val.payload() as u32, label);
+            link(c, l1, o1);
+            link(c, l2, o2);
         }
         _ => {
             let copy = prog.copy_ext(c, val);
@@ -373,6 +376,24 @@ fn dup_rule<C: Cells, P: Prog<C>>(c: &mut C, prog: &P, dup: Port, val: Port) {
             link(c, copy, o2);
         }
     }
+}
+
+/// The DUP–LAM copy of the closure in cell `l`: two lambdas, their bodies
+/// joined by a `label` dup on the old body wire, their parameters by a
+/// same-label dup acting as the superposition on the old parameter wire.
+/// The first copy keeps cell `l` (a port to it stays a valid closure:
+/// compiled code shares closures this way), the second is fresh.
+pub fn copy_lam<C: Cells>(c: &mut C, l: u32, label: u32) -> (Port, Port) {
+    let cl = c.cell(l);
+    let (wp1, wp2, wb1, wb2) = (wire(c), wire(c), wire(c), wire(c));
+    let db = c.alloc(wb1, wb2);
+    link(c, dup_port(db, label), Port(cl[1])); // copy the body
+    let su = c.alloc(wp1, wp2);
+    link(c, dup_port(su, label), Port(cl[0])); // param superposition
+    c.set(l, 0, wp1);
+    c.set(l, 1, wb1);
+    let l2 = c.alloc(wp2, wb2);
+    (Port::new(Tag::Lam, l as u64), Port::new(Tag::Lam, l2 as u64))
 }
 
 /// DUP–{OP, APP, SWI, MAT}: commute. The dup here is a superposition (its

@@ -328,6 +328,18 @@ impl<'m> Ex<'m> {
     }
 
     /// A let whose RHS is a call: run the dive, capturing on suspension.
+    /// `let x = f(a)` on a closure value: applied in the net region; on
+    /// suspension the continuation is captured like a call's.
+    fn let_app(&mut self, x: u32, f: &Core, a: &Core, bo: &Core, b: &mut String) {
+        let ef = self.val(f, true, b);
+        let ea = self.val(a, true, b);
+        let t = self.fresh();
+        b.push_str(&format!("let {t} = match apply(ctx, {ef}, {ea}) {{\nOk(v) => v,\nErr(r) => {{\n"));
+        self.emit_capture("r", Some((x, bo)), b);
+        b.push_str("}\n};\n");
+        self.emit_bind(x, &t, b);
+    }
+
     fn let_call(&mut self, x: u32, g: u32, args: &[Core], bo: &Core, b: &mut String) {
         let (call, post) = self.dive_call(g, args, b);
         let t = self.fresh();
@@ -646,7 +658,17 @@ impl<'m> Ex<'m> {
     /// (temp name, local, or literal) holding the value.
     pub fn val(&mut self, e: &Core, esc: bool, b: &mut String) -> String {
         match e {
-            Core::Lam(..) | Core::App(..) => panic!("closures are not lowered to the dive form yet (Phase B)"),
+            Core::Lam(..) => {
+                // a closure value: its entry instantiated over the captured
+                // values (owned by the net from here on)
+                let caps: Vec<u32> = free_vars(e).into_iter().collect();
+                let es: Vec<String> = caps.iter().map(|v| self.use_var(*v, true, b)).collect();
+                let id = crate::closure_entry(caps, e);
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = build_closure(ctx, {id}u16, &[{}]);\n", es.join(", ")));
+                t
+            }
+            Core::App(..) => unreachable!("codegen bug: closure application in value position (ANF binds it)"),
             Core::Prim(p, args) => {
                 use mithril_front::core::Prim;
                 let t = self.fresh();
@@ -807,6 +829,10 @@ impl<'m> Ex<'m> {
                             self.let_call(*x, *g, args, bo, b);
                             return self.val(bo, esc, b);
                         }
+                    }
+                    if let Core::App(f, a) = &**r {
+                        self.let_app(*x, f, a, bo, b);
+                        return self.val(bo, esc, b);
                     }
                     if has_call(r) {
                         self.kframes.push((*x, (**bo).clone()));
@@ -984,7 +1010,10 @@ impl<'m> Ex<'m> {
                 }
                 Core::Proj(b, _) => binders(b, out),
                 Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-                Core::Lam(_, b) => binders(b, out),
+                Core::Lam(x, b) => {
+                    out.insert(*x);
+                    binders(b, out);
+                }
                 Core::App(f_, a_) => { binders(f_, out); binders(a_, out); }
             }
         }
@@ -1143,6 +1172,10 @@ impl<'m> Ex<'m> {
                         self.let_call(*x, *g, args, bo, b);
                         return self.dive_tail(bo, b);
                     }
+                }
+                if let Core::App(f, a) = &**r {
+                    self.let_app(*x, f, a, bo, b);
+                    return self.dive_tail(bo, b);
                 }
                 if has_call(r) {
                     self.kframes.push((*x, (**bo).clone()));
@@ -1320,6 +1353,12 @@ impl<'m> Ex<'m> {
                         "match tr {{\nOk(v) => return Ok(untup::<{k}>(ctx, v)),\nErr(r) => return Err(r),\n}}\n"
                     ));
                 }
+            }
+            Core::App(f, a) => {
+                let ef = self.val(f, true, b);
+                let ea = self.val(a, true, b);
+                self.flush_toks(b);
+                b.push_str(&format!("return apply(ctx, {ef}, {ea});\n"));
             }
             Core::Call(g, args) => {
                 // Tail call: pass our own destination through, so a downstream

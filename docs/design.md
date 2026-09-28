@@ -54,7 +54,8 @@ Python-subset source
      tail recursion into loops, if-conversion of loop back-edges
   -> type inference (ty.rs, monomorphic) -> unboxing, linearity
   -> ANF normalize -> reuse marking
-  -> dual-mode emission: native sequential "dive" form + net "rule" form
+  -> dual-mode emission: native sequential "dive" form + net "rule" form,
+     plus the net region (closures) run by the same rule table (3b)
   -> rustc -O against mithril-rt (CPU) / PTX via mithril-gpu
 ```
 
@@ -268,6 +269,52 @@ capturing lambda) reduce to the oracle value; W2 from source is linear in
 N (`reduce_test`); `mk(3)` applied twice specializes to a constant; a
 returned closure specializes to a lambda; fast.py unchanged (first-order
 paths untouched). Codegen refuses `Lam`/`App` until step 3.
+
+### Phase B, step 3: the runtime runs the same rule table
+
+The rules moved to `mithril_core::rules` behind two traits — `Cells` (the
+store: cells, a redex worklist, a label supply) and `Prog` (what a `Ref`
+unfolds into, how a builtin computes, where an uncomputable op goes, the
+runtime's own value forms) — and the derived program's instantiation to
+`mithril_core::lower`. The compile-time reducer is `Net: Cells` with the
+specialization policy as its `Prog`; a runtime worker is `Wctx: Cells`
+(its arena is the same two-word cells) with the generated program as its
+`Prog`. One implementation, compiled once in `mithril-rt`
+(`reduce_net` takes `&dyn Prog`).
+
+A compiled program's *net region*:
+
+* its entry table (`net_entries`: the closures compiled code builds and,
+  transitively, the branches/arms their bodies mention; a real function
+  is never instantiated — a `Ref` to it spawns its CALL rule, and a FILL
+  record links the result back into the wire the net was waiting on);
+* two engine rules: NET (generic redexes spilled on fuel-out, or a value
+  delivered into the net from another worker) and FILL;
+* the bridge: `build_closure` (instantiate the closure's entry over the
+  captured values), `apply` (dive form: an App cell reduced in place,
+  the value returned when it arrives within budget, otherwise a
+  forwarding record the result is delivered to through a `Kont` port —
+  the dive suspends like on a call), `apply_spawn` (rule form: the
+  continuation waits in a record), `dup_closure` (sharing a closure
+  value from compiled code *is* the DUP–LAM rule, `copy_lam`, with the
+  original cell as the first copy so the caller's port stays valid),
+  and erasure of a dropped closure by the Era rule.
+
+Value forms meet across the boundary unchanged (Num/Con encodings are
+the same; arrays moved to tag 14, unboxed constructors are the runtime's
+ext values the rules copy/erase/match through the program's helpers).
+Closures in compiled code are opaque `Lam` ports until applied.
+
+Evidence (`codegen_test`): every closure shape (factory, `twice` on a
+top-level function and on a lambda, `compose`, `map` with a capturing
+lambda, a closure shared and applied in a loop, closures in data) is
+oracle-equal at 1/4/16 threads and under fuel starvation; W2 at runtime
+(`mk(k) = λx. x + heavy(k)`, k opaque) applied 4096 times: the oracle
+value, 20,485 rewrites (5 per application, `heavy` once, 0.00 s) against
+a strict twin that calls `heavy` per iteration (0.61 s); 65,536
+applications: 327,685 rewrites, 0.01 s. Same value and same rewrite
+count at 16 threads. fast.py: instruction counts unchanged; generated
+programs carry the region's fixed cost in rustc time (bfs 0.6 → 0.8 s).
 
 Oracle checks: `specialize_test.rs` (every fixture: specialized ==
 original under `eval_core`; the policy cases above) and

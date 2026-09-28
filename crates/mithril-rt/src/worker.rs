@@ -4,6 +4,9 @@
 
 use crate::alloc::Arena;
 use crate::{DiveResult, Program, Redex};
+use mithril_core::agents::Cells;
+use mithril_core::port::{Port, Tag};
+use mithril_core::rules::{process, Prog};
 
 /// Bound on records fired inline from `deliver` (each level may nest a
 /// fuel-bounded dive under it).
@@ -45,6 +48,45 @@ pub struct Wctx<'e> {
     /// a double free.
     check_free: bool,
     freed: Vec<u64>,
+    /// Generic net redexes (pairs of agent ports) waiting for the rule
+    /// table; drained by `reduce_net`.
+    net_work: Vec<(Port, Port)>,
+}
+
+/// The worker's arena is a `Cells`: the rule table rewrites it directly.
+impl<'e> Cells for Wctx<'e> {
+    #[inline]
+    fn cell(&self, i: u32) -> [u64; 2] {
+        Wctx::cell(self, i)
+    }
+    #[inline]
+    fn set(&mut self, i: u32, slot: usize, p: Port) {
+        Wctx::set(self, i, slot, p.0)
+    }
+    #[inline]
+    fn alloc(&mut self, a: Port, b: Port) -> u32 {
+        Wctx::alloc(self, a.0, b.0)
+    }
+    #[inline]
+    fn free_cell(&mut self, i: u32) {
+        Wctx::free(self, i)
+    }
+    #[inline]
+    fn push_redex(&mut self, a: Port, b: Port) {
+        self.net_work.push((a, b));
+    }
+    fn fresh_label(&mut self) -> u32 {
+        let l = self.ar.labels.fetch_add(1, Ordering::Relaxed) & 0xFF_FFFF;
+        if l == 0 {
+            1
+        } else {
+            l
+        }
+    }
+    fn alloc_flo(&mut self, f: f64) -> Port {
+        let a = Wctx::alloc(self, f.to_bits(), 0);
+        Port::new(Tag::Flo, a as u64)
+    }
 }
 
 impl<'e> Wctx<'e> {
@@ -66,7 +108,49 @@ impl<'e> Wctx<'e> {
             inline_depth: 0,
             check_free: std::env::var_os("MITHRIL_CHECK_FREE").is_some(),
             freed: Vec::new(),
+            net_work: Vec::new(),
         }
+    }
+
+    // ---- the net region ----
+
+    /// Splice entry `fid` of `entries` into this arena (see
+    /// `mithril_core::lower::instantiate`), compiled once here.
+    pub fn instantiate(&mut self, entries: &[mithril_core::lower::Entry], fid: usize, args: Vec<Port>, ret: Port) {
+        mithril_core::lower::instantiate(self, entries, fid, args, ret)
+    }
+
+    /// Queue a generic redex for `reduce_net`.
+    #[inline]
+    pub fn net_push(&mut self, a: Port, b: Port) {
+        self.net_work.push((a, b));
+    }
+
+    /// Fire the rule table on the queued generic redexes until none is
+    /// left or `budget` rewrites were done. Unfinished redexes are spawned
+    /// to the program's net rule (a later wave picks them up; on a
+    /// parallel wave, other workers). Returns whether the worklist
+    /// drained.
+    pub fn reduce_net(&mut self, prog: &dyn Prog<Wctx<'e>>, budget: i64) -> bool {
+        // pop-driven: a rule may deliver into a record that fires inline
+        // and re-enters this loop on the same worklist
+        let mut done: i64 = 0;
+        while done < budget {
+            let Some((a, b)) = self.net_work.pop() else { return true };
+            let n = process(self, prog, a, b);
+            done += n as i64;
+            self.rewrites += n;
+        }
+        if self.net_work.is_empty() {
+            return true;
+        }
+        let rule = self.prog.net_rule();
+        assert!(rule != u16::MAX, "ICE: net work left with no net rule");
+        let rest: Vec<(Port, Port)> = std::mem::take(&mut self.net_work);
+        for (a, b) in rest {
+            self.spawn(rule, Redex { a: a.0, b: b.0, aux: 0 });
+        }
+        false
     }
 
     // ---- cells ----

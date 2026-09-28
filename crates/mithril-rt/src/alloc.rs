@@ -104,6 +104,8 @@ pub(crate) fn cap_from_env(name: &str, default: usize) -> usize {
 }
 
 pub(crate) struct Arena {
+    /// Dup label supply shared by every worker (24-bit, wraps).
+    pub(crate) labels: std::sync::atomic::AtomicU32,
     /// Cell i occupies words 2i and 2i+1.
     cells: Box<[AtomicU64]>,
     /// Reference count of cell i (valid while allocated; alloc sets 1).
@@ -121,6 +123,7 @@ impl Arena {
     pub fn new(ncells: usize, nrecs: usize) -> Arena {
         assert!(ncells <= MAX_SLOTS && nrecs <= MAX_SLOTS, "capacity exceeds the u32 index range (2^32 slots)");
         Arena {
+            labels: std::sync::atomic::AtomicU32::new(1),
             cells: zeroed_slice(2 * ncells),
             rc: zeroed_slice(ncells),
             // record 0 is the reserved ROOT sink, so keep at least one slot

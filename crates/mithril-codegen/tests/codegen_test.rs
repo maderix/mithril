@@ -572,7 +572,8 @@ fn int_representations_agree_with_oracle() {
             assert!(rs.contains(&format!("fn s_{}(", id(f))), "{tag}: {f} is not native");
         }
         if rep == Some(true) {
-            assert!(!rs[rs.find("fn s_").unwrap()..].contains("wrap56("), "shifted: native code still re-wraps");
+            let native = &rs[rs.find("fn s_").unwrap()..rs.find("fn net_entries").unwrap()];
+            assert!(!native.contains("wrap56("), "shifted: native code still re-wraps");
         }
         if rep.is_none() {
             // the rolling-row inner loop keeps array lengths in locals
@@ -644,4 +645,55 @@ fn f32_primitives_match_oracle_in_every_representation() {
             assert_eq!(run(&bin, &[t]), want, "f32_ops {tag} --threads {t}");
         }
     }
+}
+
+// ---- closures through the compiled runtime (Phase B) ----
+
+#[test]
+fn closures_match_oracle_under_suspension() {
+    // every closure shape of the fixture, at 1/4/16 threads and under
+    // fuel starvation (suspensions inside and around applications)
+    let (_cm, rs) = trmc_golden("closures.py");
+    assert!(rs.contains("build_closure(ctx, "), "no closure is built by compiled code");
+    assert!(rs.contains("apply(ctx, "), "no closure is applied by compiled code");
+    // the rule form applies through the net with a continuation record
+    assert!(rs.contains("apply_spawn(ctx, "), "the rule form does not apply closures");
+}
+
+#[test]
+fn shared_closure_runs_its_free_work_once_at_runtime() {
+    // W2: `mk(k) = λx. x + heavy(k)` applied N times. heavy(k) is a
+    // compiled call the net runs once and shares; each application costs
+    // a constant number of rewrites, so rewrites grow linearly in N with a
+    // small slope, while a strict evaluation would run heavy N times.
+    let src = fixture("w2_runtime.py");
+    let (cm, rs) = pipeline(&src, 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, "w2_runtime");
+    let rewrites = |stderr: &str| -> u64 {
+        stderr
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("rewrites="))
+            .unwrap_or_else(|| panic!("no rewrites in stderr: {stderr:?}"))
+            .parse()
+            .unwrap()
+    };
+    let (out, err) = run_env(&bin, &["1"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(out, want);
+    let n = 4096u64;
+    let r = rewrites(&err);
+    assert!(r < 16 * n, "sharing lost: {r} rewrites for {n} applications");
+    // parallel: same value, sharing kept
+    let (out16, err16) = run_env(&bin, &["16"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(out16, want);
+    assert!(rewrites(&err16) < 16 * n, "sharing lost in parallel: {}", rewrites(&err16));
+    // the strict shape as a twin: heavy(k) called per iteration costs one
+    // compiled call per application (rewrites >= N), so the runtime work
+    // differs by the work of heavy per call
+    let strict = src.replace("return loop(g, i - 1, acc + g(i))", "return loop(g, i - 1, acc + i + heavy(array_len(array_new(20, 0))))");
+    let (scm, srs) = pipeline(&strict, 0);
+    let sbin = compile(&srs, "w2_strict");
+    let (sout, serr) = run_env(&sbin, &["16"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(sout, oracle(&scm));
+    assert!(rewrites(&serr) >= n, "strict twin did not call heavy per iteration: {}", rewrites(&serr));
 }

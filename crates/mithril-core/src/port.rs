@@ -29,6 +29,12 @@ pub enum Tag {
     Mat = 10,
     Ref = 11,
     Ext = 12,
+    /// Runtime only: a continuation. A value meeting `Kont(parent)` is
+    /// delivered to the engine record `parent` (the compiled world's
+    /// destination), never copied or erased.
+    Kont = 13,
+    /// Runtime only: an array block (a heap value the rules treat as opaque).
+    Arr = 14,
 }
 
 impl Tag {
@@ -47,6 +53,8 @@ impl Tag {
             10 => Tag::Mat,
             11 => Tag::Ref,
             12 => Tag::Ext,
+            13 => Tag::Kont,
+            14 => Tag::Arr,
             _ => unreachable!("invalid Port tag bits: {}", v),
         }
     }

@@ -45,6 +45,7 @@ mod worker;
 pub mod prelude;
 
 pub use engine::Engine;
+pub use mithril_core;
 pub use mithril_core::port::{Port, Tag};
 pub use worker::{RecInfo, Wctx};
 
@@ -77,6 +78,12 @@ pub const NO_REC: u32 = u32::MAX;
 /// A compiled program: numbered rules plus fuel-bounded sequential forms.
 pub trait Program: Sync {
     fn n_rules(&self) -> usize;
+    /// The bucket that fires generic net redexes (`Wctx::reduce_net`
+    /// spills its unfinished worklist there). `u16::MAX`: the program has
+    /// no net region.
+    fn net_rule(&self) -> u16 {
+        u16::MAX
+    }
     /// Work estimate per bucket entry (used for scheduling; 0 is treated as 1).
     fn rule_cost(&self, rule: u16) -> u32;
     fn fire(&self, rule: u16, e: Redex, ctx: &mut Wctx);

@@ -329,6 +329,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         *l.borrow_mut() = (0..m.fns.len()).map(|f| native[f] && !any_call(&m.fns[f].body)).collect()
     });
     BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&native).map(|(x, y)| *x || *y).collect());
+    CLOSURES.with(|c| *c.borrow_mut() = Some(mithril_net::NetProg::new(m)));
     scalar::SIGS.with(|s| {
         *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
     });
@@ -464,8 +465,15 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         fns_code.push_str(&rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared));
     }
 
-    let n_rules = sq.next as usize;
+    // the net region: generic redexes and the records that feed a call's
+    // result back into a wire
+    let net_rule = sq.next;
+    let fill_rule = sq.next + 1;
+    let n_rules = sq.next as usize + 2;
     let mut fire_arms = String::new();
+    fire_arms.push_str(&format!("            {net_rule} => net_fire(ctx, e),
+            {fill_rule} => fill_fire(ctx, e),
+"));
     fire_arms.push_str(&format!(
         "            0 => fc_{}(ctx, Redex {{ a: e.a, b: e.b, aux: ROOT }}),\n",
         m.main
@@ -563,14 +571,16 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         ));
     }
     out.push_str(&fns_code);
+    out.push_str(&net_region(m, net_rule, fill_rule, fwd));
     out.push_str(&format!(
-        "struct Pg {{ fuel: u32 }}
+        "struct Pg {{ fuel: u32, entries: Vec<Entry>, metas: Vec<MatchMeta> }}
 
 impl Program for Pg {{
     fn n_rules(&self) -> usize {{ {n_rules} }}
+    fn net_rule(&self) -> u16 {{ {net_rule} }}
     fn rule_cost(&self, rule: u16) -> u32 {{
         // An entry that may dive can burn a whole budget; pure joins are tiny.
-        const DIVING: &[usize] = &[{diving}];
+        const DIVING: &[usize] = &[{diving}, {net_rule}, {fill_rule}];
         if DIVING.contains(&(rule as usize)) {{ self.fuel }} else {{ 8 }}
     }}
     fn fire(&self, rule: u16, e: Redex, ctx: &mut Wctx) {{
@@ -606,6 +616,269 @@ impl Program for Pg {{
 /// The per-function CALL-rule fire arm: unpack (freeing the arg chain),
 /// (par-fold split), dive. Arguments arrive owned; on completion the fire
 /// reclaims the ones the dive form only borrowed (read-only parameters).
+// ---- the net region of a compiled program ----
+
+fn nexpr_src(e: &mithril_net::NExpr) -> String {
+    use mithril_net::NExpr::*;
+    let spec = |s: &mithril_net::ClosureSpec| format!("ClosureSpec {{ entry: {}, caps: vec![{}] }}", s.entry, s.caps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
+    let list = |xs: &[mithril_net::NExpr]| xs.iter().map(nexpr_src).collect::<Vec<_>>().join(", ");
+    match e {
+        Num(n) => format!("NExpr::Num({n}i64)"),
+        Flo(f) => format!("NExpr::Flo(f64::from_bits({}u64))", f.to_bits()),
+        Var(v) => format!("NExpr::Var({v})"),
+        Op2(c, a, b) => format!("NExpr::Op2({c}, Box::new({}), Box::new({}))", nexpr_src(a), nexpr_src(b)),
+        Let(v, r, b) => format!("NExpr::Let({v}, Box::new({}), Box::new({}))", nexpr_src(r), nexpr_src(b)),
+        Call(f, xs) => format!("NExpr::Call({f}, vec![{}])", list(xs)),
+        Ctor(t, xs) => format!("NExpr::Ctor({t}, vec![{}])", list(xs)),
+        Tuple(xs) => format!("NExpr::Tuple(vec![{}])", list(xs)),
+        If(c, t, e2) => format!("NExpr::If(Box::new({}), {}, {})", nexpr_src(c), spec(t), spec(e2)),
+        Match(sc, mid, specs) => format!("NExpr::Match(Box::new({}), {mid}, vec![{}])", nexpr_src(sc), specs.iter().map(spec).collect::<Vec<_>>().join(", ")),
+        Proj(a, mid) => format!("NExpr::Proj(Box::new({}), {mid})", nexpr_src(a)),
+        Prim(c, xs) => format!("NExpr::Prim({c}, vec![{}])", list(xs)),
+        Lam(x, b) => format!("NExpr::Lam({x}, Box::new({}))", nexpr_src(b)),
+        App(f, a) => format!("NExpr::App(Box::new({}), Box::new({}))", nexpr_src(f), nexpr_src(a)),
+    }
+}
+
+/// The program's net region: its entry table (the derived program, plus
+/// the closures compiled code builds), the `Prog` half of the shared rule
+/// table (a call unfolds into a spawned CALL rule whose result a FILL
+/// record links back into the net; builtins compute on runtime values;
+/// arrays and unboxed constructors are the runtime's value forms), the two
+/// engine rules of the region, and the bridge compiled code uses: build a
+/// closure, apply one (synchronously when it finishes within budget,
+/// otherwise through a forwarding record).
+fn net_region(m: &CoreModule, net_rule: u16, fill_rule: u16, fwd: u16) -> String {
+    let np = CLOSURES.with(|c| c.borrow_mut().take()).expect("closure registry");
+    // only what a Ref in the net region can reach is instantiated at
+    // runtime: the closures compiled code builds and, transitively, the
+    // lifted branches/arms their bodies mention (a real function is run by
+    // its CALL rule, never instantiated)
+    let nfns = m.fns.len();
+    let mut live = vec![false; np.entries.len()];
+    let mut work: Vec<usize> = (nfns..np.entries.len()).filter(|e| np.closure_entry(*e)).collect();
+    fn refs(e: &mithril_net::NExpr, out: &mut Vec<usize>) {
+        use mithril_net::NExpr::*;
+        match e {
+            Num(_) | Flo(_) | Var(_) => {}
+            Op2(_, a, b) | Let(_, a, b) | App(a, b) => {
+                refs(a, out);
+                refs(b, out);
+            }
+            Call(_, xs) | Ctor(_, xs) | Tuple(xs) | Prim(_, xs) => xs.iter().for_each(|x| refs(x, out)),
+            If(c, t, e2) => {
+                refs(c, out);
+                out.push(t.entry as usize);
+                out.push(e2.entry as usize);
+            }
+            Match(s, _, specs) => {
+                refs(s, out);
+                specs.iter().for_each(|sp| out.push(sp.entry as usize));
+            }
+            Proj(a, _) | Lam(_, a) => refs(a, out),
+        }
+    }
+    while let Some(e) = work.pop() {
+        if live[e] {
+            continue;
+        }
+        live[e] = true;
+        refs(&np.entries[e].body, &mut work);
+    }
+    let mut s = String::new();
+    s.push_str("fn net_entries() -> Vec<Entry> {\n    vec![\n");
+    for (i, e) in np.entries.iter().enumerate() {
+        if live[i] {
+            s.push_str(&format!("        Entry {{ params: vec![{}], body: {} }},\n", e.params.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "), nexpr_src(&e.body)));
+        } else {
+            s.push_str("        Entry { params: vec![], body: NExpr::Num(0) },\n");
+        }
+    }
+    s.push_str("    ]\n}\n\nfn net_metas() -> Vec<MatchMeta> {\n    vec![\n");
+    for mm in &np.metas {
+        match mm {
+            mithril_net::MatchMeta::Proj(i) => s.push_str(&format!("        MatchMeta::Proj({i}),\n")),
+            mithril_net::MatchMeta::Arms(tags) => s.push_str(&format!("        MatchMeta::Arms(vec![{}]),\n", tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))),
+        }
+    }
+    s.push_str("    ]\n}\n\n");
+    s.push_str(&format!(r#"const NFNS: usize = {nfns};
+static PG: std::sync::OnceLock<Pg> = std::sync::OnceLock::new();
+fn pg_ref() -> &'static Pg {{ PG.get().expect("program not installed") }}
+
+impl<'e> Prog<Wctx<'e>> for Pg {{
+    fn unfold(&self, ctx: &mut Wctx<'e>, r: Port, other: Port) -> u64 {{
+        let entry = ref_entry(r) as usize;
+        let args = net_list_collect(ctx, ref_head(r));
+        if entry < NFNS {{
+            // a compiled function: its CALL rule runs it; the result comes
+            // back through a FILL record that links it into `other`
+            let ri = ctx.alloc_rec({fill_rule}u16, 1, other.0 as u32, (other.0 >> 32) as u32, NONE);
+            let raw: Vec<u64> = args.iter().map(|p| p.0).collect();
+            spawn_call(ctx, 1 + entry as u16, &raw, (ri as u64) << 3);
+        }} else {{
+            ctx.instantiate(&self.entries, entry, args, other);
+        }}
+        1
+    }}
+    fn mat_meta(&self, mid: u16) -> MatMeta<'_> {{
+        match &self.metas[mid as usize] {{
+            MatchMeta::Proj(i) => MatMeta::Proj(*i),
+            MatchMeta::Arms(tags) => MatMeta::Arms(tags),
+        }}
+    }}
+    fn compute(&self, ctx: &mut Wctx<'e>, code: u16, x: Port, y: Port) -> Option<Port> {{
+        net_compute(ctx, code, x.0, y.0).map(Port)
+    }}
+    fn park_op(&self, _ctx: &mut Wctx<'e>, op: Port, _y: Port) {{
+        panic!("runtime: builtin {{}} could not compute", op.payload() & 0xFF)
+    }}
+    fn is_ext_value(&self, p: Port) -> bool {{
+        let t = tag(p.0);
+        t >= TU || t == T_ARR
+    }}
+    fn copy_ext(&self, ctx: &mut Wctx<'e>, p: Port) -> Port {{
+        Port(dup_val(ctx, p.0))
+    }}
+    fn erase_ext(&self, ctx: &mut Wctx<'e>, p: Port) {{
+        free_val(ctx, p.0)
+    }}
+    fn ext_ctor(&self, _ctx: &mut Wctx<'e>, p: Port) -> (u16, Vec<Port>) {{
+        let t = tag(p.0);
+        assert!(t >= TU, "runtime: match on an array");
+        (UNBOX_CID[(t - TU) as usize] as u16, vec![Port(num(as_i(p.0)))])
+    }}
+    fn deliver(&self, ctx: &mut Wctx<'e>, kont: Port, val: Port) {{
+        ctx.deliver(kont.payload(), val.0)
+    }}
+}}
+
+/// Builtins on runtime values (the compile-time `compute` folds the same
+/// codes on literals). Codes < 16 are int/float arithmetic, 16..22
+/// comparisons, 32.. the `Prim`s, 44 the (index, value) pair of a set.
+fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {{
+    if code >= 32 {{
+        return Some(match code {{
+            32 => num(f32_add(as_i(x), as_i(y))),
+            33 => num(f32_sub(as_i(x), as_i(y))),
+            34 => num(f32_mul(as_i(x), as_i(y))),
+            35 => num(f32_div(as_i(x), as_i(y))),
+            36 => num(f32_sqrt(as_i(x))),
+            37 => num(f32_lt(as_i(x), as_i(y))),
+            38 => num(f32_from_u32(as_i(x))),
+            39 => num(f32_to_u32(as_i(x))),
+            40 => arr_new(ctx, as_i(x), y),
+            41 => arr_get(ctx, x, as_i(y)),
+            42 => num(arr_len_of(x) as i64),
+            43 => {{
+                let i = field(ctx, y, 0);
+                let v = field(ctx, y, 1);
+                ctx.free(con_addr(y));
+                arr_set(ctx, x, as_i(i), v)
+            }}
+            44 => mk_con(ctx, 0xFFF, &[x, y]),
+            c => unreachable!("builtin code {{}}", c),
+        }});
+    }}
+    if tag(x) == T_NUM && tag(y) == T_NUM {{
+        let (a, b) = (as_i(x), as_i(y));
+        if code >= 16 {{
+            let r = match code {{ 16 => a < b, 17 => a <= b, 18 => a > b, 19 => a >= b, 20 => a == b, 21 => a != b, _ => unreachable!() }};
+            return Some(num(r as i64));
+        }}
+        if matches!(code, 3 | 4 | 5) && b == 0 {{
+            panic!("runtime: division by zero");
+        }}
+        let r = match code {{
+            0 => a.wrapping_add(b), 1 => a.wrapping_sub(b), 2 => a.wrapping_mul(b), 3 => a.wrapping_div(b),
+            4 => floor_div(a, b), 5 => py_mod(a, b), 6 => a.wrapping_shl(b as u32), 7 => a.wrapping_shr(b as u32),
+            8 => a & b, 9 => a | b, 10 => a ^ b, c => unreachable!("int opcode {{}}", c),
+        }};
+        return Some(num(wrap56(r)));
+    }}
+    let (a, b) = (flo_val(ctx, x), flo_val(ctx, y));
+    ctx.free((x & M56) as u32);
+    ctx.free((y & M56) as u32);
+    if code >= 16 {{
+        let r = match code {{ 16 => a < b, 17 => a <= b, 18 => a > b, 19 => a >= b, 20 => a == b, 21 => a != b, _ => unreachable!() }};
+        return Some(num(r as i64));
+    }}
+    let r = match code {{ 0 => a + b, 1 => a - b, 2 => a * b, 3 => a / b, c => unreachable!("float opcode {{}}", c) }};
+    Some(flo(ctx, r))
+}}
+
+/// Rule {net_rule}: a generic redex spilled to the engine (fuel-out, or a
+/// value delivered into the net by a FILL record on another worker).
+fn net_fire(ctx: &mut Wctx, e: Redex) {{
+    ctx.net_push(Port(e.a), Port(e.b));
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+}}
+
+/// Rule {fill_rule}: a compiled call's result links into the wire (or
+/// agent) the net was waiting on.
+fn fill_fire(ctx: &mut Wctx, e: Redex) {{
+    let inf = ctx.rec(e.aux as u32);
+    let target = Port(inf.d as u64 | ((inf.s as u64) << 32));
+    net_link(ctx, Port(e.a), target);
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+}}
+
+/// Sharing a closure value from compiled code is the net's DUP–LAM rule
+/// (`copy_lam`): the original cell stays the first copy, so the caller's
+/// port is still that closure; the second copy is returned. The bodies
+/// are copied lazily by the rules as each copy is used.
+fn dup_closure(ctx: &mut Wctx, p: u64) -> u64 {{
+    let label = mithril_rt::mithril_core::agents::Cells::fresh_label(ctx);
+    let (_, copy) = mithril_rt::mithril_core::rules::copy_lam(ctx, (p & M56) as u32, label);
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+    copy.0
+}}
+
+/// A closure value: entry `id` instantiated over its captured values.
+fn build_closure(ctx: &mut Wctx, id: u16, caps: &[u64]) -> u64 {{
+    let w = net_wire(ctx);
+    ctx.instantiate(&pg_ref().entries, id as usize, caps.iter().map(|c| Port(*c)).collect(), w);
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+    let v = net_resolve(ctx, w);
+    debug_assert!(v.tag() == Tag::Lam, "closure entry produced a {{:?}}", v.tag());
+    v.0
+}}
+
+/// Apply a closure value from compiled code: the application is reduced
+/// in the net region; a result within budget is returned, otherwise the
+/// dive suspends on a forwarding record the result will be delivered to.
+fn apply(ctx: &mut Wctx, f: u64, a: u64) -> R {{
+    let w = net_wire(ctx);
+    let c = ctx.alloc(a, w.0);
+    net_link(ctx, Port::new(Tag::App, c as u64), Port(f));
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+    let v = net_resolve(ctx, w);
+    if v.tag() != Tag::Var {{
+        return Ok(v.0);
+    }}
+    let r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);
+    net_link(ctx, Port::new(Tag::Kont, (r as u64) << 3), v);
+    Err(r as u64)
+}}
+
+/// Apply a closure value from the rule form: the result is delivered to
+/// `parent` (a record slot) when the net produces it.
+fn apply_spawn(ctx: &mut Wctx, f: u64, a: u64, parent: u64) {{
+    let c = ctx.alloc(a, Port::new(Tag::Kont, parent).0);
+    net_link(ctx, Port::new(Tag::App, c as u64), Port(f));
+    let budget = ctx.fuel();
+    ctx.reduce_net(pg_ref(), budget);
+}}
+
+"#));
+    s
+}
+
 fn call_fn(
     m: &CoreModule,
     fid: u32,
@@ -642,6 +915,10 @@ fn call_fn(
 // ---- Core walkers shared by the emitters ----
 
 thread_local! {
+    /// The derived net program of the module being emitted: the closures
+    /// compiled code builds are registered here as entries, and the whole
+    /// table is shipped with the program for its net region.
+    static CLOSURES: std::cell::RefCell<Option<mithril_net::NetProg>> = const { std::cell::RefCell::new(None) };
     /// Set for the module being emitted: `BOUNDED[f]` when every call path
     /// out of `f` is acyclic, so `f` can never run out of fuel and a call to
     /// it is an ordinary expression (no fuel check, no capture).
@@ -733,8 +1010,8 @@ pub(crate) fn any_call(e: &Core) -> bool {
         Core::Match(sc, arms) => any_call(sc) || arms.iter().any(|(_, _, b)| any_call(b)),
         Core::Proj(b, _) => any_call(b),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Lam(_, b) => any_call(b),
-        Core::App(f_, a_) => any_call(f_) || any_call(a_),
+        Core::Lam(..) => false,
+        Core::App(..) => true,
     }
 }
 
@@ -819,6 +1096,12 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
     }
 }
 
+/// Register a closure built by compiled code: an entry over its free
+/// variables (`caps`, sorted) whose body is the lambda itself.
+pub(crate) fn closure_entry(caps: Vec<u32>, lam: &Core) -> u16 {
+    CLOSURES.with(|c| c.borrow_mut().as_mut().expect("closure registry").add_entry(caps, lam))
+}
+
 pub(crate) fn is_bounded(g: u32) -> bool {
     BOUNDED.with(|b| b.borrow().get(g as usize).copied().unwrap_or(false))
 }
@@ -891,8 +1174,10 @@ pub(crate) fn has_call(e: &Core) -> bool {
         Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(has_call),
         Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
         Core::Proj(a, _) => has_call(a),
-        Core::Lam(_, a) => has_call(a),
-        Core::App(f_, a_) => has_call(f_) || has_call(a_),
+        // a closure's body is built as a net, not run here; applying one
+        // may suspend like a call
+        Core::Lam(..) => false,
+        Core::App(..) => true,
     }
 }
 
@@ -976,7 +1261,11 @@ pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
                 }
             }
             Core::Proj(a, _) => go(a, bound, out),
-            Core::Lam(_, a) => go(a, bound, out),
+            Core::Lam(x, a) => {
+                bound.push(*x);
+                go(a, bound, out);
+                bound.pop();
+            }
             Core::App(f_, a_) => { go(f_, bound, out); go(a_, bound, out); }
         }
     }
@@ -1330,6 +1619,10 @@ const PRELUDE: &str = r#"// GENERATED by mithril-codegen. Do not edit.
 #![allow(unused, unused_mut, unreachable_code, unreachable_patterns, non_snake_case, clippy::all)]
 use mithril_rt::prelude::*;
 use mithril_rt::{DiveResult, Engine, Program, Redex, Wctx, NO_REC, ROOT};
+use mithril_rt::mithril_core::agents::{list_collect as net_list_collect, ref_entry, ref_head, wire as net_wire};
+use mithril_rt::mithril_core::lower::{ClosureSpec, Entry, MatchMeta, NExpr};
+use mithril_rt::mithril_core::port::{Port, Tag};
+use mithril_rt::mithril_core::rules::{link as net_link, resolve as net_resolve, MatMeta, Prog};
 
 /// Constructor allocation; arity <= 2 direct, wider ctors chain cells
 /// (slot 0 = field, slot 1 = continuation con). The arity nibble saturates
@@ -1466,6 +1759,7 @@ fn mk_con2r(ctx: &mut Wctx, tok: u32, k: u16, f0: u64, f1: u64) -> u64 {
 fn dup_val(ctx: &mut Wctx, p: u64) -> u64 {
     match tag(p) {
         t if t >= TU => p,
+        T_LAM => dup_closure(ctx, p),
         T_FLO => {
             ctx.rc_inc((p & M56) as u32);
             p
@@ -1610,7 +1904,7 @@ fn arr_drop(ctx: &mut Wctx, p: u64) {
 #[inline(always)]
 fn free_val(ctx: &mut Wctx, p: u64) {
     let t = tag(p);
-    if t != T_CON && t != T_FLO && t != T_ARR {
+    if t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM {
         return;
     }
     free_val_slow(ctx, p);
@@ -1685,6 +1979,13 @@ fn untup<const K: usize>(ctx: &mut Wctx, p: u64) -> [u64; K] {
 fn free_val_slow(ctx: &mut Wctx, p: u64) {
     match tag(p) {
         T_ARR => arr_drop(ctx, p),
+        T_LAM => {
+            // a dropped closure: the net erases it (and the work pending
+            // in its body)
+            net_link(ctx, Port::new(Tag::Era, 0), Port(p));
+            let budget = ctx.fuel();
+            ctx.reduce_net(pg_ref(), budget);
+        }
         t if t >= TU => {}
         T_FLO => {
             let a = (p & M56) as u32;
@@ -1777,6 +2078,7 @@ fn zeros(ctx: &mut Wctx, n: usize) -> u64 {
 fn show(eng: &Engine, p: u64) -> String {
     match tag(p) {
         t if t >= TU => format!("C{}({})", UNBOX_CID[(t - TU) as usize], as_i(p)),
+        T_LAM => "<closure>".to_string(),
         T_NUM => as_i(p).to_string(),
         T_FLO => format!("{:?}", f64::from_bits(eng.cell((p & M56) as u32)[0])),
         T_CON => {
@@ -1840,9 +2142,10 @@ fn main() {
     let h = std::thread::Builder::new()
         .stack_size(1 << 30)
         .spawn(move || {
-            let pg = Pg { fuel: fuel.clamp(1, u32::MAX as i64) as u32 };
+            let pg = Pg { fuel: fuel.clamp(1, u32::MAX as i64) as u32, entries: net_entries(), metas: net_metas() };
+            let _ = PG.set(pg);
             let mut eng = Engine::new(threads, fuel);
-            let root = eng.run(&pg, Redex { a: 0, b: 0, aux: ROOT });
+            let root = eng.run(pg_ref(), Redex { a: 0, b: 0, aux: ROOT });
             println!("{}", show(&eng, root));
             if std::env::var_os("MITHRIL_STATS").is_some() {
                 let st = eng.stats();
