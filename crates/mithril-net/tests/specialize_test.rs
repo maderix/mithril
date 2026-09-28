@@ -327,3 +327,132 @@ fn work_free_of_the_parameter_is_bound_outside_the_residual_closure() {
         other => panic!("expected let heavy in lambda, got {other:?}"),
     }
 }
+
+// ---- readback keeps the net's independence (a call is bound where the
+// net created it, not where its result is first used) ----
+
+/// Every `Call(g, ..)` in `e` that sits under a `Match` whose scrutinee is
+/// the result of another call to `g`: a false dependency between two
+/// independent calls.
+fn call_under_match_of_call(e: &Core, g: u32, call_vars: &mut Vec<u32>) -> bool {
+    match e {
+        Core::Let(x, r, b) => {
+            let under = call_under_match_of_call(r, g, call_vars);
+            let pushed = matches!(&**r, Core::Call(f, _) if *f == g);
+            if pushed {
+                call_vars.push(*x);
+            }
+            let res = under || call_under_match_of_call(b, g, call_vars);
+            if pushed {
+                call_vars.pop();
+            }
+            res
+        }
+        Core::Match(s, arms) => {
+            let on_call = matches!(&**s, Core::Var(v) if call_vars.contains(v));
+            arms.iter().any(|(_, _, b)| (on_call && calls(b, g)) || call_under_match_of_call(b, g, call_vars))
+        }
+        _ => e.kids().into_iter().any(|k| call_under_match_of_call(k, g, call_vars)),
+    }
+}
+
+/// bitonic's `warp`: two independent recursive calls whose results are
+/// zipped by a function that matches the first before the second. The
+/// net fires both calls as soon as their arguments exist; the residual
+/// body must bind both before matching either, or the second waits on the
+/// first and the fork is serialized (measured on the GPU: 1454 ms -> 12 ms
+/// on a 2^16-leaf warp once both are bound first).
+#[test]
+fn independent_calls_stay_independent_through_an_inlined_match() {
+    let src = r#"
+@data
+class Tree:
+    Leaf: (v,)
+    Node: (l, r)
+
+def warp_zip(wa, wb):
+    match wa:
+        case Leaf(av):
+            return Leaf(0)
+        case Node(a0, a1):
+            match wb:
+                case Leaf(bv):
+                    return Leaf(0)
+                case Node(b0, b1):
+                    return Node(Node(a0, b0), Node(a1, b1))
+
+def warp(a, b):
+    match a:
+        case Leaf(av):
+            return Node(Leaf(av), a)
+        case Node(aa, ab):
+            match b:
+                case Leaf(bv):
+                    return Leaf(0)
+                case Node(ba, bb):
+                    return warp_zip(warp(aa, ba), warp(ab, bb))
+
+def build(n):
+    if n == 0:
+        return Leaf(n)
+    return Node(build(n - 1), build(n - 1))
+
+def count(t):
+    match t:
+        case Leaf(v):
+            return 1
+        case Node(a, b):
+            return count(a) + count(b)
+
+def main():
+    n = array_len(array_new(5, 0))
+    return count(warp(build(n), build(n)))
+"#;
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&m), oracle(&s), "specialized warp changed the result");
+    let w = fid(&s, "warp");
+    assert!(
+        !call_under_match_of_call(body(&s, "warp"), w, &mut Vec::new()),
+        "the second recursive warp waits on a match of the first:\n{:?}",
+        body(&s, "warp")
+    );
+}
+
+/// The hoist must not turn tail calls into let-bound calls: a self tail
+/// call stays in tail position (loops), a mutual tail call too.
+#[test]
+fn tail_calls_stay_in_tail_position() {
+    let src = r#"
+def ev(n, c):
+    if n == 0:
+        return c
+    return od(n - 1, c + 2)
+
+def od(n, c):
+    if n == 0:
+        return c + 1
+    return ev(n - 1, (c * 3) & 1048575)
+
+def main():
+    s = 0
+    for k in range(4):
+        s = (s + ev(3000 + k, k)) & 4294967295
+    return s
+"#;
+    let (m, s) = spec(src);
+    assert_eq!(oracle(&m), oracle(&s));
+    fn tail_call_to(e: &Core, g: u32) -> bool {
+        match e {
+            Core::Call(f, _) => *f == g,
+            Core::Let(_, _, b) => tail_call_to(b, g),
+            Core::If(_, t, f) => tail_call_to(t, g) || tail_call_to(f, g),
+            Core::Match(_, arms) => arms.iter().any(|(_, _, b)| tail_call_to(b, g)),
+            _ => false,
+        }
+    }
+    let lp = s.fns.iter().position(|f| f.name.starts_with("__for")).expect("loop helper") as u32;
+    assert!(tail_call_to(&s.fns[lp as usize].body, lp), "the loop's back-edge is no longer a tail call: {:?}", s.fns[lp as usize].body);
+    let (e, o) = (fid(&s, "ev"), fid(&s, "od"));
+    assert!(tail_call_to(body(&s, "ev"), o), "ev's call to od is no longer a tail call");
+    assert!(tail_call_to(body(&s, "od"), e), "od's call to ev is no longer a tail call");
+}

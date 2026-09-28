@@ -429,6 +429,8 @@ pub(crate) struct Reader<'a> {
     shared: HashMap<u32, u32>,
     /// the scope frame each Dup cell was created in (see `specialize`)
     dup_frame: &'a HashMap<u32, usize>,
+    /// the scope frame each pending call was created in
+    ref_frame: &'a HashMap<u64, usize>,
     /// (agent cell, arm index) -> arm info
     arms: &'a HashMap<(u32, usize), ArmInfo>,
     /// active frames, innermost last
@@ -471,10 +473,11 @@ impl<'a> Reader<'a> {
         free: &[(Port, u32)],
         next: u32,
         dup_frame: &'a HashMap<u32, usize>,
+        ref_frame: &'a HashMap<u64, usize>,
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
-        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
+        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, ref_frame, arms, stack: vec![0], bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
     }
 
     /// Read a frame's expression from `p` (its tail, compound) and wrap it
@@ -658,8 +661,40 @@ impl<'a> Reader<'a> {
             Producer::Ref(r) => {
                 let entry = ref_entry(r) as usize;
                 assert!(entry < self.prog.nfns, "ICE: residual call to a lifted entry");
+                // A pending call is bound in the frame it was created in:
+                // the net fires it there as soon as its arguments exist,
+                // whatever consumes its result later (a use inside a branch
+                // must not make the call wait on the branch: that is the
+                // parallelism the rules have). Its arguments are read in
+                // that frame too, so everything they need is bound there.
+                let cur = *self.stack.last().unwrap();
+                let mut frame = cur;
+                if let Some(f) = self.ref_frame.get(&r.0) {
+                    if self.stack.contains(f) {
+                        frame = *f;
+                    }
+                }
+                if frame == cur {
+                    // read where it is used: the caller binds it or keeps
+                    // it in tail position
+                    let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
+                    return Core::Call(entry as u32, args);
+                }
+                self.stack.push(frame);
                 let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
-                Core::Call(entry as u32, args)
+                self.stack.pop();
+                let call = Core::Call(entry as u32, args);
+                // never above a closure whose parameter it reads
+                let pos = |st: &[usize], f: usize| st.iter().position(|g| *g == f).unwrap_or(0);
+                for (lf, x) in self.lams.iter().rev() {
+                    if mentions(&call, &[*x]) {
+                        if pos(&self.stack, *lf) > pos(&self.stack, frame) {
+                            frame = *lf;
+                        }
+                        break;
+                    }
+                }
+                self.bind_in(frame, call)
             }
         }
     }

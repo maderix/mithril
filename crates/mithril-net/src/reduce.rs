@@ -148,7 +148,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
         let mut net = Net::new();
         let params = crate::build::build_fn(&mut net, &prog, fid);
         let free: Vec<(Port, u32)> = params.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
-        let mut fx = Fx { net, free, arms: HashMap::new(), dup_frame: HashMap::new(), nframes: 1, next_var: max_var(&f.body).max(f.arity as u32) + 1 };
+        let mut fx = Fx { net, free, arms: HashMap::new(), dup_frame: HashMap::new(), ref_frame: HashMap::new(), nframes: 1, next_var: max_var(&f.body).max(f.arity as u32) + 1 };
         let mut done = 0u64;
         let mut evaluated = 0usize;
         let mut memo = Spec::default();
@@ -161,7 +161,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
         let calls_kept = fx.net.residual.iter().filter(|(a, _)| a.tag() == Tag::Ref).count();
         let ops_kept = fx.net.residual.len() - calls_kept;
         let body = {
-            let mut rd = crate::residual::Reader::new(&fx.net, &prog, &ROOTS, &fx.free, fx.next_var, &fx.dup_frame, &fx.arms);
+            let mut rd = crate::residual::Reader::new(&fx.net, &prog, &ROOTS, &fx.free, fx.next_var, &fx.dup_frame, &fx.ref_frame, &fx.arms);
             rd.read_frame(0, crate::root_port())
         };
         if trace() {
@@ -196,6 +196,9 @@ struct Fx {
     arms: HashMap<(u32, usize), crate::residual::ArmInfo>,
     /// the scope frame each Dup cell belongs to
     dup_frame: HashMap<u32, usize>,
+    /// the scope frame each pending call (a residual Ref, by its port)
+    /// was created in: where it fires in the net, whatever consumes it
+    ref_frame: HashMap<u64, usize>,
     nframes: usize,
     next_var: u32,
 }
@@ -227,7 +230,7 @@ fn settle(
     if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, frame) || new_call(fx) {
         return false;
     }
-    assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, frame);
+    assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, &mut fx.ref_frame, frame);
     loop {
         let ix = crate::residual::scan(&fx.net, &ROOTS, &fx.free, &fx.net.residual);
         let todo: Vec<(u32, bool)> = ix.parked.iter().copied().filter(|(a, _)| !skip.contains(a) && !fx.arms.contains_key(&(*a, 0))).collect();
@@ -281,7 +284,7 @@ fn settle(
                 if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, f) || new_call(fx) {
                     return false;
                 }
-                assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, f);
+                assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, &mut fx.ref_frame, f);
             }
         }
     }
@@ -579,12 +582,19 @@ fn alloc_val(net: &mut Net, v: &Val) -> Port {
     }
 }
 
-/// Every Dup agent reachable now that has no frame yet belongs to `frame`.
-fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut HashMap<u32, usize>, frame: usize) {
+/// Every Dup agent and pending call reachable now that has no frame yet
+/// belongs to `frame`.
+fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut HashMap<u32, usize>, ref_frame: &mut HashMap<u64, usize>, frame: usize) {
     let ix = crate::residual::scan(net, roots, free, &net.residual);
     for p in ix.producers() {
-        if let crate::residual::Producer::Dup(d) = p {
-            dup_frame.entry(*d).or_insert(frame);
+        match p {
+            crate::residual::Producer::Dup(d) => {
+                dup_frame.entry(*d).or_insert(frame);
+            }
+            crate::residual::Producer::Ref(r) => {
+                ref_frame.entry(r.0).or_insert(frame);
+            }
+            _ => {}
         }
     }
 }
