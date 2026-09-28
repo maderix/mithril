@@ -622,3 +622,25 @@ fn mutual_tail_recursion_becomes_a_loop() {
     assert!(ev.contains("continue 'l"), "ev is not a loop");
     assert!(!ev.contains(&format!("s_{id}(")), "ev still calls od");
 }
+
+#[test]
+fn f32_primitives_match_oracle_in_every_representation() {
+    let src = fixture("f32_ops.py");
+    let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
+    let _ = mithril_reassoc::analyze(&mut m);
+    let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
+    let mut net = mithril_net::build(&cm);
+    let _ = mithril_net::reduce(&mut net, &cm, 0);
+    let want = oracle(&cm);
+    for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
+        let rs = mithril_codegen::emit_rust_opts(&cm, &net, mithril_codegen::EmitOpts { int_rep: rep });
+        // the arithmetic runs natively on hardware binary32
+        let ops = cm.fns.iter().position(|f| f.name == "ops").unwrap();
+        assert!(rs.contains(&format!("fn s_{ops}(")), "{tag}: ops is not native");
+        assert!(rs.contains("f32_mul("), "{tag}: no hardware f32 multiply");
+        let bin = compile(&rs, &format!("f32_ops_{tag}"));
+        for t in ["1", "4"] {
+            assert_eq!(run(&bin, &[t]), want, "f32_ops {tag} --threads {t}");
+        }
+    }
+}

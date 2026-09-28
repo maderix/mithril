@@ -273,6 +273,7 @@ impl<'m> Chk<'m> {
                 self.expr(&xs[1]);
             }
             Core::Prim(mithril_front::core::Prim::ArrLen, xs) => self.read(&xs[0]),
+            Core::Prim(p, xs) if p.is_f32() => xs.iter().for_each(|x| self.expr(x)),
             Core::Var(i) if self.arrs.contains_key(i) => self.fail(e),
             Core::Var(i) => {
                 if self.tvars.contains_key(i) {
@@ -527,6 +528,22 @@ fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
     }
 }
 
+/// The prelude helper of a binary32 primitive.
+pub(crate) fn f32_fn(p: mithril_front::core::Prim) -> &'static str {
+    use mithril_front::core::Prim::*;
+    match p {
+        F32Add => "f32_add",
+        F32Sub => "f32_sub",
+        F32Mul => "f32_mul",
+        F32Div => "f32_div",
+        F32Sqrt => "f32_sqrt",
+        F32Lt => "f32_lt",
+        F32FromU32 => "f32_from_u32",
+        F32ToU32 => "f32_to_u32",
+        _ => unreachable!(),
+    }
+}
+
 /// A variable or constant.
 fn is_atom(e: &Core) -> bool {
     matches!(e, Core::Num(_) | Core::Var(_))
@@ -649,8 +666,10 @@ pub(crate) fn ctx_arg(g: u32) -> &'static str {
 pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     fn prims(e: &Core, out: &mut bool, calls: &mut Vec<u32>) {
         match e {
-            Core::Prim(_, xs) => {
-                *out = true;
+            Core::Prim(p, xs) => {
+                if !p.is_f32() {
+                    *out = true;
+                }
                 xs.iter().for_each(|x| prims(x, out, calls));
             }
             Core::Call(g, xs) => {
@@ -755,6 +774,10 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
                 let (lo, lo32) = (c.r.masked(*x), c.r.masked32(*x));
                 walk(c, r, lo, lo32);
                 walk(c, b, low, low32);
+            }
+            Core::Prim(p, xs) if p.is_f32() => {
+                c.shf += xs.len() + 1;
+                xs.iter().for_each(|x| walk(c, x, false, false));
             }
             Core::Prim(p, xs) => {
                 if matches!(p, Prim::ArrGet | Prim::ArrSet) {
@@ -1420,6 +1443,12 @@ impl<'m> Sem<'m> {
                     };
                 }
                 Core::Op2(..) | Core::Cmp(..) => return self.plain_arith(e, low, low32, b),
+                Core::Prim(p, xs) if p.is_f32() => {
+                    let es: Vec<String> = xs.iter().map(|x| self.val(x, b)).collect();
+                    let t = self.fresh();
+                    b.push_str(&format!("let {t} = {}({});\n", f32_fn(*p), es.join(", ")));
+                    return t;
+                }
                 _ => {}
             }
         }
@@ -1435,6 +1464,13 @@ impl<'m> Sem<'m> {
                     Some(l) => b.push_str(&format!("let {t} = arr_get_n({a} as u64, {l}, {i}) as i64;\n")),
                     None => b.push_str(&format!("let {t} = arr_get_r({a} as u64, {i}) as i64;\n")),
                 }
+                t
+            }
+            Core::Prim(p, xs) if p.is_f32() => {
+                // shifted representation: the bit patterns go through plain
+                let es: Vec<String> = xs.iter().map(|x| self.unshifted(x, b)).collect();
+                let t = self.fresh();
+                b.push_str(&format!("let {t} = {}({}).wrapping_shl(8);\n", f32_fn(*p), es.join(", ")));
                 t
             }
             Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {

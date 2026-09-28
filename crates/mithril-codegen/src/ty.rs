@@ -64,6 +64,7 @@ impl Types {
                     Ty::Arr(true) => Ty::Int,
                     _ => Ty::Dyn,
                 },
+                _ => Ty::Int, // binary32 primitives
             },
             Core::Proj(b, i) => match self.expr(fid, b) {
                 Ty::Tup(_) => Ty::Dyn, // refined during inference via tvars
@@ -385,6 +386,14 @@ impl<'m> Inf<'m> {
                         let e = self.uf.fresh();
                         let a = self.arr_of(e);
                         self.unify(ts[0], a);
+                        self.int()
+                    }
+                    // binary32 on bit patterns: ints in, an int out
+                    _ => {
+                        for t in &ts {
+                            let i = self.int();
+                            self.unify(*t, i);
+                        }
                         self.int()
                     }
                 }

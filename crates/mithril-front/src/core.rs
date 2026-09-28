@@ -50,6 +50,47 @@ pub enum Prim {
     ArrSet,
     /// `array_len(a)`
     ArrLen,
+    /// IEEE-754 binary32 arithmetic on bit patterns (ints in [0, 2^32)):
+    /// `f32_add/sub/mul/div(a, b)`, `f32_sqrt(a)`, each correctly rounded
+    /// to nearest-even; `f32_lt(a, b)` (1 when a < b, IEEE: false on NaN);
+    /// `f32_from_u32(n)` (nearest f32 to the unsigned n); `f32_to_u32(a)`
+    /// (truncated toward zero; NaN, negative or >= 2^32 give 0).
+    F32Add,
+    F32Sub,
+    F32Mul,
+    F32Div,
+    F32Sqrt,
+    F32Lt,
+    F32FromU32,
+    F32ToU32,
+}
+
+impl Prim {
+    /// The binary32 primitives (all ints in, one int out).
+    pub fn is_f32(self) -> bool {
+        !matches!(self, Prim::ArrNew | Prim::ArrGet | Prim::ArrSet | Prim::ArrLen)
+    }
+}
+
+/// Semantics of the binary32 primitives on bit patterns (the reference for
+/// every backend).
+pub fn f32_prim(p: Prim, a: &[i64]) -> i64 {
+    let f = |x: i64| f32::from_bits(x as u32);
+    let b = |x: f32| x.to_bits() as i64;
+    match p {
+        Prim::F32Add => b(f(a[0]) + f(a[1])),
+        Prim::F32Sub => b(f(a[0]) - f(a[1])),
+        Prim::F32Mul => b(f(a[0]) * f(a[1])),
+        Prim::F32Div => b(f(a[0]) / f(a[1])),
+        Prim::F32Sqrt => b(f(a[0]).sqrt()),
+        Prim::F32Lt => (f(a[0]) < f(a[1])) as i64,
+        Prim::F32FromU32 => b((a[0] as u32) as f32),
+        Prim::F32ToU32 => {
+            let x = f(a[0]);
+            if x.is_nan() || x < 0.0 || x >= 4294967296.0 { 0 } else { x as u32 as i64 }
+        }
+        _ => unreachable!("not a binary32 primitive: {:?}", p),
+    }
 }
 
 impl Prim {
@@ -59,6 +100,14 @@ impl Prim {
             "array_get" => (Prim::ArrGet, 2),
             "array_set" => (Prim::ArrSet, 3),
             "array_len" => (Prim::ArrLen, 1),
+            "f32_add" => (Prim::F32Add, 2),
+            "f32_sub" => (Prim::F32Sub, 2),
+            "f32_mul" => (Prim::F32Mul, 2),
+            "f32_div" => (Prim::F32Div, 2),
+            "f32_sqrt" => (Prim::F32Sqrt, 1),
+            "f32_lt" => (Prim::F32Lt, 2),
+            "f32_from_u32" => (Prim::F32FromU32, 1),
+            "f32_to_u32" => (Prim::F32ToU32, 1),
             _ => return None,
         })
     }
@@ -265,6 +314,7 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
                     Val::A(ys)
                 }
                 (Prim::ArrLen, [Val::A(xs)]) => Val::I(xs.len() as i64),
+                (p, vs) if p.is_f32() => Val::I(f32_prim(*p, &vs.iter().map(as_i).collect::<Vec<_>>())),
                 (p, vs) => panic!("eval_core: bad arguments to {:?}: {:?}", p, vs),
             }
         }

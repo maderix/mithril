@@ -412,6 +412,7 @@ impl<'m> Ex<'m> {
         match e {
             Core::Prim(mithril_front::core::Prim::ArrGet, xs) => self.int_arr(&xs[0]),
             Core::Prim(mithril_front::core::Prim::ArrLen, _) => true,
+            Core::Prim(p, _) if p.is_f32() => true,
             Core::Num(_) | Core::Cmp(..) => true,
             Core::Op2(_, a, b) => self.is_int(a) && self.is_int(b),
             Core::Var(i) => self.ints.contains(i),
@@ -763,6 +764,10 @@ impl<'m> Ex<'m> {
                         if let Some(p) = post {
                             b.push_str(&format!("free_val(ctx, {p});\n"));
                         }
+                    }
+                    _ => {
+                        let es: Vec<String> = args.iter().map(|a| format!("as_i({})", self.val(a, false, b))).collect();
+                        b.push_str(&format!("let {t} = num({}({}));\n", crate::scalar::f32_fn(*p), es.join(", ")));
                     }
                 }
                 t

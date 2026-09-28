@@ -63,6 +63,68 @@ def array_len(a):
     return len(a)
 
 
+# IEEE-754 binary32 on bit patterns: compute in f64 and round to f32
+# (exact for + - * / sqrt: f64 has more than 2*24+2 significand bits, so
+# rounding twice gives the correctly rounded binary32 result)
+import math
+import struct
+
+
+def _f(x):
+    return struct.unpack("<f", struct.pack("<I", x & 0xFFFFFFFF))[0]
+
+
+def _b(v):
+    try:
+        return struct.unpack("<I", struct.pack("<f", v))[0]
+    except OverflowError:
+        return 0xFF800000 if v < 0 else 0x7F800000
+
+
+def f32_add(a, b):
+    return _b(_f(a) + _f(b))
+
+
+def f32_sub(a, b):
+    return _b(_f(a) - _f(b))
+
+
+def f32_mul(a, b):
+    return _b(_f(a) * _f(b))
+
+
+def f32_div(a, b):
+    x, y = _f(a), _f(b)
+    if y == 0.0:
+        if x == 0.0 or math.isnan(x):
+            return 0x7FC00000
+        neg = (math.copysign(1.0, x) < 0) != (math.copysign(1.0, y) < 0)
+        return 0xFF800000 if neg else 0x7F800000
+    return _b(x / y)
+
+
+def f32_sqrt(a):
+    x = _f(a)
+    if x < 0 or math.isnan(x):
+        return 0x7FC00000
+    return _b(math.sqrt(x))
+
+
+def f32_lt(a, b):
+    return 1 if _f(a) < _f(b) else 0
+
+
+def f32_from_u32(n):
+    return _b(float(n & 0xFFFFFFFF))
+
+
+def f32_to_u32(a):
+    x = _f(a)
+    if math.isnan(x) or x < 0 or x >= 4294967296.0:
+        return 0
+    return int(x)
+
+
 def run(path):
     src = open(path).read()
     code = compile(
@@ -75,6 +137,14 @@ def run(path):
         "array_get": array_get,
         "array_set": array_set,
         "array_len": array_len,
+        "f32_add": f32_add,
+        "f32_sub": f32_sub,
+        "f32_mul": f32_mul,
+        "f32_div": f32_div,
+        "f32_sqrt": f32_sqrt,
+        "f32_lt": f32_lt,
+        "f32_from_u32": f32_from_u32,
+        "f32_to_u32": f32_to_u32,
     }
     exec(code, g)
     print(g["main"]())
