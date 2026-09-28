@@ -109,6 +109,12 @@ pub(crate) struct Ex<'m> {
     pub captured: HashSet<u32>,
     /// Rule form: dives whose continuation is being emitted inline, nested.
     pub inline_calls: u32,
+    /// Dive form of a TRMC function: (ctor id, hole-fill rule).
+    pub trmc: Option<(u32, u16)>,
+    /// The delayed self call being emitted: (its var, evaluated args).
+    pub pending: Option<(u32, Vec<String>)>,
+    /// Destination-passing form: the tail parameter (not a real param).
+    pub dps_param: Option<usize>,
 }
 
 /// Variables that are *used* as arithmetic/comparison operands or bound to
@@ -182,7 +188,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, bset, bor, ints, captured: HashSet::new(), inline_calls: 0, trmc: None, pending: None, dps_param: None, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -246,9 +252,10 @@ impl<'m> Ex<'m> {
         let name = format!("cap_{}", self.fresh());
         let vars = outer_vars(&cb);
         let params: String = vars.iter().map(|v| format!(", {v}: u64")).collect();
+        let call = format!("{name}(ctx, {rv} as u32{})", vars.iter().map(|v| format!(", {v}")).collect::<String>());
         b.push_str(&format!(
-            "#[cold] #[inline(never)] fn {name}(ctx: &mut Wctx, {rv}: u32{params}) -> u64 {{\n{cb}}}\nreturn Err({name}(ctx, {rv} as u32{}));\n",
-            vars.iter().map(|v| format!(", {v}")).collect::<String>()
+            "#[cold] #[inline(never)] fn {name}(ctx: &mut Wctx, {rv}: u32{params}) -> u64 {{\n{cb}}}\nreturn Err({});\n",
+            self.hole_exit(&call)
         ));
     }
 
@@ -770,12 +777,55 @@ impl<'m> Ex<'m> {
 
     /// Emit `e` in dive tail position: ends every path with `return`, or
     /// `continue 'l` for self tail calls in loop form.
+    /// An `Err` payload leaving the function: through the hole record in a
+    /// TRMC loop.
+    fn hole_exit(&self, r: &str) -> String {
+        match self.trmc {
+            Some((_, rule)) => format!("{{ let r = {r}; hole_wrap(ctx, r, th_head, th_hole, {rule}u16) }}"),
+            None => r.to_string(),
+        }
+    }
+
+    /// An `Ok` value leaving the function: into the hole in a TRMC loop.
+    fn hole_value(&self, v: &str) -> String {
+        match self.trmc {
+            Some(_) => format!("hole_fill(ctx, th_head, th_hole, {v})"),
+            None => v.to_string(),
+        }
+    }
+
     pub fn dive_tail(&mut self, e: &Core, b: &mut String) {
         match e {
             Core::Let(x, r, bo) => {
+                if let (Some((cid, _)), Core::Call(g, args), None) = (self.trmc, &**r, &self.pending) {
+                    let mut cs = Vec::new();
+                    if *g == self.self_fid && delayed_ok(*x, bo, &mut cs) && cs.iter().all(|c| *c == cid) {
+                        // delay the self call: arguments evaluated here,
+                        // the call itself becomes the next loop iteration
+                        let qs: Vec<String> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                if Some(i) == self.dps_param {
+                                    return String::new();
+                                }
+                                let e = self.val(a, true, b);
+                                let q = self.fresh();
+                                b.push_str(&format!("let {q} = {e};\n"));
+                                q
+                            })
+                            .collect();
+                        self.pending = Some((*x, qs));
+                        self.dive_tail(bo, b);
+                        self.pending = None;
+                        return;
+                    }
+                }
                 if let Core::Call(g, args) = &**r {
-                    self.let_call(*x, *g, args, bo, b);
-                    return self.dive_tail(bo, b);
+                    if !crate::is_bounded(*g) {
+                        self.let_call(*x, *g, args, bo, b);
+                        return self.dive_tail(bo, b);
+                    }
                 }
                 if has_call(r) {
                     self.kframes.push((*x, (**bo).clone()));
@@ -862,6 +912,38 @@ impl<'m> Ex<'m> {
                 self.flush_toks(b);
                 b.push_str("continue 'l;\n");
             }
+            Core::Ctor(c, a) | Core::Reuse(_, c, a)
+                if self.pending.as_ref().is_some_and(|(x, _)| a.len() == 2 && a[1] == Core::Var(*x)) =>
+            {
+                let reuse = if let Core::Reuse(v, _, _) = e { Some(*v) } else { None };
+                self.trmc_cons(*c, reuse, &a[0], b);
+            }
+            Core::Call(g, args)
+                if self.pending.as_ref().is_some_and(|(x, _)| {
+                    dps_of(*g).is_some_and(|(p, _)| args[p] == Core::Var(*x))
+                }) =>
+            {
+                let (p, _) = dps_of(*g).unwrap();
+                self.trmc_dps(*g, p, args, b);
+            }
+            Core::Var(v) if self.dps_param.is_some_and(|p| p as u32 == *v) => {
+                // destination-passing callee reached its tail parameter:
+                // the hole stays open for the caller
+                self.flush_toks(b);
+                b.push_str("*head_out = th_head;\n*hole_out = th_hole;\nreturn;\n");
+            }
+            Core::Call(g, args) if self.trmc.is_some() => {
+                let (call, post) = self.dive_call(*g, args, b);
+                b.push_str(&format!("match {call} {{\nOk(v) => {{\n"));
+                for p in post {
+                    b.push_str(&format!("free_val(ctx, {p});\n"));
+                }
+                b.push_str(&format!(
+                    "return Ok({});\n}}\nErr(r) => return Err({}),\n}}\n",
+                    self.hole_value("v"),
+                    self.hole_exit("r")
+                ));
+            }
             Core::Call(g, args) => {
                 // Tail call: pass our own destination through, so a downstream
                 // suspension spawns its pending call against the right parent.
@@ -879,9 +961,50 @@ impl<'m> Ex<'m> {
             other => {
                 let v = self.val(other, true, b);
                 self.flush_toks(b);
-                b.push_str(&format!("return Ok({v});\n"));
+                b.push_str(&format!("return Ok({});\n", self.hole_value(&v)));
             }
         }
+    }
+
+    /// Emit a delayed self call's continuation: the cell (tail case a) or
+    /// the destination-passing callee (case b) is linked into the hole, then
+    /// the self call runs as the next loop iteration with the arguments
+    /// evaluated where the call stood.
+    fn trmc_continue(&mut self, b: &mut String) {
+        let (_, qs) = self.pending.clone().expect("trmc_continue without a pending self call");
+        self.flush_toks(b);
+        for (i, q) in qs.iter().enumerate() {
+            if Some(i) != self.dps_param {
+                b.push_str(&format!("v{i} = {q};\n"));
+            }
+        }
+        b.push_str("continue 'l;\n");
+    }
+
+    /// Tail case (a): `C(f0, x)` with `x` the pending self call.
+    fn trmc_cons(&mut self, cid: u32, reuse: Option<u32>, f0: &Core, b: &mut String) {
+        let e0 = self.val(f0, true, b);
+        let p = self.fresh();
+        let tk = reuse.map(|v| format!("tok_v{v}"));
+        match tk {
+            Some(tk) if self.toks.iter().any(|t| *t == tk) => {
+                self.toks.retain(|t| *t != tk);
+                b.push_str(&format!("let {p} = mk_con2r(ctx, {tk}, {cid}u16, {e0}, 0);\n"));
+            }
+            _ => b.push_str(&format!("let {p} = mk_con2(ctx, {cid}u16, {e0}, 0);\n")),
+        }
+        b.push_str(&format!("hole_link(ctx, &mut th_head, &mut th_hole, {p});\n"));
+        self.trmc_continue(b);
+    }
+
+    /// Tail case (b): `g(.., x, ..)` with `x` the pending self call in
+    /// `g`'s tail parameter: `g` appends its cells into our hole.
+    fn trmc_dps(&mut self, g: u32, p: usize, args: &[Core], b: &mut String) {
+        let es: Vec<String> =
+            args.iter().enumerate().filter(|(i, _)| *i != p).map(|(_, a)| self.val(a, true, b)).collect();
+        let argl: String = es.iter().map(|e| format!(", {e}")).collect();
+        b.push_str(&format!("dp_{g}(ctx, fuel{argl}, &mut th_head, &mut th_hole);\n"));
+        self.trmc_continue(b);
     }
 }
 
@@ -975,7 +1098,9 @@ pub(crate) fn dive_fn<'m>(
 ) -> String {
     let f = &m.fns[fid as usize];
     let ar = f.arity;
-    let lp = f.self_tail_rec;
+    let trmc = if bor[fid as usize].iter().any(|b| *b) { None } else { trmc_ctor(fid, body, m, unbox) };
+    let hole_rule = trmc.map(|c| sq.add_hole(c));
+    let lp = f.self_tail_rec || trmc.is_some();
     let params: String =
         (0..ar).map(|i| format!(", {}v{}: u64", if lp { "mut " } else { "" }, i)).collect();
     let argl = (0..ar).map(|i| format!("v{i}")).collect::<Vec<_>>().join(", ");
@@ -983,16 +1108,23 @@ pub(crate) fn dive_fn<'m>(
     // spawn it against a forwarding record whose parent the caller sets.
     let cparams: String = (0..ar).map(|i| format!(", v{i}: u64")).collect();
     let fuel_check = format!(
-        "*fuel -= 1;\nif *fuel < 0 {{\n#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\nlet r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err(cap(ctx{}));\n}}\n",
+        "*fuel -= 1;\nif *fuel < 0 {{\n#[cold] #[inline(never)] fn cap(ctx: &mut Wctx{cparams}) -> u64 {{\nlet r = ctx.alloc_rec({fwd}u16, 1, 0, 0, NONE);\nspawn_call(ctx, {}u16, &[{argl}], (r as u64) << 3);\nr as u64\n}}\nreturn Err({});\n}}\n",
         1 + fid,
-        (0..ar).map(|i| format!(", v{i}")).collect::<String>()
+        {
+            let c = format!("cap(ctx{})", (0..ar).map(|i| format!(", v{i}")).collect::<String>());
+            match hole_rule {
+                Some(rule) => format!("{{ let r = {c}; hole_wrap(ctx, r, th_head, th_hole, {rule}u16) }}"),
+                None => c,
+            }
+        }
     );
     let mut rem = Cnt::new();
     cnt_dive(body, &mut rem);
     let ints = crate::ints_of(tys, fid as usize);
     let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
+    ex.trmc = trmc.zip(hole_rule);
     let mut bb = String::new();
-    if !lp {
+    if !lp || trmc.is_some() {
         // Owned parameters that the body never reads die immediately.
         for i in 0..ar as u32 {
             if !ex.bset.contains(&i) && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
@@ -1008,6 +1140,9 @@ pub(crate) fn dive_fn<'m>(
         "{}#[allow(clippy::too_many_arguments)]\nfn d_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}) -> R {{\n",
         if leafy { "" } else { "" }
     );
+    if trmc.is_some() {
+        s.push_str("let mut th_head: u64 = 0;\nlet mut th_hole: u32 = NOHOLE;\n");
+    }
     if lp {
         let fc = if leafy { String::new() } else { fuel_check.clone() };
         s.push_str(&format!("'l: loop {{\n{fc}{bb}}}\n"));
@@ -1018,6 +1153,174 @@ pub(crate) fn dive_fn<'m>(
     }
     s.push_str("}\n\n");
     s
+}
+
+thread_local! {
+    /// Destination-passing callees of the module being emitted:
+    /// `DPS[g] = Some((p, ctor))` when `g` only appends `ctor` cells onto
+    /// its parameter `p` (see `dps_param`).
+    pub(crate) static DPS: std::cell::RefCell<Vec<Option<(usize, u32)>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dps_of(g: u32) -> Option<(usize, u32)> {
+    DPS.with(|d| d.borrow().get(g as usize).copied().flatten())
+}
+
+/// Every tail path of `e` uses the pending self-call result `x` exactly
+/// once, as (a) the last field of a two-field ctor or (b) the tail
+/// parameter of a destination-passing callee; nothing else reads `x` and
+/// nothing between the call and the tail can suspend. Collects the ctor
+/// of each tail.
+pub(crate) fn delayed_ok(x: u32, e: &Core, cids: &mut Vec<u32>) -> bool {
+    match e {
+        Core::Let(_, r, rest) => !has_call(r) && !free_vars(r).contains(&x) && delayed_ok(x, rest, cids),
+        Core::If(c, t, f) => !free_vars(c).contains(&x) && delayed_ok(x, t, cids) && delayed_ok(x, f, cids),
+        Core::Match(sc, arms) => !free_vars(sc).contains(&x) && arms.iter().all(|(_, _, a)| delayed_ok(x, a, cids)),
+        Core::Ctor(c, a) | Core::Reuse(_, c, a) => {
+            if a.len() == 2 && a[1] == Core::Var(x) && !free_vars(&a[0]).contains(&x) {
+                cids.push(*c);
+                true
+            } else {
+                false
+            }
+        }
+        Core::Call(g, a) => match dps_of(*g) {
+            Some((p, c)) if a[p] == Core::Var(x) && a.iter().enumerate().all(|(i, v)| i == p || !free_vars(v).contains(&x)) => {
+                cids.push(c);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The ctor every delayed self call of `body` builds, if it has any and
+/// they agree (one boxed two-field ctor per function).
+pub(crate) fn trmc_ctor(fid: u32, body: &Core, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> Option<u32> {
+    fn go(fid: u32, e: &Core, out: &mut Vec<u32>) -> bool {
+        match e {
+            Core::Let(x, r, bo) => {
+                if matches!(&**r, Core::Call(g, _) if *g == fid) {
+                    let mut cs = Vec::new();
+                    if delayed_ok(*x, bo, &mut cs) {
+                        out.extend(cs);
+                        return true;
+                    }
+                }
+                go(fid, bo, out)
+            }
+            Core::If(_, t, f) => {
+                let a = go(fid, t, out);
+                go(fid, f, out) || a
+            }
+            Core::Match(_, arms) => arms.iter().fold(false, |acc, (_, _, b)| go(fid, b, out) || acc),
+            _ => false,
+        }
+    }
+    let mut cs = Vec::new();
+    if !go(fid, body, &mut cs) {
+        return None;
+    }
+    let c = *cs.first()?;
+    if cs.iter().any(|x| *x != c) || unbox.contains_key(&c) || m.ctors[c as usize].1 != 2 {
+        return None;
+    }
+    Some(c)
+}
+
+/// `Some((p, ctor))` when `f` is a destination-passing callee: every tail
+/// is `Var(p)` or a delayed self call that passes `p` through unchanged,
+/// `p` is read nowhere else, and `f` calls nothing that can suspend.
+pub(crate) fn dps_param(fid: u32, f: &mut dyn FnMut(u32) -> bool, body: &Core, arity: usize, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> Option<(usize, u32)> {
+    fn calls_ok(fid: u32, e: &Core, f: &mut dyn FnMut(u32) -> bool) -> bool {
+        match e {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => true,
+            Core::Call(g, xs) => (*g == fid || f(*g)) && xs.iter().all(|x| calls_ok(fid, x, f)),
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => calls_ok(fid, a, f) && calls_ok(fid, b, f),
+            Core::If(a, b, c) => calls_ok(fid, a, f) && calls_ok(fid, b, f) && calls_ok(fid, c, f),
+            Core::Let(_, r, b) => calls_ok(fid, r, f) && calls_ok(fid, b, f),
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().all(|x| calls_ok(fid, x, f)),
+            Core::Match(s, arms) => calls_ok(fid, s, f) && arms.iter().all(|(_, _, b)| calls_ok(fid, b, f)),
+            Core::Proj(a, _) => calls_ok(fid, a, f),
+        }
+    }
+    // tails: Var(p), or `x = self(.., Var(p), ..)` delayed
+    fn tails(fid: u32, p: u32, e: &Core, n: &mut usize) -> bool {
+        match e {
+            Core::Var(v) => {
+                *n += 1;
+                *v == p
+            }
+            Core::Let(x, r, bo) => {
+                if let Core::Call(g, a) = &**r {
+                    if *g == fid && a.get(p as usize) == Some(&Core::Var(p)) {
+                        *n += 1;
+                        return !a.iter().enumerate().any(|(i, v)| i != p as usize && free_vars(v).contains(&p))
+                            && !free_vars(bo).contains(&p);
+                    }
+                }
+                !free_vars(r).contains(&p) && tails(fid, p, bo, n)
+            }
+            Core::If(c, t, f) => !free_vars(c).contains(&p) && tails(fid, p, t, n) && tails(fid, p, f, n),
+            Core::Match(s, arms) => !free_vars(s).contains(&p) && arms.iter().all(|(_, _, a)| tails(fid, p, a, n)),
+            _ => false,
+        }
+    }
+    if !calls_ok(fid, body, f) {
+        return None;
+    }
+    let c = trmc_ctor(fid, body, m, unbox)?;
+    (0..arity).find_map(|p| {
+        let mut n = 0;
+        if tails(fid, p as u32, body, &mut n) && n > 0 {
+            let mut uses = crate::Cnt::new();
+            crate::cnt_expr(body, &mut uses);
+            // p is read once per tail (as the value or as the passed-through arg)
+            let reads = uses.get(&(p as u32)).copied().unwrap_or(0) as usize;
+            (reads == n).then_some((p, c))
+        } else {
+            None
+        }
+    })
+}
+
+/// The destination-passing form of `g` (see `dps_param`): appends its cells
+/// into the caller's hole and returns with the hole open. Charges fuel but
+/// never suspends (it calls nothing that can).
+pub(crate) fn dps_fn<'m>(
+    m: &CoreModule,
+    fid: u32,
+    p: usize,
+    cid: u32,
+    body: &Core,
+    bor: &'m [Vec<bool>],
+    sq: &'m mut SegQ,
+    fwd: u16,
+    unbox: &'m std::collections::HashMap<u32, u8>,
+    tys: &'m Types,
+    iret: &'m [bool],
+    shared: &'m std::cell::RefCell<Shared>,
+) -> String {
+    let ar = m.fns[fid as usize].arity;
+    let params: String = (0..ar).filter(|i| *i != p).map(|i| format!(", mut v{i}: u64")).collect();
+    let mut rem = Cnt::new();
+    cnt_dive(body, &mut rem);
+    rem.remove(&(p as u32));
+    let ints = crate::ints_of(tys, fid as usize);
+    let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
+    ex.trmc = Some((cid, 0));
+    ex.dps_param = Some(p);
+    let mut bb = String::new();
+    for i in 0..ar as u32 {
+        if i as usize != p && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
+            bb.push_str(&format!("free_val(ctx, v{i});\n"));
+        }
+    }
+    ex.dive_tail(body, &mut bb);
+    format!(
+        "#[allow(clippy::too_many_arguments)]\nfn dp_{fid}(ctx: &mut Wctx, fuel: &mut i64{params}, head_out: &mut u64, hole_out: &mut u32) {{\nlet mut th_head = *head_out;\nlet mut th_hole = *hole_out;\n'l: loop {{\n*fuel -= 1;\n{bb}}}\n}}\n\n"
+    )
 }
 
 /// The `v<n>` variables a generated block reads from its enclosing scope:

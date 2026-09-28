@@ -42,6 +42,10 @@ pub(crate) struct SegQ {
     /// its call site (the dive form, and each segment whose inline path
     /// runs that call); it gets one segment, not one per path.
     pub memo: std::collections::HashMap<String, u16>,
+    /// Hole-fill rules of TRMC functions: (rule id, ctor id). The record
+    /// holds the head cell (`d`) and the pending hole cell (`s`); its one
+    /// input is the value for the hole.
+    pub holes: Vec<(u16, u32)>,
 }
 
 impl SegQ {
@@ -55,6 +59,17 @@ impl SegQ {
         assert!(self.next != 0, "codegen: more than 65535 rules");
         self.memo.insert(key, id);
         self.q.push(Seg { id, fid, slots, env, body });
+        id
+    }
+
+    pub(crate) fn add_hole(&mut self, cid: u32) -> u16 {
+        if let Some((id, _)) = self.holes.iter().find(|(_, c)| *c == cid) {
+            return *id;
+        }
+        let id = self.next;
+        self.next += 1;
+        assert!(self.next != 0, "codegen: more than 65535 rules");
+        self.holes.push((id, cid));
         id
     }
 }

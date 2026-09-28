@@ -308,3 +308,51 @@ fn small_fuel_still_correct() {
     let bin = compile(&rs, "fib_small_fuel");
     assert_eq!(run(&bin, &["4", "16"]), want, "fib_naive --threads 4 fuel 16 != oracle");
 }
+
+// ---- tail recursion modulo cons ----
+
+/// The generated dive form `d_<fid>` of the function named `name`.
+fn dive_form<'a>(cm: &CoreModule, rs: &'a str, name: &str) -> &'a str {
+    let fid = cm.fns.iter().position(|f| f.name == name).unwrap_or_else(|| panic!("no fn {name}"));
+    let start = rs.find(&format!("fn d_{fid}(")).unwrap_or_else(|| panic!("no d_{fid} for {name}"));
+    let end = rs[start..].find(&format!("fn x_{fid}(")).map(|e| start + e).unwrap_or(rs.len());
+    &rs[start..end]
+}
+
+/// Oracle equality over thread counts and fuels (fuel 1 suspends at every
+/// call and loop iteration, exercising the hole-fill records).
+fn trmc_golden(name: &str) -> (CoreModule, String) {
+    let src = fixture(name);
+    let (cm, rs) = pipeline(&src, 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, name.trim_end_matches(".py"));
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "{name} --threads {t} (default fuel)");
+        for fuel in ["1", "2", "7", "64"] {
+            assert_eq!(run(&bin, &[t, fuel]), want, "{name} --threads {t} fuel {fuel}");
+        }
+    }
+    (cm, rs)
+}
+
+#[test]
+fn trmc_list_builders_match_oracle_under_suspension() {
+    let (cm, rs) = trmc_golden("trmc_list.py");
+    // direct TRMC and the delayed self call through branches both loop
+    assert!(dive_form(&cm, &rs, "run_of").contains("hole_link("), "run_of is not a TRMC loop");
+    assert!(dive_form(&cm, &rs, "build").contains("hole_link("), "build is not a TRMC loop");
+    // run_of is a destination-passing callee and build appends through it
+    let fid = cm.fns.iter().position(|f| f.name == "run_of").unwrap();
+    assert!(rs.contains(&format!("fn dp_{fid}(")), "no destination-passing form for run_of");
+    assert!(dive_form(&cm, &rs, "build").contains(&format!("dp_{fid}(ctx, fuel")), "build does not append via dp_run_of");
+    // the doubly wrapped shape is not eligible and keeps plain recursion
+    assert!(!dive_form(&cm, &rs, "build2").contains("th_head"), "build2 must not be TRMC");
+}
+
+#[test]
+fn trmc_tree_builders_match_oracle_under_suspension() {
+    let (cm, rs) = trmc_golden("trmc_tree.py");
+    let d = dive_form(&cm, &rs, "swap_add");
+    assert!(d.contains("hole_link("), "swap_add's second call is not a TRMC site");
+    assert!(dive_form(&cm, &rs, "mk").contains("hole_link("), "mk's second call is not a TRMC site");
+}

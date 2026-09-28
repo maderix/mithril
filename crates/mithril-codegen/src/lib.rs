@@ -201,7 +201,7 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             next += 1;
         }
     }
-    let mut sq = rules::SegQ { next, q: Vec::new(), memo: Default::default() };
+    let mut sq = rules::SegQ { next, q: Vec::new(), memo: Default::default(), holes: Vec::new() };
     // forwarding segment: fuel-out at a dive entry spawns the pending call
     // against a record of this rule, which just passes the value upward
     let fwd = sq.add(u32::MAX, vec![0], vec![], Core::Var(0));
@@ -245,6 +245,16 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             }
         }
     }
+    // destination-passing callees (TRMC list builders with a tail param)
+    let dps: Vec<Option<(usize, u32)>> = (0..nf)
+        .map(|fid| {
+            if bor[fid].iter().any(|b| *b) || scal[fid].is_some() {
+                return None;
+            }
+            seq::dps_param(fid as u32, &mut |g| is_bounded(g), &bodies[fid], m.fns[fid].arity, m, &unbox)
+        })
+        .collect();
+    seq::DPS.with(|d| *d.borrow_mut() = dps.clone());
     let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     for fid in 0..nf {
@@ -256,6 +266,9 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
             fns_code.push_str(&scalar::scalar_fn(m, fid as u32, &scal, &bor));
         } else {
             fns_code.push_str(&seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
+        }
+        if let Some((p, c)) = dps[fid] {
+            fns_code.push_str(&seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, fwd, &unbox, &tys, &iret, &shared));
         }
         fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));
@@ -295,6 +308,12 @@ pub fn emit_rust(m: &CoreModule, net: &Net) -> String {
         if has_call(&seg.body) {
             diving.push(seg.id as usize);
         }
+    }
+    for (id, cid) in &sq.holes {
+        fire_arms.push_str(&format!("            {id} => hl_{id}(ctx, e),\n"));
+        fns_code.push_str(&format!(
+            "fn hl_{id}(ctx: &mut Wctx, e: Redex) {{\nlet inf = ctx.rec(e.aux as u32);\nctx.set(inf.s, 1, e.a);\nctx.deliver(inf.parent, con(inf.d, {cid}u16, 2));\n}}\n\n"
+        ));
     }
     let diving: String = diving.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
     let mut dive_arms = String::new();
@@ -1002,6 +1021,39 @@ fn consume_chain<const N: usize>(ctx: &mut Wctx, p: u64, k: u16) -> [u64; N] {
         free_val(ctx, p);
     }
     out
+}
+
+/// Tail recursion modulo cons: a TRMC loop holds the result's head and the
+/// cell whose field 1 is the pending hole (NOHOLE before the first cell).
+const NOHOLE: u32 = u32::MAX;
+#[inline(always)]
+fn hole_link(ctx: &mut Wctx, head: &mut u64, hole: &mut u32, p: u64) {
+    if *hole == NOHOLE {
+        *head = p;
+    } else {
+        ctx.set(*hole, 1, p);
+    }
+    *hole = con_addr(p);
+}
+#[inline(always)]
+fn hole_fill(ctx: &mut Wctx, head: u64, hole: u32, v: u64) -> u64 {
+    if hole == NOHOLE {
+        return v;
+    }
+    ctx.set(hole, 1, v);
+    head
+}
+/// A suspension inside a TRMC loop: the suspended value belongs in the
+/// hole, and the head is what the caller receives.
+#[cold]
+#[inline(never)]
+fn hole_wrap(ctx: &mut Wctx, r: u64, head: u64, hole: u32, rule: u16) -> u64 {
+    if hole == NOHOLE {
+        return r;
+    }
+    let hr = ctx.alloc_rec(rule, 1, con_addr(head), hole, NONE);
+    ctx.set_parent(r as u32, (hr as u64) << 3);
+    hr as u64
 }
 
 /// Build a 2-field ctor in a reuse token's cell (or allocate).
