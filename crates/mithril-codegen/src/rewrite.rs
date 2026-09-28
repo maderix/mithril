@@ -19,19 +19,7 @@ use std::collections::HashMap;
 
 /// Node count of an expression (size heuristic for inlining).
 pub(crate) fn size(e: &Core) -> usize {
-    match e {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => 1,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => 1 + size(a) + size(b),
-        Core::If(c, t, f) => 1 + size(c) + size(t) + size(f),
-        Core::Let(_, r, b) => 1 + size(r) + size(b),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-            1 + xs.iter().map(size).sum::<usize>()
-        }
-        Core::Proj(b, _) => 1 + size(b),
-        Core::Match(s, arms) => 1 + size(s) + arms.iter().map(|(_, _, b)| size(b)).sum::<usize>(),
-        Core::Lam(_, b) => 1 + size(b),
-        Core::App(f_, a_) => 1 + size(a_) + size(f_),
-    }
+    e.size()
 }
 
 /// Tail inlining: a small, non-self-recursive `g` tail-called from `f`
@@ -41,30 +29,11 @@ pub(crate) fn size(e: &Core) -> usize {
 pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
     const MAX_SIZE: usize = 64;
     fn calls_of(e: &Core, out: &mut Vec<u32>) {
-        match e {
-            Core::Call(g, xs) => {
+        e.walk(&mut |e| {
+            if let Core::Call(g, _) = e {
                 out.push(*g);
-                xs.iter().for_each(|x| calls_of(x, out));
             }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
-                calls_of(a, out);
-                calls_of(b, out);
-            }
-            Core::If(a, b, c) => {
-                calls_of(a, out);
-                calls_of(b, out);
-                calls_of(c, out);
-            }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| calls_of(x, out)),
-            Core::Match(sc, arms) => {
-                calls_of(sc, out);
-                arms.iter().for_each(|(_, _, b)| calls_of(b, out));
-            }
-            Core::Proj(b, _) => calls_of(b, out),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, b) => calls_of(b, out),
-            Core::App(f_, a_) => { calls_of(f_, out); calls_of(a_, out); }
-        }
+        });
     }
     let leaf: Vec<bool> = m.fns.iter().map(|f| !has_call(&f.body)).collect();
     // g qualifies for inlining into f's tail sites
@@ -129,63 +98,16 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
 /// Rename every binder of a closed body: params via `map`, locals to
 /// `shift + old`.
 fn shift_binders(e: &Core, shift: u32, arity: u32, map: &HashMap<u32, u32>) -> Core {
-    let mv = |i: u32| if i < arity { map[&i] } else { shift + i };
-    match e {
-        Core::Var(i) => Core::Var(mv(*i)),
-        Core::Num(_) | Core::Flo(_) => e.clone(),
-        Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(shift_binders(a, shift, arity, map)), Box::new(shift_binders(b, shift, arity, map))),
-        Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(shift_binders(a, shift, arity, map)), Box::new(shift_binders(b, shift, arity, map))),
-        Core::If(c, t, f) => Core::If(Box::new(shift_binders(c, shift, arity, map)), Box::new(shift_binders(t, shift, arity, map)), Box::new(shift_binders(f, shift, arity, map))),
-        Core::Let(x, r, b) => Core::Let(mv(*x), Box::new(shift_binders(r, shift, arity, map)), Box::new(shift_binders(b, shift, arity, map))),
-        Core::Call(g, xs) => Core::Call(*g, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
-        Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
-        Core::Reuse(v, c, xs) => Core::Reuse(mv(*v), *c, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
-        Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
-        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| shift_binders(x, shift, arity, map)).collect()),
-        Core::Proj(b, i) => Core::Proj(Box::new(shift_binders(b, shift, arity, map)), *i),
-        Core::Lam(x, b) => Core::Lam(mv(*x), Box::new(shift_binders(b, shift, arity, map))),
-        Core::App(f, a) => Core::App(Box::new(shift_binders(f, shift, arity, map)), Box::new(shift_binders(a, shift, arity, map))),
-        Core::Match(s, arms) => Core::Match(
-            Box::new(shift_binders(s, shift, arity, map)),
-            arms.iter()
-                .map(|(c, bs, b)| (*c, bs.iter().map(|x| mv(*x)).collect(), shift_binders(b, shift, arity, map)))
-                .collect(),
-        ),
-    }
+    e.rename(&mut |i| if i < arity { map[&i] } else { shift + i })
 }
 
 // ---------------------------------------------------------------- reuse
 
 fn count_uses(e: &Core, m: &mut HashMap<u32, u32>) {
-    match e {
-        Core::Var(i) => *m.entry(*i).or_insert(0) += 1,
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            count_uses(a, m);
-            count_uses(b, m);
-        }
-        Core::If(c, t, f) => {
-            count_uses(c, m);
-            count_uses(t, m);
-            count_uses(f, m);
-        }
-        Core::Let(_, r, b) => {
-            count_uses(r, m);
-            count_uses(b, m);
-        }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| count_uses(x, m)),
-        Core::Reuse(v, _, xs) => {
-            *m.entry(*v).or_insert(0) += 1;
-            xs.iter().for_each(|x| count_uses(x, m));
-        }
-        Core::Proj(b, _) => count_uses(b, m),
-        Core::Match(s, arms) => {
-            count_uses(s, m);
-            arms.iter().for_each(|(_, _, b)| count_uses(b, m));
-        }
-        Core::Lam(_, b) => count_uses(b, m),
-        Core::App(f_, a_) => { count_uses(f_, m); count_uses(a_, m); }
-    }
+    e.walk(&mut |e| match e {
+        Core::Var(i) | Core::Reuse(i, _, _) => *m.entry(*i).or_insert(0) += 1,
+        _ => {}
+    });
 }
 
 pub(crate) struct ReuseCtx<'a> {
@@ -458,17 +380,7 @@ fn select_arg(leaves: &[Leaf], j: usize, conds: &HashMap<u32, Core>) -> Core {
 
 /// Operations an if-tree computes once converted: all of its arms.
 fn tree_ops(e: &Core) -> usize {
-    match e {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => 0,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => 1 + tree_ops(a) + tree_ops(b),
-        Core::Let(_, a, b) => tree_ops(a) + tree_ops(b),
-        Core::If(c, t, f) => tree_ops(c) + tree_ops(t) + tree_ops(f),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(tree_ops).sum::<usize>(),
-        Core::Match(s, arms) => tree_ops(s) + arms.iter().map(|(_, _, b)| tree_ops(b)).sum::<usize>(),
-        Core::Proj(a, _) => 1 + tree_ops(a),
-        Core::Lam(_, a) => 1 + tree_ops(a),
-        Core::App(f_, a_) => 1 + tree_ops(a_) + tree_ops(f_),
-    }
+    e.sum(&mut |e| matches!(e, Core::Op2(..) | Core::Cmp(..) | Core::Proj(..) | Core::Lam(..) | Core::App(..)) as usize)
 }
 
 /// Apply if-conversion at every tail-position if-tree of every function

@@ -43,6 +43,125 @@ pub enum Core {
     App(Box<Core>, Box<Core>),
 }
 
+impl Core {
+    /// Immediate subexpressions, in evaluation order.
+    pub fn kids(&self) -> Vec<&Core> {
+        match self {
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => vec![],
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) | Core::App(a, b) => vec![a, b],
+            Core::If(a, b, c) => vec![a, b, c],
+            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().collect(),
+            Core::Match(s, arms) => std::iter::once(&**s).chain(arms.iter().map(|(_, _, b)| b)).collect(),
+            Core::Proj(a, _) | Core::Lam(_, a) => vec![a],
+        }
+    }
+
+    /// Pre-order search: `f` answers `Some(found)` to stop at a node or
+    /// `None` to look inside it.
+    pub fn any(&self, f: &mut dyn FnMut(&Core) -> Option<bool>) -> bool {
+        match f(self) {
+            Some(b) => b,
+            None => self.kids().into_iter().any(|k| k.any(f)),
+        }
+    }
+
+    /// Pre-order visit of every node.
+    pub fn walk(&self, f: &mut dyn FnMut(&Core)) {
+        f(self);
+        for k in self.kids() {
+            k.walk(f);
+        }
+    }
+
+    /// Post-order fold: `f` combines a node with its children's results.
+    pub fn fold<T>(&self, f: &mut dyn FnMut(&Core, Vec<T>) -> T) -> T {
+        let ks = self.kids().into_iter().map(|k| k.fold(f)).collect();
+        f(self, ks)
+    }
+
+    /// Sum of `f` over every node.
+    pub fn sum(&self, f: &mut dyn FnMut(&Core) -> usize) -> usize {
+        self.fold(&mut |e, ks| f(e) + ks.iter().sum::<usize>())
+    }
+
+    /// Node count.
+    pub fn size(&self) -> usize {
+        self.sum(&mut |_| 1)
+    }
+
+    /// Every variable index the expression mentions or binds, renamed by
+    /// `f` (binders included; no scoping).
+    pub fn rename(&self, f: &mut dyn FnMut(u32) -> u32) -> Core {
+        let go = |e: &Core, f: &mut dyn FnMut(u32) -> u32| Box::new(e.rename(f));
+        match self {
+            Core::Num(_) | Core::Flo(_) => self.clone(),
+            Core::Var(i) => Core::Var(f(*i)),
+            Core::Op2(o, a, b) => Core::Op2(o.clone(), go(a, f), go(b, f)),
+            Core::Cmp(o, a, b) => Core::Cmp(o.clone(), go(a, f), go(b, f)),
+            Core::If(a, b, c) => Core::If(go(a, f), go(b, f), go(c, f)),
+            Core::Let(x, a, b) => Core::Let(f(*x), go(a, f), go(b, f)),
+            Core::Call(g, xs) => Core::Call(*g, xs.iter().map(|x| x.rename(f)).collect()),
+            Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| x.rename(f)).collect()),
+            Core::Reuse(v, c, xs) => Core::Reuse(f(*v), *c, xs.iter().map(|x| x.rename(f)).collect()),
+            Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| x.rename(f)).collect()),
+            Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| x.rename(f)).collect()),
+            Core::Proj(a, i) => Core::Proj(go(a, f), *i),
+            Core::Lam(x, a) => Core::Lam(f(*x), go(a, f)),
+            Core::App(a, b) => Core::App(go(a, f), go(b, f)),
+            Core::Match(s, arms) => Core::Match(
+                go(s, f),
+                arms.iter().map(|(c, bs, b)| (*c, bs.iter().map(|x| f(*x)).collect(), b.rename(f))).collect(),
+            ),
+        }
+    }
+
+    /// The largest variable index mentioned or bound (0 if none).
+    pub fn max_var(&self) -> u32 {
+        let mut m = 0;
+        self.rename(&mut |v| {
+            m = m.max(v);
+            v
+        });
+        m
+    }
+
+    /// Variables read but not bound here (`Let`, `Lam` and match binders
+    /// scope over their bodies).
+    pub fn free_vars(&self) -> std::collections::BTreeSet<u32> {
+        fn go(e: &Core, bound: &mut Vec<u32>, out: &mut std::collections::BTreeSet<u32>) {
+            match e {
+                Core::Var(i) if !bound.contains(i) => {
+                    out.insert(*i);
+                }
+                Core::Let(x, r, b) => {
+                    go(r, bound, out);
+                    bound.push(*x);
+                    go(b, bound, out);
+                    bound.pop();
+                }
+                Core::Lam(x, b) => {
+                    bound.push(*x);
+                    go(b, bound, out);
+                    bound.pop();
+                }
+                Core::Match(s, arms) => {
+                    go(s, bound, out);
+                    for (_, bs, b) in arms {
+                        let n = bound.len();
+                        bound.extend(bs.iter().copied());
+                        go(b, bound, out);
+                        bound.truncate(n);
+                    }
+                }
+                _ => e.kids().into_iter().for_each(|k| go(k, bound, out)),
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        go(self, &mut Vec::new(), &mut out);
+        out
+    }
+}
+
 /// Builtins. Arrays are values: `ArrSet` yields a new array (the compiled
 /// code updates in place when it holds the only reference).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]

@@ -468,34 +468,15 @@ impl<'m> Chk<'m> {
 
 /// `e` calls `g` somewhere.
 fn calls_fn(e: &Core, g: u32) -> bool {
-    match e {
-        Core::Call(h, xs) => *h == g || xs.iter().any(|x| calls_fn(x, g)),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_fn(a, g) || calls_fn(b, g),
-        Core::If(a, b, c) => calls_fn(a, g) || calls_fn(b, g) || calls_fn(c, g),
-        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_fn(x, g)),
-        Core::Match(sc, arms) => calls_fn(sc, g) || arms.iter().any(|(_, _, b)| calls_fn(b, g)),
-        Core::Proj(b, _) => calls_fn(b, g),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Lam(_, b) => calls_fn(b, g),
-        Core::App(f_, a_) => calls_fn(f_, g) || calls_fn(a_, g),
-    }
+    e.any(&mut |e| if matches!(e, Core::Call(h, _) if *h == g) { Some(true) } else { None })
 }
 
 /// `e` calls a function other than `g` that does not always inline.
 fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
-    match e {
-        Core::Call(h, xs) => {
-            (*h != g && crate::inline_attr(&m.fns[*h as usize].body).is_empty()) || xs.iter().any(|x| calls_other_real(m, x, g))
-        }
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_other_real(m, a, g) || calls_other_real(m, b, g),
-        Core::If(a, b, c) => calls_other_real(m, a, g) || calls_other_real(m, b, g) || calls_other_real(m, c, g),
-        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_other_real(m, x, g)),
-        Core::Match(sc, arms) => calls_other_real(m, sc, g) || arms.iter().any(|(_, _, b)| calls_other_real(m, b, g)),
-        Core::Proj(b, _) => calls_other_real(m, b, g),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Lam(_, b) => calls_other_real(m, b, g),
-        Core::App(f_, a_) => calls_other_real(m, f_, g) || calls_other_real(m, a_, g),
-    }
+    e.any(&mut |e| match e {
+        Core::Call(h, _) if *h != g && crate::inline_attr(&m.fns[*h as usize].body).is_empty() => Some(true),
+        _ => None,
+    })
 }
 
 /// The prelude helper of a binary32 primitive.
@@ -635,36 +616,11 @@ pub(crate) fn ctx_arg(g: u32) -> &'static str {
 /// or results, or a call to one that does (fixpoint).
 pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     fn prims(e: &Core, out: &mut bool, calls: &mut Vec<u32>) {
-        match e {
-            Core::Prim(p, xs) => {
-                if !p.is_f32() {
-                    *out = true;
-                }
-                xs.iter().for_each(|x| prims(x, out, calls));
-            }
-            Core::Call(g, xs) => {
-                calls.push(*g);
-                xs.iter().for_each(|x| prims(x, out, calls));
-            }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
-                prims(a, out, calls);
-                prims(b, out, calls);
-            }
-            Core::If(a, b, c) => {
-                prims(a, out, calls);
-                prims(b, out, calls);
-                prims(c, out, calls);
-            }
-            Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) => xs.iter().for_each(|x| prims(x, out, calls)),
-            Core::Match(sc, arms) => {
-                prims(sc, out, calls);
-                arms.iter().for_each(|(_, _, b)| prims(b, out, calls));
-            }
-            Core::Proj(b, _) => prims(b, out, calls),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, b) => prims(b, out, calls),
-            Core::App(f_, a_) => { prims(f_, out, calls); prims(a_, out, calls); }
-        }
+        e.walk(&mut |e| match e {
+            Core::Prim(p, _) if !p.is_f32() => *out = true,
+            Core::Call(g, _) => calls.push(*g),
+            _ => {}
+        });
     }
     let n = m.fns.len();
     let mut calls = vec![Vec::new(); n];
@@ -758,26 +714,16 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
                 }
                 xs.iter().for_each(|x| walk(c, x, false, false));
             }
-            Core::Cmp(_, a, b) => {
-                walk(c, a, false, false);
-                walk(c, b, false, false);
-            }
             Core::If(a, t, f) => {
                 walk(c, a, false, false);
                 walk(c, t, low, low32);
                 walk(c, f, low, low32);
             }
-            Core::Call(_, xs) | Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) => {
-                xs.iter().for_each(|x| walk(c, x, false, false))
-            }
             Core::Match(sc, arms) => {
                 walk(c, sc, false, false);
                 arms.iter().for_each(|(_, _, b)| walk(c, b, low, low32));
             }
-            Core::Proj(b, _) => walk(c, b, false, false),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, b) => walk(c, b, false, false),
-            Core::App(f_, a_) => { walk(c, f_, false, false); walk(c, a_, false, false); }
+            _ => e.kids().into_iter().for_each(|k| walk(c, k, false, false)),
         }
     }
     let n = m.fns.len();
@@ -803,31 +749,11 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     // crossing them (args and results): each converts when the two sides
     // differ
     fn calls(e: &Core, out: &mut Vec<u32>) {
-        if let Core::Call(g, _) = e {
-            out.push(*g);
-        }
-        match e {
-            Core::Call(_, xs) | Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                xs.iter().for_each(|x| calls(x, out))
+        e.walk(&mut |e| {
+            if let Core::Call(g, _) = e {
+                out.push(*g);
             }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
-                calls(a, out);
-                calls(b, out);
-            }
-            Core::If(a, b, c) => {
-                calls(a, out);
-                calls(b, out);
-                calls(c, out);
-            }
-            Core::Match(sc, arms) => {
-                calls(sc, out);
-                arms.iter().for_each(|(_, _, b)| calls(b, out));
-            }
-            Core::Proj(b, _) => calls(b, out),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, b) => calls(b, out),
-            Core::App(f_, a_) => { calls(f_, out); calls(a_, out); }
-        }
+        });
     }
     let ints = |g: usize| -> usize {
         let s = sigs[g].as_ref().unwrap();

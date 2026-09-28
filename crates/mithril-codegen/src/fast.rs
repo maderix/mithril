@@ -206,18 +206,7 @@ impl Fp<'_> {
 }
 
 fn calls_self(fid: u32, e: &Core) -> bool {
-    match e {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Call(g, xs) => *g == fid || xs.iter().any(|x| calls_self(fid, x)),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => calls_self(fid, a) || calls_self(fid, b),
-        Core::If(a, b, c) => calls_self(fid, a) || calls_self(fid, b) || calls_self(fid, c),
-        Core::Let(_, r, b) => calls_self(fid, r) || calls_self(fid, b),
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_self(fid, x)),
-        Core::Match(s, arms) => calls_self(fid, s) || arms.iter().any(|(_, _, b)| calls_self(fid, b)),
-        Core::Proj(a, _) => calls_self(fid, a),
-        Core::Lam(_, a) => calls_self(fid, a),
-        Core::App(f_, a_) => calls_self(fid, f_) || calls_self(fid, a_),
-    }
+    e.any(&mut |e| if matches!(e, Core::Call(g, _) if *g == fid) { Some(true) } else { None })
 }
 
 /// The `q_<fid>` wrapper, when `fid` is self-recursive and has both an

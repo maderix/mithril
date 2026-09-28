@@ -23,44 +23,12 @@ pub(crate) struct ParFold {
 }
 
 fn collect_self_calls<'e>(e: &'e Core, fid: u32, out: &mut Vec<&'e Vec<Core>>) {
-    match e {
-        Core::Call(g, args) => {
-            if *g == fid {
-                out.push(args);
-            }
-            for a in args {
-                collect_self_calls(a, fid, out);
-            }
+    if let Core::Call(g, args) = e {
+        if *g == fid {
+            out.push(args);
         }
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            collect_self_calls(a, fid, out);
-            collect_self_calls(b, fid, out);
-        }
-        Core::If(a, b, c) => {
-            collect_self_calls(a, fid, out);
-            collect_self_calls(b, fid, out);
-            collect_self_calls(c, fid, out);
-        }
-        Core::Let(_, r, b) => {
-            collect_self_calls(r, fid, out);
-            collect_self_calls(b, fid, out);
-        }
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-            for x in xs {
-                collect_self_calls(x, fid, out);
-            }
-        }
-        Core::Match(s, arms) => {
-            collect_self_calls(s, fid, out);
-            for (_, _, b) in arms {
-                collect_self_calls(b, fid, out);
-            }
-        }
-        Core::Proj(a, _) => collect_self_calls(a, fid, out),
-        Core::Lam(_, a) => collect_self_calls(a, fid, out),
-        Core::App(f_, a_) => { collect_self_calls(f_, fid, out); collect_self_calls(a_, fid, out); }
     }
+    e.kids().into_iter().for_each(|k| collect_self_calls(k, fid, out));
 }
 
 /// Decide whether `fid` gets the chunked par_fold shape, and find its

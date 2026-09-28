@@ -589,23 +589,5 @@ fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut 
     }
 }
 fn max_var(e: &Core) -> u32 {
-    match e {
-        Core::Var(v) => *v,
-        Core::Num(_) | Core::Flo(_) => 0,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => max_var(a).max(max_var(b)),
-        Core::Let(v, a, b) => (*v).max(max_var(a)).max(max_var(b)),
-        Core::If(a, b, c) => max_var(a).max(max_var(b)).max(max_var(c)),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().map(max_var).max().unwrap_or(0),
-        Core::Reuse(v, _, xs) => (*v).max(xs.iter().map(max_var).max().unwrap_or(0)),
-        Core::Match(s, arms) => {
-            let mut m = max_var(s);
-            for (_, bs, b) in arms {
-                m = m.max(bs.iter().copied().max().unwrap_or(0)).max(max_var(b));
-            }
-            m
-        }
-        Core::Proj(a, _) => max_var(a),
-        Core::Lam(x, b) => (*x).max(max_var(b)),
-        Core::App(f, a) => max_var(f).max(max_var(a)),
-    }
+    e.max_var()
 }

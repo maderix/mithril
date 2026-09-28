@@ -56,34 +56,12 @@ impl Ranges {
     }
 
     fn collect(&mut self, e: &Core) {
-        match e {
-            Core::Let(x, rhs, b) => {
-                self.collect(rhs);
-                let iv = self.iv(rhs);
-                self.vars.insert(*x, iv);
-                self.collect(b);
-            }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                self.collect(a);
-                self.collect(b);
-            }
-            Core::If(c, t, f) => {
-                self.collect(c);
-                self.collect(t);
-                self.collect(f);
-            }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                xs.iter().for_each(|x| self.collect(x))
-            }
-            Core::Match(s, arms) => {
-                self.collect(s);
-                arms.iter().for_each(|(_, _, b)| self.collect(b));
-            }
-            Core::Proj(a, _) => self.collect(a),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, a) => self.collect(a),
-            Core::App(f_, a_) => { self.collect(f_); self.collect(a_); }
+        if let Core::Let(x, rhs, _) = e {
+            self.collect(rhs);
+            let iv = self.iv(rhs);
+            self.vars.insert(*x, iv);
         }
+        e.kids().into_iter().for_each(|k| self.collect(k));
     }
 
     /// Range of an int expression (full i56 when unknown).
@@ -200,7 +178,7 @@ fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
 
 /// All uses of each var, and uses of the form `var & small_mask`.
 fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usize>, m32: &mut HashMap<u32, usize>) {
-    match e {
+    e.walk(&mut |e| match e {
         Core::Var(i) => *all.entry(*i).or_insert(0) += 1,
         Core::Op2(op, a, b) => {
             if let Core::Var(i) = &**a {
@@ -211,32 +189,7 @@ fn count(e: &Core, all: &mut HashMap<u32, usize>, masked: &mut HashMap<u32, usiz
                     *m32.entry(*i).or_insert(0) += 1;
                 }
             }
-            count(a, all, masked, m32);
-            count(b, all, masked, m32);
         }
-        Core::Cmp(_, a, b) => {
-            count(a, all, masked, m32);
-            count(b, all, masked, m32);
-        }
-        Core::If(c, t, f) => {
-            count(c, all, masked, m32);
-            count(t, all, masked, m32);
-            count(f, all, masked, m32);
-        }
-        Core::Let(_, r, b) => {
-            count(r, all, masked, m32);
-            count(b, all, masked, m32);
-        }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-            xs.iter().for_each(|x| count(x, all, masked, m32))
-        }
-        Core::Match(s, arms) => {
-            count(s, all, masked, m32);
-            arms.iter().for_each(|(_, _, b)| count(b, all, masked, m32));
-        }
-        Core::Proj(a, _) => count(a, all, masked, m32),
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Lam(_, a) => count(a, all, masked, m32),
-        Core::App(f_, a_) => { count(f_, all, masked, m32); count(a_, all, masked, m32); }
-    }
+        _ => {}
+    });
 }

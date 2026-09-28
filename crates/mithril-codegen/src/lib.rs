@@ -1020,17 +1020,11 @@ fn reaches(m: &CoreModule, from: u32, to: u32) -> bool {
 /// Whether `e` contains any call at all (`has_call` counts only calls
 /// that may suspend).
 pub(crate) fn any_call(e: &Core) -> bool {
-    match e {
-        Core::Call(..) => true,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => any_call(a) || any_call(b),
-        Core::If(a, b, c) => any_call(a) || any_call(b) || any_call(c),
-        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(any_call),
-        Core::Match(sc, arms) => any_call(sc) || arms.iter().any(|(_, _, b)| any_call(b)),
-        Core::Proj(b, _) => any_call(b),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Lam(..) => false,
-        Core::App(..) => true,
-    }
+    e.any(&mut |e| match e {
+        Core::Call(..) | Core::App(..) => Some(true),
+        Core::Lam(..) => Some(false),
+        _ => None,
+    })
 }
 
 /// Inlining attribute for an emitted function: a small call-free body
@@ -1039,7 +1033,7 @@ pub(crate) fn any_call(e: &Core) -> bool {
 pub(crate) fn inline_attr(body: &Core) -> &'static str {
     const MAX: usize = 192;
     let any = any_call(body);
-    if !any && rewrite::size(body) <= MAX {
+    if !any && body.size() <= MAX {
         "#[inline(always)]\n"
     } else {
         ""
@@ -1057,30 +1051,7 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
         return a;
     }
     fn count(e: &Core, g: u32, n: &mut usize) {
-        match e {
-            Core::Call(h, xs) => {
-                *n += (*h == g) as usize;
-                xs.iter().for_each(|x| count(x, g, n));
-            }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
-                count(a, g, n);
-                count(b, g, n);
-            }
-            Core::If(a, b, c) => {
-                count(a, g, n);
-                count(b, g, n);
-                count(c, g, n);
-            }
-            Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| count(x, g, n)),
-            Core::Match(sc, arms) => {
-                count(sc, g, n);
-                arms.iter().for_each(|(_, _, b)| count(b, g, n));
-            }
-            Core::Proj(b, _) => count(b, g, n),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Lam(_, b) => count(b, g, n),
-            Core::App(f_, a_) => { count(f_, g, n); count(a_, g, n); }
-        }
+        *n += e.sum(&mut |e| matches!(e, Core::Call(h, _) if *h == g) as usize);
     }
     if !(f.name.starts_with("__while") || f.name.starts_with("__for")) {
         return "";
@@ -1128,168 +1099,37 @@ pub(crate) fn is_bounded(g: u32) -> bool {
 /// functions are plain expressions).
 /// Functions called anywhere in `e`.
 fn callees(e: &Core) -> std::collections::HashSet<u32> {
-    fn go(e: &Core, out: &mut std::collections::HashSet<u32>) {
-        match e {
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Call(g, xs) => {
-                out.insert(*g);
-                xs.iter().for_each(|x| go(x, out));
-            }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                go(a, out);
-                go(b, out);
-            }
-            Core::If(a, b, c) => {
-                go(a, out);
-                go(b, out);
-                go(c, out);
-            }
-            Core::Let(_, r, b) => {
-                go(r, out);
-                go(b, out);
-            }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| go(x, out)),
-            Core::Match(s, arms) => {
-                go(s, out);
-                arms.iter().for_each(|(_, _, b)| go(b, out));
-            }
-            Core::Proj(a, _) => go(a, out),
-            Core::Lam(_, a) => go(a, out),
-            Core::App(f_, a_) => { go(f_, out); go(a_, out); }
-        }
-    }
     let mut out = std::collections::HashSet::new();
-    go(e, &mut out);
+    e.walk(&mut |e| {
+        if let Core::Call(g, _) = e {
+            out.insert(*g);
+        }
+    });
     out
 }
 
 /// Two or more self calls, not all in tail position: recursion that forks.
 fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
-    fn n(fid: u32, e: &Core) -> usize {
-        match e {
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => 0,
-            Core::Call(g, xs) => usize::from(*g == fid) + xs.iter().map(|x| n(fid, x)).sum::<usize>(),
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => n(fid, a) + n(fid, b),
-            Core::If(a, b, c) => n(fid, a) + n(fid, b) + n(fid, c),
-            Core::Let(_, r, b) => n(fid, r) + n(fid, b),
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| n(fid, x)).sum(),
-            Core::Match(s, arms) => n(fid, s) + arms.iter().map(|(_, _, b)| n(fid, b)).sum::<usize>(),
-            Core::Proj(a, _) => n(fid, a),
-            Core::Lam(_, a) => n(fid, a),
-            Core::App(f_, a_) => n(fid, a_) + n(fid, f_),
-        }
-    }
-    !f.self_tail_rec && n(fid, &f.body) >= 2
+    !f.self_tail_rec && f.body.sum(&mut |e| matches!(e, Core::Call(g, _) if *g == fid) as usize) >= 2
 }
 
 pub(crate) fn has_call(e: &Core) -> bool {
-    match e {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Call(g, xs) => !is_bounded(*g) || xs.iter().any(has_call),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
-        Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
-        Core::Let(_, r, b) => has_call(r) || has_call(b),
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(has_call),
-        Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
-        Core::Proj(a, _) => has_call(a),
+    e.any(&mut |e| match e {
+        Core::Call(g, _) if !is_bounded(*g) => Some(true),
+        Core::App(..) => Some(true),
         // a closure's body is built as a net, not run here; applying one
         // may suspend like a call
-        Core::Lam(..) => false,
-        Core::App(..) => true,
-    }
+        Core::Lam(..) => Some(false),
+        _ => None,
+    })
 }
 
 pub(crate) fn max_var(e: &Core) -> u32 {
-    fn go(e: &Core, m: &mut u32) {
-        match e {
-            Core::Var(i) => *m = (*m).max(*i),
-            Core::Num(_) | Core::Flo(_) => {}
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                go(a, m);
-                go(b, m);
-            }
-            Core::If(a, b, c) => {
-                go(a, m);
-                go(b, m);
-                go(c, m);
-            }
-            Core::Let(x, r, b) => {
-                *m = (*m).max(*x);
-                go(r, m);
-                go(b, m);
-            }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                xs.iter().for_each(|x| go(x, m))
-            }
-            Core::Match(s, arms) => {
-                go(s, m);
-                for (_, bs, b) in arms {
-                    for bv in bs {
-                        *m = (*m).max(*bv);
-                    }
-                    go(b, m);
-                }
-            }
-            Core::Proj(a, _) => go(a, m),
-            Core::Lam(_, a) => go(a, m),
-            Core::App(f_, a_) => { go(f_, m); go(a_, m); }
-        }
-    }
-    let mut m = 0;
-    go(e, &mut m);
-    m
+    e.max_var()
 }
 
 pub(crate) fn free_vars(e: &Core) -> BTreeSet<u32> {
-    fn go(e: &Core, bound: &mut Vec<u32>, out: &mut BTreeSet<u32>) {
-        match e {
-            Core::Num(_) | Core::Flo(_) => {}
-            Core::Var(i) => {
-                if !bound.contains(i) {
-                    out.insert(*i);
-                }
-            }
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                go(a, bound, out);
-                go(b, bound, out);
-            }
-            Core::If(a, b, c) => {
-                go(a, bound, out);
-                go(b, bound, out);
-                go(c, bound, out);
-            }
-            Core::Let(x, r, b) => {
-                go(r, bound, out);
-                bound.push(*x);
-                go(b, bound, out);
-                bound.pop();
-            }
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                for x in xs {
-                    go(x, bound, out);
-                }
-            }
-            Core::Match(s, arms) => {
-                go(s, bound, out);
-                for (_, bs, b) in arms {
-                    let n = bound.len();
-                    bound.extend(bs.iter().copied());
-                    go(b, bound, out);
-                    bound.truncate(n);
-                }
-            }
-            Core::Proj(a, _) => go(a, bound, out),
-            Core::Lam(x, a) => {
-                bound.push(*x);
-                go(a, bound, out);
-                bound.pop();
-            }
-            Core::App(f_, a_) => { go(f_, bound, out); go(a_, bound, out); }
-        }
-    }
-    let mut out = BTreeSet::new();
-    go(e, &mut Vec::new(), &mut out);
-    out
+    e.free_vars()
 }
 
 // ---- use counting (linear cell discipline) ----
@@ -1299,35 +1139,11 @@ pub(crate) type Cnt = std::collections::HashMap<u32, i64>;
 
 /// Count every variable occurrence in an expression (sum over subtrees).
 pub(crate) fn cnt_expr(e: &Core, m: &mut Cnt) {
-    match e {
-        Core::Var(i) => *m.entry(*i).or_insert(0) += 1,
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            cnt_expr(a, m);
-            cnt_expr(b, m);
+    e.walk(&mut |e| {
+        if let Core::Var(i) = e {
+            *m.entry(*i).or_insert(0) += 1;
         }
-        Core::If(c, t, f) => {
-            cnt_expr(c, m);
-            cnt_expr(t, m);
-            cnt_expr(f, m);
-        }
-        Core::Let(_, r, b) => {
-            cnt_expr(r, m);
-            cnt_expr(b, m);
-        }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-            xs.iter().for_each(|x| cnt_expr(x, m))
-        }
-        Core::Match(s, arms) => {
-            cnt_expr(s, m);
-            for (_, _, b) in arms {
-                cnt_expr(b, m);
-            }
-        }
-        Core::Proj(a, _) => cnt_expr(a, m),
-        Core::Lam(_, a) => cnt_expr(a, m),
-        Core::App(f_, a_) => { cnt_expr(f_, m); cnt_expr(a_, m); }
-    }
+    });
 }
 
 /// Fold branch counts into `into` taking the per-variable maximum across
@@ -1414,49 +1230,26 @@ fn shared_classes(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> std::coll
 /// `p` lets the cell be rebuilt in place (Perceus/Koka: borrowing would
 /// trade that reuse for a later teardown by the lender).
 fn reuses_param(body: &Core, p: u32, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
-    fn builds(e: &Core, ar: usize, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
-        let builds = |e: &Core, ar: usize, m: &CoreModule| builds(e, ar, m, unbox);
-        match e {
-            Core::Ctor(c, xs) | Core::Reuse(_, c, xs) => {
-                (*c as usize) < m.ctors.len() && m.ctors[*c as usize].1 == ar && ar > 0 && !unbox.contains_key(c)
-                    || xs.iter().any(|x| builds(x, ar, m))
+    let builds = |e: &Core, ar: usize| {
+        e.any(&mut |e| match e {
+            Core::Ctor(c, _) | Core::Reuse(_, c, _)
+                if (*c as usize) < m.ctors.len() && m.ctors[*c as usize].1 == ar && ar > 0 && !unbox.contains_key(c) =>
+            {
+                Some(true)
             }
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => builds(a, ar, m) || builds(b, ar, m),
-            Core::If(a, b, c) => builds(a, ar, m) || builds(b, ar, m) || builds(c, ar, m),
-            Core::Let(_, r, b) => builds(r, ar, m) || builds(b, ar, m),
-            Core::Call(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| builds(x, ar, m)),
-            Core::Match(s, arms) => builds(s, ar, m) || arms.iter().any(|(_, _, b)| builds(b, ar, m)),
-            Core::Proj(a, _) => builds(a, ar, m),
-            Core::Lam(_, a) => builds(a, ar, m),
-            Core::App(f_, a_) => builds(f_, ar, m) || builds(a_, ar, m),
+            _ => None,
+        })
+    };
+    body.any(&mut |e| match e {
+        Core::Match(s, arms) if **s == Core::Var(p) => {
+            let hit = arms.iter().any(|(c, _, b)| {
+                let ar = m.ctors.get(*c as usize).map(|x| x.1).unwrap_or(0);
+                ar > 0 && !unbox.contains_key(c) && builds(b, ar)
+            });
+            if hit { Some(true) } else { None }
         }
-    }
-    fn go(e: &Core, p: u32, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> bool {
-        let go = |e: &Core, p: u32, m: &CoreModule| go(e, p, m, unbox);
-        match e {
-            Core::Match(s, arms) => {
-                if **s == Core::Var(p) {
-                    for (c, _, body) in arms {
-                        let ar = m.ctors.get(*c as usize).map(|x| x.1).unwrap_or(0);
-                        if ar > 0 && !unbox.contains_key(c) && builds(body, ar, m, unbox) {
-                            return true;
-                        }
-                    }
-                }
-                go(s, p, m) || arms.iter().any(|(_, _, b)| go(b, p, m))
-            }
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => go(a, p, m) || go(b, p, m),
-            Core::If(a, b, c) => go(a, p, m) || go(b, p, m) || go(c, p, m),
-            Core::Let(_, r, b) => go(r, p, m) || go(b, p, m),
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| go(x, p, m)),
-            Core::Proj(a, _) => go(a, p, m),
-            Core::Lam(_, a) => go(a, p, m),
-            Core::App(f_, a_) => go(f_, p, m) || go(a_, p, m),
-        }
-    }
-    go(body, p, m, unbox)
+        _ => None,
+    })
 }
 
 fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collections::HashMap<u32, u8>) -> (Vec<Vec<bool>>, Vec<std::collections::HashSet<u32>>) {
@@ -1520,16 +1313,6 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
     }
     fn walk(e: &Core, mask: &mut HashMap<u32, u64>, esc: &mut u64, bor: &[Vec<bool>]) {
         match e {
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                walk(a, mask, esc, bor);
-                walk(b, mask, esc, bor);
-            }
-            Core::If(c, t, f) => {
-                walk(c, mask, esc, bor);
-                walk(t, mask, esc, bor);
-                walk(f, mask, esc, bor);
-            }
             Core::Let(x, r, b) => {
                 if let Core::Var(y) = r.as_ref() {
                     let v = mask.get(y).copied().unwrap_or(0);
@@ -1573,9 +1356,7 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                     walk(b, mask, esc, bor);
                 }
             }
-            Core::Proj(a, _) => walk(a, mask, esc, bor),
-            Core::Lam(_, a) => walk(a, mask, esc, bor),
-            Core::App(f_, a_) => { walk(f_, mask, esc, bor); walk(a_, mask, esc, bor); }
+            _ => e.kids().into_iter().for_each(|k| walk(k, mask, esc, bor)),
         }
     }
     walk(body, &mut mask, &mut esc, bor);
@@ -1588,16 +1369,6 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
         own_bor.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i as u32).collect();
     fn walk(e: &Core, s: &mut std::collections::HashSet<u32>) {
         match e {
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                walk(a, s);
-                walk(b, s);
-            }
-            Core::If(c, t, f) => {
-                walk(c, s);
-                walk(t, s);
-                walk(f, s);
-            }
             Core::Let(x, r, b) => {
                 if let Core::Var(y) = r.as_ref() {
                     if s.contains(y) {
@@ -1606,9 +1377,6 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
                 }
                 walk(r, s);
                 walk(b, s);
-            }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Call(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                xs.iter().for_each(|x| walk(x, s))
             }
             Core::Match(sc, arms) => {
                 let inb = matches!(sc.as_ref(), Core::Var(y) if s.contains(y));
@@ -1622,9 +1390,7 @@ fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
                     walk(b, s);
                 }
             }
-            Core::Proj(a, _) => walk(a, s),
-            Core::Lam(_, a) => walk(a, s),
-            Core::App(f_, a_) => { walk(f_, s); walk(a_, s); }
+            _ => e.kids().into_iter().for_each(|k| walk(k, s)),
         }
     }
     walk(body, &mut s);

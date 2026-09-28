@@ -284,41 +284,19 @@ fn inline_policy(m: &CoreModule) -> Vec<bool> {
 }
 
 fn calls_of(c: &Core, out: &mut BTreeSet<u32>) {
-    match c {
-        Core::Call(f, args) => { out.insert(*f); args.iter().for_each(|a| calls_of(a, out)); }
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => { calls_of(a, out); calls_of(b, out); }
-        Core::If(a, b, c2) => { calls_of(a, out); calls_of(b, out); calls_of(c2, out); }
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| calls_of(x, out)),
-        Core::Match(s, arms) => { calls_of(s, out); arms.iter().for_each(|(_, _, b)| calls_of(b, out)); }
-        Core::Proj(a, _) | Core::Lam(_, a) => calls_of(a, out),
-        Core::App(f, a) => { calls_of(f, out); calls_of(a, out); }
-    }
+    c.walk(&mut |e| {
+        if let Core::Call(f, _) = e {
+            out.insert(*f);
+        }
+    });
 }
 
 fn count_calls(c: &Core, g: u32) -> usize {
-    match c {
-        Core::Call(f, args) => (*f == g) as usize + args.iter().map(|a| count_calls(a, g)).sum::<usize>(),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => 0,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => count_calls(a, g) + count_calls(b, g),
-        Core::If(a, b, c2) => count_calls(a, g) + count_calls(b, g) + count_calls(c2, g),
-        Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().map(|x| count_calls(x, g)).sum(),
-        Core::Match(s, arms) => count_calls(s, g) + arms.iter().map(|(_, _, b)| count_calls(b, g)).sum::<usize>(),
-        Core::Proj(a, _) | Core::Lam(_, a) => count_calls(a, g),
-        Core::App(f, a) => count_calls(f, g) + count_calls(a, g),
-    }
+    c.sum(&mut |e| matches!(e, Core::Call(f, _) if *f == g) as usize)
 }
 
 pub(crate) fn core_size(c: &Core) -> usize {
-    match c {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => 1,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => 1 + core_size(a) + core_size(b),
-        Core::If(a, b, c2) => 1 + core_size(a) + core_size(b) + core_size(c2),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => 1 + xs.iter().map(core_size).sum::<usize>(),
-        Core::Match(s, arms) => 1 + core_size(s) + arms.iter().map(|(_, _, b)| core_size(b)).sum::<usize>(),
-        Core::Proj(a, _) | Core::Lam(_, a) => 1 + core_size(a),
-        Core::App(f, a) => 1 + core_size(f) + core_size(a),
-    }
+    c.size()
 }
 
 impl NetProg {
@@ -406,61 +384,7 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
 }
 
 fn free_vars(c: &Core) -> BTreeSet<u32> {
-    let mut out = BTreeSet::new();
-    fv(c, &mut out);
-    out
-}
-
-fn fv(c: &Core, out: &mut BTreeSet<u32>) {
-    match c {
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Var(v) => {
-            out.insert(*v);
-        }
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            fv(a, out);
-            fv(b, out);
-        }
-        Core::If(c1, t, e) => {
-            fv(c1, out);
-            fv(t, out);
-            fv(e, out);
-        }
-        Core::Let(v, r, b) => {
-            fv(r, out);
-            let mut inner = BTreeSet::new();
-            fv(b, &mut inner);
-            inner.remove(v);
-            out.extend(inner);
-        }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            for a in args {
-                fv(a, out);
-            }
-        }
-        Core::Match(s, arms) => {
-            fv(s, out);
-            for (_, binders, body) in arms {
-                let mut inner = BTreeSet::new();
-                fv(body, &mut inner);
-                for b in binders {
-                    inner.remove(b);
-                }
-                out.extend(inner);
-            }
-        }
-        Core::Proj(e, _) => fv(e, out),
-        Core::Lam(x, b) => {
-            let mut inner = BTreeSet::new();
-            fv(b, &mut inner);
-            inner.remove(x);
-            out.extend(inner);
-        }
-        Core::App(f, a) => {
-            fv(f, out);
-            fv(a, out);
-        }
-    }
+    c.free_vars()
 }
 
 // ---- clone discipline ----

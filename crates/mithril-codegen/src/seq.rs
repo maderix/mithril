@@ -983,39 +983,13 @@ impl<'m> Ex<'m> {
     /// variables they use (arms take their own references to those).
     fn pin_enter(&mut self, arms: &[&Core], arm_binders: &[u32]) -> Vec<u32> {
         fn binders(e: &Core, out: &mut HashSet<u32>) {
-            match e {
-                Core::Let(x, r, b) => {
+            e.walk(&mut |e| match e {
+                Core::Let(x, _, _) | Core::Lam(x, _) => {
                     out.insert(*x);
-                    binders(r, out);
-                    binders(b, out);
                 }
-                Core::Match(sc, arms) => {
-                    binders(sc, out);
-                    for (_, bs, b) in arms {
-                        out.extend(bs.iter().copied());
-                        binders(b, out);
-                    }
-                }
-                Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                    binders(a, out);
-                    binders(b, out);
-                }
-                Core::If(a, b, c) => {
-                    binders(a, out);
-                    binders(b, out);
-                    binders(c, out);
-                }
-                Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                    xs.iter().for_each(|x| binders(x, out))
-                }
-                Core::Proj(b, _) => binders(b, out),
-                Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-                Core::Lam(x, b) => {
-                    out.insert(*x);
-                    binders(b, out);
-                }
-                Core::App(f_, a_) => { binders(f_, out); binders(a_, out); }
-            }
+                Core::Match(_, arms) => out.extend(arms.iter().flat_map(|(_, bs, _)| bs.iter().copied())),
+                _ => {}
+            });
         }
         let mut inner: HashSet<u32> = arm_binders.iter().copied().collect();
         for a in arms {
@@ -1505,20 +1479,7 @@ impl<'m> Ex<'m> {
 /// The scrutinee variable (if `sv` names one) when `body` reuses its cell.
 pub(crate) fn reuse_var(body: &Core, sv: &str) -> Option<u32> {
     let v: u32 = sv.strip_prefix('v')?.parse().ok()?;
-    fn has(e: &Core, v: u32) -> bool {
-        match e {
-            Core::Reuse(w, _, xs) => *w == v || xs.iter().any(|x| has(x, v)),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has(a, v) || has(b, v),
-            Core::If(c, t, f) => has(c, v) || has(t, v) || has(f, v),
-            Core::Let(_, r, b) => has(r, v) || has(b, v),
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => xs.iter().any(|x| has(x, v)),
-            Core::Proj(b, _) => has(b, v),
-            Core::Match(s, arms) => has(s, v) || arms.iter().any(|(_, _, b)| has(b, v)),
-            Core::Lam(_, b) => has(b, v),
-            Core::App(f_, a_) => has(f_, v) || has(a_, v),
-        }
-    }
+    let has = |e: &Core, v: u32| e.any(&mut |e| if matches!(e, Core::Reuse(w, _, _) if *w == v) { Some(true) } else { None });
     if has(body, v) { Some(v) } else { None }
 }
 
@@ -1758,18 +1719,10 @@ pub(crate) fn trmc_ctor(fid: u32, body: &Core, m: &CoreModule, unbox: &std::coll
 /// `p` is read nowhere else, and `f` calls nothing that can suspend.
 pub(crate) fn dps_param(fid: u32, f: &mut dyn FnMut(u32) -> bool, body: &Core, arity: usize, m: &CoreModule, unbox: &std::collections::HashMap<u32, u8>) -> Option<(usize, u32)> {
     fn calls_ok(fid: u32, e: &Core, f: &mut dyn FnMut(u32) -> bool) -> bool {
-        match e {
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => true,
-            Core::Call(g, xs) => (*g == fid || f(*g)) && xs.iter().all(|x| calls_ok(fid, x, f)),
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => calls_ok(fid, a, f) && calls_ok(fid, b, f),
-            Core::If(a, b, c) => calls_ok(fid, a, f) && calls_ok(fid, b, f) && calls_ok(fid, c, f),
-            Core::Let(_, r, b) => calls_ok(fid, r, f) && calls_ok(fid, b, f),
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|x| calls_ok(fid, x, f)),
-            Core::Match(s, arms) => calls_ok(fid, s, f) && arms.iter().all(|(_, _, b)| calls_ok(fid, b, f)),
-            Core::Proj(a, _) => calls_ok(fid, a, f),
-            Core::Lam(_, a) => calls_ok(fid, a, f),
-            Core::App(f_, a_) => calls_ok(fid, f_, f) || calls_ok(fid, a_, f),
-        }
+        !e.any(&mut |e| match e {
+            Core::Call(g, _) if *g != fid && !f(*g) => Some(true),
+            _ => None,
+        })
     }
     // tails: Var(p), or `x = self(.., Var(p), ..)` delayed
     fn tails(fid: u32, p: u32, e: &Core, n: &mut usize) -> bool {
@@ -1936,16 +1889,9 @@ pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
 
 /// Every occurrence of `x` in `e` is directly under a `Proj`.
 pub(crate) fn only_projected(x: u32, e: &Core) -> bool {
-    match e {
-        Core::Var(v) => *v != x,
-        Core::Proj(a, _) => matches!(&**a, Core::Var(_)) || only_projected(x, a),
-        Core::Num(_) | Core::Flo(_) => true,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => only_projected(x, a) && only_projected(x, b),
-        Core::If(a, b, c) => only_projected(x, a) && only_projected(x, b) && only_projected(x, c),
-        Core::Let(_, r, b) => only_projected(x, r) && only_projected(x, b),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().all(|a| only_projected(x, a)),
-        Core::Match(s, arms) => only_projected(x, s) && arms.iter().all(|(_, _, a)| only_projected(x, a)),
-        Core::Lam(_, a) => matches!(&**a, Core::Var(_)) || only_projected(x, a),
-        Core::App(f_, a_) => matches!(&**f_, Core::Var(_)) || only_projected(x, f_) || matches!(&**a_, Core::Var(_)) || only_projected(x, a_),
-    }
+    !e.any(&mut |e| match e {
+        Core::Var(v) => Some(*v == x),
+        Core::Proj(a, _) if matches!(&**a, Core::Var(_)) => Some(false),
+        _ => None,
+    })
 }

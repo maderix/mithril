@@ -67,103 +67,7 @@ fn cmp_idx(op: CmpOp) -> u32 {
 }
 
 fn has_call(e: &Core) -> bool {
-    match e {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-        Core::Call(..) => true,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_call(a) || has_call(b),
-        Core::If(a, b, c) => has_call(a) || has_call(b) || has_call(c),
-        Core::Let(_, a, b) => has_call(a) || has_call(b),
-        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => args.iter().any(has_call),
-        Core::Match(s, arms) => has_call(s) || arms.iter().any(|(_, _, b)| has_call(b)),
-        Core::Proj(a, _) => has_call(a),
-        Core::Lam(_, a) => has_call(a),
-        Core::App(f_, a_) => has_call(f_) || has_call(a_),
-    }
-}
-
-fn free_vars(e: &Core, bound: &mut Vec<u32>, acc: &mut BTreeSet<u32>) {
-    match e {
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Var(i) => {
-            if !bound.contains(i) {
-                acc.insert(*i);
-            }
-        }
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            free_vars(a, bound, acc);
-            free_vars(b, bound, acc);
-        }
-        Core::If(a, b, c) => {
-            free_vars(a, bound, acc);
-            free_vars(b, bound, acc);
-            free_vars(c, bound, acc);
-        }
-        Core::Let(x, r, b) => {
-            free_vars(r, bound, acc);
-            bound.push(*x);
-            free_vars(b, bound, acc);
-            bound.pop();
-        }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            for a in args {
-                free_vars(a, bound, acc);
-            }
-        }
-        Core::Match(s, arms) => {
-            free_vars(s, bound, acc);
-            for (_, binds, body) in arms {
-                let n = bound.len();
-                bound.extend(binds.iter().copied());
-                free_vars(body, bound, acc);
-                bound.truncate(n);
-            }
-        }
-        Core::Proj(a, _) => free_vars(a, bound, acc),
-        Core::Lam(x, a) => {
-            bound.push(*x);
-            free_vars(a, bound, acc);
-            bound.pop();
-        }
-        Core::App(f_, a_) => { free_vars(f_, bound, acc); free_vars(a_, bound, acc); }
-    }
-}
-
-fn max_var(e: &Core, mx: &mut u32) {
-    match e {
-        Core::Num(_) | Core::Flo(_) => {}
-        Core::Var(i) => *mx = (*mx).max(*i + 1),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            max_var(a, mx);
-            max_var(b, mx);
-        }
-        Core::If(a, b, c) => {
-            max_var(a, mx);
-            max_var(b, mx);
-            max_var(c, mx);
-        }
-        Core::Let(x, r, b) => {
-            *mx = (*mx).max(*x + 1);
-            max_var(r, mx);
-            max_var(b, mx);
-        }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            for a in args {
-                max_var(a, mx);
-            }
-        }
-        Core::Match(s, arms) => {
-            max_var(s, mx);
-            for (_, binds, body) in arms {
-                for b in binds {
-                    *mx = (*mx).max(*b + 1);
-                }
-                max_var(body, mx);
-            }
-        }
-        Core::Proj(a, _) => max_var(a, mx),
-        Core::Lam(_, a) => max_var(a, mx),
-        Core::App(f_, a_) => { max_var(f_, mx); max_var(a_, mx); }
-    }
+    e.any(&mut |e| if matches!(e, Core::Call(..)) { Some(true) } else { None })
 }
 
 struct Em {
@@ -393,9 +297,7 @@ impl Em {
     }
 
     fn fv_of(&self, e: &Core) -> BTreeSet<u32> {
-        let mut acc = BTreeSet::new();
-        free_vars(e, &mut Vec::new(), &mut acc);
-        acc
+        e.free_vars()
     }
 
     /// Fire mode: arrange for `e`'s value to be delivered to `dest`.
@@ -570,9 +472,7 @@ pub fn emit_cuda(m: &CoreModule) -> String {
     let mut ent = String::new();
 
     for (i, f) in m.fns.iter().enumerate() {
-        let mut mx = f.arity as u32;
-        max_var(&f.body, &mut mx);
-        em.next_var = mx;
+        em.next_var = (f.arity as u32).max(f.body.max_var() + 1);
 
         // dive form
         let sig: Vec<String> = (0..f.arity).map(|j| format!("u64 v{j}")).collect();
