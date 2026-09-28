@@ -365,6 +365,31 @@ original under `eval_core`; the policy cases above) and
 `examples/spec_oracle.rs` (bisects a whole program to the function whose
 specialization changed its value).
 
+### 3b-2. Readback places calls where the net created them
+
+The net fires a call as soon as its arguments exist. The reader used to
+write a call where its result was first used, so in bitonic's `warp`
+(whose inlined zip matches the first recursive result before touching the
+second) the second call was nested inside the match on the first: a
+dependency the net does not have, and one that stops the rule form from
+forking the pair. The specializer records the scope frame of each pending
+call, keyed by the call's result wire (unique per residual call; the Ref
+port is not, every nullary call to a function shares one), and the reader
+binds the call there. Two limits keep it exact: a call read under a
+closure never leaves the innermost closure on the stack (frames are
+recorded per settle and a closure body is not one), and a closure frame is
+peeled for any value only when the value reads nothing bound inside the
+closure (its parameter or its own bindings), which also fixed a
+pre-existing escape (`lambda x: fib(fib(x) + k) + 1`). A call created in
+the frame that uses it is read in place, so tail calls stay tail calls.
+
+Numbers: a 2^16-leaf warp on the GPU 1454 ms -> 12 ms; bitonic CPU
+instructions 0.965 G -> 0.912 G. Tests (specialize_test): independence of
+the pair (fails with the hoist disabled), tail calls, closure-body calls
+in scope (3 shapes), branch-only nullary call stays in its branch, shared
+call stays in its arm. An independent review of the first version found
+the closure escape and the nullary-key collision; both tests fail on it.
+
 ### 3c. One lowering, printers per backend (stage 1 of the shared backend)
 
 Decided 2026-09-28, after Phase B. Every emitter used to print Rust text

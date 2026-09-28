@@ -456,3 +456,90 @@ def main():
     assert!(tail_call_to(body(&s, "ev"), o), "ev's call to od is no longer a tail call");
     assert!(tail_call_to(body(&s, "od"), e), "od's call to ev is no longer a tail call");
 }
+
+/// Every variable a specialized body reads is bound (a parameter, a let,
+/// a match binder, a lambda parameter): nothing was hoisted out of the
+/// scope that binds it.
+fn assert_scoped(s: &CoreModule) {
+    for f in &s.fns {
+        let free = f.body.free_vars();
+        assert!(free.iter().all(|v| (*v as usize) < f.arity), "{}: reads unbound {:?} in {:?}", f.name, free, f.body);
+    }
+}
+
+const FIB: &str = "def fib(k):\n    if k < 2:\n        return k\n    return fib(k - 1) + fib(k - 2)\n\n";
+
+/// A call inside a closure body stays in the closure when its argument
+/// reads the parameter, directly or through a value bound inside the
+/// closure (review of 01d2609: `lambda x: fib(fib(x) + k)` escaped).
+#[test]
+fn calls_in_closure_bodies_stay_in_scope() {
+    for body in [
+        "lambda x: fib(fib(x) + k)",
+        "lambda x: fib(fib(x) + k) + 1",
+        "lambda x: fib(k + fib(pair(x, k)[0]))",
+    ] {
+        let src = format!("{FIB}def pair(a, b):\n    return (a, b)\n\ndef mk(k):\n    return {body}\n\ndef main():\n    g = mk(1)\n    return g(5) + g(6)\n");
+        let (m, s) = spec(&src);
+        assert_scoped(&s);
+        assert_eq!(oracle(&m), oracle(&s), "{body}");
+    }
+}
+
+/// A call created only inside a branch stays in the branch, also when an
+/// identical nullary call runs in an outer frame (review of 01d2609: all
+/// nullary calls to one function shared a key, so the branch-only one was
+/// hoisted and evaluated on every path).
+#[test]
+fn branch_only_calls_stay_in_their_branch() {
+    let src = r#"
+def z():
+    return w(array_len(array_new(3, 0)))
+
+def w(n):
+    if n == 0:
+        return 0
+    if n > 100:
+        return z()
+    return w(n - 1) + 1
+
+def f(c, d):
+    a = z()
+    if c > 0:
+        if d > 0:
+            return a + z()
+        return a
+    return 0
+
+def main():
+    return f(1, 1) + f(1, 0) + f(0, 1)
+"#;
+    let (m, s) = spec(src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+    let z = fid(&s, "z");
+    // outside every branch of f: exactly the one unconditional call
+    fn top_calls(e: &Core, g: u32) -> usize {
+        match e {
+            Core::Let(_, r, b) => top_calls(r, g) + top_calls(b, g),
+            Core::Call(f, xs) => (*f == g) as usize + xs.iter().map(|x| top_calls(x, g)).sum::<usize>(),
+            Core::If(..) | Core::Match(..) => 0,
+            _ => e.kids().into_iter().map(|k| top_calls(k, g)).sum(),
+        }
+    }
+    assert_eq!(top_calls(body(&s, "f"), z), 1, "a branch-only z() was hoisted: {:?}", body(&s, "f"));
+}
+
+/// A call whose result is shared (a Dup) inside an arm stays in the arm.
+#[test]
+fn shared_call_in_an_arm_stays_in_the_arm() {
+    let src = format!("{FIB}def f(n, c):\n    if c > 0:\n        y = fib(n)\n        return y * y + y\n    return 0\n\ndef main():\n    return f(10, 1) + f(3, 0)\n");
+    let (m, s) = spec(&src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+    let fb = fid(&s, "fib");
+    match body(&s, "f") {
+        Core::If(_, t, e) => assert!(calls(t, fb) && !calls(e, fb), "fib left its arm: {:?}", body(&s, "f")),
+        other => panic!("f is no longer a branch at the top: {other:?}"),
+    }
+}

@@ -13,8 +13,12 @@
 //! variable (hoisted to the function head; every `Dup` in a residual net
 //! comes from a strict, unconditionally evaluated binding, so hoisting only
 //! reorders unconditional pure work) and each output reads the variable.
-//! Parked branch closures splice the original Core of their lifted entry
-//! under lets for the captured arguments.
+//! A pending call is placed the same way: bound in the frame the net
+//! created it in, not where its result is first used (two independent
+//! calls stay independent), never outside the innermost closure being read,
+//! and read in place when created where it is used (tail calls stay tail
+//! calls). Parked branch closures splice the original Core of their lifted
+//! entry under lets for the captured arguments.
 
 use crate::{dup_label,
     dup_addr, list_items, mat_addr, mat_id, op_addr, op_code, ref_entry, ref_head, MatchMeta, NetProg,
@@ -58,8 +62,10 @@ pub(crate) enum Producer {
     Swi(u32),
     Mat(u32),
     Dup(u32),
-    /// a call kept as a call: the Ref port
-    Ref(Port),
+    /// a call kept as a call: the Ref port and its result wire's cell (the
+    /// wire is unique per residual call; the port is not: every nullary
+    /// call to one function has the same port)
+    Ref(Port, u32),
     /// an op that cannot fold at compile time: (op with cell [x, ret], y)
     ResOp(Port, Port),
     /// the parameter wire of a residual closure (the Lam cell)
@@ -151,7 +157,7 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
         match a.tag() {
             Tag::Ref => {
                 if b.tag() == Tag::Var {
-                    ix.producer[b.payload() as usize] = Some(Producer::Ref(*a));
+                    ix.producer[b.payload() as usize] = Some(Producer::Ref(*a, b.payload() as u32));
                 }
             }
             Tag::Op => {
@@ -429,8 +435,9 @@ pub(crate) struct Reader<'a> {
     shared: HashMap<u32, u32>,
     /// the scope frame each Dup cell was created in (see `specialize`)
     dup_frame: &'a HashMap<u32, usize>,
-    /// the scope frame each pending call was created in
-    ref_frame: &'a HashMap<u64, usize>,
+    /// the scope frame each pending call was created in, by its result
+    /// wire's cell
+    ref_frame: &'a HashMap<u32, usize>,
     /// (agent cell, arm index) -> arm info
     arms: &'a HashMap<(u32, usize), ArmInfo>,
     /// active frames, innermost last
@@ -473,7 +480,7 @@ impl<'a> Reader<'a> {
         free: &[(Port, u32)],
         next: u32,
         dup_frame: &'a HashMap<u32, usize>,
-        ref_frame: &'a HashMap<u64, usize>,
+        ref_frame: &'a HashMap<u32, usize>,
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
@@ -522,10 +529,20 @@ impl<'a> Reader<'a> {
     }
 
     fn frame_for(&self, e: &Core) -> usize {
+        // a closure frame is peeled only when the value reads nothing the
+        // closure binds: its parameter, or any value bound inside it
         for &fr in self.stack.iter().rev() {
             match self.lams.iter().find(|(lf, _)| *lf == fr) {
-                Some((_, x)) if !mentions(e, &[*x]) => continue,
-                _ => return fr,
+                Some((_, x)) => {
+                    let mut inside = vec![*x];
+                    if let Some(bs) = self.bindings.get(&fr) {
+                        inside.extend(bs.iter().map(|(v, _)| *v));
+                    }
+                    if mentions(e, &inside) {
+                        return fr;
+                    }
+                }
+                None => return fr,
             }
         }
         0
@@ -658,7 +675,7 @@ impl<'a> Reader<'a> {
                 let side = self.ix.dup_side.get(&r).map(|x| x.1).unwrap_or(0);
                 self.read_dup(d, side)
             }
-            Producer::Ref(r) => {
+            Producer::Ref(r, ret) => {
                 let entry = ref_entry(r) as usize;
                 assert!(entry < self.prog.nfns, "ICE: residual call to a lifted entry");
                 // A pending call is bound in the frame it was created in:
@@ -667,13 +684,12 @@ impl<'a> Reader<'a> {
                 // must not make the call wait on the branch: that is the
                 // parallelism the rules have). Its arguments are read in
                 // that frame too, so everything they need is bound there.
+                // Frames are recorded per settle; a closure body is not
+                // one, so a call read under a closure never leaves the
+                // innermost closure on the stack (its arguments may read
+                // the parameter, directly or through bindings).
                 let cur = *self.stack.last().unwrap();
-                let mut frame = cur;
-                if let Some(f) = self.ref_frame.get(&r.0) {
-                    if self.stack.contains(f) {
-                        frame = *f;
-                    }
-                }
+                let frame = self.call_frame(ret);
                 if frame == cur {
                     // read where it is used: the caller binds it or keeps
                     // it in tail position
@@ -683,19 +699,23 @@ impl<'a> Reader<'a> {
                 self.stack.push(frame);
                 let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
                 self.stack.pop();
-                let call = Core::Call(entry as u32, args);
-                // never above a closure whose parameter it reads
-                let pos = |st: &[usize], f: usize| st.iter().position(|g| *g == f).unwrap_or(0);
-                for (lf, x) in self.lams.iter().rev() {
-                    if mentions(&call, &[*x]) {
-                        if pos(&self.stack, *lf) > pos(&self.stack, frame) {
-                            frame = *lf;
-                        }
-                        break;
-                    }
-                }
-                self.bind_in(frame, call)
+                self.bind_in(frame, Core::Call(entry as u32, args))
             }
+        }
+    }
+
+    /// The frame a pending call is bound in: the frame the specializer
+    /// created it in, clamped to the innermost closure frame on the stack.
+    fn call_frame(&self, ret: u32) -> usize {
+        let cur = *self.stack.last().unwrap();
+        let Some(&rec) = self.ref_frame.get(&ret) else { return cur };
+        let Some(at) = self.stack.iter().rposition(|f| *f == rec) else {
+            debug_assert!(false, "ICE: a call's frame {rec} is not active (stack {:?})", self.stack);
+            return cur;
+        };
+        match self.stack[at..].iter().rev().find(|f| self.lams.iter().any(|(lf, _)| lf == *f)) {
+            Some(lf) => *lf,
+            None => rec,
         }
     }
 

@@ -198,7 +198,7 @@ struct Fx {
     dup_frame: HashMap<u32, usize>,
     /// the scope frame each pending call (a residual Ref, by its port)
     /// was created in: where it fires in the net, whatever consumes it
-    ref_frame: HashMap<u64, usize>,
+    ref_frame: HashMap<u32, usize>,
     nframes: usize,
     next_var: u32,
 }
@@ -584,15 +584,15 @@ fn alloc_val(net: &mut Net, v: &Val) -> Port {
 
 /// Every Dup agent and pending call reachable now that has no frame yet
 /// belongs to `frame`.
-fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut HashMap<u32, usize>, ref_frame: &mut HashMap<u64, usize>, frame: usize) {
+fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut HashMap<u32, usize>, ref_frame: &mut HashMap<u32, usize>, frame: usize) {
     let ix = crate::residual::scan(net, roots, free, &net.residual);
     for p in ix.producers() {
         match p {
             crate::residual::Producer::Dup(d) => {
                 dup_frame.entry(*d).or_insert(frame);
             }
-            crate::residual::Producer::Ref(r) => {
-                ref_frame.entry(r.0).or_insert(frame);
+            crate::residual::Producer::Ref(_, ret) => {
+                ref_frame.entry(*ret).or_insert(frame);
             }
             _ => {}
         }
