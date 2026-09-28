@@ -96,7 +96,6 @@ pub(crate) struct Ex<'m> {
     /// mid-evaluation; a suspension inside chains records through them.
     pub kframes: Vec<(u32, Core)>,
     /// The forwarding segment id (delivers its single slot to its parent).
-    pub fwd: u16,
     /// ctor id -> unbox slot (arity-1 int ctors carried in the port).
     pub unbox: &'m std::collections::HashMap<u32, u8>,
     /// fn -> returns a proven i56 (calls to these are int expressions).
@@ -170,61 +169,6 @@ pub(crate) fn proj_prefix(x: u32, k: usize, bo: &Core) -> Option<(Vec<(u32, usiz
     Some((binds, e))
 }
 
-/// Variables that are *used* as arithmetic/comparison operands or bound to
-/// arithmetic results. Sound as an i56 proof only when the module contains
-/// no float literal (floats cannot arise otherwise), which the caller
-/// checks; returns an empty set when the proof does not hold.
-pub(crate) fn numeric_vars(body: &Core, float_free: bool) -> HashSet<u32> {
-    fn is_numeric_expr(e: &Core) -> bool {
-        matches!(e, Core::Num(_) | Core::Op2(..) | Core::Cmp(..))
-    }
-    fn walk(e: &Core, out: &mut HashSet<u32>) {
-        match e {
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                for x in [a, b] {
-                    if let Core::Var(i) = &**x {
-                        out.insert(*i);
-                    }
-                    walk(x, out);
-                }
-            }
-            Core::If(c, t, f) => {
-                if let Core::Var(i) = &**c {
-                    out.insert(*i);
-                }
-                walk(c, out);
-                walk(t, out);
-                walk(f, out);
-            }
-            Core::Let(x, r, b) => {
-                if is_numeric_expr(r) {
-                    out.insert(*x);
-                }
-                walk(r, out);
-                walk(b, out);
-            }
-            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) | Core::Prim(_, a) => {
-                for x in a {
-                    walk(x, out);
-                }
-            }
-            Core::Match(s, arms) => {
-                walk(s, out);
-                for (_, _, b) in arms {
-                    walk(b, out);
-                }
-            }
-            Core::Proj(b, _) => walk(b, out),
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-        }
-    }
-    let mut out = HashSet::new();
-    if float_free {
-        walk(body, &mut out);
-    }
-    out
-}
-
 impl<'m> Ex<'m> {
     pub fn new(
         dive: bool,
@@ -235,13 +179,12 @@ impl<'m> Ex<'m> {
         bor: &'m [Vec<bool>],
         ints: HashSet<u32>,
         sq: Option<&'m mut SegQ>,
-        fwd: u16,
         unbox: &'m std::collections::HashMap<u32, u8>,
         iret: &'m [bool],
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -1638,7 +1581,7 @@ pub(crate) fn dive_fn<'m>(
     let mut rem = Cnt::new();
     cnt_dive(body, &mut rem);
     let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), unbox, iret, tys, shared);
     ex.trmc = trmc.zip(hole_rule);
     ex.nret = nret;
     // the fuel-out spawn takes references to borrowed params
@@ -1833,7 +1776,6 @@ pub(crate) fn dps_fn<'m>(
     body: &Core,
     bor: &'m [Vec<bool>],
     sq: &'m mut SegQ,
-    fwd: u16,
     unbox: &'m std::collections::HashMap<u32, u8>,
     tys: &'m Types,
     iret: &'m [bool],
@@ -1845,7 +1787,7 @@ pub(crate) fn dps_fn<'m>(
     cnt_dive(body, &mut rem);
     rem.remove(&(p as u32));
     let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), fwd, unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), unbox, iret, tys, shared);
     ex.trmc = Some((cid, 0));
     ex.dps_param = Some(p);
     let mut bb = String::new();

@@ -74,24 +74,6 @@ pub fn fmt_val(v: &Val) -> String {
     }
 }
 
-/// True when no function body contains a float literal: floats cannot
-/// arise any other way, so every numeric value in the program is an i56.
-pub(crate) fn float_free(m: &CoreModule) -> bool {
-    fn has_flo(e: &Core) -> bool {
-        match e {
-            Core::Flo(_) => true,
-            Core::Num(_) | Core::Var(_) => false,
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has_flo(a) || has_flo(b),
-            Core::If(c, t, f) => has_flo(c) || has_flo(t) || has_flo(f),
-            Core::Let(_, r, b) => has_flo(r) || has_flo(b),
-            Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) | Core::Prim(_, a) => a.iter().any(has_flo),
-            Core::Match(s, arms) => has_flo(s) || arms.iter().any(|(_, _, b)| has_flo(b)),
-            Core::Proj(b, _) => has_flo(b),
-        }
-    }
-    !m.fns.iter().any(|f| has_flo(&f.body))
-}
-
 /// Unary constructors whose field is a proven-i56 at EVERY construction
 /// site are unboxed: the value rides in the port (tag = TU_BASE + slot, the
 /// i56 in the payload), so building/matching/freeing them costs no cell.
@@ -384,7 +366,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
             if scal[fid].is_some() {
                 return None;
             }
-            fast::fast_fn(m, fid as u32, &bodies[fid], &tys, &unbox, &scal, &bor[fid])
+            fast::fast_fn(m, fid as u32, &bodies[fid], &tys, &unbox, &bor[fid])
         })
         .collect();
     fast::FAST.with(|f| *f.borrow_mut() = fast_code.iter().map(|c| c.is_some()).collect());
@@ -445,7 +427,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
             fns_code.push_str(q);
         }
         if let Some((p, c)) = dps[fid] {
-            fns_code.push_str(&seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, fwd, &unbox, &tys, &iret, &shared));
+            fns_code.push_str(&seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
         }
         fns_code.push_str(&rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared));
         fns_code.push_str(&call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid], &bor));

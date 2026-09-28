@@ -388,10 +388,6 @@ impl<'a> Reader<'a> {
         self.next - 1
     }
 
-    pub(crate) fn next_var(&self) -> u32 {
-        self.next
-    }
-
     pub(crate) fn read(&mut self, p: Port) -> Core {
         match p.tag() {
             Tag::Num => Core::Num(p.as_i64()),

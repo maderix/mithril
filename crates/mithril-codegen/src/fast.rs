@@ -14,7 +14,6 @@
 //! fallback happens before any side effect, so it is always valid; call
 //! sites in dive forms call `q_f` instead of `d_f`.
 
-use crate::scalar::Sig;
 use crate::seq::{bin_code, cmp_code};
 use crate::ty::{Ty, Types};
 use mithril_front::core::{Core, CoreModule};
@@ -34,7 +33,6 @@ struct Fp<'m> {
     fid: u32,
     tys: &'m Types,
     unbox: &'m HashMap<u32, u8>,
-    sigs: &'m [Option<Sig>],
     bor: &'m [bool],
     /// int locals, held as raw i64 `w<i>`
     ints: HashSet<u32>,
@@ -228,14 +226,13 @@ pub(crate) fn fast_fn(
     body: &Core,
     tys: &Types,
     unbox: &HashMap<u32, u8>,
-    sigs: &[Option<Sig>],
     bor: &[bool],
 ) -> Option<String> {
     if !calls_self(fid, body) {
         return None;
     }
     let ranges = crate::range::Ranges::of(body);
-    let mut fp = Fp { m, fid, tys, unbox, sigs, bor, ints: HashSet::new(), ranges, imm: Vec::new(), tails: 0, falls: 0 };
+    let mut fp = Fp { m, fid, tys, unbox, bor, ints: HashSet::new(), ranges, imm: Vec::new(), tails: 0, falls: 0 };
     let mut b = String::new();
     fp.tail(body, &mut b);
     if fp.tails == 0 || fp.falls == 0 {

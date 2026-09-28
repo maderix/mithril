@@ -38,8 +38,6 @@ pub struct Wctx<'e> {
     marked: Vec<bool>,
     /// Cell slots taken from the bump region (the footprint contribution).
     pub(crate) issued: usize,
-    pub(crate) live: i64,
-    pub(crate) live_peak: i64,
     pub(crate) rewrites: u64,
     /// Nesting of records fired inline from `deliver` (see `MAX_INLINE`).
     inline_depth: u32,
@@ -64,8 +62,6 @@ impl<'e> Wctx<'e> {
             dirty: Vec::new(),
             marked: vec![false; n_rules],
             issued: 0,
-            live: 0,
-            live_peak: 0,
             rewrites: 0,
             inline_depth: 0,
             check_free: std::env::var_os("MITHRIL_CHECK_FREE").is_some(),

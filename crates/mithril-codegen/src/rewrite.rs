@@ -32,27 +32,6 @@ pub(crate) fn size(e: &Core) -> usize {
     }
 }
 
-fn subst(e: &Core, map: &HashMap<u32, u32>) -> Core {
-    match e {
-        Core::Var(i) => Core::Var(*map.get(i).unwrap_or(i)),
-        Core::Num(_) | Core::Flo(_) => e.clone(),
-        Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(subst(a, map)), Box::new(subst(b, map))),
-        Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(subst(a, map)), Box::new(subst(b, map))),
-        Core::If(c, t, f) => Core::If(Box::new(subst(c, map)), Box::new(subst(t, map)), Box::new(subst(f, map))),
-        Core::Let(x, r, b) => Core::Let(*x, Box::new(subst(r, map)), Box::new(subst(b, map))),
-        Core::Call(g, xs) => Core::Call(*g, xs.iter().map(|x| subst(x, map)).collect()),
-        Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| subst(x, map)).collect()),
-        Core::Reuse(v, c, xs) => Core::Reuse(*map.get(v).unwrap_or(v), *c, xs.iter().map(|x| subst(x, map)).collect()),
-        Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| subst(x, map)).collect()),
-        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| subst(x, map)).collect()),
-        Core::Proj(b, i) => Core::Proj(Box::new(subst(b, map)), *i),
-        Core::Match(s, arms) => Core::Match(
-            Box::new(subst(s, map)),
-            arms.iter().map(|(c, bs, b)| (*c, bs.clone(), subst(b, map))).collect(),
-        ),
-    }
-}
-
 /// Tail inlining: a small, non-self-recursive `g` tail-called from `f`
 /// whose own calls are tail calls back to `f` (or calls to call-free
 /// functions) is inlined at that site. Mutual tail recursion then becomes
@@ -324,79 +303,6 @@ fn tail(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
 }
 
 // ------------------------------------------------- record-to-tuple rewrite
-
-/// A datatype with exactly one constructor whose fields are all Int is a
-/// plain record: represent it as a tuple so the scalar lowering carries it
-/// in native registers (`Ctor(c, xs)` -> `Tuple(xs)`, a single-arm match
-/// -> projections). Skipped for the type of `main`'s result (printing
-/// would change) and for any class that also has other constructors.
-pub(crate) fn records_to_tuples(m: &CoreModule, tys: &crate::ty::Types) -> CoreModule {
-    use crate::ty::Ty;
-    let n = m.ctors.len();
-    let mut per_class: HashMap<u32, Vec<u32>> = HashMap::new();
-    for c in 0..n as u32 {
-        per_class.entry(tys.class_of[c as usize]).or_default().push(c);
-    }
-    let main_ret = tys.ret[m.main as usize];
-    let mut rec: Vec<bool> = vec![false; n];
-    for (class, cs) in &per_class {
-        if cs.len() != 1 {
-            continue;
-        }
-        let c = cs[0] as usize;
-        let ar = m.ctors[c].1;
-        if ar == 0 || ar > 8 {
-            continue;
-        }
-        if !tys.field[c].iter().all(|t| *t == Ty::Int) {
-            continue;
-        }
-        if main_ret == Ty::Adt(*class) {
-            continue;
-        }
-        rec[c] = true;
-    }
-    if !rec.iter().any(|b| *b) {
-        return m.clone();
-    }
-    fn go(e: &Core, rec: &[bool], next: &mut u32) -> Core {
-        match e {
-            Core::Ctor(c, xs) if rec[*c as usize] => Core::Tuple(xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Reuse(_, c, xs) if rec[*c as usize] => Core::Tuple(xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Match(s, arms) if arms.len() == 1 && rec[arms[0].0 as usize] => {
-                let (_, bs, body) = &arms[0];
-                let t = *next;
-                *next += 1;
-                let mut out = go(body, rec, next);
-                for (i, b) in bs.iter().enumerate().rev() {
-                    out = Core::Let(*b, Box::new(Core::Proj(Box::new(Core::Var(t)), i)), Box::new(out));
-                }
-                Core::Let(t, Box::new(go(s, rec, next)), Box::new(out))
-            }
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
-            Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(go(a, rec, next)), Box::new(go(b, rec, next))),
-            Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(go(a, rec, next)), Box::new(go(b, rec, next))),
-            Core::If(c, t, f) => Core::If(Box::new(go(c, rec, next)), Box::new(go(t, rec, next)), Box::new(go(f, rec, next))),
-            Core::Let(x, r, b) => Core::Let(*x, Box::new(go(r, rec, next)), Box::new(go(b, rec, next))),
-            Core::Call(g, xs) => Core::Call(*g, xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Ctor(c, xs) => Core::Ctor(*c, xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| go(x, rec, next)).collect()),
-            Core::Proj(b, i) => Core::Proj(Box::new(go(b, rec, next)), *i),
-            Core::Match(s, arms) => Core::Match(
-                Box::new(go(s, rec, next)),
-                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), go(b, rec, next))).collect(),
-            ),
-        }
-    }
-    let mut out = m.clone();
-    for f in out.fns.iter_mut() {
-        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
-        f.body = go(&f.body, &rec, &mut next);
-    }
-    out
-}
 
 
 // ---- if-conversion of same-call branches ----

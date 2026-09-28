@@ -437,7 +437,7 @@ pub(crate) fn expand_fn(
     let mut rem = Cnt::new();
     cnt_rule(body, &mut rem);
     let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, 0, unbox, iret, tys, shared);
+    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, unbox, iret, tys, shared);
     let mut bb = String::new();
     for i in 0..ar as u32 {
         if ex.rem.get(&i).copied().unwrap_or(0) == 0 {
@@ -484,7 +484,7 @@ pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut 
     } else {
         crate::ints_of(tys, seg.fid as usize)
     };
-    let mut ex = Ex::new(false, seg.fid, false, rem, HashSet::new(), bor, ints, None, 0, unbox, iret, tys, shared);
+    let mut ex = Ex::new(false, seg.fid, false, rem, HashSet::new(), bor, ints, None, unbox, iret, tys, shared);
     let mut bb = String::new();
     rtail(&mut ex, &seg.body, "parent", &mut bb, sq);
     s.push_str(&bb);

@@ -354,10 +354,6 @@ pub(crate) enum MatchMeta {
 pub(crate) struct Entry {
     pub params: Vec<u32>,
     pub body: NExpr,
-    /// captured free vars of a lifted branch/arm (a suffix of `params`)
-    pub caps: Vec<u32>,
-    /// the original Core of a lifted entry (spliced back by residual readback)
-    pub core: Option<Core>,
 }
 
 /// What the REF-unfold rule does with a call to a real function.
@@ -393,7 +389,7 @@ impl NetProg {
         let nfns = m.fns.len();
         let mut prog = NetProg { entries: Vec::new(), metas: Vec::new(), nfns, mode: Mode::Eval, inline: vec![false; nfns], reach: Vec::new(), direct: Vec::new() };
         for f in &m.fns {
-            prog.entries.push(Entry { params: (0..f.arity as u32).collect(), body: NExpr::Num(0), caps: Vec::new(), core: None });
+            prog.entries.push(Entry { params: (0..f.arity as u32).collect(), body: NExpr::Num(0) });
         }
         for (i, f) in m.fns.iter().enumerate() {
             let body = lower(&f.body, &mut prog);
@@ -517,10 +513,10 @@ pub(crate) fn core_size(c: &Core) -> usize {
     }
 }
 
-fn lift(prog: &mut NetProg, params: Vec<u32>, caps: Vec<u32>, body: &Core) -> u16 {
+fn lift(prog: &mut NetProg, params: Vec<u32>, body: &Core) -> u16 {
     let id = prog.entries.len();
     assert!(id < (1 << 16), "ICE: lifted entry table overflows 16-bit Ref ids");
-    prog.entries.push(Entry { params, body: NExpr::Num(0), caps, core: Some(body.clone()) });
+    prog.entries.push(Entry { params, body: NExpr::Num(0) });
     let b = lower(body, prog);
     prog.entries[id].body = b;
     id as u16
@@ -530,7 +526,7 @@ fn close(prog: &mut NetProg, body: &Core, binders: &[u32]) -> ClosureSpec {
     let caps: Vec<u32> = free_vars(body).into_iter().filter(|v| !binders.contains(v)).collect();
     let mut params = binders.to_vec();
     params.extend(caps.iter().copied());
-    let entry = lift(prog, params, caps.clone(), body);
+    let entry = lift(prog, params, body);
     ClosureSpec { entry, caps }
 }
 
@@ -582,24 +578,6 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
         }
         Core::Prim(p, args) => NExpr::Prim(prim_code(*p), args.iter().map(|a| lower(a, prog)).collect()),
     }
-}
-
-/// Whether any function uses a builtin. Arrays are runtime values with
-/// in-place updates, so such a module is not reduced at compile time.
-pub fn uses_prims(m: &CoreModule) -> bool {
-    fn has(e: &Core) -> bool {
-        match e {
-            Core::Prim(..) => true,
-            Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => has(a) || has(b),
-            Core::If(a, b, c) => has(a) || has(b) || has(c),
-            Core::Let(_, r, b) => has(r) || has(b),
-            Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) => xs.iter().any(has),
-            Core::Match(s, arms) => has(s) || arms.iter().any(|(_, _, b)| has(b)),
-            Core::Proj(a, _) => has(a),
-        }
-    }
-    m.fns.iter().any(|f| has(&f.body))
 }
 
 fn free_vars(c: &Core) -> BTreeSet<u32> {

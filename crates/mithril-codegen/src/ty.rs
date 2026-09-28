@@ -149,9 +149,7 @@ impl Uf {
     }
 }
 
-struct Inf<'m> {
-    m: &'m CoreModule,
-    #[allow(dead_code)]
+struct Inf {
     uf: Uf,
     fparam: Vec<Vec<u32>>,
     fret: Vec<u32>,
@@ -167,7 +165,7 @@ struct Inf<'m> {
     pending: Vec<(u32, usize, u32)>,
 }
 
-impl<'m> Inf<'m> {
+impl Inf {
     fn cfind(&mut self, mut c: u32) -> u32 {
         while self.cclass[c as usize] != c {
             c = self.cclass[c as usize];
@@ -446,7 +444,6 @@ impl<'m> Inf<'m> {
 pub(crate) fn infer(m: &CoreModule) -> Types {
     let nf = m.fns.len();
     let mut inf = Inf {
-        m,
         uf: Uf { n: Vec::new() },
         fparam: Vec::new(),
         fret: Vec::new(),

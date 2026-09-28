@@ -106,27 +106,6 @@ fn tmask(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u3
     }
 }
 
-/// Occurrences of `Var(t)` in `e` that are NOT directly under a `Proj`.
-fn bare_uses(e: &Core, t: u32) -> usize {
-    match e {
-        Core::Var(i) => (*i == t) as usize,
-        Core::Num(_) | Core::Flo(_) => 0,
-        Core::Proj(b, _) => match &**b {
-            Core::Var(i) if *i == t => 0,
-            other => bare_uses(other, t),
-        },
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => bare_uses(a, t) + bare_uses(b, t),
-        Core::If(c, x, y) => bare_uses(c, t) + bare_uses(x, t) + bare_uses(y, t),
-        Core::Let(_, r, b) => bare_uses(r, t) + bare_uses(b, t),
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            args.iter().map(|a| bare_uses(a, t)).sum()
-        }
-        Core::Match(s, arms) => {
-            bare_uses(s, t) + arms.iter().map(|(_, _, b)| bare_uses(b, t)).sum::<usize>()
-        }
-    }
-}
-
 struct Chk<'m> {
     why: Option<String>,
     sigs: &'m [Option<Sig>],
@@ -496,19 +475,6 @@ fn calls_fn(e: &Core, g: u32) -> bool {
         Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_fn(x, g)),
         Core::Match(sc, arms) => calls_fn(sc, g) || arms.iter().any(|(_, _, b)| calls_fn(b, g)),
         Core::Proj(b, _) => calls_fn(b, g),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
-    }
-}
-
-/// `e` calls some function other than `g`.
-fn calls_other(e: &Core, g: u32) -> bool {
-    match e {
-        Core::Call(h, xs) => *h != g || xs.iter().any(|x| calls_other(x, g)),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => calls_other(a, g) || calls_other(b, g),
-        Core::If(a, b, c) => calls_other(a, g) || calls_other(b, g) || calls_other(c, g),
-        Core::Tuple(xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| calls_other(x, g)),
-        Core::Match(sc, arms) => calls_other(sc, g) || arms.iter().any(|(_, _, b)| calls_other(b, g)),
-        Core::Proj(b, _) => calls_other(b, g),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => false,
     }
 }
