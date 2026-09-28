@@ -83,6 +83,8 @@ pub(crate) struct Ex<'m> {
     /// the outer variables of the active value-position branches: only
     /// these are pinned (arm-local binders are owned normally)
     pub pinset: HashSet<u32>,
+    /// per active value-position branch: the outer values dying in it
+    pub dying: Vec<Vec<u32>>,
     /// Borrow-derived variables (dive mode only; empty in rule mode).
     pub bset: HashSet<u32>,
     /// Per-function parameter borrow modes.
@@ -239,7 +241,7 @@ impl<'m> Ex<'m> {
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), fwd, unbox, iret, tys, shared, toks: Vec::new() }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -718,9 +720,11 @@ impl<'m> Ex<'m> {
                         }
                     }
                     Prim::ArrSet if self.int_arr(&args[0]) => {
-                        let a = self.val(&args[0], true, b);
+                        // index and value first (they may read the array), then
+                        // take the array: its last use moves instead of dup+free
                         let i = self.val(&args[1], false, b);
                         let v = self.val(&args[2], true, b);
+                        let a = self.val(&args[0], true, b);
                         b.push_str(&format!("let {t} = arr_set_i(ctx, {a}, as_i({i}), {v});\n"));
                     }
                     Prim::ArrNew => {
@@ -748,9 +752,9 @@ impl<'m> Ex<'m> {
                         }
                     }
                     Prim::ArrSet => {
-                        let a = self.val(&args[0], true, b);
                         let i = self.val(&args[1], false, b);
                         let v = self.val(&args[2], true, b);
+                        let a = self.val(&args[0], true, b);
                         b.push_str(&format!("let {t} = arr_set(ctx, {a}, as_i({i}), {v});\n"));
                     }
                     Prim::ArrLen => {
@@ -833,8 +837,10 @@ impl<'m> Ex<'m> {
                 let ec = self.val(c, false, b);
                 self.flush_toks(b);
                 let outer = self.pin_enter(&[th, el], &[]);
-                let bt = self.block_val(th, esc);
-                let bf = self.block_val(el, esc);
+                let pt = self.arm_own(th);
+                let bt = pt + &self.block_val(th, esc);
+                let pf = self.arm_own(el);
+                let bf = pf + &self.block_val(el, esc);
                 let t = self.fresh();
                 b.push_str(&format!(
                     "let {t} = if as_i({ec}) != 0 {{\n{bt}}} else {{\n{bf}}};\n"
@@ -976,7 +982,7 @@ impl<'m> Ex<'m> {
                 let outer = self.pin_enter(&arm_refs, &arm_bs);
                 for (i, pre, suf) in plan {
                     let (cid, binders, body) = &arms[i];
-                    let mut ab = String::new();
+                    let mut ab = self.arm_own(body);
                     if self.unbox.contains_key(cid) {
                         if let Some(bv) = binders.first() {
                             if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
@@ -1043,11 +1049,44 @@ impl<'m> Ex<'m> {
                 }
             }
         }
+        // An owned outer value with no use after the branch dies in it: each
+        // arm moves it (or frees it if unused), like a tail branch. Only
+        // values still live after the branch are pinned.
+        let mut used = Cnt::new();
+        for a in arms {
+            crate::cnt_expr(a, &mut used);
+        }
+        let owned = |me: &Self, v: u32| !me.ints.contains(&v) && !me.bset.contains(&v) && !me.ntup.contains(&v);
+        let dying: Vec<u32> = outer
+            .iter()
+            .copied()
+            .filter(|v| owned(self, *v) && self.rem.get(v).copied().unwrap_or(0) == used.get(v).copied().unwrap_or(0) && used.get(v).copied().unwrap_or(0) > 0)
+            .collect();
+        outer.retain(|v| !dying.contains(v));
         for v in &outer {
             self.pinset.insert(*v);
         }
         self.pinned += 1;
+        self.dying.push(dying);
         outer
+    }
+
+    /// Entering one arm of a value-position branch: the values dying in the
+    /// branch are owned by this arm with its own use counts; one this arm
+    /// never uses is released here.
+    fn arm_own(&mut self, arm: &Core) -> String {
+        let dying = self.dying.last().cloned().unwrap_or_default();
+        let mut local = Cnt::new();
+        crate::cnt_expr(arm, &mut local);
+        let mut pre = String::new();
+        for v in dying {
+            let k = local.get(&v).copied().unwrap_or(0);
+            self.rem.insert(v, k);
+            if k == 0 {
+                pre.push_str(&format!("free_val(ctx, v{v});\n"));
+            }
+        }
+        pre
     }
 
     /// Leave it: the arms' uses of the pinned outer variables are retired
@@ -1055,6 +1094,9 @@ impl<'m> Ex<'m> {
     /// use was in the arms is released once, here.
     fn pin_leave(&mut self, arms: &[&Core], outer: Vec<u32>, b: &mut String) {
         self.pinned -= 1;
+        for v in self.dying.pop().unwrap_or_default() {
+            self.rem.insert(v, 0);
+        }
         let mut used = Cnt::new();
         for a in arms {
             crate::cnt_expr(a, &mut used);

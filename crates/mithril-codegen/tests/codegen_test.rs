@@ -613,3 +613,12 @@ fn value_branches_release_what_their_arms_skip() {
         assert!(err.contains("arrays_live=0"), "--threads {t}: arrays leaked: {err}");
     }
 }
+
+#[test]
+fn mutual_tail_recursion_becomes_a_loop() {
+    let (cm, rs) = trmc_golden("mutual_tail.py");
+    let ev = native_form(&cm, &rs, "ev");
+    let id = cm.fns.iter().position(|f| f.name == "od").unwrap();
+    assert!(ev.contains("continue 'l"), "ev is not a loop");
+    assert!(!ev.contains(&format!("s_{id}(")), "ev still calls od");
+}

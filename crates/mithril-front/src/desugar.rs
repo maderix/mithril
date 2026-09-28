@@ -679,7 +679,8 @@ fn compile_fn(f: &FnDef, t: &Tables, g: &mut Gen) -> Result<CoreFn, Diag> {
 
 // ---- tail-call analysis ----
 
-fn compute_self_tail_rec(fid: FnId, body: &Core) -> bool {
+/// Every self call of `fid` in `body` is in tail position.
+pub fn compute_self_tail_rec(fid: FnId, body: &Core) -> bool {
     let mut ok = true;
     walk_tail(fid, body, true, &mut ok);
     ok

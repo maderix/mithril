@@ -208,7 +208,8 @@ pub fn emit_rust_opts(m: &CoreModule, net: &Net, opts: EmitOpts) -> String {
 }
 
 fn emit_rust_inner(m: &CoreModule, net: &Net) -> String {
-    let m_i = rewrite::inline_leaves(m);
+    let m_t = rewrite::tail_inline(m);
+    let m_i = rewrite::inline_leaves(&m_t);
     // if-conversion first: a loop whose body ends in a branch becomes one
     // back-edge, which unfolding then walks linearly (not per path)
     let m_s = rewrite::unfold_static(&rewrite::if_convert(&uniquify(&m_i)));

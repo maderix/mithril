@@ -122,6 +122,96 @@ fn inline_in(e: &Core, m: &CoreModule, leafy: &[bool], next: &mut u32) -> Core {
     }
 }
 
+/// Tail inlining: a small, non-self-recursive `g` tail-called from `f`
+/// whose own calls are tail calls back to `f` (or calls to call-free
+/// functions) is inlined at that site. Mutual tail recursion then becomes
+/// self tail recursion (a loop); semantics are unchanged (pure bodies).
+pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
+    const MAX_SIZE: usize = 64;
+    fn calls_of(e: &Core, out: &mut Vec<u32>) {
+        match e {
+            Core::Call(g, xs) => {
+                out.push(*g);
+                xs.iter().for_each(|x| calls_of(x, out));
+            }
+            Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) => {
+                calls_of(a, out);
+                calls_of(b, out);
+            }
+            Core::If(a, b, c) => {
+                calls_of(a, out);
+                calls_of(b, out);
+                calls_of(c, out);
+            }
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().for_each(|x| calls_of(x, out)),
+            Core::Match(sc, arms) => {
+                calls_of(sc, out);
+                arms.iter().for_each(|(_, _, b)| calls_of(b, out));
+            }
+            Core::Proj(b, _) => calls_of(b, out),
+            Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+        }
+    }
+    let leaf: Vec<bool> = m.fns.iter().map(|f| !has_call(&f.body)).collect();
+    // g qualifies for inlining into f's tail sites
+    let fits = |f: u32, g: u32| -> bool {
+        if f == g || g == m.main {
+            return false;
+        }
+        let gb = &m.fns[g as usize].body;
+        if size(gb) > MAX_SIZE {
+            return false;
+        }
+        let mut cs = Vec::new();
+        calls_of(gb, &mut cs);
+        cs.contains(&f)
+            && cs.iter().all(|h| *h == f || (*h != g && leaf[*h as usize]))
+            && mithril_front::desugar::compute_self_tail_rec(f, gb)
+    };
+    fn rewrite_tail(e: &Core, f: u32, m: &CoreModule, fits: &dyn Fn(u32, u32) -> bool, next: &mut u32) -> Core {
+        match e {
+            Core::Call(g, args) if fits(f, *g) => {
+                let callee = &m.fns[*g as usize];
+                let base = *next;
+                *next += callee.arity as u32;
+                let shift = *next;
+                *next += max_var(&callee.body).max(callee.arity as u32) + 1;
+                let mut map = HashMap::new();
+                for p in 0..callee.arity as u32 {
+                    match &args[p as usize] {
+                        Core::Var(y) => map.insert(p, *y),
+                        _ => map.insert(p, base + p),
+                    };
+                }
+                let mut out = shift_binders(&callee.body, shift, callee.arity as u32, &map);
+                for (p, a) in args.iter().enumerate().rev() {
+                    if !matches!(a, Core::Var(_)) {
+                        out = Core::Let(base + p as u32, Box::new(a.clone()), Box::new(out));
+                    }
+                }
+                out
+            }
+            Core::Let(x, r, b) => Core::Let(*x, r.clone(), Box::new(rewrite_tail(b, f, m, fits, next))),
+            Core::If(c, t, el) => Core::If(c.clone(), Box::new(rewrite_tail(t, f, m, fits, next)), Box::new(rewrite_tail(el, f, m, fits, next))),
+            Core::Match(sc, arms) => Core::Match(
+                sc.clone(),
+                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), rewrite_tail(b, f, m, fits, next))).collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let mut out = m.clone();
+    for (fid, f) in out.fns.iter_mut().enumerate() {
+        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
+        let nb = rewrite_tail(&f.body, fid as u32, m, &fits, &mut next);
+        if nb != f.body {
+            f.body = nb;
+            f.self_tail_rec = mithril_front::desugar::compute_self_tail_rec(fid as u32, &f.body);
+        }
+    }
+    out
+}
+
 /// Rename every binder of a closed body: params via `map`, locals to
 /// `shift + old`.
 fn shift_binders(e: &Core, shift: u32, arity: u32, map: &HashMap<u32, u32>) -> Core {

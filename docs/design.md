@@ -199,6 +199,36 @@ generated code exponential; all were found hours later by full runs.
 | terrain | | 3.21 / 0.46 | being ported to arrays |
 | nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
 
+## 6b. Generality corpus (`bench/general/run.py`)
+
+Seven programs deliberately unlike the suite: a heavily shared DAG, a
+persistent BST map with live old versions, copy-on-write array versions,
+list merge/quick sort, an expression interpreter (many constructors, env
+as a list), graph DFS over an array of adjacency lists, and mutual
+recursion. Each is checked against the Python oracle (small size) and an
+idiomatic Rust twin (`rust/*.rs`, Rc/Vec; same checksum), then timed.
+
+| program | Rust | ours t1 | ours t16 |
+|---|---|---|---|
+| collatz_mutual | 0.30 | 0.43 | 0.43 |
+| cow_versions | 1.00 | 0.98 | 0.97 |
+| dag_share | 1.68 | 1.87 | 0.29 |
+| graph_dfs | 0.86 | 1.20 | 0.27 |
+| interp | 2.36 | 1.21 | 0.14 |
+| persist_map | 1.47 | 1.49 | 1.49 |
+| sorts | 6.21 | 1.41 | 0.60 |
+
+Sequentially within 1.0-1.4x of idiomatic Rust (faster where Rust pays
+per-node refcounting); 16 threads never slower than 1, and 4-9x faster
+where iterations are independent. What the corpus found (all general
+fixes): value-position `if`/`match` leaked every value whose last use was
+in an arm (cow_versions 6 GB -> 2 MB); a fold's split never fired when
+iterations were heavier than one budget; a sequential program paid for
+splits at 16 threads (waves that expose nothing now grow the budget);
+live dive bridges hid native call graphs from the backend; mutual tail
+recursion stayed calls (tail inlining makes it a loop); an array write
+evaluated the array before a value that reads it (dup + free per write).
+
 ## 7. Process rules (from the user)
 
 * One runtime model everywhere; a component that is bad is bad globally.
