@@ -19,12 +19,11 @@ type CUdeviceptr = u64;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CUmemLocation {
-    kind: i32, // CU_MEM_LOCATION_TYPE_DEVICE = 1
+    kind: i32,
     id: i32,
 }
+const CU_MEM_LOCATION_TYPE_DEVICE: i32 = 1;
 const CU_MEM_ATTACH_GLOBAL: u32 = 1;
-/// Buffers up to this size are committed eagerly (see `alloc`).
-const EAGER_MAX: usize = 256 << 20;
 /// An array block's word 1: length in bits 0..47, size class 48..55, flags 62..63 (engine.cu).
 const ARR_LEN_MASK: u64 = (1 << 48) - 1;
 const CU_MEM_ADVISE_SET_PREFERRED_LOCATION: i32 = 3;
@@ -48,6 +47,9 @@ extern "C" {
     fn cuDevicePrimaryCtxRetain(ctx: *mut *mut c_void, dev: i32) -> CUresult;
     fn cuDevicePrimaryCtxRelease_v2(dev: i32) -> CUresult;
     fn cuDevicePrimaryCtxReset_v2(dev: i32) -> CUresult;
+    fn cuCtxSynchronize() -> CUresult;
+    fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
+    fn cuModuleUnload(module: *mut c_void) -> CUresult;
     fn cuCtxSetCurrent(ctx: *mut c_void) -> CUresult;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> CUresult;
@@ -220,9 +222,12 @@ pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<Gp
 }
 
 /// The per-thread stack a compiled program needed, kept beside it (a run
-/// that hits the stack guard doubles it; the next run starts there).
+/// that hits the stack guard doubles it; the next run starts there). The
+/// name extends the artefact's, so it is never the artefact itself.
 fn stack_hint(cubin_path: &Path) -> std::path::PathBuf {
-    cubin_path.with_extension("stack")
+    let mut p = cubin_path.as_os_str().to_owned();
+    p.push(".stack");
+    p.into()
 }
 
 /// The cached .cubin of a generated program (compiled on a cache miss).
@@ -253,7 +258,8 @@ pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
     let hint = stack_hint(cubin_path);
     let start = fs::read_to_string(&hint).ok().and_then(|t| t.trim().parse().ok());
     let (r, used) = GpuRunner::run_with_stack(&cubin, boot, start);
-    if r.is_ok() && start != Some(used) {
+    // a size the user fixed (MITHRIL_GPU_STACK) is not the program's need
+    if r.is_ok() && start != Some(used) && std::env::var_os("MITHRIL_GPU_STACK").is_none() {
         let _ = fs::write(&hint, used.to_string());
     }
     if std::env::var_os("MITHRIL_GPU_STATS").is_some() {
@@ -263,8 +269,26 @@ pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
 }
 
 /// Set by a process that exits right after its one run (`mithril exec`,
-/// `mithril run --gpu`): the context is not released.
+/// `mithril run --gpu`): a successful run's buffers, module and context
+/// are left to the driver's exit path (~150 ms saved).
 pub static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Free device memory in bytes, as the runner sees it between runs.
+pub fn free_vram() -> Result<usize, String> {
+    unsafe {
+        cu(cuInit(0), "cuInit")?;
+        let mut dev = 0i32;
+        cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
+        let r = cu(cuCtxSetCurrent(ctx), "cuCtxSetCurrent").and_then(|_| {
+            let (mut free, mut total) = (0usize, 0usize);
+            cu(cuMemGetInfo_v2(&mut free, &mut total), "cuMemGetInfo").map(|_| free)
+        });
+        let _ = cuDevicePrimaryCtxRelease_v2(dev);
+        r
+    }
+}
 
 /// Driver-API runner: loads a compiled .cubin and drives the wave loop.
 pub struct GpuRunner;
@@ -282,74 +306,117 @@ impl GpuRunner {
     }
 
     unsafe fn run_inner(cubin: &[u8], boot: Redex, start: Option<usize>, used: &mut usize) -> Result<GpuResult, String> {
-        {
-            // one cooperative launch on one stream: one hardware work queue
-            // (the driver builds 8 by default; context setup halves)
-            if std::env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
-                std::env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "1");
-            }
-            cu(cuInit(0), "cuInit")?;
-            let mut dev = 0i32;
-            cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
-            // The per-thread stack is backed with local memory for every
-            // resident thread, so its size is a fixed cost of every run
-            // (nbody: 0.18 s wall at 32 KiB, 0.10 s at 8 KiB). It starts at
-            // 8 KiB and doubles when the stack guard aborts the run: a run is
-            // deterministic, so re-running it with more stack is sound.
-            let fixed = std::env::var_os("MITHRIL_GPU_STACK").is_some();
-            let mut stack = if fixed { env_cap("MITHRIL_GPU_STACK", 8 * 1024) as usize } else { start.unwrap_or(8 * 1024).clamp(8 * 1024, MAX_STACK) };
-            loop {
-                *used = stack;
-                let mut ctx: *mut c_void = std::ptr::null_mut();
-                let tc = std::time::Instant::now();
-                cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
-                cu(cuCtxSetCurrent(ctx), "cuCtxSetCurrent")?;
-                if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: context {:.0} ms", tc.elapsed().as_secs_f64() * 1e3); }
-                let r = run_in_ctx(cubin, boot, dev, stack);
-                let deeper = !fixed && stack < MAX_STACK && matches!(&r, Err(e) if e.starts_with(DEEP));
-                if r.is_err() {
-                    // a failed run may leave a sticky device error in the
-                    // shared primary context: reset it, so the next run (or
-                    // the retry) starts from a clean context
+        // one run at a time: the kernel is cooperative over the whole
+        // device, and every run shares the device's primary context
+        static ONE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        cu(cuInit(0), "cuInit")?;
+        let mut dev = 0i32;
+        cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+        // The per-thread stack is backed with local memory for every
+        // resident thread, so its size is a fixed cost of every run
+        // (nbody: 0.18 s wall at 32 KiB, 0.10 s at 8 KiB). It starts at
+        // 8 KiB and doubles when the stack guard aborts the run. An aborted
+        // run has no observable effect (its result is discarded and the
+        // retry starts from fresh buffers), so the retry is sound. Doubling
+        // stops where the device cannot back a deeper stack (the driver
+        // refuses the limit, or the arenas no longer fit): the run then
+        // reports the depth error of the last size that could run.
+        let fixed = std::env::var_os("MITHRIL_GPU_STACK").is_some();
+        let mut stack = if fixed { env_cap("MITHRIL_GPU_STACK", 8 * 1024) as usize } else { start.unwrap_or(8 * 1024).max(8 * 1024) };
+        let mut deep: Option<String> = None;
+        loop {
+            *used = stack;
+            let mut ctx: *mut c_void = std::ptr::null_mut();
+            let tc = std::time::Instant::now();
+            cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
+            let r = match cu(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") {
+                Ok(()) => {
+                    if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: context {:.0} ms", tc.elapsed().as_secs_f64() * 1e3); }
+                    run_in_ctx(cubin, boot, dev, stack)
+                }
+                Err(e) => Err(e),
+            };
+            let exiting = r.is_ok() && EXITING.load(std::sync::atomic::Ordering::Relaxed);
+            if !exiting {
+                // a device fault (700) leaves a sticky error in the context,
+                // which every later call reports: only then is it reset. A
+                // clean abort (the engine's own flags) leaves it usable.
+                if r.is_err() && cuCtxSynchronize() != 0 {
                     let _ = cuDevicePrimaryCtxReset_v2(dev);
-                } else if !EXITING.load(std::sync::atomic::Ordering::Relaxed) {
-                    // the last release destroys the context and every
-                    // allocation in it (~150 ms); a process that exits right
-                    // after the run leaves that to the driver's exit path
-                    let td = std::time::Instant::now();
-                    let _ = cuDevicePrimaryCtxRelease_v2(dev);
-                    if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: context release {:.0} ms", td.elapsed().as_secs_f64() * 1e3); }
                 }
-                if !deeper {
-                    return r;
+                let td = std::time::Instant::now();
+                let _ = cuDevicePrimaryCtxRelease_v2(dev);
+                if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: context release {:.0} ms", td.elapsed().as_secs_f64() * 1e3); }
+            }
+            match r {
+                Err(e) if e.starts_with(DEEP) && !fixed => {
+                    deep = Some(e);
+                    stack *= 2;
+                    if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: stack guard hit; re-running with {stack} bytes of stack per thread"); }
                 }
-                stack *= 2;
-                if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: stack guard hit; re-running with {stack} bytes of stack per thread"); }
+                // the deeper stack could not be backed: the depth error stands
+                Err(_) if deep.is_some() => {
+                    *used = stack / 2;
+                    return Err(deep.unwrap_or_default());
+                }
+                r => return r,
             }
         }
     }
 }
 
-/// Arenas are managed memory preferring the device: address space is
-/// reserved at once and pages are committed on first touch, so a program
-/// pays for the memory it uses, not for the arena's size (committing every
-/// arena eagerly cost ~0.25 s of setup and teardown on every run).
-unsafe fn alloc(n: usize, what: &str) -> Result<CUdeviceptr, String> {
-    // a small buffer every lane touches at once (per-lane heads, stacks,
-    // worklists) is committed now: demand-paging it only moves the faults
-    // into the kernel
-    // MITHRIL_GPU_EAGER=1 commits every arena up front (a diagnostic: it
-    // separates demand-paging cost from the rest)
-    if n <= EAGER_MAX || std::env::var_os("MITHRIL_GPU_EAGER").is_some() {
-        let mut p: CUdeviceptr = 0;
+/// What one run allocated on the device: freed (and the module unloaded)
+/// when the run ends, so the primary context holds nothing between runs.
+/// A successful run of an exiting process leaves it to the driver.
+struct Mem {
+    bufs: Vec<CUdeviceptr>,
+    module: *mut c_void,
+}
+
+impl Drop for Mem {
+    fn drop(&mut self) {
+        if EXITING.load(std::sync::atomic::Ordering::Relaxed) && !std::thread::panicking() {
+            return;
+        }
+        unsafe {
+            for &b in &self.bufs {
+                let _ = cuMemFree_v2(b);
+            }
+            if !self.module.is_null() {
+                let _ = cuModuleUnload(self.module);
+            }
+        }
+    }
+}
+
+/// How a buffer's pages are committed.
+#[derive(Clone, Copy, PartialEq)]
+enum Commit {
+    /// now: a per-lane table every lane writes as the kernel starts
+    /// (demand paging would only move the faults into the kernel)
+    Now,
+    /// on first touch: an arena that fills from its start as the run
+    /// allocates, so a run pays for what it uses, not for the arena's size
+    OnTouch,
+}
+
+/// Allocate a device buffer. `OnTouch` is managed memory preferring the
+/// device: address space is reserved at once and pages are committed on
+/// first touch (committing every arena eagerly cost ~0.25 s of setup and
+/// teardown on every run). `MITHRIL_GPU_EAGER=1` commits everything now (a
+/// diagnostic: it separates demand-paging cost from the rest).
+unsafe fn alloc(mem: &mut Mem, dev: i32, n: usize, commit: Commit, what: &str) -> Result<CUdeviceptr, String> {
+    let mut p: CUdeviceptr = 0;
+    if commit == Commit::Now || std::env::var_os("MITHRIL_GPU_EAGER").is_some() {
         cu(cuMemAlloc_v2(&mut p, n.max(1)), what)?;
+        mem.bufs.push(p);
         return Ok(p);
     }
-    let mut p: CUdeviceptr = 0;
     cu(cuMemAllocManaged(&mut p, n.max(1), CU_MEM_ATTACH_GLOBAL), what)?;
-    let mut dev = 0i32;
-    cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
-    cu(cuMemAdvise_v2(p, n.max(1), CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CUmemLocation { kind: 1, id: dev }), what)?;
+    mem.bufs.push(p);
+    let at = CUmemLocation { kind: CU_MEM_LOCATION_TYPE_DEVICE, id: dev };
+    cu(cuMemAdvise_v2(p, n.max(1), CU_MEM_ADVISE_SET_PREFERRED_LOCATION, at), what)?;
     Ok(p)
 }
 
@@ -364,14 +431,14 @@ unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Res
 
 /// The abort message of a run the stack guard stopped (see `GpuRunner::run`).
 const DEEP: &str = "mithril-gpu: recursion too deep";
-const MAX_STACK: usize = 64 * 1024;
 
 unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Result<GpuResult, String> {
     let t0 = std::time::Instant::now();
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
-    let mut module: *mut c_void = std::ptr::null_mut();
-    cu(cuModuleLoadData(&mut module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
+    let mut mem = Mem { bufs: Vec::new(), module: std::ptr::null_mut() };
+    cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
+    let module = mem.module;
     let t_load = t0.elapsed();
 
     // number of rules, published by the generated program
@@ -426,7 +493,12 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     // the array heap takes a third of what is left (a program is arrays or
     // cells; neither arena is sized by the program: a parallel array
     // program holds one working set per lane), the cells the rest
-    let hcap = hcap_req.unwrap_or(budget0 / 24).clamp(1 << 20, 1 << 32); // block indices are u32 on the free lists
+    // block indices are u32 on the free lists; below 2^20 words the heap is
+    // smaller than one lane's working set
+    let hcap = hcap_req.unwrap_or(budget0 / 24).clamp(1 << 20, 1 << 32);
+    if hcap_req.is_some_and(|h| h != hcap) {
+        eprintln!("mithril-gpu: warning: MITHRIL_GPU_HEAP={} is outside [2^20, 2^32] words; using {hcap}", hcap_req.unwrap_or(0));
+    }
     let budget = budget0.saturating_sub(8 * hcap);
     let max_ncap = (budget / 20).max(1 << 10).min(u32::MAX as u64 - 1);
     let ncap = if ncap_req > max_ncap {
@@ -447,27 +519,27 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
 
     // device buffers
     let d = Dev {
-        nodes: alloc(16 * ncap as usize, "alloc nodes")?,
-        rc: alloc(4 * ncap as usize, "alloc rc")?,
-        recs: alloc(REC_SIZE * rcap as usize, "alloc recs")?,
-        nbump: alloc(4, "alloc nbump")?,
-        rbump: alloc(4, "alloc rbump")?,
-        nfreen: alloc(4 * MAXLANES, "alloc nfreen")?,
-        nchunk: alloc(8 * MAXLANES, "alloc nchunk")?,
-        ebuf: alloc(24 * bcap as usize * nrules, "alloc ebuf")?,
-        blen: alloc(4 * nrules, "alloc blen")?,
-        bdone: alloc(4 * nrules, "alloc bdone")?,
-        result: alloc(16, "alloc result")?,
-        abortf: alloc(4, "alloc abortf")?,
-        heap: alloc(8 * hcap as usize, "alloc heap")?,
-        hbump: alloc(8, "alloc hbump")?,
+        nodes: alloc(&mut mem, dev, 16 * ncap as usize, Commit::OnTouch, "alloc nodes")?,
+        rc: alloc(&mut mem, dev, 4 * ncap as usize, Commit::OnTouch, "alloc rc")?,
+        recs: alloc(&mut mem, dev, REC_SIZE * rcap as usize, Commit::OnTouch, "alloc recs")?,
+        nbump: alloc(&mut mem, dev, 4, Commit::Now, "alloc nbump")?,
+        rbump: alloc(&mut mem, dev, 4, Commit::Now, "alloc rbump")?,
+        nfreen: alloc(&mut mem, dev, 4 * MAXLANES, Commit::Now, "alloc nfreen")?,
+        nchunk: alloc(&mut mem, dev, 8 * MAXLANES, Commit::Now, "alloc nchunk")?,
+        ebuf: alloc(&mut mem, dev, 24 * bcap as usize * nrules, Commit::OnTouch, "alloc ebuf")?,
+        blen: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc blen")?,
+        bdone: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc bdone")?,
+        result: alloc(&mut mem, dev, 16, Commit::Now, "alloc result")?,
+        abortf: alloc(&mut mem, dev, 4, Commit::Now, "alloc abortf")?,
+        heap: alloc(&mut mem, dev, 8 * hcap as usize, Commit::OnTouch, "alloc heap")?,
+        hbump: alloc(&mut mem, dev, 8, Commit::Now, "alloc hbump")?,
         hcap,
-        nw: alloc(16 * NWCAP * MAXLANES, "alloc nw")?,
-        nwn: alloc(4 * MAXLANES, "alloc nwn")?,
-        labels: alloc(4, "alloc labels")?,
-        rfreen: alloc(4 * MAXLANES, "alloc rfreen")?,
-        lstk: alloc(32 * LSCAP * MAXLANES, "alloc lstk")?,
-        lsn: alloc(4 * MAXLANES, "alloc lsn")?,
+        nw: alloc(&mut mem, dev, 16 * NWCAP * MAXLANES, Commit::Now, "alloc nw")?,
+        nwn: alloc(&mut mem, dev, 4 * MAXLANES, Commit::Now, "alloc nwn")?,
+        labels: alloc(&mut mem, dev, 4, Commit::Now, "alloc labels")?,
+        rfreen: alloc(&mut mem, dev, 4 * MAXLANES, Commit::Now, "alloc rfreen")?,
+        lstk: alloc(&mut mem, dev, 32 * LSCAP * MAXLANES, Commit::Now, "alloc lstk")?,
+        lsn: alloc(&mut mem, dev, 4 * MAXLANES, Commit::Now, "alloc lsn")?,
         ncap,
         rcap,
         bcap,
@@ -487,11 +559,16 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     cu(cuMemsetD8_v2(d.bdone, 0, 4 * nrules), "memset bdone")?;
     cu(cuMemsetD8_v2(d.result, 0, 16), "memset result")?;
     cu(cuMemsetD8_v2(d.abortf, 0, 4), "memset abortf")?;
-    let one: u32 = 1; // cell 0, record 0 and heap word 0 are reserved
+    let one: u32 = 1; // cell 0 and record 0 are reserved
     cu(cuMemcpyHtoD_v2(d.nbump, (&one as *const u32).cast(), 4), "init nbump")?;
     cu(cuMemcpyHtoD_v2(d.rbump, (&one as *const u32).cast(), 4), "init rbump")?;
-    let one64: u64 = 1;
-    cu(cuMemcpyHtoD_v2(d.hbump, (&one64 as *const u64).cast(), 8), "init hbump")?;
+    // heap words 0..2: an empty array that is never freed, the block an
+    // allocation that aborts on a full heap returns (its length is 0, so
+    // no caller writes into it)
+    let empty: [u64; 2] = [1 << 40, 0];
+    cu(cuMemcpyHtoD_v2(d.heap, empty.as_ptr().cast(), 16), "init heap")?;
+    let two64: u64 = 2;
+    cu(cuMemcpyHtoD_v2(d.hbump, (&two64 as *const u64).cast(), 8), "init hbump")?;
     // no clear of the refcounts: every allocation of a refcounted value
     // writes its count (alloc2, mk_con), and clearing would commit the
     // whole managed arena

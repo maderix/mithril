@@ -28,8 +28,9 @@ typedef unsigned long long usize;
 
 #define MAXLANES (1 << 16)
 
-// abort codes (host maps each to a message); arena outranks the rest via
-// atomicMax so the root cause wins.
+// abort codes (host maps each to a message). The first abort wins: every
+// later one is a consequence (lanes run on to their next check), so the
+// first is the root cause.
 #define AB_UNREACHABLE 1u
 #define AB_ARENA 2u
 #define AB_OOB 3u
@@ -137,7 +138,7 @@ __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
 __device__ u32 unbox_cid(u64 slot);
 
-__device__ inline void g_abort(u32 code) { atomicMax(G.abortf, code); }
+__device__ inline void g_abort(u32 code) { atomicCAS(G.abortf, 0u, code); }
 
 __device__ inline u32 lane() {
   return (blockIdx.x * blockDim.x + threadIdx.x) & (MAXLANES - 1);
@@ -236,6 +237,7 @@ __device__ inline i64 f32_mul(i64 a, i64 b) { return f32i(__fmul_rn(f32b(a), f32
 __device__ inline i64 f32_div(i64 a, i64 b) { return f32i(__fdiv_rn(f32b(a), f32b(b))); }
 __device__ inline i64 f32_sqrt(i64 a) { return f32i(__fsqrt_rn(f32b(a))); }
 __device__ inline i64 f32_lt(i64 a, i64 b) { return f32b(a) < f32b(b) ? 1 : 0; }
+__device__ inline i64 f32_le(i64 a, i64 b) { return f32b(a) <= f32b(b) ? 1 : 0; }
 __device__ inline i64 f32_from_u32(i64 a) { return f32i(__uint2float_rn((u32)a)); }
 __device__ inline i64 f32_to_u32(i64 a) {
   float x = f32b(a);
@@ -249,12 +251,12 @@ __device__ inline i64 f32_to_u32(i64 a) {
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 __device__ inline void expect_con(u64 p, const char *site) {
-  if (tag(p) != T_CON) { if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: %s on a non-constructor port %llx\n", site, p); }
+  if (tag(p) != T_CON) { if (atomicCAS(G.abortf, 0u, 9u) == 0) printf("mithril-gpu: %s on a non-constructor port %llx\n", site, p); }
 }
 __device__ inline u32 nclamp(u32 i) {
   if (i >= G.ncap) {
     // a cell index outside the arena is a corrupted port, never a valid read
-    if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: bad cell index %u\n", i);
+    if (atomicCAS(G.abortf, 0u, 9u) == 0) printf("mithril-gpu: bad cell index %u\n", i);
     return G.ncap - 1;
   }
   return i;
@@ -481,7 +483,7 @@ __device__ __noinline__ void spawn_call(u16 rule, const u64 *args, int n, u64 pa
 // Pop the head value of a `[value, next]` spill chain (`ch` = addr + 1;
 // 0 = end), freeing its cell.
 __device__ inline u64 pop_chain(u64 *ch) {
-  if (*ch == 0 || (*ch >> 32) != 0) { if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: pop_chain on %llx\n", *ch); }
+  if (*ch == 0 || (*ch >> 32) != 0) { if (atomicCAS(G.abortf, 0u, 9u) == 0) printf("mithril-gpu: pop_chain on %llx\n", *ch); }
   u32 i = (u32)(*ch - 1);
   u64 v = cell0(i);
   *ch = cell1(i);
@@ -833,8 +835,10 @@ __device__ inline u64 arr_set_n(u64 a, usize n, i64 i, u64 v) {
 __device__ inline u64 arr_new_i(i64 n, u64 v) { return arr_new_raw(n, sh(v)); }
 __device__ inline u64 arr_rc_load(u64 p) { return *(volatile u64 *)arr_block(p); }
 __device__ __noinline__ u64 arr_copy(u64 a) {
-  usize n = arr_len_of(a);
-  u64 b = arr_alloc(n);
+  // the block's own length: an allocation that aborted returns the empty
+  // block at heap word 0
+  u64 b = arr_alloc(arr_len_of(a));
+  usize n = arr_len_of(b);
   if (arr_boxed(a)) {
     for (usize k = 0; k < n; k++) arr_elems(b)[k] = dup_val(arr_elems(a)[k]);
     arr_block(b)[1] |= ARR_BOXED;
@@ -852,6 +856,7 @@ __device__ __noinline__ u64 arr_new(i64 n, u64 v) {
   usize un = (usize)n;
   if (!is_heap(v)) return arr_alloc_fill(un, v);
   u64 p = arr_alloc(un);
+  un = arr_len_of(p); // 0 when the allocation aborted
   for (usize k = 0; k < un; k++) arr_elems(p)[k] = (k + 1 == un) ? v : dup_val(v);
   if (un == 0) free_val(v); else arr_mark_boxed(p, v);
   return p;
@@ -1068,7 +1073,7 @@ __device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
 #define EMPTY ((T_EXT << 56) | M56)
 #define OP_FLIP 0x100u
 #define CTAG_TUPLE 0xfffu
-#define ARR_PAIR 44u
+#define ARR_PAIR 45u
 #define LISTCAP 64
 
 __device__ inline u64 payload(u64 p) { return p & M56; }
@@ -1257,7 +1262,8 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
       *out = arr_set(x, as_i(i), v);
       return true;
     }
-    case 44: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
+    case 44: *out = num(f32_le(as_i(x), as_i(y))); return true;
+    case 45: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
     default: g_abort(AB_UNREACHABLE); return false;
     }
   }
@@ -1809,7 +1815,7 @@ __device__ inline void fire(u32 rule, u64 e0, u64 e1, u64 e2) {
 __device__ void drain_local() {
   u32 L = lane();
   while (G.lsn[L]) {
-    if (*(volatile u32 *)G.abortf >= AB_ARENA)
+    if (*(volatile u32 *)G.abortf != 0)
       return;
     u32 n = G.lsn[L];
     u64 *t = &G.lstk[((u64)L * LSCAP + n - 1) * 4];
@@ -1875,7 +1881,7 @@ __device__ void work_phase(u32 max_steps) {
   u32 ntask = g_woff[G.nrules];
   u32 next = gid;
   for (; s < max_steps; s++) {
-    if (*(volatile u32 *)G.abortf >= AB_ARENA)
+    if (*(volatile u32 *)G.abortf != 0)
       return;
     u32 rule;
     u64 e0, e1, e2;
@@ -2002,7 +2008,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       __syncthreads();
       u32 n = g_off[G.nrules];
       for (u32 i = gid; i < n; i += nl) {
-        if (*(volatile u32 *)G.abortf >= AB_ARENA) break;
+        if (*(volatile u32 *)G.abortf != 0) break;
         u32 r = 0;
         while (i >= g_off[r + 1]) r++;
         fire_task(r, G.bdone[r] + (i - g_off[r]));

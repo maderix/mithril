@@ -86,6 +86,7 @@ const FIXTURES: &[&str] = &[
     "arrays.py",
     "hetero_array.py",
     "f32_ops.py",
+    "f32_surface.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",
@@ -257,6 +258,103 @@ fn gpu_deep_native_recursion_is_a_clean_error() {
     let (_, cu) = pipeline_src(src);
     let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("100,000 native frames cannot fit the device stack");
     assert!(err.contains("recursion too deep"), "wrong error: {err}");
+    // the stack doubled past its 8 KiB start before the device refused
+    let bytes: usize = err.split('(').nth(1).and_then(|t| t.split(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    assert!(bytes > 8192, "no doubling before the depth error: {err}");
+}
+
+/// A recursion 600 deep under a dive budget of 1000 needs more than the
+/// 8 KiB starting stack.
+const DEEP600: &str = "def count(n):\n    if n == 0:\n        return 0\n    return (count(n - 1) * 3 + 1) & 4294967295\n\ndef main():\n    return count(array_len(array_new(600, 0)))\n";
+
+fn cubin_of(src: &str) -> (String, PathBuf) {
+    let (cm, cu) = pipeline_src(src);
+    (oracle(&cm), mithril_gpu::compile_to_cubin(&cu.expect("not a constant"), &cache_dir()).unwrap())
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_FUEL; run --test-threads=1)"]
+fn gpu_stack_doubles_until_the_program_fits() {
+    if !gpu_on() {
+        return;
+    }
+    std::env::set_var("MITHRIL_GPU_FUEL", "1000");
+    let (want, cubin) = cubin_of(DEEP600);
+    let bytes = std::fs::read(&cubin).unwrap();
+    let (r, used) = mithril_gpu::GpuRunner::run_with_stack(&bytes, BOOT, None);
+    // started where the first run ended: no doubling
+    let (r2, used2) = mithril_gpu::GpuRunner::run_with_stack(&bytes, BOOT, Some(used));
+    std::env::remove_var("MITHRIL_GPU_FUEL");
+    assert_eq!(r.map(|r| r.text), Ok(want.clone()), "the doubled run must match the oracle");
+    assert!(used >= 16384, "the stack never doubled ({used} bytes)");
+    assert_eq!(r2.map(|r| r.text), Ok(want));
+    assert_eq!(used2, used, "a run started at the known size doubled again");
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_FUEL and _STACK; run --test-threads=1)"]
+fn gpu_stack_hint_is_kept_beside_the_artefact() {
+    if !gpu_on() {
+        return;
+    }
+    std::env::set_var("MITHRIL_GPU_FUEL", "1000");
+    let (want, cubin) = cubin_of(DEEP600);
+    let dir = std::env::temp_dir().join(format!("mithril-hint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // an artefact named like a hint: the hint must not overwrite it
+    let art = dir.join("p.stack");
+    std::fs::copy(&cubin, &art).unwrap();
+    let r = mithril_gpu::run_cubin(&art, BOOT);
+    let hint = std::fs::read_to_string(dir.join("p.stack.stack")).unwrap_or_default();
+    // a size the user fixed is not written
+    std::env::set_var("MITHRIL_GPU_STACK", "65536");
+    let fixed = dir.join("q.cubin");
+    std::fs::copy(&cubin, &fixed).unwrap();
+    let r2 = mithril_gpu::run_cubin(&fixed, BOOT);
+    std::env::remove_var("MITHRIL_GPU_STACK");
+    std::env::remove_var("MITHRIL_GPU_FUEL");
+    assert_eq!(r.map(|r| r.text), Ok(want.clone()));
+    assert_eq!(std::fs::read(&art).unwrap(), std::fs::read(&cubin).unwrap(), "the artefact was overwritten");
+    assert!(hint.trim().parse::<usize>().is_ok_and(|n| n >= 16384), "hint: {hint:?}");
+    assert_eq!(r2.map(|r| r.text), Ok(want));
+    assert!(!dir.join("q.cubin.stack").exists(), "a fixed stack size was kept as the program's");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_NODES; run --test-threads=1)"]
+fn gpu_failed_runs_leave_no_memory_behind() {
+    if !gpu_on() {
+        return;
+    }
+    let before = mithril_gpu::free_vram().unwrap();
+    std::env::set_var("MITHRIL_GPU_NODES", "1024");
+    for _ in 0..3 {
+        assert!(run_fixture("tree_sum.py").1.is_err(), "the tree cannot fit in 1024 cells");
+    }
+    std::env::remove_var("MITHRIL_GPU_NODES");
+    for _ in 0..3 {
+        let (want, got) = run_fixture("fib_naive.py");
+        assert_eq!(got.map(|r| r.text), Ok(want));
+    }
+    let after = mithril_gpu::free_vram().unwrap();
+    let lost = before.saturating_sub(after);
+    assert!(lost < 64 << 20, "{} MiB of device memory not returned", lost >> 20);
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_EAGER; run --test-threads=1)"]
+fn gpu_eager_commit_gives_the_same_results() {
+    if !gpu_on() {
+        return;
+    }
+    std::env::set_var("MITHRIL_GPU_EAGER", "1");
+    let got: Vec<_> = ["f32_surface.py", "tree_sum.py", "arrays.py"].iter().map(|n| run_fixture(n)).collect();
+    std::env::remove_var("MITHRIL_GPU_EAGER");
+    for (want, got) in got {
+        assert_eq!(got.map(|r| r.text), Ok(want));
+    }
 }
 
 #[test]
