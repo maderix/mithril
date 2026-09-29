@@ -169,7 +169,7 @@ fn contains_return(stmts: &[Stmt]) -> bool {
 
 /// Names assigned anywhere within `stmts` (recursing into nested blocks).
 /// A `for` loop's induction variable counts as assigned by the loop.
-fn assigned_names(stmts: &[Stmt]) -> BTreeSet<String> {
+pub fn assigned_names(stmts: &[Stmt]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     fn go(stmts: &[Stmt], out: &mut BTreeSet<String>) {
         for s in stmts {
@@ -199,7 +199,8 @@ fn assigned_names(stmts: &[Stmt]) -> BTreeSet<String> {
     out
 }
 
-fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
+/// Names `e` reads that it does not bind (a lambda's parameters are bound).
+pub fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
     match e {
         Expr::Var(n) => {
             out.insert(n.clone());
