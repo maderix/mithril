@@ -1,8 +1,8 @@
 //! Compile-time reducer (fuel-bounded, deterministic FIFO worklist) and
 //! readback of fully-reduced values.
 
-use crate::rules::{flo_bits, process};
-use crate::{Mode, NetProg, CTAG_TUPLE, CTAG_UNREACHABLE, EMPTY};
+use crate::rules::process;
+use crate::{flo_bits, Mode, NetProg, CTAG_TUPLE, CTAG_UNREACHABLE, EMPTY};
 use mithril_core::net::Net;
 use mithril_core::port::{Port, Tag};
 use mithril_front::core::{Core, CoreModule, Val};

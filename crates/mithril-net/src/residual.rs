@@ -22,14 +22,14 @@
 //! closure binds; otherwise every application shares it. Parked branch closures splice the original Core of their lifted
 //! entry under lets for the captured arguments.
 
-use crate::{dup_label,
+use crate::{cid_of, dup_label,
     dup_addr, list_items, mat_addr, mat_id, op_addr, op_code, ref_entry, ref_head, MatchMeta, NetProg,
-    CTAG_TUPLE, CTAG_UNREACHABLE, EMPTY, OP_FLIP, PRIM_BASE,
+    CTAG_TUPLE, EMPTY, OP_FLIP, PRIM_BASE,
 };
 use mithril_core::net::Net;
 use mithril_core::port::{Port, Tag};
 use mithril_front::ast::{BinOp, CmpOp};
-use mithril_front::core::{Core, Prim, UNREACHABLE_CTOR};
+use mithril_front::core::{Core, Prim};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -88,8 +88,6 @@ pub(crate) struct Index {
     input_of: Vec<Option<u32>>,
     /// parked Swi/Mat agents: (cell, is_match) in discovery order
     pub(crate) parked: Vec<(u32, bool)>,
-    /// every Ref port met (residual calls, parked arm closures): its entry
-    pub(crate) refs: Vec<u16>,
     /// label of every Dup cell met
     pub(crate) dup_labels: HashMap<u32, u32>,
     /// pending calls (by result wire) and Dup cells reached only inside an
@@ -190,7 +188,7 @@ fn agent_addr(p: Port) -> u32 {
 /// input wires with their Core variables.
 pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[(Port, Port)]) -> Index {
     let n = net.cells.len();
-    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), refs: Vec::new(), dup_labels: HashMap::new(), lam_only: HashSet::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
+    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), dup_labels: HashMap::new(), lam_only: HashSet::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
     let params: Vec<Port> = free.iter().map(|(p, _)| *p).collect();
     for (p, v) in free {
         debug_assert_eq!(p.tag(), Tag::Var);
@@ -290,15 +288,11 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
                 }
             }
             Tag::Ref => {
-                ix.refs.push(ref_entry(p));
                 for a in list_items(net, ref_head(p)) {
                     work.push(a);
                 }
             }
             Tag::Dup => {
-                // a value shared k ways is a chain of k-1 Dup cells, each
-                // link's port sitting in the previous cell's second slot:
-                // every output of the chain is the one shared value
                 // a value shared k ways is a chain of k-1 Dup cells, each
                 // link's port sitting in the previous cell's second slot;
                 // every cell is its own dup (its own label) whose input is
@@ -526,15 +520,10 @@ fn lam_frame(l: u32) -> usize {
 
 /// Whether `e` reads any of `vars`.
 fn mentions(e: &Core, vars: &[u32]) -> bool {
-    match e {
-        Core::Var(v) => vars.contains(v),
-        Core::Num(_) | Core::Flo(_) => false,
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) | Core::App(a, b) => mentions(a, vars) || mentions(b, vars),
-        Core::If(a, b, c) => mentions(a, vars) || mentions(b, vars) || mentions(c, vars),
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => xs.iter().any(|x| mentions(x, vars)),
-        Core::Match(s, arms) => mentions(s, vars) || arms.iter().any(|(_, _, b)| mentions(b, vars)),
-        Core::Proj(a, _) | Core::Lam(_, a) => mentions(a, vars),
-    }
+    e.any(&mut |n| match n {
+        Core::Var(v) => Some(vars.contains(v)),
+        _ => None,
+    })
 }
 
 impl<'a> Reader<'a> {
@@ -662,16 +651,13 @@ impl<'a> Reader<'a> {
     pub(crate) fn read(&mut self, p: Port) -> Core {
         match p.tag() {
             Tag::Num => Core::Num(p.as_i64()),
-            Tag::Flo => Core::Flo(f64::from_bits(crate::rules::flo_bits(self.net.cell(p.payload() as u32)))),
+            Tag::Flo => Core::Flo(f64::from_bits(crate::flo_bits(self.net.cell(p.payload() as u32)))),
             Tag::Con => {
                 let fields: Vec<Core> = con_fields(self.net, p).into_iter().map(|f| self.atom(f)).collect();
-                let tag = p.con_tag();
-                if tag == CTAG_TUPLE {
+                if p.con_tag() == CTAG_TUPLE {
                     Core::Tuple(fields)
-                } else if tag == CTAG_UNREACHABLE {
-                    Core::Ctor(UNREACHABLE_CTOR, fields)
                 } else {
-                    Core::Ctor(tag as u32, fields)
+                    Core::Ctor(cid_of(p.con_tag()), fields)
                 }
             }
             Tag::Var => self.read_wire(p.payload() as u32),
@@ -726,7 +712,7 @@ impl<'a> Reader<'a> {
                 Core::App(Box::new(f), Box::new(arg))
             }
             Producer::Op(a) => {
-                let code = op_code(self.stored_op(a));
+                let code = op_code(self.stored(a));
                 self.read_op(a, code)
             }
             Producer::ResOp(op, y) => {
@@ -751,7 +737,7 @@ impl<'a> Reader<'a> {
                 let scrut = self.read_input(m);
                 let scrut = self.bind_atom(scrut);
                 let c = self.net.cell(m);
-                let mid = mat_id(self.stored_mat(m)) as usize;
+                let mid = mat_id(self.stored(m)) as usize;
                 match &self.prog.metas[mid] {
                     MatchMeta::Proj(i) => Core::Proj(Box::new(scrut), *i),
                     MatchMeta::Arms(tags) => {
@@ -759,10 +745,9 @@ impl<'a> Reader<'a> {
                         let tags = tags.clone();
                         let mut arms = Vec::new();
                         for (i, (t, r)) in tags.iter().zip(slots).enumerate() {
-                            let cid = if *t == CTAG_UNREACHABLE { UNREACHABLE_CTOR } else { *t as u32 };
                             let binders = self.arms[&(m, i)].binders.clone();
                             let body = self.arm(m, i, r);
-                            arms.push((cid, binders, body));
+                            arms.push((cid_of(*t), binders, body));
                         }
                         Core::Match(Box::new(scrut), arms)
                     }
@@ -775,6 +760,7 @@ impl<'a> Reader<'a> {
             Producer::Ref(r, ret) => {
                 let entry = ref_entry(r) as usize;
                 assert!(entry < self.prog.nfns, "ICE: residual call to a lifted entry");
+                let call = |me: &mut Self| Core::Call(entry as u32, list_items(me.net, ref_head(r)).into_iter().map(|a| me.atom(a)).collect());
                 // A pending call binds in the frame it was created in (the
                 // net fires it there), under anything it reads (`place`).
                 let created = self.ref_frame.get(&ret).map(|f| {
@@ -783,19 +769,13 @@ impl<'a> Reader<'a> {
                 match created {
                     Some(pos) if pos != self.here() => {
                         let frame = self.stack[pos];
-                        let call = self.read_in(frame, |me| {
-                            let args: Vec<Core> = list_items(me.net, ref_head(r)).into_iter().map(|a| me.atom(a)).collect();
-                            Core::Call(entry as u32, args)
-                        });
+                        let call = self.read_in(frame, call);
                         let at = self.read_in(frame, |me| me.place(&call));
                         self.bind_in(at, call)
                     }
                     // created where it is used: read in place (the caller
                     // binds it, or keeps it as a tail call)
-                    _ => {
-                        let args: Vec<Core> = list_items(self.net, ref_head(r)).into_iter().map(|a| self.atom(a)).collect();
-                        Core::Call(entry as u32, args)
-                    }
+                    _ => call(self),
                 }
             }
         }
@@ -846,28 +826,14 @@ impl<'a> Reader<'a> {
         self.read_input(d)
     }
 
-    fn producer_of(&mut self, r: u32) -> Producer {
-        match self.ix.producer[r as usize] {
-            Some(p) => p,
-            None => {
-                let st = self.ix.stored[r as usize];
-                let extra = format!(" (stored {st:?})");
-                panic!("ICE: residual wire class {} has no producer (stored: {:?}){}", r, st.map(|p| p.tag()), extra)
-            }
-        }
+    fn producer_of(&self, r: u32) -> Producer {
+        self.ix.producer[r as usize].unwrap_or_else(|| panic!("ICE: residual wire class {} has no producer (stored {:?})", r, self.ix.stored[r as usize]))
     }
 
     /// The port of agent `a` as stored in its input wire.
-    fn stored_op(&mut self, a: u32) -> Port {
-        let r = match self.ix.input_of[a as usize] {
-            Some(r) => r,
-            None => panic!("ICE: agent at cell {} is not stored in any wire", a),
-        };
+    fn stored(&self, a: u32) -> Port {
+        let r = self.ix.input_of[a as usize].unwrap_or_else(|| panic!("ICE: agent at cell {} is not stored in any wire", a));
         self.ix.stored[r as usize].unwrap()
-    }
-
-    fn stored_mat(&mut self, m: u32) -> Port {
-        self.stored_op(m)
     }
 
     /// The value the agent at `a` is waiting on: its input wire's producer
@@ -929,28 +895,7 @@ fn op_core(code: u16, x: Core, y: Core) -> Core {
         };
     }
     if code >= 16 {
-        let op = match code {
-            16 => CmpOp::Lt,
-            17 => CmpOp::Le,
-            18 => CmpOp::Gt,
-            19 => CmpOp::Ge,
-            20 => CmpOp::Eq,
-            _ => CmpOp::Ne,
-        };
-        return Core::Cmp(op, Box::new(x), Box::new(y));
+        return Core::Cmp(CmpOp::ALL[(code - 16) as usize], Box::new(x), Box::new(y));
     }
-    let op = match code {
-        0 => BinOp::Add,
-        1 => BinOp::Sub,
-        2 => BinOp::Mul,
-        3 => BinOp::Div,
-        4 => BinOp::FloorDiv,
-        5 => BinOp::Mod,
-        6 => BinOp::Shl,
-        7 => BinOp::Shr,
-        8 => BinOp::BitAnd,
-        9 => BinOp::BitOr,
-        _ => BinOp::BitXor,
-    };
-    Core::Op2(op, Box::new(x), Box::new(y))
+    Core::Op2(BinOp::ALL[code as usize], Box::new(x), Box::new(y))
 }

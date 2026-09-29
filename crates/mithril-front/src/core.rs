@@ -295,6 +295,38 @@ pub fn py_mod(a: i64, b: i64) -> i64 {
     }
 }
 
+/// i56 semantics of a binary op (one definition for the oracle and the
+/// reducer); `None` on a zero divisor.
+pub fn int_op(op: BinOp, x: i64, y: i64) -> Option<i64> {
+    if y == 0 && matches!(op, BinOp::Div | BinOp::FloorDiv | BinOp::Mod) {
+        return None;
+    }
+    Some(wrap56(match op {
+        BinOp::Add => x.wrapping_add(y),
+        BinOp::Sub => x.wrapping_sub(y),
+        BinOp::Mul => x.wrapping_mul(y),
+        BinOp::Div => x.wrapping_div(y),
+        BinOp::FloorDiv => floor_div(x, y),
+        BinOp::Mod => py_mod(x, y),
+        BinOp::Shl => x.wrapping_shl(y as u32),
+        BinOp::Shr => x.wrapping_shr(y as u32),
+        BinOp::BitAnd => x & y,
+        BinOp::BitOr => x | y,
+        BinOp::BitXor => x ^ y,
+    }))
+}
+
+/// f64 semantics of a binary op; `None` where it is not defined on floats.
+pub fn flo_op(op: BinOp, x: f64, y: f64) -> Option<f64> {
+    Some(match op {
+        BinOp::Add => x + y,
+        BinOp::Sub => x - y,
+        BinOp::Mul => x * y,
+        BinOp::Div => x / y,
+        _ => return None,
+    })
+}
+
 /// Evaluate `f(args)` under module `m`. This is a small, direct-style
 /// reference interpreter: no attempt is made to be fast, only correct and
 /// simple enough to serve as an oracle for the net-based runtime's tests.
@@ -323,26 +355,8 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
         Core::Op2(op, a, b) => {
             let (va, vb) = (eval(m, env, a), eval(m, env, b));
             match (&va, &vb) {
-                (Val::I(x), Val::I(y)) => Val::I(wrap56(match op {
-                    BinOp::Add => x.wrapping_add(*y),
-                    BinOp::Sub => x.wrapping_sub(*y),
-                    BinOp::Mul => x.wrapping_mul(*y),
-                    BinOp::Div => x.wrapping_div(*y),
-                    BinOp::FloorDiv => floor_div(*x, *y),
-                    BinOp::Mod => py_mod(*x, *y),
-                    BinOp::Shl => x.wrapping_shl(*y as u32),
-                    BinOp::Shr => x.wrapping_shr(*y as u32),
-                    BinOp::BitAnd => x & y,
-                    BinOp::BitOr => x | y,
-                    BinOp::BitXor => x ^ y,
-                })),
-                (Val::F(x), Val::F(y)) => Val::F(match op {
-                    BinOp::Add => x + y,
-                    BinOp::Sub => x - y,
-                    BinOp::Mul => x * y,
-                    BinOp::Div => x / y,
-                    _ => panic!("eval_core: op {:?} not defined on floats", op),
-                }),
+                (Val::I(x), Val::I(y)) => Val::I(int_op(*op, *x, *y).expect("eval_core: division by zero")),
+                (Val::F(x), Val::F(y)) => Val::F(flo_op(*op, *x, *y).unwrap_or_else(|| panic!("eval_core: op {:?} not defined on floats", op))),
                 _ => panic!("eval_core: Op2 type mismatch: {:?} {:?} {:?}", op, va, vb),
             }
         }

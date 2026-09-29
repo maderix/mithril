@@ -71,6 +71,11 @@ impl Cells for Net {
     }
 }
 
+/// The f64 bits of a `Net` float cell (the inverse of its `alloc_flo`).
+pub fn flo_bits(cell: [u64; 2]) -> u64 {
+    Port(cell[0]).payload() | (Port(cell[1]).payload() << 56)
+}
+
 /// An unfilled wire slot and the terminator of a list chain. Encoded as
 /// `Ext` with an all-ones payload so it cannot collide with a real
 /// `Ext(addr)` chain pointer.

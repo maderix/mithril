@@ -3,9 +3,10 @@
 //! policy, how builtins compute (or stay opaque), and where an op that
 //! cannot compute goes (the residual program).
 
-use crate::{instantiate, list_collect, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
+use crate::{flo_bits, instantiate, list_collect, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
 use mithril_core::net::Net;
-use mithril_front::core::{cmp_bool, floor_div, py_mod, wrap56};
+use mithril_front::ast::{BinOp, CmpOp};
+use mithril_front::core::{cmp_bool, flo_op, int_op};
 use mithril_core::port::{Port, Tag};
 use mithril_core::rules::{MatMeta, Prog};
 
@@ -51,18 +52,11 @@ impl Prog<Net> for NetProg {
 
 
 fn cmp_result(code: u16, ord: Option<std::cmp::Ordering>) -> Port {
-    Port::num(cmp_bool(mithril_front::ast::CmpOp::ALL[(code - 16) as usize], ord) as i64)
+    Port::num(cmp_bool(CmpOp::ALL[(code - 16) as usize], ord) as i64)
 }
 
-/// Boxed f64 helpers: the bit pattern is split across two `Num`-tagged
-/// ports so `Net::dump` never sees an invalid tag byte.
-
-pub(crate) fn flo_bits(cell: [u64; 2]) -> u64 {
-    (Port(cell[0]).payload()) | (Port(cell[1]).payload() << 56)
-}
-
-/// Numeric fold, mirroring `eval_core`'s semantics exactly (i56 wrapping
-/// ints, f64 floats boxed in cells, comparisons producing 0/1). `None`
+/// Numeric fold with `eval_core`'s semantics (`int_op`, `flo_op`,
+/// `cmp_bool`; floats boxed in cells, comparisons producing 0/1). `None`
 /// where the op cannot fold at compile time: a failing evaluation (division
 /// by zero stays a runtime error), an array builtin (arrays are runtime
 /// values), or the pairing pseudo-op.
@@ -84,24 +78,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
             if code >= 16 {
                 return Some(cmp_result(code, Some(a.cmp(&b))));
             }
-            if matches!(code, 3 | 4 | 5) && b == 0 {
-                return None;
-            }
-            let r = match code {
-                0 => a.wrapping_add(b),
-                1 => a.wrapping_sub(b),
-                2 => a.wrapping_mul(b),
-                3 => a.wrapping_div(b),
-                4 => floor_div(a, b),
-                5 => py_mod(a, b),
-                6 => a.wrapping_shl(b as u32),
-                7 => a.wrapping_shr(b as u32),
-                8 => a & b,
-                9 => a | b,
-                10 => a ^ b,
-                _ => panic!("ICE: unknown int opcode {}", code),
-            };
-            Some(Port::num(wrap56(r)))
+            int_op(BinOp::ALL[code as usize], a, b).map(Port::num)
         }
         (Tag::Flo, Tag::Flo) => {
             let (ax, ay) = (x.payload() as u32, y.payload() as u32);
@@ -112,13 +89,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
             if code >= 16 {
                 return Some(cmp_result(code, a.partial_cmp(&b)));
             }
-            let r = match code {
-                0 => a + b,
-                1 => a - b,
-                2 => a * b,
-                3 => a / b,
-                _ => panic!("ICE: opcode {} not defined on floats", code),
-            };
+            let r = flo_op(BinOp::ALL[code as usize], a, b).unwrap_or_else(|| panic!("ICE: opcode {} not defined on floats", code));
             Some(mithril_core::agents::Cells::alloc_flo(net, r))
         }
         (tx, ty) => panic!("type error: arithmetic on mixed int/float operands ({:?}/{:?})", tx, ty),

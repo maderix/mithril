@@ -15,6 +15,14 @@ pub enum BinOp {
     BitXor,
 }
 
+impl BinOp {
+    /// Declaration order is the opcode order (the index).
+    pub const ALL: [BinOp; 11] = [
+        BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::FloorDiv, BinOp::Mod,
+        BinOp::Shl, BinOp::Shr, BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor,
+    ];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
     Lt,
