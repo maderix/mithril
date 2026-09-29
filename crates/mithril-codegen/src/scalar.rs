@@ -28,7 +28,7 @@
 
 use crate::lir::{do_, as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
-use mithril_front::core::{Core, CoreModule};
+use mithril_front::core::{Core, CoreModule, Prim};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -84,7 +84,6 @@ fn slot_name(key: u64) -> String {
 
 /// Whether `e` is array-valued (under the current bindings).
 fn akind(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core) -> bool {
-    use mithril_front::core::Prim;
     match e {
         Core::Var(v) => arrs.contains_key(v),
         Core::Proj(..) => slot_key(e, tarr, arrs).is_some(),
@@ -173,7 +172,6 @@ impl<'m> Chk<'m> {
     /// is returned for deferred consumption (it moves when the enclosing
     /// operation runs, after its other operands are evaluated).
     fn aexpr(&mut self, e: &Core) -> Option<u64> {
-        use mithril_front::core::Prim;
         if !self.ok {
             return None;
         }
@@ -202,14 +200,7 @@ impl<'m> Chk<'m> {
                 _ => self.fail(e),
             },
             Core::If(c, x, y) => {
-                self.expr(c);
-                let before = self.live.clone();
-                let d = self.aexpr(x);
-                self.settle(x, d);
-                let after = std::mem::replace(&mut self.live, before);
-                let d = self.aexpr(y);
-                self.settle(y, d);
-                if self.live != after {
+                if !self.arms(c, x, y, |s, e| { let d = s.aexpr(e); s.settle(e, d) }).2 {
                     self.fail(e);
                 }
             }
@@ -221,6 +212,18 @@ impl<'m> Chk<'m> {
             _ => self.fail(e),
         }
         None
+    }
+
+    /// Check both arms of an `if` from the same live set; true when both
+    /// end in the same set.
+    fn arms<R>(&mut self, c: &Core, x: &Core, y: &Core, mut f: impl FnMut(&mut Self, &Core) -> R) -> (R, R, bool) {
+        self.expr(c);
+        let before = self.live.clone();
+        let a = f(self, x);
+        let after = std::mem::replace(&mut self.live, before);
+        let b = f(self, y);
+        let same = self.live == after;
+        (a, b, same)
     }
 
     /// Consume a deferred slot now.
@@ -248,29 +251,21 @@ impl<'m> Chk<'m> {
         }
         match e {
             Core::Num(_) => {}
-            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
+            Core::Prim(Prim::ArrGet, xs) => {
                 self.read(&xs[0]);
                 self.expr(&xs[1]);
             }
-            Core::Prim(mithril_front::core::Prim::ArrLen, xs) => self.read(&xs[0]),
+            Core::Prim(Prim::ArrLen, xs) => self.read(&xs[0]),
             Core::Prim(p, xs) if p.is_f32() => xs.iter().for_each(|x| self.expr(x)),
-            Core::Var(i) if self.arrs.contains_key(i) => self.fail(e),
-            Core::Var(i) => {
-                if self.tvars.contains_key(i) {
-                    { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false }; // tuple var escaping without Proj
-                }
-            }
+            // an array, or a tuple var escaping without Proj
+            Core::Var(i) if self.arrs.contains_key(i) || self.tvars.contains_key(i) => self.fail(e),
+            Core::Var(_) => {}
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
                 self.expr(a);
                 self.expr(b);
             }
             Core::If(c, x, y) => {
-                self.expr(c);
-                let before = self.live.clone();
-                self.expr(x);
-                let after = std::mem::replace(&mut self.live, before);
-                self.expr(y);
-                if self.live != after {
+                if !self.arms(c, x, y, |s, e| s.expr(e)).2 {
                     self.fail(e);
                 }
             }
@@ -278,18 +273,13 @@ impl<'m> Chk<'m> {
                 self.bind(*x, r);
                 self.expr(b);
             }
-            Core::Call(g, args) => {
-                match &self.sigs[*g as usize] {
-                    Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(sig.params.clone(), args),
-                    _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
-                }
-            }
-            Core::Proj(..) if self.slot(e).is_some() => self.fail(e), // an array component
-            Core::Proj(b, i) => match &**b {
-                Core::Var(t) if self.tvars.get(t).is_some_and(|k| i < k) => {}
-                _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
+            Core::Call(g, args) => match &self.sigs[*g as usize] {
+                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(sig.params.clone(), args),
+                _ => self.fail(e),
             },
-            _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
+            Core::Proj(..) if self.slot(e).is_some() => self.fail(e), // an array component
+            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).is_some_and(|k| i < k)) => {}
+            _ => self.fail(e),
         }
     }
 
@@ -317,7 +307,7 @@ impl<'m> Chk<'m> {
                             self.expr(it);
                         }
                     }
-                    _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", a))); } self.ok = false },
+                    _ => self.fail(a),
                 },
             }
         }
@@ -379,12 +369,8 @@ impl<'m> Chk<'m> {
                 }
             }
             Core::If(c, x, y) => {
-                self.expr(c);
-                let before = self.live.clone();
-                self.tuple_expr(x, k);
-                let after = std::mem::replace(&mut self.live, before);
-                self.tuple_expr(y, k);
-                if self.live != after || tmask(self.sigs, &self.tarr, &self.arrs, x, k) != tmask(self.sigs, &self.tarr, &self.arrs, y, k) {
+                let same = self.arms(c, x, y, |s, e| s.tuple_expr(e, k)).2;
+                if !same || tmask(self.sigs, &self.tarr, &self.arrs, x, k) != tmask(self.sigs, &self.tarr, &self.arrs, y, k) {
                     self.fail(e);
                 }
             }
@@ -394,9 +380,9 @@ impl<'m> Chk<'m> {
             }
             Core::Call(g, args) => match &self.sigs[*g as usize] {
                 Some(sig) if sig.ret == Kind::SK(k) => self.args(sig.params.clone(), args),
-                _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
+                _ => self.fail(e),
             },
-            _ => { if self.why.is_none() { self.why = Some(format!("{:.160}", format!("{:?}", e))); } self.ok = false },
+            _ => self.fail(e),
         }
     }
 
@@ -413,11 +399,7 @@ impl<'m> Chk<'m> {
                 self.tail(b, fid)
             }
             Core::If(c, x, y) => {
-                self.expr(c);
-                let before = self.live.clone();
-                let a = self.tail(x, fid);
-                self.live = before;
-                let b = self.tail(y, fid);
+                let (a, b, _) = self.arms(c, x, y, |s, e| s.tail(e, fid));
                 if a == b || b.0 == Kind::No {
                     a
                 } else if a.0 == Kind::No {
@@ -474,22 +456,7 @@ pub(crate) fn calls_fn(e: &Core, g: u32) -> bool {
 
 /// `fid` is reached again through another function's body (a cycle).
 pub(crate) fn recursive_via_others(m: &CoreModule, fid: u32) -> bool {
-    let callees = |g: u32| {
-        let mut v = Vec::new();
-        m.fns[g as usize].body.any(&mut |e| { if let Core::Call(h, _) = e { v.push(*h); } None::<bool> });
-        v
-    };
-    let (mut seen, mut todo) = (vec![false; m.fns.len()], callees(fid));
-    todo.retain(|h| *h != fid);
-    while let Some(g) = todo.pop() {
-        if g == fid {
-            return true;
-        }
-        if !std::mem::replace(&mut seen[g as usize], true) {
-            todo.extend(callees(g));
-        }
-    }
-    false
+    crate::callees(&m.fns[fid as usize].body).into_iter().any(|g| g != fid && crate::reaches(m, g, fid))
 }
 
 /// `e` calls a function other than `g` that does not always inline.
@@ -501,8 +468,8 @@ fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
 }
 
 /// The prelude helper of a binary32 primitive.
-pub(crate) fn f32_fn(p: mithril_front::core::Prim) -> &'static str {
-    use mithril_front::core::Prim::*;
+pub(crate) fn f32_fn(p: Prim) -> &'static str {
+    use Prim::*;
     match p {
         F32Add => "f32_add",
         F32Sub => "f32_sub",
@@ -516,15 +483,9 @@ pub(crate) fn f32_fn(p: mithril_front::core::Prim) -> &'static str {
     }
 }
 
-/// A variable or constant.
-fn is_atom(e: &Core) -> bool {
-    matches!(e, Core::Num(_) | Core::Var(_))
-}
-
 /// An expression that can be evaluated as a value join: no calls and no
 /// array writes or allocations (reads are fine).
 fn join_arm(e: &Core) -> bool {
-    use mithril_front::core::Prim;
     match e {
         Core::Num(_) | Core::Var(_) | Core::Proj(..) => true,
         Core::Op2(_, a, b) | Core::Cmp(_, a, b) => join_arm(a) && join_arm(b),
@@ -604,29 +565,27 @@ thread_local! {
     /// itself; its one unit is counted at the call site (a register
     /// increment in native callers), so fuel still measures work.
     pub(crate) static LEAF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
     /// `BRIDGE_LIVE[g]`: native `g` can be reached through its dive bridge
     /// (it is the entry, a fold, or has a non-native caller).
     pub(crate) static BRIDGE_LIVE: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
     /// `SHIFTED[g]`: native `g` holds its ints pre-shifted (`x << 8`); see
     /// `choose_reps`.
     pub(crate) static SHIFTED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
     /// `CTX[g]`: native `g` takes the worker context (it touches arrays,
     /// itself or through a callee); the rest keep their argument registers.
     pub(crate) static CTX: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Test override of `choose_reps` (see `EmitOpts`).
+    pub(crate) static FORCE_REP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Entry `g` of a per-function flag table (`d` past its end).
+pub(crate) fn flag(t: &'static std::thread::LocalKey<std::cell::RefCell<Vec<bool>>>, g: u32, d: bool) -> bool {
+    t.with(|l| l.borrow().get(g as usize).copied().unwrap_or(d))
 }
 
 /// The context argument of a call to native `g` (`"ctx, "` or nothing).
 pub(crate) fn ctx_arg(g: u32) -> &'static str {
-    if CTX.with(|c| c.borrow().get(g as usize).copied().unwrap_or(true)) {
+    if flag(&CTX, g, true) {
         "ctx, "
     } else {
         ""
@@ -656,13 +615,8 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     crate::fixpoint(need, |f, s| calls[f].iter().any(|g| s[*g as usize]))
 }
 
-thread_local! {
-    /// Test override of `choose_reps` (see `EmitOpts`).
-    pub(crate) static FORCE_REP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn shifted(g: u32) -> bool {
-    SHIFTED.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
+    flag(&SHIFTED, g, false)
 }
 
 /// Integer representation of each native function, chosen by a static op
@@ -676,7 +630,6 @@ pub(crate) fn shifted(g: u32) -> bool {
 pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     use crate::range::{feeds_mask, feeds_mask32, low32_closed};
     use mithril_front::ast::BinOp;
-    use mithril_front::core::Prim;
     struct C<'a> {
         r: &'a crate::range::Ranges,
         plain: usize,
@@ -813,14 +766,7 @@ fn conv(e: E, from_sh: bool, to_sh: bool) -> E {
 }
 
 pub(crate) fn is_leaf(g: u32) -> bool {
-    LEAF.with(|l| l.borrow().get(g as usize).copied().unwrap_or(false))
-}
-
-/// Fuel accounting a native caller emits for a call to `g`.
-fn leaf_unit(g: u32, b: &mut Vec<S>) {
-    if is_leaf(g) {
-        b.push(set("fl", bin(Bop::Add, v("fl"), i64_(1))));
-    }
+    flag(&LEAF, g, false)
 }
 
 /// The signature of `g` when dive code may call its native form directly:
@@ -1079,7 +1025,6 @@ impl<'m> Sem<'m> {
     /// An array-valued expression in a consuming position; a slot operand
     /// is returned by name with its key for deferred consumption.
     fn aval(&mut self, e: &Core, b: &mut Vec<S>) -> (E, Option<u64>) {
-        use mithril_front::core::Prim;
         if let Some(k) = self.slot(e) {
             return (v(slot_name(k)), Some(k));
         }
@@ -1115,21 +1060,7 @@ impl<'m> Sem<'m> {
                 b.push(let_(&t, Ty::I64, call));
             }
             Core::If(cd, x, y) => {
-                let ec = self.val(cd, b);
-                let before = self.live.clone();
-                let lens0 = self.lens.clone();
-                let mut bx = Vec::new();
-                let vx = self.aval_now(x, &mut bx);
-                bx.push(set(&t, vx));
-                let after = std::mem::replace(&mut self.live, before);
-                self.lens = lens0.clone();
-                let mut by = Vec::new();
-                let vy = self.aval_now(y, &mut by);
-                by.push(set(&t, vy));
-                self.live = after;
-                self.lens = lens0;
-                b.push(S::Decl(t.clone(), Ty::I64));
-                b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
+                self.join(cd, x, y, b, |_| vec![t.clone()], |s, e, bb| vec![s.aval_now(e, bb)]);
             }
             Core::Let(x, r, bo) => {
                 self.bind(*x, r, b);
@@ -1138,6 +1069,29 @@ impl<'m> Sem<'m> {
             _ => unreachable!("non-array Core in scalar array emission"),
         }
         (v(t), None)
+    }
+
+    /// Both arms of a value `if` into the locals `names` makes (after the
+    /// condition), from the same live set and lengths; x's live set
+    /// survives (the arms agree, see Chk).
+    fn join(&mut self, cd: &Core, x: &Core, y: &Core, b: &mut Vec<S>, names: impl FnOnce(&mut Self) -> Vec<String>, mut arm: impl FnMut(&mut Self, &Core, &mut Vec<S>) -> Vec<E>) -> Vec<String> {
+        let ec = self.val(cd, b);
+        let names = names(self);
+        let (live0, lens0) = (self.live.clone(), self.lens.clone());
+        let mut bx = Vec::new();
+        for (n, e) in names.iter().zip(arm(self, x, &mut bx)) {
+            bx.push(set(n, e));
+        }
+        let after = std::mem::replace(&mut self.live, live0);
+        self.lens = lens0.clone();
+        let mut by = Vec::new();
+        for (n, e) in names.iter().zip(arm(self, y, &mut by)) {
+            by.push(set(n, e));
+        }
+        (self.live, self.lens) = (after, lens0);
+        b.extend(names.iter().map(|n| S::Decl(n.clone(), Ty::I64)));
+        b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
+        names
     }
 
     /// `aval`, consuming a slot operand immediately.
@@ -1161,7 +1115,9 @@ impl<'m> Sem<'m> {
     /// The call `s_g(ctx?, fuel, args..)` with its fuel accounting.
     fn raw_call(&mut self, g: u32, args: &[Core], b: &mut Vec<S>) -> E {
         let es = self.call_args(g, args, b);
-        leaf_unit(g, b);
+        if is_leaf(g) {
+            b.push(set("fl", bin(Bop::Add, v("fl"), i64_(1)))); // a leaf's unit, counted here
+        }
         let mut a = vec![v("fuel")];
         a.extend(es);
         E::Call { f: format!("s_{g}"), ctx: !ctx_arg(g).is_empty(), args: a }
@@ -1195,24 +1151,6 @@ impl<'m> Sem<'m> {
         for k in &self.live {
             b.push(free(as_u(v(slot_name(*k)))));
         }
-    }
-
-    /// The mutable local names of `fid`'s flattened parameter list, in
-    /// flattened order (v<p> for ints, q<p>_<i> for tuple components).
-    fn slot_names(&self, fid: u32) -> Vec<String> {
-        let sig = self.sigs[fid as usize].as_ref().unwrap();
-        let mut out = Vec::new();
-        for (pp, pt) in sig.params.iter().enumerate() {
-            match pt {
-                PTy::I | PTy::A | PTy::B => out.push(vn(pp as u32)),
-                PTy::T(k) => {
-                    for i in 0..*k {
-                        out.push(format!("q{pp}_{i}"));
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// Flatten call args per the callee's parameter types (tuple params
@@ -1318,28 +1256,11 @@ impl<'m> Sem<'m> {
             }
             Core::If(cd, x, y) => {
                 let k = tuple_kind(self.sigs, e).expect("tuple if");
-                let ec = self.val(cd, b);
-                let t = self.fresh();
-                let names: Vec<String> = (0..k).map(|i| format!("{t}_{i}")).collect();
-                let before = self.live.clone();
-                let lens0 = self.lens.clone();
-                let mut bx = Vec::new();
-                for (n, x) in names.iter().zip(self.tval(x, &mut bx)) {
-                    bx.push(set(n, x));
-                }
-                let after = std::mem::replace(&mut self.live, before);
-                self.lens = lens0.clone();
-                let mut by = Vec::new();
-                for (n, y) in names.iter().zip(self.tval(y, &mut by)) {
-                    by.push(set(n, y));
-                }
-                self.live = after;
-                self.lens = lens0;
-                for n in &names {
-                    b.push(S::Decl(n.clone(), Ty::I64));
-                }
-                b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
-                names.into_iter().map(v).collect()
+                let names = |s: &mut Self| {
+                    let t = s.fresh();
+                    (0..k).map(|i| format!("{t}_{i}")).collect()
+                };
+                self.join(cd, x, y, b, names, |s, e, bb| s.tval(e, bb)).into_iter().map(v).collect()
             }
             Core::Let(x, r, bo) => {
                 self.bind(*x, r, b);
@@ -1353,59 +1274,31 @@ impl<'m> Sem<'m> {
     fn val(&mut self, e: &Core, b: &mut Vec<S>) -> E {
         let low = std::mem::take(&mut self.low);
         let low32 = std::mem::take(&mut self.low32);
-        if !self.shifted {
-            match e {
-                Core::Num(n) => return i64_(*n),
-                Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
-                    let a = self.rd(&xs[0]);
-                    let i = self.val(&xs[1], b);
-                    let t = self.fresh();
-                    let get = self.arr_get(&a, i);
-                    b.push(let_(&t, Ty::I64, bin(Bop::Shr, cast(get, Ty::I64), i64_(8))));
-                    return v(t);
-                }
-                Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
-                    let a = self.rd(&xs[0]);
-                    return match self.acc(&a) {
-                        Some(l) => cast(v(l), Ty::I64),
-                        None => cast(p("arr_len_of", vec![as_u(v(a))]), Ty::I64),
-                    };
-                }
-                Core::Op2(..) | Core::Cmp(..) => return self.plain_arith(e, low, low32, b),
-                Core::Prim(pr, xs) if pr.is_f32() => {
-                    let es: Vec<E> = xs.iter().map(|x| self.val(x, b)).collect();
-                    let t = self.fresh();
-                    b.push(let_(&t, Ty::I64, p(f32_fn(*pr), es)));
-                    return v(t);
-                }
-                _ => {}
-            }
-        }
+        let sh = self.shifted;
         match e {
-            // native ints are pre-shifted (`x << 8`): i64 wrapping is i56
-            // wrapping, so no op needs a wrap fix-up
-            Core::Num(n) => i64_((*n).wrapping_shl(8)),
-            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => {
+            Core::Op2(..) | Core::Cmp(..) if !sh => self.plain_arith(e, low, low32, b),
+            // shifted ints are `x << 8`: i64 wrapping is i56 wrapping, so no
+            // op needs a wrap fix-up
+            Core::Num(n) => i64_(if sh { (*n).wrapping_shl(8) } else { *n }),
+            Core::Prim(Prim::ArrGet, xs) => {
                 let a = self.rd(&xs[0]);
                 let i = self.unshifted(&xs[1], b);
                 let t = self.fresh();
                 let get = self.arr_get(&a, i);
-                b.push(let_(&t, Ty::I64, cast(get, Ty::I64)));
+                b.push(let_(&t, Ty::I64, conv(cast(get, Ty::I64), true, sh))); // stored pre-shifted
                 v(t)
             }
             Core::Prim(pr, xs) if pr.is_f32() => {
-                // shifted representation: the bit patterns go through plain
+                // the bit patterns go through plain
                 let es: Vec<E> = xs.iter().map(|x| self.unshifted(x, b)).collect();
                 let t = self.fresh();
-                b.push(let_(&t, Ty::I64, bin(Bop::Shl, p(f32_fn(*pr), es), i64_(8))));
+                b.push(let_(&t, Ty::I64, conv(p(f32_fn(*pr), es), false, sh)));
                 v(t)
             }
-            Core::Prim(mithril_front::core::Prim::ArrLen, xs) => {
+            Core::Prim(Prim::ArrLen, xs) => {
                 let a = self.rd(&xs[0]);
-                match self.acc(&a) {
-                    Some(l) => bin(Bop::Shl, cast(v(l), Ty::I64), i64_(8)),
-                    None => bin(Bop::Shl, cast(p("arr_len_of", vec![as_u(v(a))]), Ty::I64), i64_(8)),
-                }
+                let l = self.acc(&a).map(v).unwrap_or_else(|| p("arr_len_of", vec![as_u(v(a))]));
+                conv(cast(l, Ty::I64), false, sh)
             }
             Core::Var(i) => v(vn(*i)),
             Core::Proj(base, i) => match &**base {
@@ -1452,7 +1345,7 @@ impl<'m> Sem<'m> {
                 let (ex, ey) = (self.val(x, b), self.val(y, b));
                 bin(Bop::Shl, cast(compare(cmp_code(op), ex, ey), Ty::I64), i64_(8))
             }
-            Core::If(cd, x, y) if is_atom(x) && is_atom(y) => {
+            Core::If(cd, x, y) if matches!((&**x, &**y), (Core::Num(_) | Core::Var(_), Core::Num(_) | Core::Var(_))) => {
                 // a select of computed values (what if-conversion leaves):
                 // mask arithmetic, so the backend cannot turn it back into
                 // an unpredictable branch on a loop-carried chain
@@ -1464,25 +1357,7 @@ impl<'m> Sem<'m> {
                 b.push(let_(&t, Ty::I64, bin(Bop::Or, bin(Bop::And, vx, v(&m)), bin(Bop::And, vy, bin(Bop::Xor, v(&m), i64_(-1))))));
                 v(t)
             }
-            Core::If(cd, x, y) => {
-                let ec = self.val(cd, b);
-                let t = self.fresh();
-                let before = self.live.clone();
-                let lens0 = self.lens.clone();
-                let mut bx = Vec::new();
-                let vx = self.val(x, &mut bx);
-                bx.push(set(&t, vx));
-                let after = std::mem::replace(&mut self.live, before);
-                self.lens = lens0.clone();
-                let mut by = Vec::new();
-                let vy = self.val(y, &mut by);
-                by.push(set(&t, vy));
-                self.live = after;
-                self.lens = lens0;
-                b.push(S::Decl(t.clone(), Ty::I64));
-                b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
-                v(t)
-            }
+            Core::If(cd, x, y) => v(self.join(cd, x, y, b, |s| vec![s.fresh()], |s, e, bb| vec![s.val(e, bb)]).remove(0)),
             Core::Let(x, r, bo) => {
                 self.bind(*x, r, b);
                 self.val(bo, b)
@@ -1576,16 +1451,17 @@ impl<'m> Sem<'m> {
                 }
                 self.drop_live(b);
                 let sig = self.sigs[fid as usize].clone().unwrap();
+                let names = flat_names(&sig);
                 let mut nl = Vec::new();
                 for (pp, pt) in sig.params.iter().enumerate() {
                     if self.use_lens && matches!(pt, PTy::A | PTy::B) {
                         // es is flattened; array params occupy one slot each
-                        let j = self.slot_names(fid).iter().position(|n| *n == vn(pp as u32)).unwrap();
+                        let j = names.iter().position(|n| *n == vn(pp as u32)).unwrap();
                         let l = self.len_of(&name_of(&es[j]), b);
                         nl.push((pp, l));
                     }
                 }
-                for (i, slot) in self.slot_names(fid).into_iter().enumerate() {
+                for (i, slot) in names.into_iter().enumerate() {
                     b.push(set(slot, v(format!("n{i}"))));
                 }
                 for (pp, l) in nl {
@@ -1621,6 +1497,16 @@ impl<'m> Sem<'m> {
     }
 }
 
+/// Local names of a signature's flattened parameters: v<p>, or q<p>_<i>
+/// per tuple component.
+fn flat_names(sig: &Sig) -> Vec<String> {
+    let comps = |(pp, pt): (usize, &PTy)| match pt {
+        PTy::T(k) => (0..*k).map(|i| format!("q{pp}_{i}")).collect(),
+        _ => vec![vn(pp as u32)],
+    };
+    sig.params.iter().enumerate().flat_map(comps).collect()
+}
+
 /// The native form `s_<fid>` plus the bridging dive form `d_<fid>`.
 /// `bor[fid][p]` = param p is borrowed (bridge must not free a tuple arg's
 /// spine; owned tuple args are freed after unpacking — components are NUMs,
@@ -1631,16 +1517,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     let lp = f.self_tail_rec;
     let sig = sigs[fid as usize].as_ref().unwrap().clone();
     let mut params: Vec<(String, Ty)> = vec![("fuel".into(), Ty::RefI64)];
-    for (pp, pt) in sig.params.iter().enumerate() {
-        match pt {
-            PTy::I | PTy::A | PTy::B => params.push((vn(pp as u32), Ty::I64)),
-            PTy::T(k) => {
-                for i in 0..*k {
-                    params.push((format!("q{pp}_{i}"), Ty::I64));
-                }
-            }
-        }
-    }
+    params.extend(flat_names(&sig).into_iter().map(|n| (n, Ty::I64)));
     let ret_ty = match sig.ret {
         Kind::S1 => Ty::I64,
         Kind::SK(k) => Ty::Tup(k),
@@ -1683,7 +1560,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     // may alias the other's header, forcing a reload per access). With one
     // array, or only reads, the header load is hoisted already, and a
     // register length only obstructs the backend (e.g. vectorization).
-    let arr_params = sig.params.iter().filter(|t| matches!(t, PTy::A | PTy::B)).count();
+    let arr_ps: Vec<usize> = sig.params.iter().enumerate().filter(|(_, t)| matches!(t, PTy::A | PTy::B)).map(|(pp, _)| pp).collect();
     let writes = sig.params.iter().any(|t| matches!(t, PTy::A));
     // Only in a loop whose body calls nothing but itself: the lengths
     // take registers, which a call-free loop body has to spare; a loop
@@ -1691,14 +1568,10 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     // (a call to a small call-free function that always inlines does not
     // count: after inlining the body is still call-free)
     let leaf_loop = calls_fn(&f.body, fid) && !calls_other_real(m, &f.body, fid);
-    let looping = lp && leaf_loop && arr_params >= 2 && writes;
+    let looping = lp && leaf_loop && arr_ps.len() >= 2 && writes;
     sem.use_lens = looping;
-    if looping {
-        for (pp, pt) in sig.params.iter().enumerate() {
-            if matches!(pt, PTy::A | PTy::B) {
-                sem.lens.insert(vn(pp as u32), format!("l_v{pp}"));
-            }
-        }
+    for pp in arr_ps.iter().filter(|_| looping) {
+        sem.lens.insert(vn(*pp as u32), format!("l_v{pp}"));
     }
     let mut bb = Vec::new();
     sem.tail(&f.body, fid, lp, &mut bb);
@@ -1706,13 +1579,8 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     // code never suspends, but its work counts toward the enclosing dive's
     // budget (so parallel granularity tracks work, not dive calls). Counted
     // in a local and settled at each return, so it stays in a register.
-    let mut body: Vec<S> = sig
-        .params
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| looping && matches!(t, PTy::A | PTy::B))
-        .map(|(pp, _)| let_(format!("l_v{pp}"), Ty::Usize, p("arr_len_of", vec![as_u(v(vn(pp as u32)))])))
-        .collect();
+    let mut body: Vec<S> =
+        arr_ps.iter().filter(|_| looping).map(|pp| let_(format!("l_v{pp}"), Ty::Usize, p("arr_len_of", vec![as_u(v(vn(*pp as u32)))]))).collect();
     // the device's stack guard where native frames can pile up (no budget)
     if (calls_fn(&f.body, fid) && !lp) || recursive_via_others(m, fid) {
         body.push(do_(p("stack_guard", vec![])));
@@ -1793,7 +1661,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     // has no caller and must not look like one (a live bridge call site
     // with unknown arguments blocks the backend's interprocedural
     // constant propagation and single-call-site inlining).
-    if !BRIDGE_LIVE.with(|b| b.borrow().get(fid as usize).copied().unwrap_or(true)) {
+    if !flag(&BRIDGE_LIVE, fid, true) {
         bridge_body = vec![S::Unreachable];
     }
     let mut dparams = vec![("fuel".to_string(), Ty::RefI64)];

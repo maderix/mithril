@@ -976,7 +976,7 @@ pub(crate) fn fixpoint(mut set: Vec<bool>, step: impl Fn(usize, &[bool]) -> bool
 }
 
 /// `from` (transitively) calls `to`.
-fn reaches(m: &CoreModule, from: u32, to: u32) -> bool {
+pub(crate) fn reaches(m: &CoreModule, from: u32, to: u32) -> bool {
     let mut seen = vec![false; m.fns.len()];
     let mut stack = vec![from];
     while let Some(g) = stack.pop() {
@@ -1041,7 +1041,7 @@ pub(crate) fn closure_entry(caps: Vec<u32>, lam: &Core) -> u16 {
 }
 
 pub(crate) fn is_bounded(g: u32) -> bool {
-    BOUNDED.with(|b| b.borrow().get(g as usize).copied().unwrap_or(false))
+    scalar::flag(&BOUNDED, g, false)
 }
 
 /// The callee of every call site in `e` (with repeats), pre-order.
