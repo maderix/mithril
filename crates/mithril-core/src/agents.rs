@@ -146,6 +146,23 @@ pub fn ref_entry(p: Port) -> u16 {
     (p.payload() & 0xFFFF) as u16
 }
 
+/// The cell of an agent port.
+pub fn addr_of(p: Port) -> u32 {
+    match p.tag() {
+        Tag::Op => op_addr(p),
+        Tag::Mat => mat_addr(p),
+        Tag::Dup => dup_addr(p),
+        _ => p.payload() as u32,
+    }
+}
+
+/// Read and free cell `a`.
+pub fn take<C: Cells>(c: &mut C, a: u32) -> (Port, Port) {
+    let cell = c.cell(a);
+    c.free_cell(a);
+    (Port(cell[0]), Port(cell[1]))
+}
+
 // ---- list chains ([item, Ext(next)|EMPTY] cells) ----
 
 pub fn list_alloc<C: Cells>(c: &mut C, items: &[Port]) -> Port {
@@ -191,14 +208,7 @@ pub fn con_alloc<C: Cells>(c: &mut C, ctag: u16, fields: &[Port]) -> Port {
     let n = fields.len();
     match n {
         0 => Port::con(0, ctag, 0),
-        1 => {
-            let a = c.alloc(fields[0], EMPTY);
-            Port::con(a as u64, ctag, 1)
-        }
-        2 => {
-            let a = c.alloc(fields[0], fields[1]);
-            Port::con(a as u64, ctag, 2)
-        }
+        1 | 2 => Port::con(c.alloc(fields[0], *fields.get(1).unwrap_or(&EMPTY)) as u64, ctag, n as u8),
         _ => {
             let rest = con_alloc(c, ctag, &fields[1..]);
             let a = c.alloc(fields[0], rest);
@@ -207,32 +217,38 @@ pub fn con_alloc<C: Cells>(c: &mut C, ctag: u16, fields: &[Port]) -> Port {
     }
 }
 
-/// Walk and free a constructor chain, returning the field ports in order.
-pub fn con_collect<C: Cells>(c: &mut C, mut p: Port) -> Vec<Port> {
+/// Constructor fields, without freeing the chain.
+pub fn con_fields<C: Cells>(c: &C, mut p: Port) -> Vec<Port> {
     let mut out = Vec::new();
-    loop {
-        let n = p.con_arity();
-        let a = p.con_addr() as u32;
-        match n {
-            0 => break,
-            1 => {
-                let cell = c.cell(a);
-                c.free_cell(a);
-                out.push(Port(cell[0]));
-                break;
-            }
+    while p.con_arity() > 0 {
+        let cell = c.cell(p.con_addr() as u32);
+        out.push(Port(cell[0]));
+        match p.con_arity() {
+            1 => break,
             2 => {
-                let cell = c.cell(a);
-                c.free_cell(a);
-                out.push(Port(cell[0]));
                 out.push(Port(cell[1]));
                 break;
             }
+            _ => p = Port(cell[1]),
+        }
+    }
+    out
+}
+
+/// Walk and free a constructor chain, returning the field ports in order.
+pub fn con_collect<C: Cells>(c: &mut C, mut p: Port) -> Vec<Port> {
+    let mut out = Vec::new();
+    while p.con_arity() > 0 {
+        let (x, y) = take(c, p.con_addr() as u32);
+        out.push(x);
+        match p.con_arity() {
+            1 => break,
+            2 => {
+                out.push(y);
+                break;
+            }
             _ => {
-                let cell = c.cell(a);
-                c.free_cell(a);
-                out.push(Port(cell[0]));
-                p = Port(cell[1]);
+                p = y;
                 debug_assert_eq!(p.tag(), Tag::Con);
             }
         }

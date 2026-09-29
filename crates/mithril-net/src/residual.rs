@@ -22,7 +22,7 @@
 //! closure binds; otherwise every application shares it. Parked branch closures splice the original Core of their lifted
 //! entry under lets for the captured arguments.
 
-use crate::{cid_of, dup_label,
+use crate::{addr_of, cid_of, con_fields, dup_label,
     dup_addr, list_items, mat_addr, mat_id, op_addr, op_code, ref_entry, ref_head, MatchMeta, NetProg,
     CTAG_TUPLE, EMPTY, OP_FLIP, PRIM_BASE,
 };
@@ -174,16 +174,6 @@ fn is_consumer(p: Port) -> bool {
     matches!(p.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup | Tag::App)
 }
 
-fn agent_addr(p: Port) -> u32 {
-    match p.tag() {
-        Tag::Op => op_addr(p),
-        Tag::Mat => mat_addr(p),
-        Tag::Dup => dup_addr(p),
-        Tag::Swi | Tag::App => p.payload() as u32,
-        t => panic!("ICE: agent_addr of {:?}", t),
-    }
-}
-
 /// Typed walk from the roots; fills the index. `free` are the unknown
 /// input wires with their Core variables.
 pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[(Port, Port)]) -> Index {
@@ -234,7 +224,7 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
                 } else {
                     ix.stored[w as usize] = Some(s);
                     if is_consumer(s) {
-                        ix.input_of[agent_addr(s) as usize] = Some(w);
+                        ix.input_of[addr_of(s) as usize] = Some(w);
                     }
                     if s.tag() == Tag::Dup {
                         ix.dup_labels.insert(dup_addr(s), dup_label(s));
@@ -441,34 +431,6 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
         }
     }
     ix
-}
-
-/// Constructor fields without freeing the chain.
-pub(crate) fn con_fields(net: &Net, mut p: Port) -> Vec<Port> {
-    let mut out = Vec::new();
-    loop {
-        let n = p.con_arity();
-        let a = p.con_addr() as u32;
-        match n {
-            0 => break,
-            1 => {
-                out.push(Port(net.cell(a)[0]));
-                break;
-            }
-            2 => {
-                let c = net.cell(a);
-                out.push(Port(c[0]));
-                out.push(Port(c[1]));
-                break;
-            }
-            _ => {
-                let c = net.cell(a);
-                out.push(Port(c[0]));
-                p = Port(c[1]);
-            }
-        }
-    }
-    out
 }
 
 /// Per arm of an instantiated parked branch: the binder variables of its

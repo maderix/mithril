@@ -85,9 +85,9 @@ pub fn count_uses(v: u32, e: &NExpr) -> usize {
     match e {
         NExpr::Num(_) | NExpr::Flo(_) => 0,
         NExpr::Var(u) => (*u == v) as usize,
-        NExpr::Op2(_, a, b) => count_uses(v, a) + count_uses(v, b),
+        NExpr::Op2(_, a, b) | NExpr::App(a, b) => count_uses(v, a) + count_uses(v, b),
         NExpr::Let(u, r, b) => count_uses(v, r) + if *u == v { 0 } else { count_uses(v, b) },
-        NExpr::Call(_, args) | NExpr::Ctor(_, args) | NExpr::Tuple(args) => {
+        NExpr::Call(_, args) | NExpr::Ctor(_, args) | NExpr::Tuple(args) | NExpr::Prim(_, args) => {
             args.iter().map(|a| count_uses(v, a)).sum()
         }
         NExpr::If(c, t, e2) => {
@@ -97,9 +97,7 @@ pub fn count_uses(v: u32, e: &NExpr) -> usize {
             count_uses(v, s) + specs.iter().filter(|sp| sp.caps.contains(&v)).count()
         }
         NExpr::Proj(e2, _) => count_uses(v, e2),
-        NExpr::Prim(_, args) => args.iter().map(|a| count_uses(v, a)).sum(),
         NExpr::Lam(u, b) => if *u == v { 0 } else { count_uses(v, b) },
-        NExpr::App(f, a) => count_uses(v, f) + count_uses(v, a),
     }
 }
 
@@ -156,6 +154,28 @@ fn closure<C: Cells>(net: &mut C, env: &mut Env, spec: &ClosureSpec) -> Port {
     ref_port(head, spec.entry)
 }
 
+/// A binary agent `mk(cell)` with cell `[second, ret]`, linked to `first`;
+/// returns ret.
+fn agent2<C: Cells>(net: &mut C, mk: impl Fn(u32) -> Port, first: Port, second: Port) -> Port {
+    let w = wire(net);
+    let c = net.alloc(second, w);
+    link(net, mk(c), first);
+    w
+}
+
+/// A selector `mk(cell)` with cell `[ret, rest]`, linked to its input;
+/// returns ret.
+fn selector<C: Cells>(net: &mut C, mk: impl Fn(u32) -> Port, input: Port, rest: Port) -> Port {
+    let w = wire(net);
+    let m = net.alloc(w, rest);
+    link(net, mk(m), input);
+    w
+}
+
+fn insts<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, xs: &[NExpr]) -> Vec<Port> {
+    xs.iter().map(|a| inst(net, prog, env, a)).collect()
+}
+
 /// Instantiate one expression, returning the port its value flows out of.
 fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port {
     match e {
@@ -165,10 +185,7 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
         NExpr::Op2(code, a, b) => {
             let p1 = inst(net, prog, env, a);
             let p2 = inst(net, prog, env, b);
-            let w = wire(net);
-            let c = net.alloc(p2, w);
-            link(net, op_port(c, *code), p1);
-            w
+            agent2(net, |c| op_port(c, *code), p1, p2)
         }
         NExpr::Let(v, r, b) => {
             let pr = inst(net, prog, env, r);
@@ -176,7 +193,7 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
             inst(net, prog, env, b)
         }
         NExpr::Call(f, args) => {
-            let ps: Vec<Port> = args.iter().map(|a| inst(net, prog, env, a)).collect();
+            let ps = insts(net, prog, env, args);
             let head = list_alloc(net, &ps);
             let w = wire(net);
             // A Ref must meet the unfold rule, not be parked in a wire.
@@ -184,11 +201,11 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
             w
         }
         NExpr::Ctor(ctag, args) => {
-            let ps: Vec<Port> = args.iter().map(|a| inst(net, prog, env, a)).collect();
+            let ps = insts(net, prog, env, args);
             con_alloc(net, *ctag, &ps)
         }
         NExpr::Tuple(items) => {
-            let ps: Vec<Port> = items.iter().map(|a| inst(net, prog, env, a)).collect();
+            let ps = insts(net, prog, env, items);
             con_alloc(net, CTAG_TUPLE, &ps)
         }
         NExpr::If(c, t, e2) => {
@@ -196,35 +213,21 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
             let rt = closure(net, env, t);
             let re = closure(net, env, e2);
             let s2 = net.alloc(rt, re);
-            let w = wire(net);
-            let s = net.alloc(w, Port::new(Tag::Ext, s2 as u64));
-            link(net, Port::new(Tag::Swi, s as u64), pc);
-            w
+            selector(net, |s| Port::new(Tag::Swi, s as u64), pc, Port::new(Tag::Ext, s2 as u64))
         }
         NExpr::Match(s, mid, specs) => {
             let ps = inst(net, prog, env, s);
             let refs: Vec<Port> = specs.iter().map(|sp| closure(net, env, sp)).collect();
             let head = list_alloc(net, &refs);
-            let w = wire(net);
-            let m = net.alloc(w, head);
-            link(net, mat_port(m, *mid), ps);
-            w
+            selector(net, |m| mat_port(m, *mid), ps, head)
         }
         NExpr::Proj(e2, mid) => {
             let pe = inst(net, prog, env, e2);
-            let w = wire(net);
-            let m = net.alloc(w, EMPTY);
-            link(net, mat_port(m, *mid), pe);
-            w
+            selector(net, |m| mat_port(m, *mid), pe, EMPTY)
         }
         NExpr::Prim(code, args) => {
-            let ps: Vec<Port> = args.iter().map(|a| inst(net, prog, env, a)).collect();
-            let binop = |net: &mut C, code: u16, p1: Port, p2: Port| -> Port {
-                let w = wire(net);
-                let c = net.alloc(p2, w);
-                link(net, op_port(c, code), p1);
-                w
-            };
+            let ps = insts(net, prog, env, args);
+            let binop = |net: &mut C, code: u16, p1: Port, p2: Port| agent2(net, |c| op_port(c, code), p1, p2);
             match ps.len() {
                 1 => binop(net, *code, ps[0], Port::num(0)),
                 2 => binop(net, *code, ps[0], ps[1]),
@@ -251,10 +254,7 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
         NExpr::App(f, a) => {
             let pf = inst(net, prog, env, f);
             let pa = inst(net, prog, env, a);
-            let w = wire(net);
-            let c = net.alloc(pa, w);
-            link(net, Port::new(Tag::App, c as u64), pf);
-            w
+            agent2(net, |c| Port::new(Tag::App, c as u64), pf, pa)
         }
     }
 }

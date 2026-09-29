@@ -53,42 +53,13 @@ pub fn readback(net: &Net, root: Port) -> Option<Val> {
     }
 }
 
-fn read_con(net: &Net, mut p: Port) -> Option<Val> {
-    let ctag = p.con_tag();
-    if ctag == CTAG_UNREACHABLE {
+fn read_con(net: &Net, p: Port) -> Option<Val> {
+    if p.con_tag() == CTAG_UNREACHABLE {
         return None;
     }
-    let mut fields = Vec::new();
-    loop {
-        let n = p.con_arity();
-        let a = p.con_addr() as u32;
-        match n {
-            0 => break,
-            1 => {
-                fields.push(readback(net, Port(net.cell(a)[0]))?);
-                break;
-            }
-            2 => {
-                let c = net.cell(a);
-                fields.push(readback(net, Port(c[0]))?);
-                fields.push(readback(net, Port(c[1]))?);
-                break;
-            }
-            _ => {
-                let c = net.cell(a);
-                fields.push(readback(net, Port(c[0]))?);
-                p = Port(c[1]);
-                if p.tag() != Tag::Con {
-                    return None;
-                }
-            }
-        }
-    }
-    if ctag == CTAG_TUPLE {
-        Some(Val::T(std::sync::Arc::new(fields)))
-    } else {
-        Some(Val::C(ctag as u32, std::sync::Arc::new(fields)))
-    }
+    let fields: Vec<Val> = crate::con_fields(net, p).into_iter().map(|f| readback(net, f)).collect::<Option<_>>()?;
+    let fields = std::sync::Arc::new(fields);
+    Some(if p.con_tag() == CTAG_TUPLE { Val::T(fields) } else { Val::C(p.con_tag() as u32, fields) })
 }
 
 /// Per-function specialization report.
@@ -460,32 +431,13 @@ fn unfold_call(
 /// Live agent cells: both slots in use (an op, a branch, a constructor or
 /// list link, a sharing node); a wire cell holds one port at most.
 fn agents(net: &Net) -> usize {
-    let mut freed = vec![false; net.cells.len()];
-    for &i in &net.free {
-        freed[i as usize] = true;
-    }
-    net.cells.iter().enumerate().filter(|(i, c)| !freed[*i] && c[0] != EMPTY.0 && c[1] != EMPTY.0).count()
+    net.live().filter(|(_, c)| c[0] != EMPTY.0 && c[1] != EMPTY.0).count()
 }
 
 /// Live constructor cells other than tuples, by the ports stored in wires
 /// (a constructor is reachable only through a wire or another one's field).
 fn data_nodes(net: &Net) -> usize {
-    let mut freed = vec![false; net.cells.len()];
-    for &i in &net.free {
-        freed[i as usize] = true;
-    }
-    let mut n = 0;
-    for (i, c) in net.cells.iter().enumerate() {
-        if freed[i] {
-            continue;
-        }
-        for p in [Port(c[0]), Port(c[1])] {
-            if p.tag() == Tag::Con && p.con_tag() != crate::CTAG_TUPLE {
-                n += 1;
-            }
-        }
-    }
-    n
+    net.live().flat_map(|(_, c)| c).filter(|p| Port(*p).tag() == Tag::Con && Port(*p).con_tag() != crate::CTAG_TUPLE).count()
 }
 
 /// Every argument of the call is a known value (no unfilled wire).
@@ -493,7 +445,7 @@ fn args_known(net: &Net, head: Port) -> bool {
     fn known(net: &Net, p: Port) -> bool {
         match p.tag() {
             Tag::Num | Tag::Flo => true,
-            Tag::Con => crate::residual::con_fields(net, p).into_iter().all(|f| known(net, f)),
+            Tag::Con => crate::con_fields(net, p).into_iter().all(|f| known(net, f)),
             Tag::Var => {
                 let s = Port(net.cell(p.payload() as u32)[0]);
                 s != EMPTY && s.tag() != Tag::Var && !matches!(s.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup | Tag::Ref) && known(net, s)
