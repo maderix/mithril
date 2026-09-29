@@ -477,6 +477,7 @@ pub(crate) fn f32_fn(p: Prim) -> &'static str {
         F32Div => "f32_div",
         F32Sqrt => "f32_sqrt",
         F32Lt => "f32_lt",
+        F32Le => "f32_le",
         F32FromU32 => "f32_from_u32",
         F32ToU32 => "f32_to_u32",
         _ => unreachable!(),

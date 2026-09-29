@@ -8,12 +8,13 @@ use crate::Diag;
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
-    /// loops seen so far: makes each `range(a, b)` loop's hidden names unique
-    loops: usize,
+    /// hidden names made so far (range loops, tuple destructuring): keeps
+    /// each one unique
+    hidden: usize,
 }
 
 pub fn parse_module(toks: &[Token]) -> Result<Module, Diag> {
-    let mut p = Parser { toks, pos: 0, loops: 0 };
+    let mut p = Parser { toks, pos: 0, hidden: 0 };
     p.module()
 }
 
@@ -159,31 +160,63 @@ impl<'a> Parser<'a> {
             TokKind::Match => self.match_stmt(),
             TokKind::Return => {
                 self.bump();
-                let e = self.expr()?;
+                let e = self.expr_list()?;
                 self.expect_newline()?;
                 Ok(Stmt::Return(e))
             }
             TokKind::Name(n) if UNSUPPORTED_KEYWORDS.contains(&n.as_str()) => {
                 Err(Diag::new(self.line(), format!("unsupported statement: {}", n)))
             }
-            _ => self.simple_stmt(),
+            _ => return self.simple_stmt(),
         }?])
     }
 
-    fn simple_stmt(&mut self) -> Result<Stmt, Diag> {
+    /// `e`, or `a, b = e` (tuple destructuring: a hidden name holds the
+    /// tuple, each target reads one component), or `e1, e2` as a tuple.
+    fn simple_stmt(&mut self) -> Result<Vec<Stmt>, Diag> {
         let line = self.line();
-        let e = self.expr()?;
+        let e = self.expr_list()?;
         if matches!(self.kind(), TokKind::Assign) {
             self.bump();
-            let rhs = self.expr()?;
+            let rhs = self.expr_list()?;
             self.expect_newline()?;
-            return match e {
-                Expr::Var(name) => Ok(Stmt::Assign(name, rhs)),
+            let name = |t: &Expr| match t {
+                Expr::Var(n) => Ok(n.clone()),
                 _ => Err(Diag::new(line, "invalid assignment target")),
+            };
+            return match e {
+                Expr::Tuple(targets) if !targets.is_empty() => {
+                    self.hidden += 1;
+                    let tmp = format!("__tuple{}", self.hidden);
+                    let mut out = vec![Stmt::Assign(tmp.clone(), rhs)];
+                    for (i, t) in targets.iter().enumerate() {
+                        let proj = Expr::Index(Box::new(Expr::Var(tmp.clone())), Box::new(Expr::Int(i as i64)));
+                        out.push(Stmt::Assign(name(t)?, proj));
+                    }
+                    Ok(out)
+                }
+                t => Ok(vec![Stmt::Assign(name(&t)?, rhs)]),
             };
         }
         self.expect_newline()?;
-        Ok(Stmt::ExprStmt(e))
+        Ok(vec![Stmt::ExprStmt(e)])
+    }
+
+    /// `e` or a bare tuple `e1, e2, ...` (as after `return` or `=`).
+    fn expr_list(&mut self) -> Result<Expr, Diag> {
+        let first = self.expr()?;
+        if !matches!(self.kind(), TokKind::Comma) {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while matches!(self.kind(), TokKind::Comma) {
+            self.bump();
+            if matches!(self.kind(), TokKind::Newline | TokKind::Assign) {
+                break;
+            }
+            items.push(self.expr()?);
+        }
+        Ok(Expr::Tuple(items))
     }
 
     fn if_stmt(&mut self) -> Result<Stmt, Diag> {
@@ -245,8 +278,8 @@ impl<'a> Parser<'a> {
             Some(b) => {
                 // per-loop names: a nested loop reusing `var` must not reset
                 // the outer loop's start
-                self.loops += 1;
-                let (ctr, lo) = (format!("__range{}_{var}", self.loops), format!("__lo{}_{var}", self.loops));
+                self.hidden += 1;
+                let (ctr, lo) = (format!("__range{}_{var}", self.hidden), format!("__lo{}_{var}", self.hidden));
                 let lo_v = || Box::new(Expr::Var(lo.clone()));
                 body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), lo_v())));
                 Ok(vec![Stmt::Assign(lo.clone(), first), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])
@@ -412,11 +445,18 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr, Diag> {
-        // Unary +/- is not part of this grammar (see brief: decline
-        // anything not listed); only binary +/- and unary `not` exist.
-        if let TokKind::Minus | TokKind::Plus = self.kind() {
-            let sign = if matches!(self.kind(), TokKind::Minus) { "minus" } else { "plus" };
-            return Err(Diag::new(self.line(), format!("unary {} is not supported", sign)));
+        // unary minus binds tighter than `*` and looser than a call or
+        // index (as in Python); a literal operand folds into the literal
+        if matches!(self.kind(), TokKind::Minus) {
+            self.bump();
+            return Ok(match self.unary()? {
+                Expr::Int(v) => Expr::Int(v.wrapping_neg()),
+                Expr::Float(v) => Expr::Float(-v),
+                e => Expr::Neg(Box::new(e)),
+            });
+        }
+        if matches!(self.kind(), TokKind::Plus) {
+            return Err(Diag::new(self.line(), "unary plus is not supported"));
         }
         self.postfix()
     }

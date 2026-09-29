@@ -4,6 +4,7 @@
 pub mod ast;
 pub mod core;
 pub mod desugar;
+pub mod infer;
 pub mod lex;
 pub mod parse;
 
@@ -24,8 +25,11 @@ impl Diag {
     }
 }
 
-/// Parse Mithril source into a surface `Module`.
+/// Parse Mithril source into a surface `Module`, with its f32 operations
+/// lowered to the builtins (`infer`).
 pub fn parse(src: &str) -> Result<Module, Diag> {
     let toks = lex::lex(src)?;
-    parse::parse_module(&toks)
+    let mut m = parse::parse_module(&toks)?;
+    infer::elaborate(&mut m)?;
+    Ok(m)
 }

@@ -212,7 +212,7 @@ pub fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
             free_reads_expr(a, out);
             free_reads_expr(b, out);
         }
-        Expr::Not(a) => free_reads_expr(a, out),
+        Expr::Not(a) | Expr::Neg(a) => free_reads_expr(a, out),
         Expr::IfExp(c, t, e2) => {
             free_reads_expr(c, out);
             free_reads_expr(t, out);
@@ -304,6 +304,8 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         Expr::Bool2(BoolOp::And, a, b) => Ok(Core::If(c(a)?, c(b)?, num(0))),
         Expr::Bool2(BoolOp::Or, a, b) => Ok(Core::If(c(a)?, num(1), c(b)?)),
         Expr::Not(a) => Ok(Core::If(c(a)?, num(0), num(1))),
+        // on ints; `infer` rewrites a float negation before desugaring
+        Expr::Neg(a) => Ok(Core::Op2(BinOp::Sub, num(0), c(a)?)),
         Expr::IfExp(cond, then, els) => {
             check_cond(cond, scope)?;
             Ok(Core::If(c(cond)?, c(then)?, c(els)?))

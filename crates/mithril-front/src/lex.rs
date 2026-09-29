@@ -283,6 +283,15 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
         }
+        // an exponent: `1e-9`, `2.5E3`
+        let sign = matches!(self.peek_at(1), b'+' | b'-') as usize;
+        if matches!(self.peek(), b'e' | b'E') && self.peek_at(1 + sign).is_ascii_digit() {
+            is_float = true;
+            self.pos += 1 + sign;
+            while self.peek().is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
         if is_float {
             let v: f64 = text.parse().map_err(|_| Diag::new(line, "invalid float literal"))?;

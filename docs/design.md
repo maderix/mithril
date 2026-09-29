@@ -275,9 +275,23 @@ array (ints and lists in one array) poisons every connected int to
 `hetero_array.py` covers the runtime conversion.
 
 Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
-f32 bit patterns operated on by builtins; a static f32 type is planned.
-Comparisons with NaN follow IEEE (only `!=` holds), one definition shared
-by the oracle and the reducer. A variable stays boolean across loops and
+binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
+definition shared by the oracle and the reducer.
+
+**f32 in the surface** (`infer.rs`, run by `parse`). A second monomorphic
+inference, over the surface AST: every variable, parameter, result,
+constructor field, tuple component and array element has one type, found
+by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
+assignments, operators, calls and returns. Where a value is f32, a
+literal becomes its bit pattern and `+ - * /` and comparisons become the
+`f32_*` builtins, so Core, the net and every backend see ints and the
+existing rules: `x + y` on f32 is `f32_add(x, y)`, nothing new in the
+rule table but `f32_le` (IEEE `<=`; `==` is `le(a, b) & le(b, a)`, a
+helper written in the language). Unary minus on f32 flips the sign bit.
+`int(x)` truncates toward zero. Mixing f32 with an int variable is an
+error that names the function; integer operators on f32 are errors. A
+program without f32 is unchanged, except that f64 negation becomes
+`-1.0 * x`. The inference is monomorphic: a function is used at one type. A variable stays boolean across loops and
 joins when every assignment to it is boolean.
 
 ### 4.2 Representation
@@ -656,17 +670,21 @@ at once.
 
 ### 7.3 Budgets on the device
 
-* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). The budget is the
-  only bound on native recursion depth.
-* The per-thread stack starts at 8 KiB and doubles, up to 64 KiB, when
-  the stack guard aborts a run. A run is deterministic, so re-running it
-  with more stack is sound. The size that worked is kept beside the
-  artefact (`<artefact>.stack`) and the next run starts there.
-  `MITHRIL_GPU_STACK` fixes it. The driver backs the stack with local
-  memory for every resident thread, so a large fixed stack costs setup
-  time on every run (16 GB eager arenas plus 32 KiB stack: 0.31 s). An unbounded budget in WORK
-  measured 0.84 s against 1.03 s on tree-bitonic depth 23; the bound is
-  kept because of the stack.
+* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). It bounds native
+  recursion depth in dive forms; the stack guard catches the rest. An
+  unbounded budget in WORK measured 0.84 s against 1.03 s on
+  tree-bitonic depth 23; the bound is kept because of the stack.
+* The per-thread stack starts at 8 KiB and doubles when the stack guard
+  aborts a run. An aborted run has no observable effect (its result is
+  discarded and the retry starts from fresh buffers), so the retry is
+  sound. Doubling stops where the device cannot back a deeper stack (the
+  driver refuses the limit, or the arenas no longer fit); the run then
+  reports the depth error of the last size that ran (64 KiB on the RTX
+  4090). The size that worked is kept beside the artefact
+  (`<artefact>.stack`, unless `MITHRIL_GPU_STACK` fixed it) and the next
+  run starts there. The driver backs the stack with local memory for
+  every resident thread, so a large fixed stack costs setup time on every
+  run (16 GB eager arenas plus 32 KiB stack: 0.31 s).
 * A dive-form call refunds its budget when it returns. The budget bounds
   depth, not the work of a subtree. With a work budget, raytrace's work
   phase suspended every 64 rewrites in every lane's subtree (1.42 s);
@@ -676,7 +694,8 @@ at once.
   the frame's next budget check to suspend, so no fire runs unbounded; a
   runaway loop cycles rounds to the round limit instead of freezing the
   device, which the desktop shares.
-* `stack_guard` compares against the thread's stack less a 4 KiB margin.
+* The stack guard (`stack_deep` on the device) compares against the
+  thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives
   too); a limit left at its default faulted small stacks with error 700.
 
@@ -707,23 +726,33 @@ The budget is free VRAM at start, less the fixed buffers, less the
 driver's stack reserve for all resident threads (SMs x threads per SM x
 the stack size), less 1 GiB of slack.
 
+No free path takes an atomic. A bump-only heap leaked every array block;
+bfs and terrain exhausted it at the big size and run (255 ms, 296 ms)
+with the free lists. Heap words 0 and 1 are an empty array that is never
+freed: an allocation that aborts on a full heap returns it, so no caller
+writes past the heap.
+
 Setup cost is paid only for memory a run touches:
 
-* Arenas above 256 MiB are managed memory with the device as preferred
-  location, so pages are committed on first touch. Small buffers every
-  lane touches at once are ordinary device allocations.
-  `MITHRIL_GPU_EAGER=1` commits everything up front (a diagnostic).
+* Each buffer states how its pages are committed. The arenas (cells,
+  counts, records, task rings, array heap) fill from their start as the
+  run allocates: they are managed memory with the device as preferred
+  location, committed on first touch. Per-lane tables every lane writes
+  as the kernel starts are committed at allocation (demand paging would
+  only move the faults into the kernel). `MITHRIL_GPU_EAGER=1` commits
+  everything at allocation (a diagnostic).
 * No arena is cleared: every refcounted allocation writes its own count.
 * A lane's cell chunks start at 64 cells and double, so a lane holds
   what it uses.
-* The runner uses the device's primary context with one hardware
-  connection (`CUDA_DEVICE_MAX_CONNECTIONS=1` unless set). A process
-  that is exiting skips the arena release; the driver reclaims it.
+* The runner uses the device's primary context. The CLI sets one
+  hardware connection (`CUDA_DEVICE_MAX_CONNECTIONS=1` unless set)
+  before any thread starts. Runs are serialized (the kernel is
+  cooperative over the whole device). A run frees its buffers and module
+  and releases the context when it ends; a successful run of a process
+  that is exiting leaves that to the driver.
 
 Measured on a bare process: one connection 0.05 s; 16 GB eager arenas
-with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s. No free path takes an atomic. A bump-only
-heap leaked every array block; bfs and terrain exhausted it at the big
-size and run (255 ms, 296 ms) with the free lists.
+with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
 
 ### 7.6 Bounds
 
@@ -731,11 +760,12 @@ size and run (255 ms, 296 ms) with the free lists.
   converge stops with an error.
 * Deadline: the host waits at most `MITHRIL_GPU_TIMEOUT` (300 s) and
   tears the context down past it.
-* A failed run resets the primary context: a sticky device error (700)
-  otherwise poisons every later run in the process.
+* A failed run that left a sticky device error (700) in the context
+  resets it; a clean abort leaves the context as it is.
 * Any arena exhaustion, out-of-bounds index, bad cell index or stack
   overflow sets the abort flag; every lane stops at its next check and
-  the host reports the named cause.
+  the host reports the named cause. The first abort wins: a later one is
+  a consequence of it.
 
 Diagnostics: `MITHRIL_GPU_STATS` (setup and run time, rounds, grow sweeps
 and work phases with their cycles, widest frontier, cells and records
@@ -962,6 +992,38 @@ is to generate graphs that Blaze lowers (the residual net exported as a
 graph of Blaze calls on buffers, the irregular structure decided at
 compile time or by a residual Mithril region) is undecided.
 
+### 11.4 Demos: a ray tracer and a path tracer
+
+`demos/cornell_whitted.py` and `demos/cornell_path.py` render a Cornell
+box (red and green walls, a ceiling emitter, a mirror sphere, a glass
+sphere, a diffuse block), written the way a person writes them: f32
+vectors as tuples, one function per shape, the image forked as a tree of
+rows and columns. Nothing in them names a thread, a device or a task.
+`mithril run --image out.ppm` writes the result, `--stats out.json` the
+stage times; the same file runs on the CPU and the device.
+
+* Whitted: 512 x 512, 2 x 2 samples, mirror and glass (Schlick's
+  Fresnel) to depth 5, direct light from four points of the emitter.
+* Path tracing: 256 x 256, 64 paths per pixel, next-event estimation
+  plus cosine-weighted bounces (Malley's method in the Duff et al.
+  basis), glass chosen by the Fresnel probability, six bounces, no
+  Russian roulette. The random numbers are a hash of (pixel, sample,
+  bounce), so the image is identical on every run, thread count and
+  device.
+* Both approximate glass shadows the same way: a shadow ray passes
+  through glass dimmed. The path tracer leaves caustics out (after a
+  diffuse bounce light arrives by next-event estimation only).
+
+| demo | CPU 16 threads (run) | device (run, 16 rounds) |
+|---|---|---|
+| Whitted, 512 x 512 x 4 samples | 0.34 s | 2.73 s |
+| path, 256 x 256 x 64 paths | 1.37 s | 7.59 s |
+
+The device image is byte-identical to the CPU image for both. The device
+is 5 to 8 times slower than 16 CPU threads here: the scheduling gap of
+section 12, not a property of the programs. A test renders the Whitted
+demo at 12 x 12 and checks it against the oracle at 1, 4 and 16 threads.
+
 ## 12. Open items
 
 Device:
@@ -1068,7 +1130,7 @@ The working rules are in `CLAUDE.md`. The ones that shape this design:
 ## 14. Prior art and provenance
 
 Mithril stands on published work and says where. An independent review
-(09-30) audited what came from reference. Findings:
+audited what came from reference. Findings:
 
 * **No runtime or compiler code is copied.** The rule table, lowering,
   CPU runtime and device engine are written here.
@@ -1083,7 +1145,8 @@ Mithril stands on published work and says where. An independent review
   Arora, Blumofe and Plaxton 1998), on the CPU and the device together.
 * **Device setup** (primary context, one hardware connection, managed
   arenas) is standard CUDA driver usage. The choice was prompted by
-  reading reference's host code; each effect was measured here (section 7.5).
+  reading reference's host code, before the rule below; each effect was
+  measured here (section 7.5).
 * **Benchmarks.** Except kdtree (Mithril's own), `bench/ports/*.c` are
   reference's reference C programs (`bench/runtime/<name>/main.c`,
   Apache-2.0), kept verbatim as the C baseline; `bench/ports/*.py` are
@@ -1096,5 +1159,5 @@ Mithril stands on published work and says where. An independent review
   and reuse, erasure as parallel work, the stack guard and stack
   doubling, static dealing, per-rule rings, the one-kernel driver.
 
-Rule from 09-30: reference is a measured baseline. Its runtime source is not
-read to design Mithril's.
+Rule: reference is a measured baseline. Its runtime source is not read to
+design Mithril's.

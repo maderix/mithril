@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 
 /// Opcode of the pairing pseudo-op (a ternary builtin rides a binary Op
 /// whose second operand is a pair of its last two arguments).
-pub const ARR_PAIR: u16 = 44;
+pub const ARR_PAIR: u16 = 45;
 /// Opcodes from here up are the builtins (`Core::Prim`).
 pub const PRIM_BASE: u16 = 32;
 

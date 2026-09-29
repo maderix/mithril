@@ -711,6 +711,44 @@ fn f32_primitives_match_oracle_in_every_representation() {
     }
 }
 
+#[test]
+fn f32_surface_matches_oracle_and_numpy() {
+    // the expected value is computed independently (numpy float32) for the
+    // ray batch and by hand for the rest
+    let (cm, _) = pipeline(&fixture("f32_surface.py"), 1 << 20);
+    let want = "(66621, 14, (8, 7, 0, 16777216), 45)";
+    assert_eq!(oracle(&cm), want);
+    let mut m = mithril_front::parse(&fixture("f32_surface.py")).unwrap();
+    let _ = mithril_reassoc::analyze(&mut m);
+    let (sm, _) = mithril_net::specialize(&desugar(&m).unwrap(), 1 << 20);
+    for (tag, rep) in [("plain", Some(false)), ("shifted", Some(true))] {
+        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
+        let bin = compile(&rs, &format!("f32_surface_{tag}"));
+        for t in ["1", "4", "16"] {
+            assert_eq!(run(&bin, &[t]), want, "f32_surface {tag} --threads {t}");
+        }
+    }
+}
+
+/// The Cornell box demo at a small size (its `size()` replaced).
+fn cornell_small(n: u32) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demos/cornell_whitted.py");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert!(src.contains("def size():\n    return 512\n"), "the demo's size() changed");
+    src.replace("def size():\n    return 512\n", &format!("def size():\n    return {n}\n"))
+}
+
+#[test]
+fn cornell_demo_matches_oracle_at_every_thread_count() {
+    let (cm, rs) = pipeline(&cornell_small(12), 1 << 20);
+    let want = oracle(&cm);
+    assert!(want.starts_with("(12, 12, "), "{want}");
+    let bin = compile(&rs, "cornell_small");
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "cornell --threads {t}");
+    }
+}
+
 // ---- closures through the compiled runtime (Phase B) ----
 
 #[test]

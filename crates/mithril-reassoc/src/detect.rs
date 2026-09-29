@@ -161,6 +161,7 @@ pub fn sym_eval(e: &Expr, env: &HashMap<String, Poly>, mask: u64) -> Result<Poly
             BinOp::Mul => Ok(pmul(&sym_eval(a, env, mask)?, &sym_eval(b, env, mask)?, mask)),
             other => Err(format!("operator {other:?} is outside the wrapping +,-,* fragment")),
         },
+        Expr::Neg(a) => Ok(pneg(&sym_eval(a, env, mask)?, mask)),
         Expr::Tuple(_) => Err("tuple in scalar position".into()),
         Expr::Call(f, _) => Err(format!("call to '{f}' inside the combiner")),
         Expr::Cmp(..) => Err("comparison inside the combiner".into()),

@@ -124,6 +124,7 @@ pub const ARR_RAW: u64 = 1 << 62;
 #[inline(always)] pub fn f32_div(a: i64, b: i64) -> i64 { f32i(f32b(a) / f32b(b)) }
 #[inline(always)] pub fn f32_sqrt(a: i64) -> i64 { f32i(f32b(a).sqrt()) }
 #[inline(always)] pub fn f32_lt(a: i64, b: i64) -> i64 { (f32b(a) < f32b(b)) as i64 }
+#[inline(always)] pub fn f32_le(a: i64, b: i64) -> i64 { (f32b(a) <= f32b(b)) as i64 }
 #[inline(always)] pub fn f32_from_u32(a: i64) -> i64 { f32i((a as u32) as f32) }
 #[inline(always)] pub fn f32_to_u32(a: i64) -> i64 { let x = f32b(a); if x.is_nan() || x < 0.0 || x >= 4294967296.0 { 0 } else { x as u32 as i64 } }
 /// Native int representation: an i56 value held as `x << 8`, so i64

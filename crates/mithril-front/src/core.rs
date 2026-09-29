@@ -177,6 +177,7 @@ pub enum Prim {
     /// IEEE-754 binary32 arithmetic on bit patterns (ints in [0, 2^32)):
     /// `f32_add/sub/mul/div(a, b)`, `f32_sqrt(a)`, each correctly rounded
     /// to nearest-even; `f32_lt(a, b)` (1 when a < b, IEEE: false on NaN);
+    /// `f32_le(a, b)` (1 when a <= b, IEEE: false on NaN);
     /// `f32_from_u32(n)` (nearest f32 to the unsigned n); `f32_to_u32(a)`
     /// (truncated toward zero; NaN, negative or >= 2^32 give 0).
     F32Add,
@@ -185,6 +186,7 @@ pub enum Prim {
     F32Div,
     F32Sqrt,
     F32Lt,
+    F32Le,
     F32FromU32,
     F32ToU32,
 }
@@ -208,6 +210,7 @@ pub fn f32_prim(p: Prim, a: &[i64]) -> i64 {
         Prim::F32Div => b(f(a[0]) / f(a[1])),
         Prim::F32Sqrt => b(f(a[0]).sqrt()),
         Prim::F32Lt => (f(a[0]) < f(a[1])) as i64,
+        Prim::F32Le => (f(a[0]) <= f(a[1])) as i64,
         Prim::F32FromU32 => b((a[0] as u32) as f32),
         Prim::F32ToU32 => {
             let x = f(a[0]);
@@ -230,6 +233,7 @@ impl Prim {
             "f32_div" => (Prim::F32Div, 2),
             "f32_sqrt" => (Prim::F32Sqrt, 1),
             "f32_lt" => (Prim::F32Lt, 2),
+            "f32_le" => (Prim::F32Le, 2),
             "f32_from_u32" => (Prim::F32FromU32, 1),
             "f32_to_u32" => (Prim::F32ToU32, 1),
             _ => return None,

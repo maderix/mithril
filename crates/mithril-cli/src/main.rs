@@ -54,6 +54,12 @@ impl From<std::io::Error> for CliErr {
 // ------------------------------------------------------------ entry point
 
 fn main() {
+    // one cooperative launch on one stream needs one hardware work queue
+    // (the driver builds 8 by default; context setup halves). Set before
+    // any thread or CUDA call exists.
+    if env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
+        env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "1");
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     match dispatch(&args) {
         Ok(code) => std::process::exit(code),
@@ -68,7 +74,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove> f.py [--threads N] [--gpu] [-o out] | mithril exec <artefact>";
+const USAGE: &str = "usage: mithril <run|build|net|prove> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
 
 fn dispatch(args: &[String]) -> Result<i32, CliErr> {
     match args.first().map(String::as_str) {
@@ -89,13 +95,24 @@ struct Opts {
     threads: Option<usize>,
     gpu: bool,
     out: Option<PathBuf>,
+    /// `run`: write the result as an image (see `write_image`)
+    image: Option<PathBuf>,
+    /// `run`: write timings and sizes as JSON
+    stats: Option<PathBuf>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
     let (mut file, mut threads, mut gpu, mut out) = (None, None, false, None);
+    let (mut image, mut stats) = (None, None);
     let mut i = 0;
     while i < args.len() {
+        let path = |i: &mut usize, what: &str| -> Result<PathBuf, CliErr> {
+            *i += 1;
+            Ok(PathBuf::from(args.get(*i).ok_or(format!("{what} needs a path"))?))
+        };
         match args[i].as_str() {
+            "--image" => image = Some(path(&mut i, "--image")?),
+            "--stats" => stats = Some(path(&mut i, "--stats")?),
             "--threads" => {
                 i += 1;
                 let v = args.get(i).ok_or("--threads needs a value")?;
@@ -103,10 +120,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
                 threads = Some(n.max(1));
             }
             "--gpu" => gpu = true,
-            "-o" => {
-                i += 1;
-                out = Some(PathBuf::from(args.get(i).ok_or("-o needs a path")?));
-            }
+            "-o" => out = Some(path(&mut i, "-o")?),
             s if s.starts_with('-') => return Err(format!("unknown option '{}'\n{}", s, USAGE).into()),
             s => {
                 if file.is_some() {
@@ -117,7 +131,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
         }
         i += 1;
     }
-    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out })
+    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, image, stats })
 }
 
 // ------------------------------------------------------------ front stages
@@ -278,26 +292,129 @@ fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
 
 // ------------------------------------------------------------ subcommands
 
+/// What a run printed and what it cost (seconds).
+struct Ran {
+    text: String,
+    front: f64,
+    compile: f64,
+    run: f64,
+    /// device rounds (grow sweeps and work phases)
+    rounds: Option<u64>,
+}
+
 fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
     let t0 = std::time::Instant::now();
     let (sm, _) = specialized(&o)?;
+    let front = t0.elapsed().as_secs_f64();
     if std::env::var_os("MITHRIL_TIMING").is_some() {
-        eprintln!("mithril: front end + specialization {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("mithril: front end + specialization {:.0} ms", front * 1e3);
     }
-    if o.gpu {
-        return run_gpu(&sm);
+    let ran = if o.gpu {
+        run_gpu(&sm, front)?
+    } else {
+        let tmp = make_temp_dir()?;
+        let bin = tmp.join("prog");
+        let tc = std::time::Instant::now();
+        compile_program(&sm, &bin)?;
+        let compile = tc.elapsed().as_secs_f64();
+        let mut c = Command::new(&bin);
+        if let Some(t) = o.threads {
+            c.args(["--threads", &t.to_string()]);
+        }
+        let tr = std::time::Instant::now();
+        let out = c.stderr(std::process::Stdio::inherit()).output().map_err(|e| format!("cannot run compiled program: {}", e))?;
+        let run = tr.elapsed().as_secs_f64();
+        let _ = fs::remove_dir_all(&tmp);
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() {
+            println!("{text}");
+            return Ok(out.status.code().unwrap_or(1));
+        }
+        Ran { text, front, compile, run, rounds: None }
+    };
+    let dims = match &o.image {
+        Some(path) => {
+            let (w, h) = write_image(path, &ran.text)?;
+            println!("wrote {} ({w}x{h})", path.display());
+            Some((w, h))
+        }
+        None => {
+            println!("{}", ran.text);
+            None
+        }
+    };
+    if let Some(path) = &o.stats {
+        write_stats(path, &o, &ran, dims)?;
     }
-    let tmp = make_temp_dir()?;
-    let bin = tmp.join("prog");
-    compile_program(&sm, &bin)?;
-    let mut c = Command::new(&bin);
-    if let Some(t) = o.threads {
-        c.args(["--threads", &t.to_string()]);
+    Ok(0)
+}
+
+/// The ints of a printed value in order, constructor names skipped.
+fn ints_of(text: &str) -> Result<Vec<i64>, CliErr> {
+    let b = text.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        let start = i;
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+        } else if b[i].is_ascii_digit() || (b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if matches!(b.get(i), Some(b'.' | b'e' | b'E')) {
+                return Err("an image holds ints; the value has a float".into());
+            }
+            out.push(text[start..i].parse::<i64>().map_err(|e| format!("image value {}: {e}", &text[start..i]))?);
+        } else {
+            i += 1;
+        }
     }
-    let status = c.status().map_err(|e| format!("cannot run compiled program: {}", e))?;
-    let _ = fs::remove_dir_all(&tmp);
-    Ok(status.code().unwrap_or(1))
+    Ok(out)
+}
+
+/// `--image`: the value is `(width, height, pixels)`, pixels any nesting of
+/// tuples or constructors read depth-first, each pixel 0xRRGGBB or an
+/// `(r, g, b)` of 0..255. Written as binary PPM.
+fn write_image(path: &Path, text: &str) -> Result<(usize, usize), CliErr> {
+    let v = ints_of(text)?;
+    let (w, h) = match v[..] {
+        [w, h, ..] if w > 0 && h > 0 => (w as usize, h as usize),
+        _ => return Err("--image: the value must be (width, height, pixels)".into()),
+    };
+    let px = &v[2..];
+    let byte = |c: i64| c.clamp(0, 255) as u8;
+    let rgb: Vec<u8> = if px.len() == w * h {
+        px.iter().flat_map(|&p| [byte(p >> 16 & 255), byte(p >> 8 & 255), byte(p & 255)]).collect()
+    } else if px.len() == 3 * w * h {
+        px.iter().map(|&c| byte(c)).collect()
+    } else {
+        return Err(format!("--image: {w}x{h} needs {} pixels or {} channels; the value has {}", w * h, 3 * w * h, px.len()).into());
+    };
+    let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
+    f.extend(rgb);
+    fs::write(path, f).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok((w, h))
+}
+
+/// `--stats`: what ran where, and what each stage cost.
+fn write_stats(path: &Path, o: &Opts, r: &Ran, dims: Option<(usize, usize)>) -> Result<(), CliErr> {
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "null".into());
+    let json = format!(
+        "{{\n  \"program\": {:?},\n  \"backend\": \"{}\",\n  \"threads\": {},\n  \"front_s\": {:.4},\n  \"compile_s\": {:.4},\n  \"run_s\": {:.4},\n  \"device_rounds\": {},\n  \"image\": {}\n}}\n",
+        o.file.display().to_string(),
+        if o.gpu { "gpu" } else { "cpu" },
+        opt(o.threads.filter(|_| !o.gpu).map(|t| t.to_string())),
+        r.front,
+        r.compile,
+        r.run,
+        opt(r.rounds.map(|n| n.to_string())),
+        opt(dims.map(|(w, h)| format!("{{ \"width\": {w}, \"height\": {h} }}"))),
+    );
+    fs::write(path, json).map_err(|e| format!("cannot write {}: {e}", path.display()).into())
 }
 
 fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
@@ -379,26 +496,26 @@ fn lean_binary() -> Option<PathBuf> {
 // -------------------------------------------------------------------- gpu
 
 #[cfg(feature = "gpu")]
-fn run_gpu(sm: &CoreModule) -> Result<i32, CliErr> {
+fn run_gpu(sm: &CoreModule, front: f64) -> Result<Ran, CliErr> {
     // the same lowering as the CPU program, printed for the device
     let cu = match mithril_gpu::emit_cuda(sm) {
         Ok(cu) => cu,
-        Err(constant) => {
-            println!("{constant}");
-            return Ok(0);
-        }
+        Err(constant) => return Ok(Ran { text: constant, front, compile: 0.0, run: 0.0, rounds: None }),
     };
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     let cache = target_dir().join("mithril-cache").join("gpu");
     fs::create_dir_all(&cache)?;
     let t0 = std::time::Instant::now();
+    let cubin = mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?;
+    let compile = t0.elapsed().as_secs_f64();
     mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let r = mithril_gpu::compile_and_run(&cu, boot, &cache).map_err(CliErr::Other)?;
+    let t1 = std::time::Instant::now();
+    let r = mithril_gpu::run_cubin(&cubin, boot).map_err(CliErr::Other)?;
+    let run = t1.elapsed().as_secs_f64();
     if std::env::var_os("MITHRIL_TIMING").is_some() {
-        eprintln!("mithril: device compile-or-load + run + readback {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("mithril: device compile-or-load {:.0} ms, run + readback {:.0} ms", compile * 1e3, run * 1e3);
     }
-    println!("{}", r.text);
-    Ok(0)
+    Ok(Ran { text: r.text, front, compile, run, rounds: Some(r.rounds) })
 }
 
 #[cfg(feature = "gpu")]
@@ -434,7 +551,6 @@ fn exec_gpu(_path: &Path) -> Result<i32, CliErr> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn run_gpu(_sm: &CoreModule) -> Result<i32, CliErr> {
-    eprintln!("gpu support not built; rebuild with --features gpu");
-    Ok(1)
+fn run_gpu(_sm: &CoreModule, _front: f64) -> Result<Ran, CliErr> {
+    Err("gpu support not built; rebuild with --features gpu".into())
 }

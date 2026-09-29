@@ -206,3 +206,93 @@ fn threads_flag_requires_count() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("--threads"), "stderr: {}", stderr(&out));
 }
+
+// ------------------------------------------------------- --image / --stats
+
+fn write_prog(dir: &Path, src: &str) -> PathBuf {
+    let p = dir.join("prog.py");
+    fs::write(&p, src).unwrap();
+    p
+}
+
+#[test]
+fn run_image_writes_packed_pixels_as_ppm() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("image-packed");
+    let prog = write_prog(&d, "def main():\n    return (2, 2, ((16711680, 65280), (255, 16777215)))\n");
+    let img = d.join("out.ppm");
+    let out = mithril(&["run", prog.to_str().unwrap(), "--image", img.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), format!("wrote {} (2x2)", img.display()));
+    let mut want = b"P6\n2 2\n255\n".to_vec();
+    want.extend([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
+    assert_eq!(fs::read(&img).unwrap(), want);
+}
+
+#[test]
+fn run_image_reads_rgb_triples_through_constructors() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("image-rgb");
+    let src = "@data\nclass P:\n    Px: (r, g, b)\n\ndef main():\n    return (2, 1, (Px(1, 2, 3), Px(250, 300, -5)))\n";
+    let prog = write_prog(&d, src);
+    let img = d.join("out.ppm");
+    let out = mithril(&["run", prog.to_str().unwrap(), "--image", img.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let mut want = b"P6\n2 1\n255\n".to_vec();
+    // channels clamp to 0..255
+    want.extend([1, 2, 3, 250, 255, 0]);
+    assert_eq!(fs::read(&img).unwrap(), want);
+}
+
+#[test]
+fn run_image_rejects_values_that_are_not_images() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("image-bad");
+    let img = d.join("out.ppm");
+    for (src, msg) in [
+        ("def main():\n    return (2, 2, (1, 2, 3))\n", "needs 4 pixels or 12 channels; the value has 3"),
+        ("def main():\n    return (1, 1, 0.5)\n", "the value has a float"),
+        ("def main():\n    return 7\n", "must be (width, height, pixels)"),
+        ("def main():\n    return (0, 1, 5)\n", "must be (width, height, pixels)"),
+    ] {
+        let prog = write_prog(&d, src);
+        let out = mithril(&["run", prog.to_str().unwrap(), "--image", img.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1), "{src}");
+        assert!(stderr(&out).contains(msg), "{src}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn run_stats_records_backend_timings_and_image() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("stats");
+    let prog = write_prog(&d, "def main():\n    return (1, 1, 255)\n");
+    let (img, st) = (d.join("o.ppm"), d.join("s.json"));
+    let out = mithril(&["run", prog.to_str().unwrap(), "--threads", "3", "--image", img.to_str().unwrap(), "--stats", st.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = fs::read_to_string(&st).unwrap();
+    for field in ["\"backend\": \"cpu\"", "\"threads\": 3", "\"front_s\": ", "\"compile_s\": ", "\"run_s\": ", "\"device_rounds\": null", "\"width\": 1, \"height\": 1"] {
+        assert!(j.contains(field), "missing {field} in {j}");
+    }
+    // without --image the value is printed and the image field is null
+    let out = mithril(&["run", prog.to_str().unwrap(), "--stats", st.to_str().unwrap()]);
+    assert_eq!(stdout(&out).trim(), "(1, 1, 255)");
+    assert!(fs::read_to_string(&st).unwrap().contains("\"image\": null"));
+}
+
+#[test]
+fn image_and_stats_need_a_path() {
+    for flag in ["--image", "--stats"] {
+        let out = mithril(&["run", fixture("fact_while.py").to_str().unwrap(), flag]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stderr(&out).contains(&format!("{flag} needs a path")), "{}", stderr(&out));
+    }
+}

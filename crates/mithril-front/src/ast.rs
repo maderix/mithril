@@ -54,6 +54,8 @@ pub enum Expr {
     Cmp(CmpOp, Box<Expr>, Box<Expr>),
     Bool2(BoolOp, Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
+    /// unary minus (`-e`; a literal operand is folded by the parser)
+    Neg(Box<Expr>),
     IfExp(Box<Expr>, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
     Tuple(Vec<Expr>),
