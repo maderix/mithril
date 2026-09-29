@@ -962,16 +962,6 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             sigs[fid] = None;
         }
     }
-    if std::env::var_os("MITHRIL_DEBUG_SCALAR").is_some() {
-        for (fid, f) in m.fns.iter().enumerate() {
-            match &sigs[fid] {
-                None => {
-                    eprintln!("not scalar {fid} {}: {}", f.name, whys[fid].clone().unwrap_or_else(|| "ret kind".into()));
-                }
-                Some(sig) => eprintln!("scalar {fid} {}: {:?} -> {:?} {:?}", f.name, sig.params, sig.ret, sig.ra),
-            }
-        }
-    }
     sigs
 }
 

@@ -280,14 +280,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     // codegen itself owns: mutual tail recursion into loops, and
     // if-conversion of loop back-edges.
     let m_s = rewrite::tail_inline(m);
-    if let Some(which) = std::env::var_os("MITHRIL_DUMP_CORE") {
-        let which = which.to_string_lossy().to_string();
-        for (fid, f) in m_s.fns.iter().enumerate() {
-            if f.name == which || which == "all" {
-                eprintln!("core {fid} {} = {:?}", f.name, f.body);
-            }
-        }
-    }
     let m_u = rewrite::if_convert(&uniquify(&m_s));
     // records_to_tuples (rewrite.rs) is parked: without native multi-value
     // returns in the dive form it only trades ctor cells for tuple chains.
@@ -367,13 +359,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     {
         let sn: Vec<Option<scalar::Sig>> = scal.iter().zip(&native).map(|(s, n)| if *n { s.clone() } else { None }).collect();
         let reps = scalar::choose_reps(m, &sn);
-        if std::env::var_os("MITHRIL_DEBUG_SCALAR").is_some() {
-            for (f, r) in reps.iter().enumerate() {
-                if native[f] {
-                    eprintln!("rep {f} {}: {}", m.fns[f].name, if *r { "shifted" } else { "plain" });
-                }
-            }
-        }
         scalar::SHIFTED.with(|l| *l.borrow_mut() = reps);
         let cx = scalar::needs_ctx(m, &sn);
         scalar::CTX.with(|c| *c.borrow_mut() = cx);
@@ -387,18 +372,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         *s.borrow_mut() = scal.iter().zip(&native).map(|(sig, n)| if *n { sig.clone() } else { None }).collect()
     });
     let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
-    if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
-        for (fid, f) in m.fns.iter().enumerate() {
-            eprintln!("bor {fid} {} {:?}", f.name, bor[fid]);
-        }
-    }
     let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
-    if std::env::var_os("MITHRIL_DEBUG_TY").is_some() {
-        for (fid, f) in m.fns.iter().enumerate() {
-            let ps: Vec<String> = (0..f.arity as u32).map(|p| format!("{:?}", tys.var(fid, p))).collect();
-            eprintln!("ty {fid} {}({}) -> {:?}  locals {:?}", f.name, ps.join(", "), tys.ret[fid], tys.locals[fid]);
-        }
-    }
     // static reuse rewrite: consumed same-arity cells are rebuilt in place
     let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
     let shared = std::cell::RefCell::new(seq::Shared::default());
@@ -482,7 +456,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
             .map(|(fid, p)| p.as_ref().map(|pf| fold::split_snippet_dive(fid as u32, m.fns[fid].arity, pf, join_rule[fid])))
             .collect()
     });
-    let trace = std::env::var_os("MITHRIL_TRACE_GEN").is_some();
     let mut fns_code = String::new();
     // every IR function, in emission order (printed as it is produced so
     // a function's forms stay adjacent in the text)
@@ -494,9 +467,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         }
     };
     for fid in 0..nf {
-        if trace {
-            eprintln!("gen fn {} ({}) segs={} code={}B", fid, m.fns[fid].name, sq.q.len(), fns_code.len());
-        }
         if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
             emit(scalar::scalar_fn(m, fid as u32, &scal, &bor, true), &mut fns_code);
@@ -519,9 +489,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        if trace && done % 500 == 0 {
-            eprintln!("gen seg {} of {} (fn {}) code={}B", done, sq.q.len(), seg.fid, fns_code.len());
-        }
         emit(vec![rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
     }
 
@@ -1188,9 +1155,6 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
     let Some(c) = caller else { return "" };
     if !reaches(m, fid, c) {
         return "";
-    }
-    if std::env::var_os("MITHRIL_DEBUG_INLINE").is_some() {
-        eprintln!("loop helper {fid} {}: {n} call sites", f.name);
     }
     if n == 1 {
         "#[inline(always)]\n"

@@ -7,8 +7,8 @@
 //     __device__ R prog_dive(...) and __device__ void prog_fire(...)
 // This file supplies the same helper vocabulary the lowered IR (lir) names
 // on the CPU (`mithril_rt::prelude`): cells, refcounts, records, delivery,
-// dives, constructors, sharing, arrays, arithmetic; plus the kernels the
-// host wave loop launches. Protocol mirrors the CPU engine (mithril-rt):
+// dives, constructors, sharing, arrays, arithmetic; plus the driver
+// (`k_run`). Protocol mirrors the CPU engine (mithril-rt):
 // the boot redex fires as rule 0, record 0 is the reserved ROOT result
 // sink (parent address 0), a record whose pend counter reaches zero is
 // queued (never fired inline) into its rule's bucket with the record index
@@ -39,6 +39,7 @@ typedef unsigned long long usize;
 #define AB_RECS 6u
 #define AB_BUCKET 7u
 #define AB_HEAP 8u
+#define AB_ROUNDS 10u // the round limit (MITHRIL_GPU_ROUNDS): a run that does not converge
 // a walk over cells that never ends is a corrupted arena, not a hang
 #define GUARD(n) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return; } } while (0)
 #define GUARDV(n, v) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return v; } } while (0)
@@ -46,7 +47,7 @@ typedef unsigned long long usize;
 struct Rec {
   int pend;
   unsigned short rule;
-  unsigned short _pad;
+  unsigned short par; // 1: created in a GROW wave (its children run on different lanes)
   u32 d; // a spill chain head, a FILL target's low word, a TRMC head cell
   u32 s; // a FILL target's high word, a TRMC hole cell
   u64 parent; // rec_idx << 3 | slot
@@ -78,22 +79,23 @@ struct Dev {
   u32 *labels; // Dup label supply
   u32 *rfree;  // MAXLANES * RFREECAP per-lane record free lists
   u32 *rfreen; // MAXLANES record free-list lengths
+  u64 *lstk;   // MAXLANES * LSCAP lane-local tasks (rule, a, b, c), WORK phase
+  u32 *lsn;    // MAXLANES lane-local task counts
+  u32 *rovf;   // global overflow ring of freed records (idx; 0 = empty)
+  int *rovftop;
   u32 ncap, rcap, bcap, ovfcap, chunksz, nrules;
   int fuel;    // per-dive budget
   int net_fuel; // rewrites per net reduction before spilling to the net rule
 };
 #define NWCAP 64
 #define RFREECAP 64
+#define LSCAP 64
 
 extern "C" {
 // the runtime descriptor is written once by the host: constant memory, so
 // a field read is a cached broadcast, not a dependent global load
 __constant__ Dev G;
 __device__ u32 g_nrules = PROG_NRULES;
-// [0] pump steps, [1] pump scan iterations, [2] pump cycles in prog_fire, [3] pump cycles scanning
-__device__ unsigned long long g_stat[4];
-__device__ unsigned long long g_rule_steps[PROG_NRULES];
-__device__ unsigned long long g_rule_cycles[PROG_NRULES];
 }
 
 
@@ -107,9 +109,22 @@ struct P2 { u64 f0, f1; };
 struct P2R { u64 f0, f1; u32 f2; };
 // T<k> (native int tuples) are declared by the program for the widths it uses
 
+// per thread (blocks are at most 256 threads): 1 = the lane's own depth-
+// first work, 0 = the parallel world (a GROW wave, or a cross-lane join a
+// WORK lane is running at once): fork sites fork, spawns go global
+__shared__ int s_mode[256];
+#define WORK_MODE (s_mode[threadIdx.x])
+// a lane-local task whose rule word carries this bit runs in the parallel world
+#define PAR_TASK 0x80000000u
+// the dive budget of the phase (a task's own body; a fork site's callee gets
+// none in the parallel world)
+__shared__ int s_fuel;
+
 __device__ void prog_fire(u32 rule, u64 e0, u64 e1, u64 e2);
 // rule -> its entries carry a record index in their third word
 __device__ bool prog_rec_rule(u32 rule);
+// rule -> its tasks can fork (the driver grows the frontier through these)
+__device__ bool prog_forks(u32 rule);
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
 __device__ u32 unbox_cid(u64 slot);
@@ -189,6 +204,8 @@ __device__ inline i64 f32_to_u32(i64 a) {
 // ---- clamped cell access (safe even on garbage after an abort) ----
 
 #include <cstdio>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 __device__ inline void expect_con(u64 p, const char *site) {
   if (tag(p) != T_CON) { if (atomicMax(G.abortf, 9u) == 0) printf("mithril-gpu: %s on a non-constructor port %llx\n", site, p); }
 }
@@ -256,10 +273,8 @@ __device__ __noinline__ void free_node(u32 i) {
   }
   // lane list full: spill to the global overflow ring (fixes the spike leak)
   int t = atomicAdd(G.ovftop, 1);
-  if (t >= 0 && (u32)t < G.ovfcap)
-    atomicExch(&G.ovf[t], i + 1);
-  else
-    atomicSub(G.ovftop, 1); // ring full: drop (bounded leak, never unsafe)
+  if (t < 0 || (u32)t >= G.ovfcap || atomicCAS(&G.ovf[t], 0u, i + 1) != 0)
+    atomicSub(G.ovftop, 1); // ring full, or the slot still holds an unread value: drop (bounded leak, never unsafe)
 }
 
 __device__ inline u32 alloc2(u64 a, u64 b) { u32 i = alloc_node(a, b); G.rc[nclamp(i)] = 1; return i; }
@@ -274,27 +289,41 @@ __device__ inline bool rc_unique(u32 i) { return *(volatile u32 *)&G.rc[nclamp(i
 // ---- records / buckets / delivery ----
 
 // records fired by a record-activated rule are dead: recycled per lane
+// (the lane list full: the global ring, as cells; a full ring drops)
 __device__ inline void rec_free(u32 i) {
   if (i == 0 || i >= G.rcap) return;
   u32 L = lane();
-  if (G.rfreen[L] < RFREECAP) G.rfree[L * RFREECAP + G.rfreen[L]++] = i;
+  if (G.rfreen[L] < RFREECAP) {
+    G.rfree[L * RFREECAP + G.rfreen[L]++] = i;
+    return;
+  }
+  int t = atomicAdd(G.rovftop, 1);
+  if (t < 0 || (u32)t >= G.ovfcap || atomicCAS(&G.rovf[t], 0u, i) != 0)
+    atomicSub(G.rovftop, 1); // full, or an unread value in the slot: drop
 }
 __device__ __noinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
   u32 L = lane();
-  u32 i;
+  u32 i = 0;
   if (G.rfreen[L]) {
     i = G.rfree[L * RFREECAP + --G.rfreen[L]];
   } else {
-    i = atomicAdd(G.rbump, 1);
-    if (i >= G.rcap) {
-      g_abort(AB_RECS);
-      return G.rcap - 1;
+    if (*(volatile int *)G.rovftop > 0) {
+      int t = atomicSub(G.rovftop, 1) - 1;
+      if (t >= 0 && (u32)t < G.ovfcap) i = atomicExch(&G.rovf[t], 0u);
+      if (!i) atomicAdd(G.rovftop, 1);
+    }
+    if (!i) {
+      i = atomicAdd(G.rbump, 1);
+      if (i >= G.rcap) {
+        g_abort(AB_RECS);
+        return G.rcap - 1;
+      }
     }
   }
   Rec &r = G.recs[i];
   r.pend = (int)pend;
   r.rule = (unsigned short)rule;
-  r._pad = 0;
+  r.par = WORK_MODE ? 0 : 1;
   r.s = s;
   r.d = d;
   r.parent = parent;
@@ -308,23 +337,72 @@ __device__ inline u64 rec_parent(u32 rec) { return G.recs[rclamp(rec)].parent; }
 __device__ inline u32 rec_d(u32 rec) { return G.recs[rclamp(rec)].d; }
 __device__ inline u32 rec_s(u32 rec) { return G.recs[rclamp(rec)].s; }
 __device__ inline void set_parent(u32 rec, u64 parent) { G.recs[rclamp(rec)].parent = parent; }
-__device__ inline i64 fuel_of() { return (i64)G.fuel; }
+__device__ inline i64 fuel_of() { return (i64)s_fuel; } // the phase's budget (fold estimates)
 
+// Buckets are rings: `blen` and `bdone` grow without bound (bcap is a
+// power of two, so u32 wrap-around keeps `i % bcap` consistent); only the
+// live entries, blen - bdone, are capped.
+
+__device__ __noinline__ void spawn_global(u32 rule, u64 a, u64 b, u64 c);
 __device__ __noinline__ void spawn3(u32 rule, u64 a, u64 b, u64 c) {
+  if (WORK_MODE) {
+    u32 L = lane();
+    u32 n = G.lsn[L];
+    if (n < LSCAP) {
+      u64 *t = &G.lstk[((u64)L * LSCAP + n) * 4];
+      t[0] = rule;
+      t[1] = a;
+      t[2] = b;
+      t[3] = c;
+      G.lsn[L] = n + 1;
+      return;
+    }
+  }
+  spawn_global(rule, a, b, c);
+}
+__device__ __noinline__ void spawn_global(u32 rule, u64 a, u64 b, u64 c) {
   u32 i = atomicAdd(&G.blen[rule], 1);
-  if (i >= G.bcap) {
+  if (i - *(volatile u32 *)&G.bdone[rule] >= G.bcap) {
     g_abort(AB_BUCKET);
     return;
   }
-  u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
+  u64 *e = &G.ebuf[((u64)rule * G.bcap + (i & (G.bcap - 1))) * 3];
   e[0] = a;
   e[1] = b;
   e[2] = c;
 }
 
+// A cross-lane join just completed. The CPU runtime's rule (and reference's):
+// the lane whose delivery completed it runs it at once, in the parallel
+// world (what it forks goes to the global rings for the next GROW), in
+// every kernel. It waits on the lane's own stack, not the C stack, and
+// the kernel drains that stack after each task (`drain_local`).
+__device__ inline void join_ready(u32 rule, u64 a, u64 b, u64 c) {
+  {
+    u32 L = lane();
+    u32 n = G.lsn[L];
+    if (n < LSCAP) {
+      u64 *t = &G.lstk[((u64)L * LSCAP + n) * 4];
+      t[0] = rule | PAR_TASK;
+      t[1] = a;
+      t[2] = b;
+      t[3] = c;
+      G.lsn[L] = n + 1;
+      return;
+    }
+  }
+  spawn_global(rule, a, b, c);
+}
+// A ready record (a task with no inputs: the rest of a body after a fork
+// site) runs at once on this lane: in the parallel world the body then
+// reaches all its fork sites in one step (reference's fork releases every
+// child at once); in WORK it is the lane's own.
 __device__ inline void ready_rec(u32 rec) {
   Rec &r = G.recs[rclamp(rec)];
-  spawn3(r.rule, r.args[0], r.args[1], (u64)rec);
+  if (r.par)
+    join_ready(r.rule, r.args[0], r.args[1], (u64)rec);
+  else
+    spawn3(r.rule, r.args[0], r.args[1], (u64)rec);
 }
 
 __device__ __noinline__ void deliver(u64 parent, u64 val) {
@@ -345,7 +423,14 @@ __device__ __noinline__ void deliver(u64 parent, u64 val) {
     // the other slot was written by another SM in this wave: read it past L1
     volatile u64 *args = (volatile u64 *)r.args;
     __threadfence();
-    spawn3(r.rule, args[0], args[1], (u64)ri);
+    // a join created in a GROW wave has children on different lanes: its
+    // continuation runs in the parallel world (the global rings, where the
+    // next GROW can widen what it forks); a join created in WORK is the
+    // lane's own and continues on it
+    if (r.par)
+      join_ready(r.rule, args[0], args[1], (u64)ri);
+    else
+      spawn3(r.rule, args[0], args[1], (u64)ri);
   }
 }
 
@@ -382,8 +467,25 @@ __device__ inline u64 pop_chain(u64 *ch) {
 // Dive `f` (args[0] = the destination) and deliver its result there; a
 // suspended dive's residue root is attached to the destination.
 __device__ __noinline__ void dive_to(u16 f, const u64 *args, int n) {
-  i64 fuel = (i64)G.fuel;
+  i64 fuel = (i64)s_fuel;
   R r = prog_dive(f, args, &fuel);
+  if (r.ok)
+    deliver(args[0], r.v);
+  else if (args[0] != NONE)
+    set_parent((u32)r.v, args[0]);
+}
+
+// A segment's tail call delivering to args[0]: in the parallel world it
+// becomes a task at once (it dives with no budget: the entry suspends and
+// spawns the call against a forwarding record attached to the
+// destination); in WORK it dives here.
+__device__ __noinline__ void tail_to(u16 f, const u64 *args, int n) {
+  if (WORK_MODE) {
+    dive_to(f, args, n);
+    return;
+  }
+  i64 zero = 0;
+  R r = prog_dive(f, args, &zero);
   if (r.ok)
     deliver(args[0], r.v);
   else if (args[0] != NONE)
@@ -392,8 +494,28 @@ __device__ __noinline__ void dive_to(u16 f, const u64 *args, int n) {
 
 // Dive `f` with no destination (args[0] = NONE): ok = the value, else the
 // root record of its residue, whose parent the caller sets.
+//
+// The two worlds (reference's): in the sequential world (WORK) a callee gets
+// the lane's budget and runs here; in the parallel world (a GROW sweep) a
+// callee gets no budget, so it suspends at entry and becomes a task at
+// once, and the caller captures its continuation as records. A task's own
+// body runs between its calls; the frontier widens by one call level per
+// sweep, evenly.
+__device__ i64 g_fz[MAXLANES]; // the empty budget a callee gets in the parallel world
+__device__ inline i64 *fork_fuel(i64 *fuel) {
+  if (WORK_MODE) return fuel;
+  u32 L = lane();
+  g_fz[L] = 0;
+  return &g_fz[L];
+}
+// a cut: the callee runs here with the lane's budget in both worlds
 __device__ __noinline__ R dive_res(u16 f, const u64 *args, int n) {
-  i64 fuel = (i64)G.fuel;
+  i64 fuel = (i64)s_fuel;
+  return prog_dive(f, args, &fuel);
+}
+// a fork site's callee: a task at once in the parallel world
+__device__ __noinline__ R dive_res_fork(u16 f, const u64 *args, int n) {
+  i64 fuel = WORK_MODE ? (i64)s_fuel : 0;
   return prog_dive(f, args, &fuel);
 }
 
@@ -1604,71 +1726,237 @@ __device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
   reduce_net();
 }
 
-// ---- kernels (host wave loop launches these via the driver API) ----
+// ---- the kernels: boot, and the driver ----
 
-extern "C" __global__ void k_boot(u64 a, u64 b, u64 c) { prog_fire(0, a, b, c); }
-
-// Grid-stride: the host launches at most MAXLANES threads, so a lane (its
-// free list, bump chunk and net worklist) belongs to exactly one thread.
-extern "C" __global__ void k_fire(u32 rule, u32 start, u32 count) {
-  u32 stride = gridDim.x * blockDim.x;
-  for (u32 i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += stride) {
-    if (*G.abortf >= AB_ARENA)
-      return; // poisoned: stop generating work
-    const u64 *e = &G.ebuf[((u64)rule * G.bcap + start + i) * 3];
-    prog_fire(rule, e[0], e[1], e[2]);
-    if (prog_rec_rule(rule)) rec_free((u32)e[2]); // a fired record is dead
-  }
-}
-
-// Sequential-tail pump: when total pending work is tiny, one host wave per
-// rewrite (sync + memcpy + launch) dominates, so the host launches this
-// single-thread kernel instead. It drains entries one by one for up to
-// max_steps rewrites, recycling fully drained buckets, and hands back to
-// the parallel loop as soon as the frontier widens again.
-extern "C" __global__ void k_pump(u32 max_steps) {
-  u32 r0 = 0; // round-robin start (chains hop between few rules)
-  for (u32 s = 0; s < max_steps; s++) {
-    if (*G.abortf >= AB_ARENA)
+// Run the joins this lane completed (parallel world: outside k_work the
+// local stack only ever holds completed cross-lane joins).
+__device__ void drain_local() {
+  u32 L = lane();
+  while (G.lsn[L]) {
+    if (*(volatile u32 *)G.abortf >= AB_ARENA)
       return;
-    if ((s & 255u) == 255u) {
-      u64 tot = 0;
-      for (u32 r = 0; r < G.nrules; r++) {
-        u32 len = G.blen[r] > G.bcap ? G.bcap : G.blen[r];
-        tot += len - G.bdone[r];
-      }
-      if (tot > 1024)
-        return; // wide again: let the host drain it in parallel
-    }
-    u32 rule = G.nrules;
-    long long c0 = clock64();
-    for (u32 k = 0; k < G.nrules; k++) {
-      g_stat[1]++;
-      u32 r = (r0 + k) % G.nrules;
-      u32 len = G.blen[r] > G.bcap ? G.bcap : G.blen[r];
-      u32 d = G.bdone[r];
-      if (d >= len) {
-        if (len && d >= G.blen[r]) { // fully drained: recycle the bucket
-          G.blen[r] = 0;
-          G.bdone[r] = 0;
-        }
-        continue;
-      }
-      rule = r;
-      break;
-    }
-    if (rule == G.nrules)
-      return; // quiescent
-    r0 = rule;
-    u32 i = G.bdone[rule]++;
-    const u64 *e = &G.ebuf[((u64)rule * G.bcap + i) * 3];
-    long long c1 = clock64();
-    g_stat[3] += c1 - c0;
-    prog_fire(rule, e[0], e[1], e[2]);
-    if (prog_rec_rule(rule)) rec_free((u32)e[2]);
-    g_stat[2] += clock64() - c1;
-    g_rule_cycles[rule] += clock64() - c1;
-    g_rule_steps[rule]++;
-    g_stat[0]++;
+    u32 n = G.lsn[L];
+    u64 *t = &G.lstk[((u64)L * LSCAP + n - 1) * 4];
+    u32 rule = (u32)t[0] & ~PAR_TASK;
+    u64 e0 = t[1], e1 = t[2], e2 = t[3];
+    G.lsn[L] = n - 1;
+    prog_fire(rule, e0, e1, e2);
+    if (prog_rec_rule(rule)) rec_free((u32)e2);
   }
 }
+
+extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
+  s_mode[threadIdx.x] = 0;
+  s_fuel = fuel;
+  prog_fire(0, a, b, c);
+  drain_local();
+}
+
+// Fire one global task in the current world; a fired record is dead, and
+// the joins and ready records its firing completed run at once on this lane.
+__device__ inline void fire_task(u32 rule, u32 idx) {
+  const u64 *e = &G.ebuf[((u64)rule * G.bcap + (idx & (G.bcap - 1))) * 3];
+  u64 e0 = e[0], e1 = e[1], e2 = e[2];
+  prog_fire(rule, e0, e1, e2);
+  if (prog_rec_rule(rule)) rec_free((u32)e2);
+  drain_local();
+}
+
+// WORK phase: every lane drains its own tasks depth-first (the tasks it
+// spawns and the joins it completes stay on it), dealt every nl-th pending
+// task of the snapshot. After `max_steps` fires a lane spills its stack to
+// the global rings and stops, so no phase runs unbounded.
+#define LOGCAP (1u << 16)
+__device__ u32 g_off[PROG_NRULES + 1]; // forkable-task prefix of the snapshot
+__device__ u32 g_woff[PROG_NRULES + 1]; // pending-task prefix of the snapshot (WORK deals these)
+__device__ u32 g_snap[PROG_NRULES];    // blen at the snapshot
+__device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, widest frontier, grow cycles, work cycles
+__device__ u32 g_wmax, g_wsum;         // a work phase: the most steps one lane took, all lanes' steps
+__device__ u32 g_wcyc, g_wbusy, g_wsteps_of_max; // a work phase: the slowest lane's K cycles, lanes that fired, its steps
+__device__ u32 g_wlog[LOGCAP * 6];     // per round: work steps (max lane, sum), K cycles, slowest lane K cycles, its steps, busy lanes; trace
+__device__ int g_phase;                // 0 exit, 1 grow, 2 work
+__device__ int g_grew = 1;
+__device__ u64 g_prev = 0;             // total pushes at the previous snapshot
+__device__ u32 g_log[LOGCAP * 3];      // per round: phase, pending, forkable (trace)
+#define RLOG 64
+__device__ u32 g_rlog[RLOG * PROG_NRULES]; // the first rounds' pending tasks per rule (trace)
+
+// The sequential world runs a lane's subtrees with the dive budget: a
+// fuel-out suspension costs ~100 rewrites' worth of allocation (bitonic
+// depth 23: 0.84 s -> 1.03 s against an unbounded budget), but the budget
+// is also the only bound on native recursion depth, and the device stack
+// is 32 KiB per thread.
+__device__ void work_phase(u32 max_steps) {
+  s_mode[threadIdx.x] = 1;
+  s_fuel = G.fuel;
+  __syncthreads();
+  u32 L = lane();
+  const u32 nl = gridDim.x * blockDim.x;
+  const u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 s = 0;
+  long long w0 = clock64();
+  // this lane's column: every nl-th pending task of the snapshot (dealt,
+  // not claimed: no race, every lane gets its share), each drained
+  // depth-first with what it spawns and the joins it completes
+  u32 ntask = g_woff[G.nrules];
+  u32 next = gid;
+  for (; s < max_steps; s++) {
+    if (*(volatile u32 *)G.abortf >= AB_ARENA)
+      return;
+    u32 rule;
+    u64 e0, e1, e2;
+    u32 n = G.lsn[L];
+    if (n) {
+      u64 *t = &G.lstk[((u64)L * LSCAP + n - 1) * 4];
+      rule = (u32)t[0];
+      e0 = t[1];
+      e1 = t[2];
+      e2 = t[3];
+      G.lsn[L] = n - 1;
+      if (rule & PAR_TASK) {
+        rule &= ~PAR_TASK;
+        s_mode[threadIdx.x] = 0; // a cross-lane join: the parallel world
+      }
+    } else {
+      if (next >= ntask)
+        break; // this lane's column is drained
+      u32 r = 0;
+      while (next >= g_woff[r + 1]) r++;
+      u32 idx = G.bdone[r] + (next - g_woff[r]);
+      const u64 *e = &G.ebuf[((u64)r * G.bcap + (idx & (G.bcap - 1))) * 3];
+      rule = r;
+      e0 = e[0];
+      e1 = e[1];
+      e2 = e[2];
+      next += nl;
+    }
+    prog_fire(rule, e0, e1, e2);
+    if (prog_rec_rule(rule)) rec_free((u32)e2);
+    s_mode[threadIdx.x] = 1;
+  }
+  // step cap: hand the unfinished local tasks, and the dealt tasks this
+  // lane never started, back to the global rings (the leader then moves
+  // bdone past the snapshot)
+  u32 n = G.lsn[L];
+  for (u32 i = 0; i < n; i++) {
+    u64 *t = &G.lstk[((u64)L * LSCAP + i) * 4];
+    spawn_global((u32)t[0] & ~PAR_TASK, t[1], t[2], t[3]);
+  }
+  G.lsn[L] = 0;
+  for (; next < ntask; next += nl) {
+    u32 r = 0;
+    while (next >= g_woff[r + 1]) r++;
+    u32 idx = G.bdone[r] + (next - g_woff[r]);
+    const u64 *e = &G.ebuf[((u64)r * G.bcap + (idx & (G.bcap - 1))) * 3];
+    spawn_global(r, e[0], e[1], e[2]);
+  }
+  if (s) {
+    atomicMax(&g_wmax, s);
+    atomicAdd(&g_wsum, s);
+    atomicAdd(&g_wbusy, 1);
+    u32 kc = (u32)((clock64() - w0) >> 10);
+    if (atomicMax(&g_wcyc, kc) < kc) g_wsteps_of_max = s;
+  }
+}
+
+// ---- the driver on the device ----
+//
+// One cooperative launch runs the whole program in reference's rhythm. A round:
+// while the frontier (pending global tasks) is narrower than the lanes and
+// some pending task can fork, GROW sweeps: every forkable task below a
+// snapshot fires in the parallel world, one grid barrier per sweep, until
+// the frontier is wide or a sweep grew nothing; then one WORK phase: every
+// lane drains its column in the sequential world. It stops when nothing is
+// pending (the root delivered) or the run aborted. The host launches once.
+
+extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, u64 max_rounds) {
+  cg::grid_group grid = cg::this_grid();
+  const u32 nl = gridDim.x * blockDim.x;
+  const u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (;;) {
+    if (gid == 0) {
+      u32 total = 0, forkable = 0, off = 0;
+      for (u32 r = 0; r < G.nrules; r++) {
+        u32 len = *(volatile u32 *)&G.blen[r];
+        u32 pend = len - G.bdone[r];
+        g_snap[r] = len;
+        g_off[r] = off;
+        g_woff[r] = total;
+        if (g_rounds[0] < RLOG) g_rlog[g_rounds[0] * PROG_NRULES + r] = pend;
+        if (prog_forks(r)) {
+          off += pend;
+          forkable += pend;
+        }
+        total += pend;
+      }
+      g_off[G.nrules] = off;
+      g_woff[G.nrules] = total;
+      // reference's rule: a grow sweep grew when it pushed anything (some task
+      // forked); growth stops when a sweep forks nothing or the frontier
+      // is as wide as the lanes
+      u64 pushed = 0;
+      for (u32 r = 0; r < G.nrules; r++) pushed += g_snap[r];
+      u64 f = pushed - g_prev; // the frontier: tasks pushed by the last phase
+      if (g_phase == 1) g_grew = f > 0;
+      g_prev = pushed;
+      if (total > g_rounds[3]) g_rounds[3] = total;
+      if (g_rounds[0] >= max_rounds) g_abort(AB_ROUNDS);
+      if (*(volatile u32 *)G.abortf != 0 || total == 0)
+        g_phase = 0;
+      else if (forkable > 0 && f < grow_width && g_grew)
+        g_phase = 1;
+      else
+        g_phase = 2;
+      g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
+      if (g_rounds[0] < LOGCAP) {
+        g_log[g_rounds[0] * 3] = g_phase;
+        g_log[g_rounds[0] * 3 + 1] = total;
+        g_log[g_rounds[0] * 3 + 2] = (u32)f;
+      }
+      g_rounds[0]++;
+    }
+    grid.sync();
+    int ph = *(volatile int *)&g_phase;
+    if (ph == 0) return;
+    long long c0 = clock64();
+    if (ph == 1) {
+      s_mode[threadIdx.x] = 0;
+      s_fuel = grow_fuel; // >= 1 (the runner clamps it): a task's own entry must run, or it would re-spawn itself forever
+      __syncthreads();
+      u32 n = g_off[G.nrules];
+      for (u32 i = gid; i < n; i += nl) {
+        if (*(volatile u32 *)G.abortf >= AB_ARENA) break;
+        u32 r = 0;
+        while (i >= g_off[r + 1]) r++;
+        fire_task(r, G.bdone[r] + (i - g_off[r]));
+      }
+      grid.sync();
+      if (gid == 0) {
+        for (u32 r = 0; r < G.nrules; r++)
+          if (prog_forks(r)) G.bdone[r] = g_snap[r];
+        g_rounds[1]++;
+        g_rounds[4] += clock64() - c0;
+      }
+    } else {
+      work_phase(work_steps);
+      grid.sync();
+      if (gid == 0) {
+        for (u32 r = 0; r < G.nrules; r++) G.bdone[r] = g_snap[r];
+        g_grew = 1;
+        g_rounds[2]++;
+        g_rounds[5] += clock64() - c0;
+        u64 i = g_rounds[0] - 1;
+        if (i < LOGCAP) {
+          g_wlog[i * 6] = g_wmax;
+          g_wlog[i * 6 + 1] = g_wsum;
+          g_wlog[i * 6 + 2] = (u32)((clock64() - c0) >> 10);
+          g_wlog[i * 6 + 3] = g_wcyc;
+          g_wlog[i * 6 + 4] = g_wsteps_of_max;
+          g_wlog[i * 6 + 5] = g_wbusy;
+        }
+      }
+    }
+    grid.sync();
+  }
+}
+

@@ -58,7 +58,8 @@ fn helper_ret(f: &str) -> Ty {
         "con_addr" | "alloc2" | "alloc_rec" | "rec_d" | "rec_s" => Ty::U32,
         "arr_len_of" => Ty::Usize,
         "flag_load" | "is_err" => Ty::Bool,
-        "apply" | "dive_res" => Ty::Res,
+        "apply" | "dive_res" | "dive_res_fork" => Ty::Res,
+        "fork_fuel" => Ty::RefI64,
         _ if f.starts_with("f32_") => Ty::I64,
         _ => Ty::U64,
     }
@@ -366,7 +367,18 @@ impl<'a> P<'a> {
                 let rt = self.ty_of(e);
                 let v = self.ex(e);
                 let rn = self.fresh("_r");
-                self.line(format!("auto {rn} = {v};"));
+                // On the device the budget a dive-form call hands down is
+                // refunded when the callee returns, so the budget bounds the
+                // native recursion depth (the device stack is small) and not
+                // the work of a subtree: a wide, shallow subtree runs without
+                // suspending. (The CPU keeps the work budget: its suspension
+                // is what exposes work to idle threads.)
+                let hands_budget = matches!(e, E::Call { args, .. } if matches!(args.first(), Some(E::V(f)) if f == "fuel") || matches!(args.first(), Some(E::Call { f, .. }) if f == "fork_fuel"));
+                if hands_budget {
+                    self.line(format!("i64 {rn}_keep = *fuel; auto {rn} = {v}; *fuel = {rn}_keep;"));
+                } else {
+                    self.line(format!("auto {rn} = {v};"));
+                }
                 self.out.push_str(&format!("if (!{rn}.ok) "));
                 let recf = if matches!(rt, Ty::ResArr(_)) { "rec" } else { "v" };
                 let mut hb = vec![];
@@ -509,6 +521,10 @@ pub fn print(prog: &LirProgram) -> String {
     let _ = writeln!(out, "__device__ u32 unbox_cid(u64 slot) {{ return UNBOX_CID[slot]; }}");
     let rr: Vec<&str> = prog.rules.iter().map(|r| if matches!(r, Rule::Seg(_) | Rule::Join(_) | Rule::Hole(_) | Rule::Fill) { "true" } else { "false" }).collect();
     let _ = writeln!(out, "__device__ const bool REC_RULE[PROG_NRULES] = {{{}}};\n__device__ bool prog_rec_rule(u32 rule) {{ return REC_RULE[rule]; }}", rr.join(", "));
+    // rules that can fork (a call rule, a segment with a call, the net
+    // region's rules): a GROW sweep fires only these
+    let forks: Vec<&str> = (0..prog.rules.len()).map(|r| if prog.diving.contains(&(r as u16)) { "1" } else { "0" }).collect();
+    let _ = writeln!(out, "extern \"C\" __device__ const unsigned char FORKS[PROG_NRULES] = {{{}}};\n__device__ bool prog_forks(u32 rule) {{ return FORKS[rule] != 0; }}", forks.join(", "));
     for f in &prog.folds {
         let _ = writeln!(out, "__device__ i64 FOLD_EST_{f} = 1;\n__device__ int FOLD_MEAS_{f} = 0;");
     }

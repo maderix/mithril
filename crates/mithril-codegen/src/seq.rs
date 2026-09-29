@@ -250,9 +250,6 @@ impl<'m> Ex<'m> {
         } else {
             self.tys.var(self.self_fid as usize, i)
         };
-        if std::env::var_os("MITHRIL_DEBUG_SHARE").is_some() {
-            eprintln!("share: fn {} var {} ty {:?} pinned {} rem {:?}", self.self_fid, i, t, self.pinned, self.rem.get(&i));
-        }
         let mut sh = self.shared.borrow_mut();
         match t {
             CTy::Int => {}
@@ -358,24 +355,19 @@ impl<'m> Ex<'m> {
         // happens on fuel-out.
         for (x, bo) in &frames {
             if let Some((p_body, live, j_body)) = split_frame(*x, bo) {
-                let mut env_j = free_vars(&j_body);
-                env_j.remove(x);
-                env_j.remove(&live);
-                let env_j: Vec<u32> = env_j.into_iter().collect();
-                let sid_j = self.sq.as_mut().expect("dive capture without a segment registry").add(self.self_fid, vec![*x, live], env_j.clone(), j_body.clone());
+                let mut sq = self.sq.take().expect("dive capture without a segment registry");
                 let env_p: Vec<u32> = free_vars(&p_body).into_iter().collect();
-                let sid_p = self.sq.as_mut().expect("dive capture without a segment registry").add(self.self_fid, vec![], env_p.clone(), p_body.clone());
-                let rn = emit_rec(self, &env_j, sid_j, 2, &E::Const("NONE".into()), b);
-                b.push(do_(c("set_parent", vec![v(&child), rec_addr(&rn)])));
+                let sid_p = sq.add(self.self_fid, vec![], env_p.clone(), p_body.clone());
+                let (rn, rx) = crate::rules::join_records(self, &mut sq, *x, live, &j_body, &E::Const("NONE".into()), b);
+                self.sq = Some(sq);
+                b.push(do_(c("set_parent", vec![v(&child), rec_addr(&rx)])));
                 let rp = emit_rec(self, &env_p, sid_p, 0, &bin(Bop::Or, rec_addr(&rn), u64_(1)), b);
                 b.push(do_(c("ready_rec", vec![v(rp)])));
                 child = rn;
             } else {
-                let mut env = free_vars(bo);
-                env.remove(x);
-                let env: Vec<u32> = env.into_iter().collect();
-                let sid = self.sq.as_mut().expect("dive capture without a segment registry").add(self.self_fid, vec![*x], env.clone(), bo.clone());
-                let rn = emit_rec(self, &env, sid, 1, &E::Const("NONE".into()), b);
+                let mut sq = self.sq.take().expect("dive capture without a segment registry");
+                let rn = crate::rules::cont_rec(self, *x, bo, &E::Const("NONE".into()), b, &mut sq);
+                self.sq = Some(sq);
                 b.push(do_(c("set_parent", vec![v(&child), rec_addr(&rn)])));
                 child = rn;
             }
@@ -389,15 +381,26 @@ impl<'m> Ex<'m> {
     fn let_app(&mut self, x: u32, f: &Core, a: &Core, bo: &Core, b: &mut Vec<S>) {
         let ef = self.val(f, true, b);
         let ea = self.val(a, true, b);
-        let t = self.fresh();
-        let mut h = Vec::new();
-        self.emit_capture("r", Some((x, bo)), &mut h);
-        b.push(S::Try(Pat::One(t.clone()), c("apply", vec![ef, ea]), "r".into(), h));
-        self.emit_bind(x, v(t), b);
+        self.let_try(x, c("apply", vec![ef, ea]), Vec::new(), bo, b);
     }
 
     fn let_call(&mut self, x: u32, g: u32, args: &[Core], bo: &Core, b: &mut Vec<S>) {
-        let (call, post) = self.dive_call(g, args, b);
+        let (mut call, post) = self.dive_call(g, args, b);
+        // a fork site (the continuation has an independent part): the
+        // device's parallel world makes the callee a task at once
+        // (`fork_fuel` hands it no budget); a cut runs inline with the
+        // caller's budget; the CPU has one world
+        if split_frame(x, bo).is_some() {
+            if let E::Call { args, .. } = &mut call {
+                args[0] = p("fork_fuel", vec![v("fuel")]);
+            }
+        }
+        self.let_try(x, call, post, bo, b);
+    }
+
+    /// `let x = <call>` that may suspend: bind the value, or capture the
+    /// continuation `bo` (releasing `post`, the borrowed reads, on both paths).
+    fn let_try(&mut self, x: u32, call: E, post: Vec<E>, bo: &Core, b: &mut Vec<S>) {
         let t = self.fresh();
         let mut h: Vec<S> = post.iter().map(|q| free(q.clone())).collect();
         self.emit_capture("r", Some((x, bo)), &mut h);
@@ -1092,6 +1095,71 @@ impl<'m> Ex<'m> {
         }
     }
 
+    /// The two arms of an `if` in tail position (`e` = the whole `if`), each
+    /// entered as its own branch and emitted by `emit`; `cnt` counts a
+    /// body's uses for the form (`cnt_dive` / `cnt_rule`). Reuse tokens
+    /// (dive form only; the rule form never holds any) carry into each arm.
+    pub(crate) fn if_arms(&mut self, e: &Core, cd: &Core, th: &Core, el: &Core, cnt: fn(&Core, &mut Cnt), mut emit: impl FnMut(&mut Self, &Core, &mut Vec<S>), b: &mut Vec<S>) {
+        let ec = self.val(cd, false, b);
+        // tail branches inherit pending tokens; every arm ends in a
+        // terminal (call/return/back-edge) that releases its unused ones
+        let tk = self.toks.clone();
+        let saved = self.rem.clone();
+        let live = free_vars(e);
+        let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
+        cnt(th, &mut lt);
+        cnt(el, &mut lf);
+        let mut bt = Vec::new();
+        self.enter_branch(&live, &lt, &mut bt);
+        emit(self, th, &mut bt);
+        self.rem = saved.clone();
+        self.toks = tk;
+        let mut bf = Vec::new();
+        self.enter_branch(&live, &lf, &mut bf);
+        emit(self, el, &mut bf);
+        self.rem = saved;
+        self.toks.clear();
+        b.push(S::If(truthy(ec), bt, bf));
+    }
+
+    /// The arms of a `match` in tail position (`e` = the whole match): each
+    /// enters its branch, binds its fields (reusing the matched cell in the
+    /// dive form) and is emitted by `emit`.
+    pub(crate) fn match_arms(&mut self, e: &Core, s: &Core, arms: &[(u32, Vec<u32>, Core)], cnt: fn(&Core, &mut Cnt), mut emit: impl FnMut(&mut Self, &Core, &mut Vec<S>), b: &mut Vec<S>) {
+        let (sv, hold) = self.scrutinee(s, b);
+        let tk = self.toks.clone();
+        let saved = self.rem.clone();
+        let mut live = free_vars(e);
+        if let Core::Var(x) = s {
+            live.remove(x); // consumed by the match itself
+        }
+        let unbox = self.unbox;
+        let sw = plan_arms(&sv, arms, unbox, |i| {
+            let (cid, binders, body) = &arms[i];
+            self.rem = saved.clone();
+            self.toks = tk.clone();
+            let mut ab = Vec::new();
+            let mut local = Cnt::new();
+            cnt(body, &mut local);
+            self.enter_branch(&live, &local, &mut ab);
+            if unbox.contains_key(cid) {
+                if let Some(bv) = binders.first() {
+                    if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
+                        ab.push(let_(vn(*bv), Ty::U64, num(as_i(sv.clone()))));
+                    }
+                }
+            } else {
+                let tok = reuse_var(body, &sv);
+                self.bind_fields(&sv, hold, *cid, binders, tok, &mut ab);
+            }
+            emit(self, body, &mut ab);
+            ab
+        });
+        self.rem = saved;
+        self.toks.clear();
+        b.push(sw);
+    }
+
     /// Emit `e` in dive tail position: ends every path with `return`, or
     /// `continue 'l` for self tail calls in loop form.
     pub fn dive_tail(&mut self, e: &Core, b: &mut Vec<S>) {
@@ -1153,61 +1221,9 @@ impl<'m> Ex<'m> {
                 self.dive_tail(bo, b);
             }
             Core::If(cd, th, el) => {
-                let ec = self.val(cd, false, b);
-                // tail branches inherit pending tokens; every arm ends in a
-                // terminal (call/return/back-edge) that releases its unused ones
-                let toks = self.toks.clone();
-                let saved = self.rem.clone();
-                let live = free_vars(e);
-                let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
-                cnt_dive(th, &mut lt);
-                cnt_dive(el, &mut lf);
-                let mut bt = Vec::new();
-                self.enter_branch(&live, &lt, &mut bt);
-                self.dive_tail(th, &mut bt);
-                self.rem = saved.clone();
-                self.toks = toks.clone();
-                let mut bf = Vec::new();
-                self.enter_branch(&live, &lf, &mut bf);
-                self.dive_tail(el, &mut bf);
-                self.rem = saved;
-                self.toks.clear();
-                b.push(S::If(truthy(ec), bt, bf));
+                self.if_arms(e, cd, th, el, cnt_dive, |ex, body, ab| ex.dive_tail(body, ab), b);
             }
-            Core::Match(s, arms) => {
-                let (sv, hold) = self.scrutinee(s, b);
-                let toks = self.toks.clone();
-                let saved = self.rem.clone();
-                let mut live = free_vars(e);
-                if let Core::Var(x) = &**s {
-                    live.remove(x); // consumed by the match itself
-                }
-                let unbox = self.unbox;
-                let sw = plan_arms(&sv, arms, unbox, |i| {
-                    let (cid, binders, body) = &arms[i];
-                    self.rem = saved.clone();
-                    self.toks = toks.clone();
-                    let mut ab = Vec::new();
-                    let mut local = Cnt::new();
-                    cnt_dive(body, &mut local);
-                    self.enter_branch(&live, &local, &mut ab);
-                    if unbox.contains_key(cid) {
-                        if let Some(bv) = binders.first() {
-                            if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
-                                ab.push(let_(vn(*bv), Ty::U64, num(as_i(sv.clone()))));
-                            }
-                        }
-                    } else {
-                        let tok = reuse_var(body, &sv);
-                        self.bind_fields(&sv, hold, *cid, binders, tok, &mut ab);
-                    }
-                    self.dive_tail(body, &mut ab);
-                    ab
-                });
-                self.rem = saved;
-                self.toks.clear();
-                b.push(sw);
-            }
+            Core::Match(s, arms) => self.match_arms(e, s, arms, cnt_dive, |ex, body, ab| ex.dive_tail(body, ab), b),
             Core::Call(g, args) if *g == self.self_fid && self.loop_form => {
                 // Self tail call as a loop iteration: compute all next-state
                 // values first (they read the current v*), then assign.
@@ -1813,9 +1829,6 @@ pub(crate) fn dps_fn<'m>(
 /// reads), and J is the dependent rest. `None` when P does no call or
 /// has zero or several live-outs (those frames wait as plain records).
 pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
-    if std::env::var_os("MITHRIL_NO_SPLIT").is_some() {
-        return None;
-    }
     let mut binds: Vec<(u32, &Core)> = Vec::new();
     let mut cur = bo;
     while let Core::Let(v, r, b) = cur {
@@ -1849,6 +1862,50 @@ pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
         p_body = Core::Let(*v, Box::new((*r).clone()), Box::new(p_body));
     }
     Some((p_body, live[0], j_body))
+}
+
+/// Split the dependent rest `j` of a frame (see `split_frame`) around
+/// the independent part's live-out `live`: `Some((D, m, J2))` where D is
+/// the chain of J's bindings that need x but not `live`, ending in its one
+/// live-out `m`, and J2 the rest (which reads `m` and `live`, not x). `None`
+/// when D does no call, has zero or several live-outs, or J2 reads x.
+pub(crate) fn split_dep(x: u32, live: u32, j: &Core) -> Option<(Core, u32, Core)> {
+    let mut binds: Vec<(u32, &Core)> = Vec::new();
+    let mut cur = j;
+    while let Core::Let(v, r, b) = cur {
+        binds.push((*v, r));
+        cur = b;
+    }
+    let mut dl: HashSet<u32> = HashSet::from([live]);
+    let (mut d, mut j2): (Vec<(u32, &Core)>, Vec<(u32, &Core)>) = (Vec::new(), Vec::new());
+    for (v, r) in binds {
+        if free_vars(r).iter().any(|f| dl.contains(f)) {
+            dl.insert(v);
+            j2.push((v, r));
+        } else {
+            d.push((v, r));
+        }
+    }
+    if !d.iter().any(|(_, r)| has_call(r)) {
+        return None;
+    }
+    let mut j2_body = cur.clone();
+    for (v, r) in j2.iter().rev() {
+        j2_body = Core::Let(*v, Box::new((*r).clone()), Box::new(j2_body));
+    }
+    let jf = free_vars(&j2_body);
+    if jf.contains(&x) {
+        return None;
+    }
+    let m: Vec<u32> = d.iter().map(|(v, _)| *v).filter(|v| jf.contains(v)).collect();
+    if m.len() != 1 {
+        return None;
+    }
+    let mut d_body = Core::Var(m[0]);
+    for (v, r) in d.iter().rev() {
+        d_body = Core::Let(*v, Box::new((*r).clone()), Box::new(d_body));
+    }
+    Some((d_body, m[0], j2_body))
 }
 
 /// Every occurrence of `x` in `e` is directly under a `Proj`.

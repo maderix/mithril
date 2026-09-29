@@ -516,57 +516,140 @@ Open after stage 3: device-side memory for arrays is never reclaimed;
 `bench/gpu_vs_cpu.py`: every port at fast.py's mid size, CPU binary vs
 the device, results equal on all 16 (two device bugs that only showed at
 this size were fixed first: a 16-bit record field truncating the TRMC
-hole cell, and records never recycled). Wall times: the device is
-10-1000x slower. tree-bitonic (CPU t1 0.04 s, device 9.0 s) traced:
+hole cell, and records never recycled). Wall times were then 10-1000x
+slower than the CPU. The per-fire cost, replicated standalone
+(`bench/gpu/fire_cost.cu`, the real `engine.cu` with a stub program, a
+synthetic fire: ~24 cell allocs, ~24 frees, ~31 reads, a record, a spawn
+and a delivery; cycles per fire):
 
-* host loop and launches 15 ms; kernels 9 s;
-* the 680 parallel waves: 0.4 ms each, 0.27 s in all;
-* the 7 sequential-tail pumps (one device thread while the frontier is
-  under 128 entries): 8.7 s = 409,599 fires of `warp`/`flow` segments at
-  ~49k cycles each. Per fire (profiled on the pump lane): ~24 cell allocs
-  at 730 cycles, ~24 frees at 485, ~31 cell reads at 160, a record, a
-  spawn and a delivery at 700-3,000 (atomics). Bucket scanning: 2%.
-* per-dive fuel cannot rise: the driver reserves the stack for every
-  resident thread (`cuCtxSetLimit` fails at 128 KiB), so 32 KiB and fuel
-  64 are the ceiling: 64x more fires than the CPU's fuel 4096.
+| component | one thread | full grid (65,536 threads), per thread |
+|---|---|---|
+| 24 cell allocs | 23,300 | 331,000 |
+| 24 allocs + 24 frees | 18,300 | 350,000 |
+| the whole fire | 30,000 | 560,000 |
 
-The model, replicated standalone (`bench/gpu/fire_cost.cu`, the real
-`engine.cu` with a stub program, a synthetic fire with the mix above,
-each component priced alone; cycles per fire):
+so a lane's step costs 30k cycles alone and ~560k under load (memory
+round-trips: 80 cycles per cell read, 300-1000 per allocation, and no
+allocator variant gets below ~24k alone). The model that held up:
 
-| component (one thread) | engine (V0) | no ring atomics (V1) | counters in shared (V2) | lane state in registers (V3) |
-|---|---|---|---|---|
-| 24 cell allocs | 23,300 | 18,900 | 9,900 | 7,800 |
-| 24 allocs + 24 frees | 18,300 | 17,100 | 15,600 | 7,900 |
-| 62 cell reads | 5,000 | | | |
-| record alloc/free | 1,050 | | | |
-| record + spawn | 1,600 | | | |
-| record + deliver | 3,800 | | | |
-| the whole fire | 29,500 | 28,000 | 26,500 | 24,300 |
+    T = sum over rounds of (the slowest lane's steps x cost per step)
 
-Same fire on the full grid (65,536 threads): 3.5-4.2 ns amortized. So:
+Every slowdown found was in the first factor. In order (tree-bitonic,
+depth 16 unless said; CPU t1 0.04 s; reference on this 4090: 0.576 s at
+depth 23):
 
-* T(program) = T(wide waves) + T(narrow phases); wide waves cost
-  ~4 ns/fire plus a ~0.4 ms per-wave floor; narrow phases cost
-  25-50k cycles per fire on one thread: 409,599 x 49k / 2.5 GHz = 8 s,
-  which is the 8.7 s measured.
-* A single device thread pays 80 cycles per cell read (L2) and 325-970
-  per allocation (two stores plus lane bookkeeping in global memory); a
-  CPU core pays 1-10. The allocator is 78% of a synthetic fire, and even
-  with all lane state in registers a fire stays at ~24k cycles: the floor
-  is the memory round-trips, not the bookkeeping. The best allocator gives
-  the tail ~2x, not 100x.
-* Conclusion (a property of the model): sequential phases cannot run on
-  the device. The fix is structural, not an allocator tweak: narrow
-  frontiers must run on the host, i.e. the same rule engine on the CPU
-  continuing on the same arena (one arena format for both engines), or
-  the program must be made wide (the split mechanisms). Not started;
-  the user decides which.
+1. Host wave loop: 7,764 rounds (one launch and one sync per round,
+   ~130 us of host per round): 1.8 s. Runtime unchanged.
+2. Fork sites hand-edited into the program (a callee suspends at entry
+   and becomes a task, the rest of the body goes on): 196,511 rounds,
+   12 s. A completed join was queued globally, so every join level cost a
+   round; running it at once on the completing lane (the CPU runtime's
+   rule, and reference's): 4,586 rounds, 3.8 s.
+3. The lowering's two-way frame split: after `warp_node(a)` suspends in
+   `flow`, `flow(left)` (which needs only that result) sat in the same
+   join as `Node(left, right)` and so waited for the whole right half:
+   every merge ran right-then-left, a chain of 2^15 steps, three rounds
+   each, 92,844 rounds. Fixed in the lowering (`split_dep`, 3f-1 below):
+   461 rounds.
+4. The driver on the device (`k_run`, one cooperative launch, grid
+   barriers between phases; the rounds are now 10-20 us) and reference's grow
+   rule (a sweep grew when it pushed anything; stop when it pushed at
+   least a lane's worth): 833 sweeps, no work phase, 0.12 s. Depth 20
+   still 2.6 s and depth 23 did not finish: the first WORK phase ran one
+   lane for 40 s.
+5. Static dealing in WORK (every lane gets every nl-th pending task; the
+   claim race had left 90% of lanes idle) and, at first, no fuel-out
+   suspension in the sequential world (superseded by 7): all 32,768
+   lanes busy, the slowest lane a few dozen steps.
+6. reference's fork in the parallel world (3f-2 below): the independent part
+   of a body used to run its sibling call inline with the dive budget, so
+   one side of every fork unfolded several levels per sweep and lanes got
+   subtrees of wildly different sizes. A fork's children are now both
+   tasks (`let x = f(..) in x` in the independent part is a tail call)
+   and a cut runs inline. Depth 23: 0.84 s. (Every call a task, with no
+   cuts, gave 0.62 s here, the frontier doubling exactly, but a
+   sequential chain then cost a round per step: 100,000 steps, 100,001
+   rounds, 1.3 s; with cuts inline it is 1,563 rounds and 0.3 s.)
+7. The sequential world keeps the dive budget (an unbounded budget gave
+   0.84 s against 1.03 s, but the budget is the only bound on native
+   recursion depth on a 32 KiB device stack), and on the device a
+   dive-form call refunds its budget when it returns, so the budget
+   bounds the depth of the native recursion, not the work of a subtree:
+   raytrace's work phase went 1.42 s (a suspension per 64 rewrites in
+   every lane's subtree) back to 0.06 s, bitonic 23 to 0.86 s. The budget
+   is a per-backend scheduling parameter, not semantics: the CPU keeps
+   the work budget because its suspension is the split mechanism that
+   exposes work to idle threads (the refund was not measured there; a
+   depth budget would suspend only at depth 4096 and expose nothing on
+   a wide, shallow tree). Fold estimates read the phase's budget.
 
-Runtime changes made while measuring, all gated: the runtime descriptor
-`G` in constant memory (9.0 -> 7.8 s on bitonic: each field read was two
-dependent global loads); named abort codes and traps for corrupted ports;
-`MITHRIL_GPU_STATS` / `MITHRIL_GPU_TRACE` reporting.
+Standing (device, this box, default caps): tree-bitonic depth 8 6 ms,
+16 64 ms, 23 860 ms (reference GPU 576 ms; CPU t16 2.46 s); raytrace big
+61 ms (reference GPU 544 ms; CPU t16 2.84 s); a boxed chain of 100,000
+steps 0.3 s. Results equal the oracle on every fixture, port and corpus
+program. The frontier at the first WORK is 49,152 tasks on 32,768 lanes
+(a fork step of x1.5 on average), so half the lanes carry two subtrees:
+that quantization is the gap to reference on bitonic.
+
+#### 3f-1. The frame split follows the net's dependencies
+
+A suspended frame's continuation is a let chain. `split_frame` gives P,
+the bindings independent of the pending value x (they run at once, as a
+ready record) ending in one live-out l, and J, the rest. J now splits
+again (`split_dep`): D, the bindings that need x but not l, ending in
+one live-out m (a pend-1 record chained under the join, fired when x
+arrives), and J2, the join of m and l (pend 2). `join_records` builds
+these for both forms. Without D, a call in J that needed only x waited
+for P to finish: a sequential dependency the net does not have (in the
+net the call node fires when its own input arrives). The three-way split
+is exact dataflow for the shape `Node(f(g(a)), f(g(b)))`; a J that
+reads x in J2, or a D with several live-outs, falls back to the two-way
+split. Fixture `fork_chain.py`; every fixture stays oracle-equal on
+every thread count and fuel.
+
+#### 3f-2. Two worlds, one lowering
+
+The device runtime runs reference's rhythm. GROW: every forkable pending
+task fires in the parallel world. There a fork site's callee is a task at
+once (`fork_fuel` hands it no budget, so it suspends at entry;
+`dive_res_fork` in the rule form) and so is a segment's tail call
+(`tail_to`, reference's marked call: the sibling in the independent part),
+while a cut (a call whose result the next statement needs) runs inline
+with the task's budget; the continuation is captured as records. (Two
+fork sites still run as cuts: a native multi-value callee, and a call
+past the rule form's inline-nesting limit; performance only.) A
+`let x = g(..) in x` at any rule-form position is a tail call. The
+frontier widens by one fork level per sweep. When a sweep pushed at
+least as many tasks as there are lanes, or nothing, WORK: every lane
+gets every nl-th pending task and drains it and everything it spawns
+depth-first with the dive budget on its own stack; a cross-lane join it
+completes runs at once in the parallel world, and what that forks goes to
+the global rings for the next round. On the CPU `fork_fuel`,
+`dive_res_fork` and `tail_to` are identities (one world, the wave runtime
+as before), so the same lowered program runs on both; the schedule is
+the only difference, as the core constraint requires. Records freed by a
+lane past its list spill to a global ring (as cells do; a push never
+overwrites an unread slot; a pop that finds an empty slot leaves the
+entries below it stranded until later pops pass it: a leak bounded by
+the ring, never a double hand-out). `k_run` needs a cooperative launch (all lanes
+resident); the host launches once and reads the rounds back. A run that
+does not converge stops at `MITHRIL_GPU_ROUNDS` rounds with an error, and
+any device fault ends the run. Known limit: a native scalar function's
+non-tail recursion has no budget and overflows the device stack (32 KiB
+per thread) past a few thousand frames, as a driver fault that loses the
+context. reference has the same kind of limit (a fixed value stack of 2048
+words per device lane) but checks every push and fails with a numbered
+error; a depth counter in the scalar lowering with a named abort is the
+pending fix.
+
+The old host loop, its kernels and the sequential-tail pump are gone;
+the regression comparison is the round count: `gpu_schedule_is_bounded_
+by_fork_levels` (tree-bitonic depth 8 in under 400 rounds; the host loop
+took thousands at depth 8 and 7,764 at depth 16) and
+`gpu_chain_costs_a_round_per_budget_not_per_step`. Fixtures
+`fork_split_shapes.py` (every split shape and fallback, a boxed value
+shared by the three records), `chain_boxed.py`, `deep_leaves.py` (deep
+recursion inside a WORK lane).
 
 ## 4. Runtime: waves, dives, records
 

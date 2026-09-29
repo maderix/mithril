@@ -335,6 +335,48 @@ fn trmc_golden(name: &str) -> (CoreModule, String) {
 }
 
 #[test]
+fn dependent_calls_wait_only_for_their_own_input() {
+    // fork_chain: `Node(merge(bump(a)), merge(bump(b)))`. When bump(a)
+    // suspends, merge(bump(a)) needs only its result: it waits behind a
+    // pend-1 record whose parent is the pend-2 join of both branches, so
+    // the independent branch does not gate it (a two-way split made the
+    // whole merge run right-then-left, a chain of 2^d steps).
+    let (cm, rs) = trmc_golden("fork_chain.py");
+    let df = dive_form(&cm, &rs, "merge");
+    let re = has_chained_pend1_record(df);
+    assert!(re, "merge's capture has no dependent-chain record (pend 1, parent = the join record):\n{df}");
+    // the CPU has one world: every callee gets the caller's budget through fork_fuel
+    assert!(df.contains("fork_fuel(fuel)"), "merge's calls do not pass their budget through fork_fuel");
+}
+
+#[test]
+fn split_shapes_and_chains_match_oracle() {
+    // every split shape (a boxed value shared by D, P and J2; the three
+    // two-way fallbacks) and a boxed chain, on every thread count and fuel
+    trmc_golden("fork_split_shapes.py");
+    trmc_golden("chain_boxed.py");
+    trmc_golden("deep_leaves.py");
+}
+
+/// A one-slot record whose parent is a two-slot (join) record allocated
+/// in the same capture: `let tJ: u32 = alloc_rec(ctx, .., 2u32, ..)` then
+/// `alloc_rec(ctx, .., 1u32, .., rec_addr(tJ))`.
+fn has_chained_pend1_record(s: &str) -> bool {
+    s.match_indices(": u32 = alloc_rec(ctx, ").any(|(i, _)| {
+        let call = &s[i..s[i..].find(");").map(|e| i + e).unwrap_or(s.len())];
+        if !call.contains(", 2u32, ") {
+            return false;
+        }
+        let name = s[..i].rsplit("let ").next().unwrap_or("").trim();
+        let rest = &s[i..];
+        rest.match_indices("alloc_rec(ctx, ").any(|(j, _)| {
+            let c = &rest[j..rest[j..].find(");").map(|e| j + e).unwrap_or(rest.len())];
+            c.contains(", 1u32, ") && c.ends_with(&format!("rec_addr({name})"))
+        })
+    })
+}
+
+#[test]
 fn trmc_list_builders_match_oracle_under_suspension() {
     let (cm, rs) = trmc_golden("trmc_list.py");
     // direct TRMC and the delayed self call through branches both loop
@@ -394,7 +436,9 @@ fn base_case_wrappers_match_oracle_under_suspension() {
         let fid = cm.fns.iter().position(|f| f.name == name).unwrap();
         assert!(rs.contains(&format!("fn q_{fid}(")), "{name} has no base-case wrapper");
         // recursive call sites go through the wrapper
-        assert!(dive_form(&cm, &rs, name).contains(&format!("q_{fid}(ctx, fuel")), "{name} does not call q_{fid}");
+        // (a fork site hands the callee `fork_fuel(fuel)`)
+        let df = dive_form(&cm, &rs, name);
+        assert!(df.contains(&format!("q_{fid}(ctx, fuel")) || df.contains(&format!("q_{fid}(ctx, fork_fuel(fuel)")), "{name} does not call q_{fid}");
     }
     // zipsum's leaf arm drops the owned, unmatched tree u
     let fid = cm.fns.iter().position(|f| f.name == "zipsum").unwrap();

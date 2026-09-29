@@ -405,6 +405,20 @@ pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
         crate::DiveResult::Suspended(rec) => Err(rec),
     }
 }
+/// The budget a callee gets: the caller's (the CPU has one world; the
+/// device runtime hands none in its parallel world, where every call is a
+/// task at once).
+#[inline] pub fn fork_fuel(fuel: &mut i64) -> &mut i64 { fuel }
+/// A fork site's call in the rule form: the same on the CPU.
+#[inline]
+pub fn dive_res_fork(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
+    dive_res(ctx, f, args)
+}
+/// A segment's tail call (delivering to `args[0]`): one world on the CPU.
+#[inline]
+pub fn tail_to(ctx: &mut Wctx, f: u16, args: &[u64]) {
+    dive_to(ctx, f, args)
+}
 #[inline] pub fn imax(a: i64, b: i64) -> i64 { a.max(b) }
 #[inline] pub fn sat_mul(a: i64, b: i64) -> i64 { a.saturating_mul(b) }
 #[inline] pub fn is_err(r: &R) -> bool { r.is_err() }

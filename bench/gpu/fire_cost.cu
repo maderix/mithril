@@ -21,6 +21,7 @@
 
 __device__ const bool REC_RULE[PROG_NRULES] = {false, true, true, true, true, true, false, true};
 __device__ bool prog_rec_rule(u32 rule) { return REC_RULE[rule]; }
+__device__ bool prog_forks(u32 rule) { return false; }
 __device__ bool lin(u16 k) { return k == 1; } // ctor 1 linear, ctor 2 refcounted
 __device__ u32 unbox_cid(u64 slot) { return 0; }
 __device__ void prog_inst(u16, const u64 *, int, u64) {}
@@ -160,6 +161,7 @@ __device__ __noinline__ void fire_sim(u32 mask, u32 seed, u32 variant) {
 }
 
 extern "C" __global__ void k_seq(u32 steps, u32 mask, u32 variant, unsigned long long *cyc) {
+  s_mode[threadIdx.x] = 0; s_fuel = 64; // the parallel world, as a GROW sweep
   s_nfreen[threadIdx.x] = 0; s_chunk[2 * threadIdx.x] = 0; s_chunk[2 * threadIdx.x + 1] = 0;
   long long c0 = clock64();
   for (u32 s = 0; s < steps; s++) fire_sim(mask, s, variant);
@@ -167,6 +169,7 @@ extern "C" __global__ void k_seq(u32 steps, u32 mask, u32 variant, unsigned long
 }
 
 extern "C" __global__ void k_par(u32 count, u32 mask, u32 variant, unsigned long long *cyc) {
+  s_mode[threadIdx.x] = 0; s_fuel = 64; // the parallel world, as a GROW sweep
   s_nfreen[threadIdx.x] = 0; s_chunk[2 * threadIdx.x] = 0; s_chunk[2 * threadIdx.x + 1] = 0;
   u32 stride = gridDim.x * blockDim.x;
   long long c0 = clock64();
@@ -220,6 +223,13 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&d.labels, 4));
   CK(cudaMalloc(&d.rfree, 4ull * RFREECAP * MAXLANES));
   CK(cudaMalloc(&d.rfreen, 4ull * MAXLANES));
+  CK(cudaMalloc(&d.lstk, 32ull * LSCAP * MAXLANES));
+  CK(cudaMalloc(&d.lsn, 4ull * MAXLANES));
+  CK(cudaMalloc(&d.rovf, 4ull * ovfcap));
+  CK(cudaMalloc(&d.rovftop, 4));
+  CK(cudaMemset(d.rovf, 0, 4ull * ovfcap));
+  CK(cudaMemset(d.rovftop, 0, 4));
+  CK(cudaMemset(d.lsn, 0, 4ull * MAXLANES));
   d.hcap = 1u << 20;
   d.ncap = ncap; d.rcap = rcap; d.bcap = bcap; d.ovfcap = ovfcap; d.chunksz = 1024; d.nrules = nrules;
   d.fuel = 64; d.net_fuel = 4096;

@@ -34,6 +34,20 @@ extern "C" {
     fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> CUresult;
+    fn cuOccupancyMaxActiveBlocksPerMultiprocessor(n: *mut i32, f: *mut c_void, block: i32, shared: usize) -> CUresult;
+    #[allow(clippy::too_many_arguments)]
+    fn cuLaunchCooperativeKernel(
+        f: *mut c_void,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+        shared: u32,
+        stream: *mut c_void,
+        params: *mut *mut c_void,
+    ) -> CUresult;
     fn cuMemsetD8_v2(dst: CUdeviceptr, uc: u8, n: usize) -> CUresult;
     fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, n: usize) -> CUresult;
     fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, n: usize) -> CUresult;
@@ -93,6 +107,10 @@ struct Dev {
     labels: CUdeviceptr,
     rfree: CUdeviceptr,
     rfreen: CUdeviceptr,
+    lstk: CUdeviceptr,
+    lsn: CUdeviceptr,
+    rovf: CUdeviceptr,
+    rovftop: CUdeviceptr,
     ncap: u32,
     rcap: u32,
     bcap: u32,
@@ -104,6 +122,7 @@ struct Dev {
 }
 const NWCAP: usize = 64;
 const RFREECAP: usize = 64;
+const LSCAP: usize = 64;
 
 /// What a run delivered to ROOT: the port, and its printed form (the same
 /// text the CPU program prints).
@@ -111,6 +130,9 @@ const RFREECAP: usize = 64;
 pub struct GpuResult {
     pub port: u64,
     pub text: String,
+    /// rounds of the device driver (grow sweeps + work phases): the
+    /// schedule's length, bounded by the program's fork levels
+    pub rounds: u64,
 }
 
 const REC_SIZE: usize = 40; // sizeof(Rec) in engine.cu
@@ -183,9 +205,13 @@ fn nvcc_compile(dir: &Path) -> Result<(), String> {
 
 /// Write `cu_src` + the fixed engine into a hash-keyed subdir of
 /// `cache_dir`, compile to a .cubin via docker nvcc (skipped on a cache
-/// hit), load it through the driver API and run the wave loop. Returns the
+/// hit), load it through the driver API and run it (`k_run`). Returns the
 /// result port raw delivered to ROOT.
 pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<GpuResult, String> {
+    // MITHRIL_GPU_CU=<file>: run a hand-edited program.cu instead (the SOP's
+    // proof step before a change becomes a lowering)
+    let edited = std::env::var("MITHRIL_GPU_CU").ok().map(|p| fs::read_to_string(&p).map_err(|e| format!("mithril-gpu: read {p}: {e}"))).transpose()?;
+    let cu_src = edited.as_deref().unwrap_or(cu_src);
     // key on program AND engine source, so an engine change invalidates too
     let key = fnv1a(cu_src) ^ fnv1a(ENGINE_CU).rotate_left(1);
     let dir = cache_dir.join(format!("{key:016x}"));
@@ -267,6 +293,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     } else {
         ((1u64 << 24) / nrules as u64).clamp(1 << 14, 1 << 20) as u32
     };
+    let bcap = 1u32 << (31 - bcap.leading_zeros()); // rings: a power of two
     let ovfcap: u32 = 1 << 20;
     let hcap = env_cap("MITHRIL_GPU_HEAP", 1 << 26);
     let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
@@ -287,10 +314,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let fixed = REC_SIZE as u64 * rcap as u64
         + 24 * bcap as u64 * nrules as u64
         + (4 * MAXLANES * FREECAP + 12 * MAXLANES) as u64
-        + 4 * ovfcap as u64
+        + 8 * ovfcap as u64
         + 8 * nrules as u64
         + 8 * hcap
-        + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4 + 4 * RFREECAP * MAXLANES + 4 * MAXLANES) as u64
+        + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4 + 4 * RFREECAP * MAXLANES + 4 * MAXLANES + 32 * LSCAP * MAXLANES + 4 * MAXLANES) as u64
         + (1 << 20);
     let slack: u64 = 1 << 30;
     let budget = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
@@ -332,6 +359,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         labels: alloc(4, "alloc labels")?,
         rfree: alloc(4 * RFREECAP * MAXLANES, "alloc rfree")?,
         rfreen: alloc(4 * MAXLANES, "alloc rfreen")?,
+        lstk: alloc(32 * LSCAP * MAXLANES, "alloc lstk")?,
+        lsn: alloc(4 * MAXLANES, "alloc lsn")?,
+        rovf: alloc(4 * ovfcap as usize, "alloc rovf")?,
+        rovftop: alloc(4, "alloc rovftop")?,
         ncap,
         rcap,
         bcap,
@@ -370,6 +401,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     }
     cu(cuMemsetD8_v2(d.nwn, 0, 4 * MAXLANES), "memset nwn")?;
     cu(cuMemsetD8_v2(d.rfreen, 0, 4 * MAXLANES), "memset rfreen")?;
+    cu(cuMemsetD8_v2(d.lsn, 0, 4 * MAXLANES), "memset lsn")?;
+    cu(cuMemsetD8_v2(d.rovf, 0, 4 * ovfcap as usize), "memset rovf")?;
+    cu(cuMemsetD8_v2(d.rovftop, 0, 4), "memset rovftop")?;
     cu(cuMemcpyHtoD_v2(d.labels, (&one as *const u32).cast(), 4), "init labels")?;
 
     // publish Dev to the module global G
@@ -387,19 +421,19 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
 
     let mut k_boot: *mut c_void = std::ptr::null_mut();
     cu(cuModuleGetFunction(&mut k_boot, module, c"k_boot".as_ptr()), "get k_boot")?;
-    let mut k_fire: *mut c_void = std::ptr::null_mut();
-    cu(cuModuleGetFunction(&mut k_fire, module, c"k_fire".as_ptr()), "get k_fire")?;
-    let mut k_pump: *mut c_void = std::ptr::null_mut();
-    cu(cuModuleGetFunction(&mut k_pump, module, c"k_pump".as_ptr()), "get k_pump")?;
 
+    // which rules can fork (published by the program)
     let t_setup = t0.elapsed();
-    // boot fires rule 0 with the redex, parent = ROOT (aux)
+    // boot fires rule 0 with the redex, parent = ROOT (aux), in the
+    // parallel world with the dive budget
     {
         let (mut a, mut b, mut c) = (boot.a, boot.b, boot.aux);
+        let mut bf: i32 = fuel;
         let mut params = [
             (&mut a as *mut u64).cast::<c_void>(),
             (&mut b as *mut u64).cast::<c_void>(),
             (&mut c as *mut u64).cast::<c_void>(),
+            (&mut bf as *mut i32).cast::<c_void>(),
         ];
         cu(
             cuLaunchKernel(k_boot, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
@@ -407,159 +441,86 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         )?;
     }
 
-    // Host wave loop. Bucket counters live on the device (`blen` append,
-    // `bdone` drained prefix): each wave the host syncs, reads them back,
-    // recycles fully drained buckets to slot 0 (so ebuf only has to hold a
-    // wave's live entries, not the whole run's appends), then either fires
-    // the largest bucket in parallel or — when the frontier is tiny, as in
-    // a strict dependence chain — launches the device-side pump, which
-    // batches up to PUMP_STEPS dependent rewrites in one kernel instead of
-    // one host round-trip each.
-    const PUMP_MAX_PENDING: u64 = 128;
-    const PUMP_STEPS: u32 = 1 << 16;
-    let wave_limit = env_cap("MITHRIL_GPU_WAVES", 1 << 24);
-    let mut waves: u64 = 0;
+    // The driver on the device: k_run, one cooperative launch.
     let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
-    let trace = std::env::var_os("MITHRIL_GPU_TRACE").is_some();
-    let t_run = std::time::Instant::now();
-    let mut pumps: u64 = 0;
-    let mut t_kernel = std::time::Duration::ZERO;
-    let mut t_host = std::time::Duration::ZERO;
-    let mut t_wave = std::time::Instant::now();
-    let mut last: Option<(u32, u32, bool)> = None;
-    loop {
-        cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
-        let tk = t_wave.elapsed();
-        t_kernel += tk;
-        if let Some((rule, count, pump)) = last.take() {
-            if trace {
-                eprintln!("mithril-gpu: wave {waves}: {} rule {rule} count {count}: {:.2} ms", if pump { "pump" } else { "fire" }, tk.as_secs_f64() * 1e3);
-            }
-        }
-        t_wave = std::time::Instant::now();
-        let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
+    let abort_message = |ab: u32| -> String {
         match ab {
-            0 => {}
-            1 => return Err("mithril-gpu: unreachable match arm reached".to_string()),
-            3 => return Err("mithril-gpu: array index out of bounds".to_string()),
-            4 => return Err("mithril-gpu: the program used an unsupported device feature".to_string()),
-            5 => return Err("mithril-gpu: a cell walk did not terminate (corrupted arena)".to_string()),
-            6 => return Err(format!("mithril-gpu: arena exhausted: records ({rcap}; raise MITHRIL_GPU_RECS)")),
-            7 => return Err(format!("mithril-gpu: arena exhausted: rule bucket ({bcap} entries; raise MITHRIL_GPU_BUCKET)")),
-            8 => return Err(format!("mithril-gpu: arena exhausted: array heap ({hcap} words; raise MITHRIL_GPU_HEAP)")),
-            9 => return Err("mithril-gpu: a cell index outside the arena was read (corrupted port)".to_string()),
-            _ => return Err(format!("mithril-gpu: arena exhausted: cells ({ncap}; raise MITHRIL_GPU_NODES)")),
+            1 => "mithril-gpu: unreachable match arm reached".to_string(),
+            3 => "mithril-gpu: array index out of bounds".to_string(),
+            4 => "mithril-gpu: the program used an unsupported device feature".to_string(),
+            5 => "mithril-gpu: a cell walk did not terminate (corrupted arena)".to_string(),
+            6 => format!("mithril-gpu: arena exhausted: records ({rcap}; raise MITHRIL_GPU_RECS)"),
+            7 => format!("mithril-gpu: arena exhausted: rule bucket ({bcap} entries; raise MITHRIL_GPU_BUCKET)"),
+            8 => format!("mithril-gpu: arena exhausted: array heap ({hcap} words; raise MITHRIL_GPU_HEAP)"),
+            9 => "mithril-gpu: a cell index outside the arena was read (corrupted port)".to_string(),
+            10 => "mithril-gpu: round limit reached (MITHRIL_GPU_ROUNDS): the run does not converge".to_string(),
+            _ => format!("mithril-gpu: arena exhausted: cells ({ncap}; raise MITHRIL_GPU_NODES)"),
         }
-        let mut lens = dtoh::<u32>(d.blen, nrules, "read blen")?;
-        let mut dones = dtoh::<u32>(d.bdone, nrules, "read bdone")?;
-        let mut best = usize::MAX;
-        let mut best_n = 0u32;
-        let mut total: u64 = 0;
-        let mut recycled = false;
-        for k in 0..nrules {
-            let pend = lens[k].min(bcap).saturating_sub(dones[k]);
-            if pend == 0 && lens[k] > 0 && dones[k] >= lens[k] {
-                lens[k] = 0; // fully drained: recycle the bucket
-                dones[k] = 0;
-                recycled = true;
-            }
-            total += pend as u64;
-            if pend > best_n {
-                best_n = pend;
-                best = k;
-            }
-        }
-        if best == usize::MAX {
-            break;
-        }
-        waves += 1;
-        if waves > wave_limit {
-            return Err(
-                "mithril-gpu: wave limit exceeded (non-terminating program? raise MITHRIL_GPU_WAVES)"
-                    .to_string(),
-            );
-        }
-        if total <= PUMP_MAX_PENDING {
-            // sequential tail: drain it on-device
-            if recycled {
-                cu(
-                    cuMemcpyHtoD_v2(d.blen, lens.as_ptr().cast(), 4 * nrules),
-                    "upload blen",
-                )?;
-            }
-            cu(cuMemcpyHtoD_v2(d.bdone, dones.as_ptr().cast(), 4 * nrules), "upload bdone")?;
-            let mut steps = PUMP_STEPS;
-            let mut params = [(&mut steps as *mut u32).cast::<c_void>()];
-            cu(
-                cuLaunchKernel(k_pump, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
-                "launch k_pump",
-            )?;
-            pumps += 1;
-            last = Some((0, total as u32, true));
-            t_host += t_wave.elapsed();
-            t_wave = std::time::Instant::now();
-            continue;
-        }
-        let (mut rule, mut start, mut count) = (best as u32, dones[best], best_n);
-        dones[best] += best_n;
-        if recycled {
-            cu(cuMemcpyHtoD_v2(d.blen, lens.as_ptr().cast(), 4 * nrules), "upload blen")?;
-        }
-        cu(cuMemcpyHtoD_v2(d.bdone, dones.as_ptr().cast(), 4 * nrules), "upload bdone")?;
-        let mut params = [
-            (&mut rule as *mut u32).cast::<c_void>(),
-            (&mut start as *mut u32).cast::<c_void>(),
-            (&mut count as *mut u32).cast::<c_void>(),
-        ];
-        // MITHRIL_GPU_THREADS caps the threads per wave (1 = sequential device
-        // execution: a determinism probe)
-        let tpb = env_cap("MITHRIL_GPU_THREADS", MAXLANES as u64).clamp(1, TPB as u64) as u32;
-        let max_grid = (env_cap("MITHRIL_GPU_THREADS", MAXLANES as u64).clamp(1, MAXLANES as u64) as u32).div_ceil(tpb);
-        let grid = count.div_ceil(tpb).min(max_grid);
-        if std::env::var_os("MITHRIL_GPU_DEBUG").is_some() {
-            eprintln!("mithril-gpu: wave {waves}: rule {rule} count {count} grid {grid} x {tpb}");
-        }
-        cu(
-            cuLaunchKernel(k_fire, grid, 1, 1, tpb, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
-            "launch k_fire",
-        )?;
-        last = Some((rule, count, false));
-        t_host += t_wave.elapsed();
-        t_wave = std::time::Instant::now();
-    }
-
+    };
+    let mut k_run: *mut c_void = std::ptr::null_mut();
+    cu(cuModuleGetFunction(&mut k_run, module, c"k_run".as_ptr()), "get k_run")?;
+    let mut per_sm: i32 = 0;
+    cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut per_sm, k_run, TPB as i32, 0), "occupancy k_run")?;
+    let mut sms: i32 = 0;
+    cu(cuDeviceGetAttribute(&mut sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev), "sm count")?;
+    // MITHRIL_GPU_LANES caps the lanes (the one-lane run is the determinism probe)
+    let blocks = ((per_sm.max(1) * sms.max(1)) as u32).min(MAXLANES as u32 / TPB).min(env_cap("MITHRIL_GPU_LANES", MAXLANES as u64).clamp(1, MAXLANES as u64).div_ceil(TPB as u64) as u32).max(1);
+    let lanes = blocks * TPB;
+    let t_run = std::time::Instant::now();
+    let mut width: u32 = env_cap("MITHRIL_GPU_GROW_WIDTH", lanes as u64).clamp(1, lanes as u64) as u32;
+    let mut steps: u32 = env_cap("MITHRIL_GPU_WORK_STEPS", 1 << 30).clamp(1, u32::MAX as u64) as u32;
+    // a grow task runs its body with the dive budget; fork-site callees
+    // and tail calls become tasks at once
+    let mut gfuel: i32 = env_cap("MITHRIL_GPU_GROW_FUEL", fuel as u64).clamp(1, i32::MAX as u64) as i32;
+    // a run that does not converge stops with an error at this many rounds
+    let mut max_rounds: u64 = env_cap("MITHRIL_GPU_ROUNDS", 1 << 24);
+    let mut params = [(&mut width as *mut u32).cast::<c_void>(), (&mut steps as *mut u32).cast::<c_void>(), (&mut gfuel as *mut i32).cast::<c_void>(), (&mut max_rounds as *mut u64).cast::<c_void>()];
+    cu(
+        cuLaunchCooperativeKernel(k_run, blocks, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr()),
+        "launch k_run (cooperative)",
+    )?;
+    cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
+    let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
+    let mut ptr: CUdeviceptr = 0;
+    let mut sz = 0usize;
+    cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_rounds".as_ptr()), "cuModuleGetGlobal(g_rounds)")?;
+    let r = dtoh::<u64>(ptr, 8, "read g_rounds")?;
     if stats {
-        let mut st_ptr: CUdeviceptr = 0;
-        let mut st_sz = 0usize;
-        cu(cuModuleGetGlobal_v2(&mut st_ptr, &mut st_sz, module, c"g_stat".as_ptr()), "cuModuleGetGlobal(g_stat)")?;
-        let st = dtoh::<u64>(st_ptr, 4, "read g_stat")?;
-        eprintln!("mithril-gpu: pump: {} steps, {} scan iterations, {:.0} M cycles firing, {:.0} M cycles scanning", st[0], st[1], st[2] as f64 / 1e6, st[3] as f64 / 1e6);
-        let mut rs_ptr: CUdeviceptr = 0;
-        let mut rs_sz = 0usize;
-        cu(cuModuleGetGlobal_v2(&mut rs_ptr, &mut rs_sz, module, c"g_rule_steps".as_ptr()), "cuModuleGetGlobal(g_rule_steps)")?;
-        let steps = dtoh::<u64>(rs_ptr, nrules, "read g_rule_steps")?;
-        cu(cuModuleGetGlobal_v2(&mut rs_ptr, &mut rs_sz, module, c"g_rule_cycles".as_ptr()), "cuModuleGetGlobal(g_rule_cycles)")?;
-        let cyc = dtoh::<u64>(rs_ptr, nrules, "read g_rule_cycles")?;
-        let mut rows: Vec<(usize, u64, u64)> = (0..nrules).filter(|r| steps[*r] > 0).map(|r| (r, steps[r], cyc[r])).collect();
-        rows.sort_by_key(|(_, _, c)| std::cmp::Reverse(*c));
-        for (r, n, c) in rows.iter().take(6) {
-            eprintln!("mithril-gpu: pump rule {r}: {n} steps, {} cycles each", c / n.max(&1));
-        }
         let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
-        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms (kernels {:.0} ms, host {:.0} ms), {waves} waves ({pumps} pumps), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, t_kernel.as_secs_f64() * 1e3, t_host.as_secs_f64() * 1e3);
+        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[3]);
+        if std::env::var_os("MITHRIL_GPU_TRACE").is_some() {
+            let n = (r[0] as usize).min(1 << 20);
+            cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_log".as_ptr()), "cuModuleGetGlobal(g_log)")?;
+            let log = dtoh::<u32>(ptr, n * 3, "read g_log")?;
+            cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_wlog".as_ptr()), "cuModuleGetGlobal(g_wlog)")?;
+            let wl = dtoh::<u32>(ptr, n * 6, "read g_wlog")?;
+            cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_rlog".as_ptr()), "cuModuleGetGlobal(g_rlog)")?;
+            let rl = dtoh::<u32>(ptr, 64 * nrules, "read g_rlog")?;
+            for i in 0..n {
+                if i < 64 {
+                    let per: Vec<String> = (0..nrules).filter(|k| rl[i * nrules + k] > 0).map(|k| format!("r{k}:{}", rl[i * nrules + k])).collect();
+                    eprintln!("mithril-gpu:   [{}]", per.join(" "));
+                }
+                let ph = ["EXIT", "GROW", "WORK"][log[i * 3].min(2) as usize];
+                let w = if log[i * 3] == 2 { format!(" steps max {} sum {} Kcycles {} slowest lane {} Kcycles in {} steps, {} lanes busy", wl[i * 6], wl[i * 6 + 1], wl[i * 6 + 2], wl[i * 6 + 3], wl[i * 6 + 4], wl[i * 6 + 5]) } else { String::new() };
+                eprintln!("mithril-gpu: round {i}: pending {} pushed {} -> {ph}{w}", log[i * 3 + 1], log[i * 3 + 2]);
+            }
+        }
+    }
+    if ab != 0 {
+        return Err(abort_message(ab));
     }
     let res = dtoh::<u64>(d.result, 2, "read result")?;
     if res[0] == 0 {
         return Err("mithril-gpu: run finished without delivering a result to ROOT".to_string());
     }
-    // the printed form: read the cells the result reaches, on demand
     let mut ub_ptr: CUdeviceptr = 0;
     let mut ub_sz = 0usize;
     cu(cuModuleGetGlobal_v2(&mut ub_ptr, &mut ub_sz, module, c"UNBOX_CID".as_ptr()), "cuModuleGetGlobal(UNBOX_CID)")?;
     let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
     let text = show(&d, &unbox, res[1])?;
-    Ok(GpuResult { port: res[1], text })
+    Ok(GpuResult { port: res[1], text, rounds: r[0] })
 }
 
 // ---- readback of a result port (mirrors mithril_rt::prelude::show) ----

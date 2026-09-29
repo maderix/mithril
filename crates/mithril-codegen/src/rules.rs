@@ -19,7 +19,7 @@
 //! rule. Frees are deferred into a local `fr` and flushed when the fire
 //! returns (fires are committed, so this is just batching).
 
-use crate::lir::{c, do_, free, i64_, let_, rec_addr, set, truthy, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
+use crate::lir::{c, do_, free, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
 use crate::seq::{vn, vparams, Ex};
 use crate::{cnt_expr, free_vars, has_call, merge_max, Cnt};
 use mithril_front::core::{Core, CoreModule};
@@ -272,12 +272,43 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &E, 
     rn
 }
 
+/// The records a suspended frame's dependent rest waits in, after
+/// `split_frame` gave P (independent, live-out `live`) and J: the pend-2
+/// join `rn` (slots: J's other input, `live`; parent `par`) and the record
+/// the pending value x must be delivered to. When a call in J needs only x
+/// (`split_dep`), that is a pend-1 record D chained under the join, so it
+/// runs as soon as x arrives; otherwise the join itself takes x.
+pub(crate) fn join_records(ex: &mut Ex, sq: &mut SegQ, x: u32, live: u32, j_body: &Core, par: &E, b: &mut Vec<S>) -> (String, String) {
+    if let Some((d_body, m, j2)) = crate::seq::split_dep(x, live, j_body) {
+        let mut env: BTreeSet<u32> = free_vars(&j2);
+        env.remove(&m);
+        env.remove(&live);
+        let env: Vec<u32> = env.into_iter().collect();
+        let sid = sq.add(ex.self_fid, vec![m, live], env.clone(), j2);
+        let rn = emit_rec(ex, &env, sid, 2, par, b);
+        let mut env_d: BTreeSet<u32> = free_vars(&d_body);
+        env_d.remove(&x);
+        let env_d: Vec<u32> = env_d.into_iter().collect();
+        let sid_d = sq.add(ex.self_fid, vec![x], env_d.clone(), d_body);
+        let rd = emit_rec(ex, &env_d, sid_d, 1, &rec_addr(&rn), b);
+        (rn, rd)
+    } else {
+        let mut env: BTreeSet<u32> = free_vars(j_body);
+        env.remove(&x);
+        env.remove(&live);
+        let env: Vec<u32> = env.into_iter().collect();
+        let sid = sq.add(ex.self_fid, vec![x, live], env.clone(), j_body.clone());
+        let rn = emit_rec(ex, &env, sid, 2, par, b);
+        (rn.clone(), rn)
+    }
+}
+
 /// Dives nested inline in one rule-form body before the rest is deferred
 /// to a record (see `rtail`).
 const MAX_INLINE_CALLS: u32 = 4;
 
 /// The continuation record of `bo` after `x` (a one-slot segment).
-fn cont_rec(ex: &mut Ex, x: u32, bo: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) -> String {
+pub(crate) fn cont_rec(ex: &mut Ex, x: u32, bo: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) -> String {
     let mut env = free_vars(bo);
     env.remove(&x);
     let env: Vec<u32> = env.into_iter().collect();
@@ -301,6 +332,12 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                 return rtail(ex, bo, par, b, sq);
             }
             match r.as_ref() {
+                Core::Call(g, gargs) if matches!(&**bo, Core::Var(y) if y == x) => {
+                    // `let x = g(..) in x`: a tail call
+                    let mut es: Vec<E> = gargs.iter().map(|a| ex.val(a, true, b)).collect();
+                    es.insert(0, par.clone());
+                    b.push(do_(c("tail_to", vec![u16_(*g as u64), E::Slice(es)])));
+                }
                 Core::Call(g, gargs) => {
                     // Dive inline; the continuation runs right here when the
                     // callee finishes within fuel. On suspension the frame
@@ -331,21 +368,19 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     ex.inline_calls -= 1;
                     ex.rem = saved.clone();
                     let mut susp = Vec::new();
-                    if let Some((p_body, live, j_body)) = crate::seq::split_frame(*x, bo) {
-                        let mut env: BTreeSet<u32> = free_vars(&j_body);
-                        env.remove(x);
-                        env.remove(&live);
-                        let env: Vec<u32> = env.into_iter().collect();
-                        let sid = sq.add(ex.self_fid, vec![*x, live], env.clone(), j_body.clone());
-                        let rn = emit_rec(ex, &env, sid, 2, par, &mut susp);
-                        susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rn)])));
+                    let split = crate::seq::split_frame(*x, bo);
+                    let fork = split.is_some();
+                    if let Some((p_body, live, j_body)) = split {
+                        let (rn, rx) = join_records(ex, sq, *x, live, &j_body, par, &mut susp);
+                        susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rx)])));
                         rtail(ex, &p_body, &bin(Bop::Or, rec_addr(&rn), u64_(1)), &mut susp, sq);
                     } else {
                         let rn = cont_rec(ex, *x, bo, par, &mut susp, sq);
                         susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rn)])));
                     }
                     ex.rem = saved;
-                    b.push(S::Res(c("dive_res", vec![u16_(*g as u64), E::Slice(es)]), "v".into(), done, "rec".into(), susp));
+                    let dive = if fork { "dive_res_fork" } else { "dive_res" };
+                    b.push(S::Res(c(dive, vec![u16_(*g as u64), E::Slice(es)]), "v".into(), done, "rec".into(), susp));
                 }
                 Core::If(..) | Core::Match(..) => {
                     let rn = cont_rec(ex, *x, bo, par, b, sq);
@@ -363,57 +398,15 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                 _ => unreachable!("codegen bug: non-normalized let RHS carrying a call"),
             }
         }
-        Core::If(cd, t, f) => {
-            let ec = ex.val(cd, false, b);
-            let saved = ex.rem.clone();
-            let live = free_vars(e);
-            let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
-            cnt_rule(t, &mut lt);
-            cnt_rule(f, &mut lf);
-            let mut bt = Vec::new();
-            ex.enter_branch(&live, &lt, &mut bt);
-            rtail(ex, t, par, &mut bt, sq);
-            ex.rem = saved.clone();
-            let mut bf = Vec::new();
-            ex.enter_branch(&live, &lf, &mut bf);
-            rtail(ex, f, par, &mut bf, sq);
-            ex.rem = saved;
-            b.push(S::If(truthy(ec), bt, bf));
-        }
-        Core::Match(s, arms) => {
-            let (sv, hold) = ex.scrutinee(s, b);
-            let saved = ex.rem.clone();
-            let mut live = free_vars(e);
-            if let Core::Var(x) = &**s {
-                live.remove(x);
-            }
-            let unbox = ex.unbox;
-            let sw = crate::seq::plan_arms(&sv, arms, unbox, |i| {
-                let (cid, binders, body) = &arms[i];
-                ex.rem = saved.clone();
-                let mut ab = Vec::new();
-                let mut local = Cnt::new();
-                cnt_rule(body, &mut local);
-                ex.enter_branch(&live, &local, &mut ab);
-                if unbox.contains_key(cid) {
-                    if let Some(bv) = binders.first() {
-                        if ex.rem.get(bv).copied().unwrap_or(0) > 0 {
-                            ab.push(let_(vn(*bv), Ty::U64, crate::lir::num(crate::lir::as_i(sv.clone()))));
-                        }
-                    }
-                } else {
-                    ex.bind_fields(&sv, hold, *cid, binders, None, &mut ab);
-                }
-                rtail(ex, body, par, &mut ab, sq);
-                ab
-            });
-            ex.rem = saved;
-            b.push(sw);
-        }
+        Core::If(cd, t, f) => ex.if_arms(e, cd, t, f, cnt_rule, |ex, body, ab| rtail(ex, body, par, ab, sq), b),
+        Core::Match(s, arms) => ex.match_arms(e, s, arms, cnt_rule, |ex, body, ab| rtail(ex, body, par, ab, sq), b),
         Core::Call(g, args) => {
+            // a tail call delivering to `par`: in the parallel world the
+            // device runtime spawns it as a task (reference's marked call);
+            // otherwise it dives here
             let mut es: Vec<E> = args.iter().map(|a| ex.val(a, true, b)).collect();
             es.insert(0, par.clone());
-            b.push(do_(c("dive_to", vec![u16_(*g as u64), E::Slice(es)])));
+            b.push(do_(c("tail_to", vec![u16_(*g as u64), E::Slice(es)])));
         }
         Core::App(f, a) => {
             let ef = ex.val(f, true, b);
