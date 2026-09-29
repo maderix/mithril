@@ -1482,6 +1482,9 @@ pub(crate) fn dive_fn<'m>(
     if lp {
         let mut lb = if leafy { Vec::new() } else { fuel_check.clone() };
         if !leafy {
+            // the entry is one depth unit (a zero-budget fork callee suspends
+            // here); an iteration is a work unit
+            s.push(burn_fuel());
             lb[1] = work_fuel(i64_(1));
         }
         if is_fold {
@@ -1649,6 +1652,7 @@ pub(crate) fn dps_fn<'m>(
     let body = vec![
         let_("th_head", Ty::U64, E::Deref("head_out".into())),
         let_("th_hole", Ty::U32, E::Deref("hole_out".into())),
+        burn_fuel(),
         S::Loop(bb),
     ];
     FnDef { name: format!("dp_{fid}"), ctx: true, params, ret: Ty::Unit, body, inline: Inline::Default, cold: false }
