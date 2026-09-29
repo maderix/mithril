@@ -202,6 +202,11 @@ fn a_local_named_like_a_builtin_shadows_it_from_its_assignment_on() {
 }
 
 #[test]
+fn a_user_function_named_int_keeps_its_float_literals() {
+    assert_eq!(run("def int(x):\n    return x * 0.1\n\ndef main():\n    return int(0.3)\n"), Val::F(0.3 * 0.1));
+}
+
+#[test]
 fn a_user_function_shadows_the_builtin_name() {
     let src = "def sqrt(x):\n    return x + 1\n\ndef main():\n    return sqrt(3)\n";
     assert_eq!(int(src), 4);

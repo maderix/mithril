@@ -60,6 +60,9 @@ pub(crate) struct Types {
     /// fn -> the layout of each tuple parameter, and of a tuple result
     pub pshape: Vec<Vec<Option<Shape>>>,
     pub rshape: Vec<Option<Shape>>,
+    /// fn -> which parameters hold values of conflicting types (a
+    /// parameter used at int and at a tuple, a float or a constructor)
+    pub pmixed: Vec<Vec<bool>>,
 }
 
 impl Types {
@@ -333,7 +336,15 @@ impl Inf {
                 let ta = self.walk(fid, a, env);
                 let tb = self.walk(fid, b, env);
                 self.unify(ta, tb);
-                ta
+                // an op on ints (floats) yields a fresh int (float): a
+                // conflict where the result is used stays there, instead of
+                // flowing back into the operands
+                let r = self.uf.find(ta);
+                match self.uf.n[r as usize] {
+                    Node::Int => self.int(),
+                    Node::Flo => self.node(Node::Flo),
+                    _ => ta,
+                }
             }
             Core::Cmp(_, a, b) => {
                 let ta = self.walk(fid, a, env);
@@ -534,5 +545,9 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
     let locals = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
     let pshape = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| inf.shape(t)).collect()).collect();
     let rshape = inf.fret.clone().iter().map(|&t| inf.shape(t)).collect();
-    Types { class_of, params, ret, field, locals, pshape, rshape }
+    let pmixed = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| {
+        let r = inf.uf.find(t);
+        inf.uf.n[r as usize] == Node::Adt(u32::MAX)
+    }).collect()).collect();
+    Types { class_of, params, ret, field, locals, pshape, rshape, pmixed }
 }

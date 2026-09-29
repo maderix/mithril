@@ -90,6 +90,7 @@ const FIXTURES: &[&str] = &[
     "tuple_whole.py",
     "tuple_nested.py",
     "tuple_leaves.py",
+    "mixed_params.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",

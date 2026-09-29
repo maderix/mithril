@@ -215,7 +215,7 @@ impl<'m> Infer<'m> {
                 let xs: Vec<usize> = args.iter().map(|a| self.expr(a, env)).collect();
                 // a float literal written as the argument of f32() or int()
                 // is f32 (a float variable keeps its own type)
-                if let ([Expr::Float(_)], "f32" | "int") = (args.as_slice(), f.as_str()) {
+                if matches!((args.as_slice(), f.as_str()), ([Expr::Float(_)], "f32" | "int")) && self.builtin(f, env) {
                     self.conv.push(xs[0]);
                 }
                 self.call(f, &xs, env)

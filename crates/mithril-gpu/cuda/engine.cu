@@ -104,9 +104,6 @@ __device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, wide
 __shared__ u32 s_era[256];
 __shared__ u32 s_era_depth[256];
 __shared__ u32 s_work[256];
-// native work since the thread started, counted across calls (a native
-// loop iteration or a recursive native entry is one unit)
-__shared__ u32 s_native[256];
 __device__ u32 g_nrules = NRULES_ALL;
 }
 
@@ -198,7 +195,6 @@ __device__ inline void stack_mark() {
   s_sp0[threadIdx.x] = sp_now();
   s_era[threadIdx.x] = s_era_depth[threadIdx.x] = 0;
   s_work[threadIdx.x] = 0;
-  s_native[threadIdx.x] = 0;
 }
 // Work charged on the device: it deepens no stack, so it does not touch
 // the depth budget, but every WORK_CAP units it forces the frame's next
@@ -213,21 +209,14 @@ __device__ inline void work_fuel(i64 *fuel, i64 n) {
   }
   s_work[threadIdx.x] = w;
 }
-// the stop check of native code, once per WORK_CAP units: the host asked
-// the run to stop at its deadline (the lanes then leave at their next check)
-// Once seen, the stop holds: every later entry leaves at once, so a
-// recursion unwinds instead of running on between checks.
-#define NATIVE_STOPPED 0xFFFFFFFFu
-__device__ inline bool stop_asked() {
-  u32 n = s_native[threadIdx.x];
-  if (n == NATIVE_STOPPED) return true;
-  if (++n < WORK_CAP) {
-    s_native[threadIdx.x] = n;
-    return false;
-  }
-  bool stop = *(volatile u32 *)G.abortf == AB_TIMEOUT;
-  s_native[threadIdx.x] = stop ? NATIVE_STOPPED : 0;
-  return stop;
+// A native loop's stop check, once per WORK_CAP iterations (`n` counts the
+// frame's iterations in a register): the run is aborting (an abort, or the
+// host's stop at the deadline), so the frame leaves; the lanes then stop at
+// their next check. Native recursion needs none: without a fork it is
+// bounded by the stack guard, and forking recursion runs in dive forms,
+// which suspend every WORK_CAP units.
+__device__ inline bool stop_asked(i64 n) {
+  return (n & (WORK_CAP - 1)) == 0 && *(volatile u32 *)G.abortf != 0;
 }
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;

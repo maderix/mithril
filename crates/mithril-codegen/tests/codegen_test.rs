@@ -773,6 +773,20 @@ fn tuples_with_non_int_leaves_are_not_read_as_ints() {
     }
 }
 
+#[test]
+fn mixed_type_params_are_not_read_as_ints() {
+    let (cm, rs) = pipeline(&fixture("mixed_params.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert!(want.starts_with("((3, 5), 3, 2.5, 3, "), "{want}");
+    // the int producer of a mixed consumer keeps its native form
+    let leaf = cm.fns.iter().position(|x| x.name == "leaf").unwrap();
+    assert!(rs.contains(&format!("fn s_{leaf}(")), "leaf has no native form");
+    let bin = compile(&rs, "mixed_params");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "mixed_params --threads {t}");
+    }
+}
+
 /// The Cornell box demo at a small size (its `size()` replaced).
 fn cornell_small(n: u32) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demos/cornell_whitted.py");

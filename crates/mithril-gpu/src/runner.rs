@@ -274,6 +274,10 @@ pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
 /// are left to the driver's exit path (~150 ms saved).
 pub static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A run of this process was abandoned at twice its deadline: its kernel
+/// still runs, so no later run can start.
+static STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// One run at a time: the kernel is cooperative over the whole device, and
 /// every run shares the device's primary context.
 static ONE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -337,6 +341,10 @@ impl GpuRunner {
 
     unsafe fn run_inner(cubin: &[u8], boot: Redex, start: Option<usize>, used: &mut usize) -> Result<GpuResult, String> {
         let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        if STUCK.load(std::sync::atomic::Ordering::Relaxed) {
+            // anything queued now would wait behind the abandoned kernel
+            return Err("mithril-gpu: an earlier run of this process was abandoned and still occupies the device".into());
+        }
         cu(cuInit(0), "cuInit")?;
         let mut dev = 0i32;
         cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
@@ -368,6 +376,7 @@ impl GpuRunner {
             if !exiting {
                 // an abandoned kernel still runs: nothing here would return
                 if matches!(&r, Err(e) if e.starts_with(TIMEOUT) && e.ends_with(ABANDONED)) {
+                    STUCK.store(true, std::sync::atomic::Ordering::Relaxed);
                     return r;
                 }
                 // a device fault (700) leaves a sticky error in the context,

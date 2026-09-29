@@ -269,10 +269,13 @@ iteration; the rewrite count is the same at 16 threads. Regression tests:
 
 Inference (`ty.rs`) is monomorphic. It has a function type, so an ADT
 field holding both ints and closures poisons to `Dyn` (a closure is never
-an immediate). Ints are unified through arithmetic, so one heterogeneous
-array (ints and lists in one array) poisons every connected int to
-`Dyn`: correct tagged code, slower. No port does this;
-`hetero_array.py` covers the runtime conversion.
+an immediate). An operator unifies its operands, and its result is a
+fresh int (or float) once they are known: a conflict where a result is
+used (an int stored in a tree that also holds tuples) stays at that use
+and does not flow back into the arithmetic that made it. One
+heterogeneous array (ints and lists in one array) still poisons the ints
+unified with its elements to `Dyn`: correct tagged code, slower. No port
+does this; `hetero_array.py` covers the runtime conversion.
 
 Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
 binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
@@ -286,8 +289,8 @@ inference, over the surface AST: every variable, parameter, result,
 constructor field, tuple component and array element has one type, found
 by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
 assignments, operators, calls and returns, and a float literal written as
-the argument of `f32()` or `int()` is f32 (an f64 variable passed to
-either is an error, not a retyping). Where a value is f32, a literal becomes its bit
+the argument of `f32()` or `int()` is f32 (any other f64 expression passed
+to either is an error, not a retyping). Where a value is f32, a literal becomes its bit
 pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
 Core, the net and every backend see ints and the existing rules: `x + y`
 on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
@@ -418,7 +421,8 @@ Each function is emitted in the forms its uses need.
   tuple is held as its leaves: a nested one (a record such as
   `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`: every
   leaf an int, nesting at most 8 deep; a tuple parameter holding anything
-  else keeps the function boxed), and a
+  else, or a parameter used at conflicting types, keeps the function
+  boxed), and a
   projection of a nested component is a view of its leaves. A tuple may
   be used whole (returned, passed on, aliased, joined). Parameter and
   result layouts come from type inference, so a parameter that is only
@@ -723,11 +727,14 @@ at once.
   runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
   a dive form's next budget check to suspend, so no dive runs unbounded;
   a runaway loop cycles rounds to the round limit instead of freezing the
-  device, which the desktop shares. Native code never suspends: each
-  native loop iteration and recursive native entry counts one unit per
-  thread, and once per `WORK_CAP` units it checks whether the host asked
-  the run to stop; once seen, the stop holds and every frame leaves (a
-  no-op on the CPU).
+  device, which the desktop shares. A native loop never suspends: once
+  per `WORK_CAP` iterations of the frame it checks the abort flag, and
+  leaves when the run is aborting (an abort, or the host's stop at the
+  deadline; a no-op on the CPU). Native recursion needs no check: without
+  a fork it is bounded by the stack guard, and forking recursion runs in
+  dive forms. A counter shared across frames and checked at every
+  recursive entry cost the Whitted demo's kernel 19 to 32 ms; the
+  per-frame register check costs 2 ms.
 * The stack guard (`stack_deep` on the device) compares against the
   thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives
@@ -795,14 +802,17 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
   converge stops with an error.
 * Deadline: at `MITHRIL_GPU_TIMEOUT` (300 s) the host writes a stop code
   into the abort flag (managed memory, written while the kernel runs, on
-  devices with concurrent managed access, and only when no abort is set);
-  every lane stops at its next check and the run ends with a named error.
+  devices with concurrent managed access, and only when no abort is set;
+  the host's read and write are not one atomic step, so a device abort
+  landing between them is reported as the timeout). Lanes stop at their
+  next check and the run ends with a named error.
   Measured: a runaway native loop stops within the deadline plus about
   3 s. A runaway forking recursion does not stop (a dive form that leaves
   early reads as suspended, and its work keeps expanding as tasks): at
   twice the deadline the run returns an error and the kernel is
-  abandoned until the process exits. A context reset does not stop a
-  running kernel (measured), so none is attempted.
+  abandoned until the process exits, and every later run in the process
+  fails at once (it would queue behind that kernel). A context reset does
+  not stop a running kernel (measured), so none is attempted.
 * A failed run that left a sticky device error (700) in the context
   resets it; a clean abort leaves the context as it is.
 * Any arena exhaustion, out-of-bounds index, bad cell index or stack
