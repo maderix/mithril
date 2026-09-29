@@ -403,6 +403,44 @@ call stays in its arm, shared values in closure bodies stay in scope (2
 shapes), a call outside a closure is shared by every application. Each
 bug test fails on the commit it guards.
 
+### 3b-3. Placement follows what a value reads; sharing per selection
+
+The third review of 3b-2 found three readback bugs, two of them wrong
+answers with no error. (1) A shared Dup's binding was cached by its cell
+alone: a closure applied twice at compile time to different arguments
+reads the same Dup under different superposition sides, and the second
+application reused the first's value (oracle 1157, program 2). The cache
+is keyed by (cell, selection); the key is the whole selection, so a
+captured shared value read under three selections is bound three times
+(duplicated work, not a wrong answer; keying by the selections a read
+consults is the pending refinement). (2) A pending call inside an
+unapplied closure's body was stamped with the frame of the first settle
+that reached it, so when the closure was applied inside an arm the call
+bound outside the arm: a diverging call then ran on the other path, or a
+match binder was read before its match. The specializer now stamps no
+pending call or Dup whose value depends on an unapplied closure's
+parameter (`needs_param`, a walk over the producers); it is stamped at
+the settle where the application fired. In the reader, `place` also never
+binds a value below the innermost frame binding something it reads, and
+a frame read as the floor is exactly that frame's position. Tests: the
+shapes (the call's argument made in the branch, a parameter, a match
+arm), oracle-equal, scoped, the call kept under its branch. Open: a
+closure created in an arm capturing a pattern binder, applied twice,
+ICEs in the reader (an ignored test); two specializer crashes on nested
+closures with conditionals (`mithril-core` net.rs:54 and rules.rs:290,
+the reviewer's probes b4/b5).
+
+The device stack guard (with 3f): a native scalar function's non-tail
+recursion has no budget, so on the device its frames overflowed the
+32 KiB thread stack as a driver fault. Every dive form and every native
+function whose frames can pile up (a non-tail self call, or a cycle
+through other functions) now begins with `stack_guard`, a no-op on the
+CPU; the device compares the PTX stack pointer with the one at kernel
+entry against the runner's limit and leaves the frame with a named abort
+("recursion too deep for the device"). Guarding every non-leaf native
+function cost raytrace 3x (isect is called 10^8 times), hence the
+recursion test; with it, raytrace and bitonic are unchanged.
+
 ### 3c. One lowering, printers per backend (stage 1 of the shared backend)
 
 Decided 2026-09-28, after Phase B. Every emitter used to print Rust text

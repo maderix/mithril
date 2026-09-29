@@ -92,6 +92,10 @@ pub(crate) struct Index {
     pub(crate) refs: Vec<u16>,
     /// label of every Dup cell met
     pub(crate) dup_labels: HashMap<u32, u32>,
+    /// pending calls (by result wire) and Dup cells reached only inside an
+    /// unapplied closure's body: no frame stamps them until the closure is
+    /// applied (the net cannot fire them before)
+    pub(crate) lam_only: HashSet<u32>,
     /// for a wire that is an output of a Dup cell: (cell, side)
     pub(crate) dup_side: HashMap<u32, (u32, usize)>,
     /// a chain link: the Dup cell it takes its input from, and the side
@@ -126,6 +130,46 @@ impl Index {
     pub(crate) fn producers(&self) -> impl Iterator<Item = &Producer> {
         self.producer.iter().flatten()
     }
+
+    /// Whether the value at `p` depends on an unapplied closure's parameter.
+    fn needs_param(&self, net: &Net, p: Port, memo: &mut HashMap<u32, bool>) -> bool {
+        let wire = |w: u32| Port::new(Tag::Var, w as u64);
+        match p.tag() {
+            Tag::Con => con_fields(net, p).into_iter().any(|f| self.needs_param(net, f, memo)),
+            Tag::Ref => list_items(net, ref_head(p)).into_iter().any(|a| self.needs_param(net, a, memo)),
+            Tag::Var => {
+                let mut r = p.payload() as u32;
+                while self.uf[r as usize] != r {
+                    r = self.uf[r as usize];
+                }
+                if let Some(v) = memo.get(&r) {
+                    return *v;
+                }
+                memo.insert(r, false);
+                let input = |me: &Self, memo: &mut HashMap<u32, bool>, a: u32| me.input_of[a as usize].is_some_and(|w| me.needs_param(net, wire(w), memo));
+                let v = match self.producer[r as usize] {
+                    Some(Producer::LamParam(_)) => true,
+                    Some(Producer::Ref(a, _)) => self.needs_param(net, a, memo),
+                    Some(Producer::ResOp(a, y)) => self.needs_param(net, Port(net.cell(op_addr(a))[0]), memo) || self.needs_param(net, y, memo),
+                    Some(Producer::Op(a) | Producer::App(a)) => self.needs_param(net, Port(net.cell(a)[0]), memo) || input(self, memo, a),
+                    Some(Producer::Swi(a) | Producer::Mat(a)) => input(self, memo, a),
+                    Some(Producer::Dup(d)) => self.dup_needs_param(net, d, memo),
+                    Some(Producer::Free(_)) | None => false,
+                };
+                memo.insert(r, v);
+                v
+            }
+            _ => false,
+        }
+    }
+
+    /// A dup's input: its own, or through the dup it was commuted from.
+    fn dup_needs_param(&self, net: &Net, mut d: u32, memo: &mut HashMap<u32, bool>) -> bool {
+        while let Some((pd, _)) = self.dup_parent.get(&d) {
+            d = *pd;
+        }
+        self.input_of[d as usize].is_some_and(|w| self.needs_param(net, Port::new(Tag::Var, w as u64), memo))
+    }
 }
 
 fn is_consumer(p: Port) -> bool {
@@ -146,7 +190,7 @@ fn agent_addr(p: Port) -> u32 {
 /// input wires with their Core variables.
 pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[(Port, Port)]) -> Index {
     let n = net.cells.len();
-    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), refs: Vec::new(), dup_labels: HashMap::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
+    let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), refs: Vec::new(), dup_labels: HashMap::new(), lam_only: HashSet::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
     let params: Vec<Port> = free.iter().map(|(p, _)| *p).collect();
     for (p, v) in free {
         debug_assert_eq!(p.tag(), Tag::Var);
@@ -339,6 +383,19 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
             ix.input_of[a] = Some(ix.find(w));
         }
     }
+    // what depends on an unapplied closure's parameter is stamped at its application
+    let mut memo = HashMap::new();
+    for (a, b) in residual {
+        if a.tag() == Tag::Ref && b.tag() == Tag::Var && ix.needs_param(net, *a, &mut memo) {
+            ix.lam_only.insert(b.payload() as u32);
+        }
+    }
+    let dups: Vec<u32> = ix.dup_labels.keys().copied().collect();
+    for d in dups {
+        if ix.dup_needs_param(net, d, &mut memo) {
+            ix.lam_only.insert(d);
+        }
+    }
     let sides: Vec<(u32, (u32, usize))> = ix.dup_side.iter().map(|(w, v)| (*w, *v)).collect();
     for (w, v) in sides {
         let r = ix.find(w);
@@ -434,7 +491,10 @@ pub(crate) struct Reader<'a> {
     prog: &'a NetProg,
     ix: Index,
     next: u32,
-    shared: HashMap<u32, u32>,
+    /// a shared Dup's binding, per superposition selection in effect
+    shared: HashMap<(u32, Vec<(u32, usize)>), u32>,
+    /// pattern binders per arm frame
+    arm_binders: HashMap<usize, Vec<u32>>,
     /// the scope frame each Dup cell was created in (see `specialize`)
     dup_frame: &'a HashMap<u32, usize>,
     /// the scope frame each pending call was created in, by its result
@@ -489,7 +549,11 @@ impl<'a> Reader<'a> {
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
         let ix = scan(net, roots, free, &net.residual);
-        Reader { net, prog, ix, next, shared: HashMap::new(), dup_frame, ref_frame, arms, stack: vec![0], floor: usize::MAX, bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
+        let mut arm_binders: HashMap<usize, Vec<u32>> = HashMap::new();
+        for a in arms.values() {
+            arm_binders.entry(a.frame).or_default().extend(a.binders.iter().copied());
+        }
+        Reader { net, prog, ix, next, shared: HashMap::new(), arm_binders, dup_frame, ref_frame, arms, stack: vec![0], floor: usize::MAX, bindings: HashMap::new(), lams: Vec::new(), lam_param: HashMap::new(), sel: Vec::new() }
     }
 
     /// Read a frame's expression from `p` (its tail, compound) and wrap it
@@ -536,49 +600,51 @@ impl<'a> Reader<'a> {
         self.bind_in(frame, e)
     }
 
-    /// The one placement rule for every let-bound value (a plain compound
-    /// value, a shared value, a pending call). Walk the active frames from
-    /// the innermost: a closure frame is kept exactly when the value reads
-    /// something the closure binds (its parameter, or a value bound in it or
-    /// in a frame nested in it), otherwise the value is shared by every
-    /// application and moves out (the net computed it once); a non-closure
-    /// frame (an arm, the function body) takes the value, except the frames
-    /// above `floor` while a value created in an outer frame is being read
-    /// (the net made it there, unconditionally).
+    /// what frame `fr` binds: pattern binders and let-bound values
+    fn bound_in(&self, fr: usize) -> Vec<u32> {
+        let mut vs: Vec<u32> = self.arm_binders.get(&fr).cloned().unwrap_or_default();
+        vs.extend(self.bindings.get(&fr).into_iter().flatten().map(|(v, _)| *v));
+        vs
+    }
+
+    /// The one placement rule for every let-bound value (a compound value,
+    /// a shared value, a pending call): no lower than the innermost frame
+    /// binding something it reads (a binder, a bound value); above that, a
+    /// closure frame is kept exactly when the value reads what the closure
+    /// binds (else it is shared by every application: the net computed it
+    /// once), and a non-closure frame takes it unless it is above `floor`
+    /// (a value created in an outer frame is being read: the net made it
+    /// there, unconditionally).
     fn place(&self, e: &Core) -> usize {
+        let need = self.stack.iter().rposition(|fr| mentions(e, &self.bound_in(*fr))).unwrap_or(0);
         for (i, &fr) in self.stack.iter().enumerate().rev() {
             match self.lams.iter().find(|(lf, _)| *lf == fr) {
                 Some((_, x)) => {
                     let mut inside = vec![*x];
                     for g in &self.stack[i..] {
-                        if let Some(bs) = self.bindings.get(g) {
-                            inside.extend(bs.iter().map(|(v, _)| *v));
-                        }
+                        inside.extend(self.bound_in(*g));
                     }
                     if mentions(e, &inside) {
                         return fr;
                     }
                 }
-                None if i > self.floor => continue,
+                None if i > self.floor && i > need => continue,
                 None => return fr,
             }
         }
         0
     }
 
-    /// Read with the stack position of frame `frame` as the floor: values
-    /// the read binds go to that frame (or a closure above it they need).
-    fn read_in<T>(&mut self, frame: usize, f: impl FnOnce(&mut Self) -> T) -> (T, usize) {
+    /// Read with frame `frame`'s stack position as the floor (see `place`).
+    fn read_in<T>(&mut self, frame: usize, f: impl FnOnce(&mut Self) -> T) -> T {
         let pos = self.stack.iter().rposition(|g| *g == frame).unwrap_or_else(|| panic!("ICE: frame {frame} read outside its scope (stack {:?})", self.stack));
-        let target = pos.min(self.floor);
-        let saved = std::mem::replace(&mut self.floor, target);
+        let saved = std::mem::replace(&mut self.floor, pos);
         let v = f(self);
-        let floor = self.floor;
         self.floor = saved;
-        (v, floor)
+        v
     }
 
-    /// The stack position values currently bind at (the floor, or the top).
+    /// where values bind now: the floor, or the top
     fn here(&self) -> usize {
         self.floor.min(self.stack.len() - 1)
     }
@@ -713,27 +779,19 @@ impl<'a> Reader<'a> {
             Producer::Ref(r, ret) => {
                 let entry = ref_entry(r) as usize;
                 assert!(entry < self.prog.nfns, "ICE: residual call to a lifted entry");
-                // A pending call is bound in the frame it was created in:
-                // the net fires it there as soon as its arguments exist,
-                // whatever consumes its result later (a use inside a branch
-                // must not make the call wait on the branch: that is the
-                // parallelism the rules have). Its arguments are read in
-                // that frame too, so everything they need is bound there.
-                // Frames are recorded per settle; a closure body is not
-                // one, so a call read under a closure never leaves the
-                // innermost closure on the stack (its arguments may read
-                // the parameter, directly or through bindings).
+                // A pending call binds in the frame it was created in (the
+                // net fires it there), under anything it reads (`place`).
                 let created = self.ref_frame.get(&ret).map(|f| {
                     self.stack.iter().rposition(|g| g == f).unwrap_or_else(|| panic!("ICE: a call's frame {f} is not active (stack {:?})", self.stack))
                 });
                 match created {
-                    Some(pos) if pos < self.here() => {
+                    Some(pos) if pos != self.here() => {
                         let frame = self.stack[pos];
-                        let (call, _) = self.read_in(frame, |me| {
+                        let call = self.read_in(frame, |me| {
                             let args: Vec<Core> = list_items(me.net, ref_head(r)).into_iter().map(|a| me.atom(a)).collect();
                             Core::Call(entry as u32, args)
                         });
-                        let (at, _) = self.read_in(frame, |me| me.place(&call));
+                        let at = self.read_in(frame, |me| me.place(&call));
                         self.bind_in(at, call)
                     }
                     // created where it is used: read in place (the caller
@@ -769,15 +827,16 @@ impl<'a> Reader<'a> {
             self.sel.pop();
             return e;
         }
-        if let Some(x) = self.shared.get(&d) {
+        let key = (d, self.sel.clone());
+        if let Some(x) = self.shared.get(&key) {
             return Core::Var(*x);
         }
         let frame = *self.dup_frame.get(&d).unwrap_or(&0);
-        let (e, _) = self.read_in(frame, |me| me.read_dup_input(d));
-        let (at, _) = self.read_in(frame, |me| me.place(&e));
+        let e = self.read_in(frame, |me| me.read_dup_input(d));
+        let at = self.read_in(frame, |me| me.place(&e));
         let a = self.bind_in(at, e);
         if let Core::Var(v) = a {
-            self.shared.insert(d, v);
+            self.shared.insert(key, v);
         }
         a
     }
@@ -796,10 +855,7 @@ impl<'a> Reader<'a> {
             Some(p) => p,
             None => {
                 let st = self.ix.stored[r as usize];
-                let extra = match st {
-                    Some(p) if p.tag() == Tag::Dup => format!(" dup cell {} = {:?} label {:?} sel {:?} parent {:?} input_of {:?} sup_labels {:?} dup_side(slots) {:?}", dup_addr(p), self.net.cell(dup_addr(p)).map(|w| (Port(w).tag(), Port(w).payload())), self.ix.dup_labels.get(&dup_addr(p)), self.sel, self.ix.dup_parent.get(&dup_addr(p)), self.ix.input_of[dup_addr(p) as usize], self.ix.sup_labels, self.net.cell(dup_addr(p)).map(|w| self.ix.dup_side.get(&(Port(w).payload() as u32)).copied())),
-                    _ => String::new(),
-                };
+                let extra = format!(" (stored {st:?})");
                 panic!("ICE: residual wire class {} has no producer (stored: {:?}){}", r, st.map(|p| p.tag()), extra)
             }
         }

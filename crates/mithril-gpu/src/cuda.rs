@@ -319,6 +319,8 @@ impl<'a> P<'a> {
                 let v = self.ex(e);
                 self.line(format!("(*{x}) = {v};"));
             }
+            // the stack guard leaves the frame (value-initialized return)
+            S::Do(E::Call { f, .. }) if f == "stack_guard" => self.line(format!("if (stack_deep()) return{};", if self.ret == Ty::Unit { "" } else { " {}" })),
             S::Do(e) => {
                 let v = self.ex(e);
                 self.line(format!("{v};"));

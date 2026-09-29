@@ -40,6 +40,7 @@ typedef unsigned long long usize;
 #define AB_BUCKET 7u
 #define AB_HEAP 8u
 #define AB_ROUNDS 10u // the round limit (MITHRIL_GPU_ROUNDS): a run that does not converge
+#define AB_DEEP 11u   // a native frame past the thread's stack (recursion too deep for the device)
 // a walk over cells that never ends is a corrupted arena, not a hang
 #define GUARD(n) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return; } } while (0)
 #define GUARDV(n, v) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return v; } } while (0)
@@ -171,6 +172,23 @@ __device__ inline i64 sat_mul(i64 a, i64 b) {
 }
 __device__ inline bool is_err(const R *r) { return !r->ok; }
 __device__ inline u64 mith_unreachable() { g_abort(AB_UNREACHABLE); return 0; }
+// The stack guard: every dive form and non-leaf native function checks its
+// frame against the thread's stack (the pointer at kernel entry, the limit
+// from the runner) and aborts with AB_DEEP instead of faulting.
+__shared__ unsigned long long s_sp0[256];
+__device__ u32 g_stack_limit = 28 * 1024;
+__device__ __forceinline__ unsigned long long sp_now() {
+  unsigned long long v;
+  asm volatile("stacksave.u64 %0;" : "=l"(v));
+  return v;
+}
+__device__ inline void stack_mark() { s_sp0[threadIdx.x] = sp_now(); }
+__device__ inline bool stack_deep() {
+  if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
+  g_abort(AB_DEEP);
+  return true;
+}
+
 
 __device__ inline i64 floor_div(i64 a, i64 b) {
   if (b == 0) return 0;
@@ -1746,6 +1764,7 @@ __device__ void drain_local() {
 }
 
 extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
+  stack_mark();
   s_mode[threadIdx.x] = 0;
   s_fuel = fuel;
   prog_fire(0, a, b, c);
@@ -1871,6 +1890,7 @@ __device__ void work_phase(u32 max_steps) {
 
 extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, u64 max_rounds) {
   cg::grid_group grid = cg::this_grid();
+  stack_mark();
   const u32 nl = gridDim.x * blockDim.x;
   const u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
   for (;;) {

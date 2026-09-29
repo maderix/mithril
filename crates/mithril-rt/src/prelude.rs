@@ -409,6 +409,8 @@ pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
 /// device runtime hands none in its parallel world, where every call is a
 /// task at once).
 #[inline] pub fn fork_fuel(fuel: &mut i64) -> &mut i64 { fuel }
+/// The device aborts a frame past its thread's stack; the CPU's stacks are large.
+#[inline] pub fn stack_guard() {}
 /// A fork site's call in the rule form: the same on the CPU.
 #[inline]
 pub fn dive_res_fork(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {

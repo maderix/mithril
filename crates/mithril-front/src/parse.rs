@@ -37,6 +37,20 @@ impl<'a> Parser<'a> {
             Err(Diag::new(self.line(), format!("expected {:?}, found {:?}", k, self.kind())))
         }
     }
+    fn names_to_rparen(&mut self) -> Result<Vec<String>, Diag> {
+        let mut binds = Vec::new();
+        while !matches!(self.kind(), TokKind::RParen) {
+            binds.push(self.expect_name()?);
+            if matches!(self.kind(), TokKind::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokKind::RParen)?;
+        Ok(binds)
+    }
+
     fn expect_name(&mut self) -> Result<String, Diag> {
         match self.kind().clone() {
             TokKind::Name(n) => {
@@ -102,16 +116,7 @@ impl<'a> Parser<'a> {
             let cname = self.expect_name()?;
             self.expect(TokKind::Colon)?;
             self.expect(TokKind::LParen)?;
-            let mut binds = Vec::new();
-            while !matches!(self.kind(), TokKind::RParen) {
-                binds.push(self.expect_name()?);
-                if matches!(self.kind(), TokKind::Comma) {
-                    self.bump();
-                } else {
-                    break;
-                }
-            }
-            self.expect(TokKind::RParen)?;
+            let binds = self.names_to_rparen()?;
             self.expect_newline()?;
             ctors.push((cname, binds));
         }
@@ -290,16 +295,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if matches!(self.kind(), TokKind::LParen) {
                     self.bump();
-                    let mut binds = Vec::new();
-                    while !matches!(self.kind(), TokKind::RParen) {
-                        binds.push(self.expect_name()?);
-                        if matches!(self.kind(), TokKind::Comma) {
-                            self.bump();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(TokKind::RParen)?;
+                    let binds = self.names_to_rparen()?;
                     Ok(Pat { ctor: n, binds })
                 } else {
                     Ok(Pat { ctor: n, binds: Vec::new() })

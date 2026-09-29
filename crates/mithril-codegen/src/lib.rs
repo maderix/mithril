@@ -115,6 +115,17 @@ pub(crate) fn ints_of(tys: &ty::Types, fid: usize) -> std::collections::HashSet<
 /// unique id, so one var id means one value everywhere in the body (the
 /// desugarer reuses ids across match arms). Parameters keep 0..arity.
 fn uniquify(m: &CoreModule) -> CoreModule {
+    fn bound(x: u32, b: &Core, env: &mut std::collections::HashMap<u32, u32>, next: &mut u32) -> (u32, Core) {
+        let nx = *next;
+        *next += 1;
+        let saved = env.insert(x, nx);
+        let b2 = go(b, env, next);
+        match saved {
+            Some(v) => env.insert(x, v),
+            None => env.remove(&x),
+        };
+        (nx, b2)
+    }
     fn go(e: &Core, env: &mut std::collections::HashMap<u32, u32>, next: &mut u32) -> Core {
         match e {
             Core::Var(i) => Core::Var(*env.get(i).unwrap_or(i)),
@@ -123,27 +134,13 @@ fn uniquify(m: &CoreModule) -> CoreModule {
             Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
             Core::If(c, t, f) => Core::If(Box::new(go(c, env, next)), Box::new(go(t, env, next)), Box::new(go(f, env, next))),
             Core::Lam(x, b) => {
-                let nx = *next;
-                *next += 1;
-                let saved = env.insert(*x, nx);
-                let b2 = go(b, env, next);
-                match saved {
-                    Some(v) => env.insert(*x, v),
-                    None => env.remove(x),
-                };
+                let (nx, b2) = bound(*x, b, env, next);
                 Core::Lam(nx, Box::new(b2))
             }
             Core::App(f, a) => Core::App(Box::new(go(f, env, next)), Box::new(go(a, env, next))),
             Core::Let(x, r, b) => {
                 let r2 = go(r, env, next);
-                let nx = *next;
-                *next += 1;
-                let saved = env.insert(*x, nx);
-                let b2 = go(b, env, next);
-                match saved {
-                    Some(v) => env.insert(*x, v),
-                    None => env.remove(x),
-                };
+                let (nx, b2) = bound(*x, b, env, next);
                 Core::Let(nx, Box::new(r2), Box::new(b2))
             }
             Core::Call(g, a) => Core::Call(*g, a.iter().map(|x| go(x, env, next)).collect()),

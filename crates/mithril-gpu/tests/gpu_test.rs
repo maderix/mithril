@@ -138,7 +138,7 @@ fn engine_source_is_program_independent() {
     assert!(!ENGINE_CU.contains("prog_fire(u32 rule, u64 e0, u64 e1, u64 e2) {"));
     assert!(!ENGINE_CU.contains("bool lin(u16 k) {"));
     // the IR's context vocabulary, on the device without a context object
-    for h in ["alloc2(", "alloc_rec(", "deliver(", "dive_to(", "dive_res(", "dive_res_fork(", "tail_to(", "fork_fuel(", "pop_chain(", "rec_parent(", "spawn_call(", "mk_con2(", "consume2k(", "dup_val(", "free_val(", "take_field(", "arr_set_n(", "hole_link(", "tup_add("] {
+    for h in ["alloc2(", "alloc_rec(", "deliver(", "dive_to(", "dive_res(", "dive_res_fork(", "tail_to(", "fork_fuel(", "stack_deep(", "pop_chain(", "rec_parent(", "spawn_call(", "mk_con2(", "consume2k(", "dup_val(", "free_val(", "take_field(", "arr_set_n(", "hole_link(", "tup_add("] {
         assert!(ENGINE_CU.contains(h), "engine lacks {h}");
     }
 }
@@ -243,6 +243,20 @@ fn gpu_chain_costs_a_round_per_budget_not_per_step() {
     let r = got.expect("device run");
     assert_eq!(r.text, want, "chain_boxed on the device");
     assert!(r.rounds < 2000, "the chain took {} rounds", r.rounds);
+}
+
+/// A native (scalar) non-tail recursion has no budget; past the thread's
+/// stack the guard aborts with a named error instead of a driver fault.
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_deep_native_recursion_is_a_clean_error() {
+    if !gpu_on() {
+        return;
+    }
+    let src = "def count(n):\n    if n == 0:\n        return 0\n    return (count(n - 1) * 3 + 1) & 4294967295\n\ndef main():\n    return count(array_len(array_new(100000, 0)))\n";
+    let (_, cu) = pipeline_src(src);
+    let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("100,000 native frames cannot fit the device stack");
+    assert!(err.contains("recursion too deep"), "wrong error: {err}");
 }
 
 #[test]

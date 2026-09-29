@@ -454,6 +454,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
             8 => format!("mithril-gpu: arena exhausted: array heap ({hcap} words; raise MITHRIL_GPU_HEAP)"),
             9 => "mithril-gpu: a cell index outside the arena was read (corrupted port)".to_string(),
             10 => "mithril-gpu: round limit reached (MITHRIL_GPU_ROUNDS): the run does not converge".to_string(),
+            11 => format!("mithril-gpu: recursion too deep for the device ({} bytes of stack per thread; MITHRIL_GPU_STACK)", stack),
             _ => format!("mithril-gpu: arena exhausted: cells ({ncap}; raise MITHRIL_GPU_NODES)"),
         }
     };
@@ -474,6 +475,14 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let mut gfuel: i32 = env_cap("MITHRIL_GPU_GROW_FUEL", fuel as u64).clamp(1, i32::MAX as u64) as i32;
     // a run that does not converge stops with an error at this many rounds
     let mut max_rounds: u64 = env_cap("MITHRIL_GPU_ROUNDS", 1 << 24);
+    {
+        // the stack guard's limit: the thread's stack less a margin for the
+        // runtime's own frames below the guard
+        let lim: u32 = stack.saturating_sub(4096).max(1024) as u32;
+        let (mut p, mut sz) = (0 as CUdeviceptr, 0usize);
+        cu(cuModuleGetGlobal_v2(&mut p, &mut sz, module, c"g_stack_limit".as_ptr()), "cuModuleGetGlobal(g_stack_limit)")?;
+        cu(cuMemcpyHtoD_v2(p, (&lim as *const u32).cast(), 4), "set g_stack_limit")?;
+    }
     let mut params = [(&mut width as *mut u32).cast::<c_void>(), (&mut steps as *mut u32).cast::<c_void>(), (&mut gfuel as *mut i32).cast::<c_void>(), (&mut max_rounds as *mut u64).cast::<c_void>()];
     cu(
         cuLaunchCooperativeKernel(k_run, blocks, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr()),

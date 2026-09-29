@@ -5,6 +5,7 @@
 
 use crate::{instantiate, list_collect, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
 use mithril_core::net::Net;
+use mithril_front::core::{floor_div, py_mod, wrap56};
 use mithril_core::port::{Port, Tag};
 use mithril_core::rules::{MatMeta, Prog};
 
@@ -48,28 +49,6 @@ impl Prog<Net> for NetProg {
     }
 }
 
-fn wrap56(v: i64) -> i64 {
-    ((v as u64) << 8) as i64 >> 8
-}
-
-fn floor_div(a: i64, b: i64) -> i64 {
-    let q = a.wrapping_div(b);
-    let r = a.wrapping_rem(b);
-    if r != 0 && (r < 0) != (b < 0) {
-        q - 1
-    } else {
-        q
-    }
-}
-
-fn py_mod(a: i64, b: i64) -> i64 {
-    let r = a.wrapping_rem(b);
-    if r != 0 && (r < 0) != (b < 0) {
-        r + b
-    } else {
-        r
-    }
-}
 
 fn cmp_result(code: u16, ord: std::cmp::Ordering) -> Port {
     use std::cmp::Ordering::*;

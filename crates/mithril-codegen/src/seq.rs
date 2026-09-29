@@ -679,6 +679,18 @@ impl<'m> Ex<'m> {
         }
     }
 
+    /// A binary op or comparison: native on proven ints, else the runtime helper.
+    fn binop(&mut self, x: &Core, y: &Core, b: &mut Vec<S>, code: u8, helper: &str, int: impl FnOnce(E, E) -> E) -> E {
+        let ints = self.is_int(x) && self.is_int(y);
+        let own = (!self.is_braw(x) as u8) | ((!self.is_braw(y) as u8) << 1);
+        let ex = self.val(x, false, b);
+        let ey = self.val(y, false, b);
+        let t = self.fresh();
+        let e = if ints { num(int(as_i(ex), as_i(ey))) } else { c(helper, vec![u8_(code as u64), ex, ey, u8_(own as u64)]) };
+        b.push(let_(&t, Ty::U64, e));
+        v(t)
+    }
+
     /// Emit statements computing `e` into `b`; returns the expression
     /// (temp name, local, or literal) holding the value.
     pub fn val(&mut self, e: &Core, esc: bool, b: &mut Vec<S>) -> E {
@@ -769,34 +781,9 @@ impl<'m> Ex<'m> {
                 v(t)
             }
             Core::Var(i) => self.use_var(*i, esc, b),
-            Core::Op2(op, x, y) => {
-                let ints = self.is_int(x) && self.is_int(y);
-                let own = (!self.is_braw(x) as u8) | ((!self.is_braw(y) as u8) << 1);
-                let ex = self.val(x, false, b);
-                let ey = self.val(y, false, b);
-                let t = self.fresh();
-                if ints {
-                    // num keeps the low 56 bits and as_i sign-extends from
-                    // bit 55: storing is the i56 wrap
-                    b.push(let_(&t, Ty::U64, num(arith(bin_code(op), as_i(ex), as_i(ey)))));
-                } else {
-                    b.push(let_(&t, Ty::U64, c("bin", vec![u8_(bin_code(op) as u64), ex, ey, u8_(own as u64)])));
-                }
-                v(t)
-            }
-            Core::Cmp(op, x, y) => {
-                let ints = self.is_int(x) && self.is_int(y);
-                let own = (!self.is_braw(x) as u8) | ((!self.is_braw(y) as u8) << 1);
-                let ex = self.val(x, false, b);
-                let ey = self.val(y, false, b);
-                let t = self.fresh();
-                if ints {
-                    b.push(let_(&t, Ty::U64, num(cast(compare(cmp_code(op), as_i(ex), as_i(ey)), Ty::I64))));
-                } else {
-                    b.push(let_(&t, Ty::U64, c("cmp", vec![u8_(cmp_code(op) as u64), ex, ey, u8_(own as u64)])));
-                }
-                v(t)
-            }
+            // ints: storing is the i56 wrap (num keeps 56 bits, as_i sign-extends)
+            Core::Op2(op, x, y) => self.binop(x, y, b, bin_code(op), "bin", |ex, ey| arith(bin_code(op), ex, ey)),
+            Core::Cmp(op, x, y) => self.binop(x, y, b, cmp_code(op), "cmp", |ex, ey| cast(compare(cmp_code(op), ex, ey), Ty::I64)),
             Core::If(cd, th, el) => {
                 let ec = self.val(cd, false, b);
                 self.flush_toks(b);
@@ -1574,7 +1561,7 @@ pub(crate) fn dive_fn<'m>(
             None => call,
         };
         out.push(ret(err(exit)));
-        vec![burn_fuel(), S::If(bin(Bop::Lt, E::Deref("fuel".into()), i64_(0)), out, vec![])]
+        vec![do_(p("stack_guard", vec![])), burn_fuel(), S::If(bin(Bop::Lt, E::Deref("fuel".into()), i64_(0)), out, vec![])]
     };
     let mut rem = Cnt::new();
     cnt_dive(body, &mut rem);
@@ -1808,7 +1795,7 @@ pub(crate) fn dps_fn<'m>(
     let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), unbox, iret, tys, shared);
     ex.trmc = Some((cid, 0));
     ex.dps_param = Some(pp);
-    let mut bb = vec![burn_fuel()];
+    let mut bb = vec![do_(p("stack_guard", vec![])), burn_fuel()];
     for i in 0..ar as u32 {
         if i as usize != pp && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
             bb.push(free(v(vn(i))));

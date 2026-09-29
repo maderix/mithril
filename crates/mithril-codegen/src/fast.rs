@@ -217,14 +217,10 @@ impl Fp<'_> {
     }
 }
 
-fn calls_self(fid: u32, e: &Core) -> bool {
-    e.any(&mut |e| if matches!(e, Core::Call(g, _) if *g == fid) { Some(true) } else { None })
-}
-
 /// The `q_<fid>` wrapper, when `fid` is self-recursive and has both an
 /// inlinable base case and a fallback.
 pub(crate) fn fast_fn(m: &CoreModule, fid: u32, body: &Core, tys: &Types, unbox: &HashMap<u32, u8>, bor: &[bool]) -> Option<FnDef> {
-    if !calls_self(fid, body) {
+    if !crate::scalar::calls_fn(body, fid) {
         return None;
     }
     let ranges = crate::range::Ranges::of(body);

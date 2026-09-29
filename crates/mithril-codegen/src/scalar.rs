@@ -26,7 +26,7 @@
 //! pre-lowering behavior of `bin`'s unchecked int path, and pinned by the
 //! checksum oracles in every test lane.
 
-use crate::lir::{as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
+use crate::lir::{do_, as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
 use mithril_front::core::{Core, CoreModule};
 use std::collections::HashMap;
@@ -468,8 +468,29 @@ impl<'m> Chk<'m> {
 }
 
 /// `e` calls `g` somewhere.
-fn calls_fn(e: &Core, g: u32) -> bool {
+pub(crate) fn calls_fn(e: &Core, g: u32) -> bool {
     e.any(&mut |e| if matches!(e, Core::Call(h, _) if *h == g) { Some(true) } else { None })
+}
+
+/// `fid` is reached again through another function's body (a cycle that
+/// grows the native stack even when its own self call is a loop).
+pub(crate) fn recursive_via_others(m: &CoreModule, fid: u32) -> bool {
+    let callees = |g: u32| {
+        let mut v = Vec::new();
+        m.fns[g as usize].body.any(&mut |e| { if let Core::Call(h, _) = e { v.push(*h); } None::<bool> });
+        v
+    };
+    let (mut seen, mut todo) = (vec![false; m.fns.len()], callees(fid));
+    todo.retain(|h| *h != fid);
+    while let Some(g) = todo.pop() {
+        if g == fid {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[g as usize], true) {
+            todo.extend(callees(g));
+        }
+    }
+    false
 }
 
 /// `e` calls a function other than `g` that does not always inline.
@@ -1710,6 +1731,10 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         .filter(|(_, t)| looping && matches!(t, PTy::A | PTy::B))
         .map(|(pp, _)| let_(format!("l_v{pp}"), Ty::Usize, p("arr_len_of", vec![as_u(v(vn(pp as u32)))])))
         .collect();
+    // the device's stack guard where native frames can pile up (no budget)
+    if (calls_fn(&f.body, fid) && !lp) || recursive_via_others(m, fid) {
+        body.push(do_(p("stack_guard", vec![])));
+    }
     body.push(let_("fl", Ty::I64, i64_(1)));
     if lp {
         let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1)))];

@@ -139,11 +139,6 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
     let eval_prog = NetProg::new(m);
     let mut out = m.clone();
     let mut reports = Vec::new();
-    if trace() {
-        for (i, f) in m.fns.iter().enumerate() {
-            eprintln!("fn {i} = {} (arity {}, inline {})", f.name, f.arity, prog.inline[i]);
-        }
-    }
     for (fid, f) in m.fns.iter().enumerate() {
         let mut net = Net::new();
         let params = crate::build::build_fn(&mut net, &prog, fid);
@@ -154,19 +149,12 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
         let mut memo = Spec::default();
         let ok = settle(&mut fx, &prog, &eval_prog, fuel, &mut done, &mut evaluated, &mut memo, 0, 0, &HashSet::new(), &HashSet::new());
         assert!(ok, "ICE: specialization of `{}` ran out of fuel ({} rewrites)", f.name, done);
-        if std::env::var_os("MITHRIL_NET_DUMP").is_some() {
-            eprintln!("== {} free wires {:?}\n{}", f.name, fx.free, fx.net.dump());
-            eprintln!("residual: {:?}", fx.net.residual.iter().map(|(a, b)| (a.tag(), a.payload(), b.tag(), b.payload())).collect::<Vec<_>>());
-        }
         let calls_kept = fx.net.residual.iter().filter(|(a, _)| a.tag() == Tag::Ref).count();
         let ops_kept = fx.net.residual.len() - calls_kept;
         let body = {
             let mut rd = crate::residual::Reader::new(&fx.net, &prog, &ROOTS, &fx.free, fx.next_var, &fx.dup_frame, &fx.ref_frame, &fx.arms);
             rd.read_frame(0, crate::root_port())
         };
-        if trace() {
-            eprintln!("{}: {} rewrites, {} calls kept, {} ops kept, {} calls evaluated, size {} -> {}", f.name, done, calls_kept, ops_kept, evaluated, crate::core_size(&f.body), crate::core_size(&body));
-        }
         reports.push(SpecReport {
             name: f.name.clone(),
             rewrites: done,
@@ -234,9 +222,6 @@ fn settle(
     loop {
         let ix = crate::residual::scan(&fx.net, &ROOTS, &fx.free, &fx.net.residual);
         let todo: Vec<(u32, bool)> = ix.parked.iter().copied().filter(|(a, _)| !skip.contains(a) && !fx.arms.contains_key(&(*a, 0))).collect();
-        if trace() {
-            eprintln!("{}settle: parked {} todo {} cells {} residual {} rewrites {}", "  ".repeat(depth as usize), ix.parked.len(), todo.len(), fx.net.cells.len(), fx.net.residual.len(), done);
-        }
         if todo.is_empty() {
             return true;
         }
@@ -277,9 +262,6 @@ fn settle(
                 let f = fx.nframes;
                 fx.nframes += 1;
                 fx.arms.insert((agent, i), crate::residual::ArmInfo { binders, frame: f });
-                if trace() {
-                    eprintln!("{}arm {i} of agent {agent} -> entry {entry}", "  ".repeat(depth as usize + 1));
-                }
                 crate::instantiate(&mut fx.net, &prog.entries, entry, args, ret);
                 if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, f) || new_call(fx) {
                     return false;
@@ -358,11 +340,6 @@ fn run(
             return true;
         }
     }
-}
-
-/// `MITHRIL_NET_TRACE=1`: narrate specialization on stderr.
-fn trace() -> bool {
-    std::env::var_os("MITHRIL_NET_TRACE").is_some()
 }
 
 /// Per-function speculation state: failed attempts (by call key or by
@@ -450,10 +427,7 @@ fn unfold_call(
         (ok, *done - before)
     };
     memo.cap = outer_cap;
-    let reject = |why: &str| {
-        if trace() {
-            eprintln!("{}unfold of {}: {why}", "  ".repeat(depth as usize + 1), pattern_key(&fx.net, r));
-        }
+    let reject = |_why: &str| {
         false
     };
     if !ok {
@@ -475,9 +449,6 @@ fn unfold_call(
     let ix = crate::residual::scan(&clone.net, &ROOTS, &clone.free, &clone.net.residual);
     if ix.parked.iter().any(|(a, is_match)| *is_match && !old_parked.contains(a)) {
         return reject("a match remains");
-    }
-    if trace() {
-        eprintln!("{}unfolded entry {entry} ({sub_done} rewrites, +{} agents)", "  ".repeat(depth as usize + 1), live_after.saturating_sub(live_before));
     }
     if depth == 0 {
         *done += sub_done;
@@ -588,10 +559,10 @@ fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut 
     let ix = crate::residual::scan(net, roots, free, &net.residual);
     for p in ix.producers() {
         match p {
-            crate::residual::Producer::Dup(d) => {
+            crate::residual::Producer::Dup(d) if !ix.lam_only.contains(d) => {
                 dup_frame.entry(*d).or_insert(frame);
             }
-            crate::residual::Producer::Ref(_, ret) => {
+            crate::residual::Producer::Ref(_, ret) if !ix.lam_only.contains(ret) => {
                 ref_frame.entry(*ret).or_insert(frame);
             }
             _ => {}

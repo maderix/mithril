@@ -582,3 +582,69 @@ fn a_call_outside_a_closure_is_shared_by_every_application() {
     let b = body(&s, "mk");
     assert!(calls(b, fb) && !call_under_lam(b, fb, false), "fib(n) is recomputed per application: {b:?}");
 }
+
+// ---- placement follows what a value reads; sharing per selection (review of ba0c48b) ----
+
+#[test]
+fn a_closure_applied_twice_at_compile_time_shares_nothing_across_applications() {
+    // g(1) and g(k) read the same Dup through different superposition
+    // sides; the shared binding must be per selection, or g(k) reuses g(1)
+    let src = format!("{FIB}def sq(y):\n    return y * y\n\ndef f(k, c):\n    g = lambda x: sq(fib(x) + c)\n    return g(1) + g(k)\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, 0)\n");
+    let (m, s) = spec(&src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+}
+
+#[test]
+fn a_call_created_in_a_branch_stays_in_the_branch() {
+    // a closure body's call is applied inside a branch: it binds there
+    // (down diverges for a negative argument: moving the call out of the
+    // branch changes termination). Three shapes: the call's argument is
+    // made in the branch; it is a parameter (the closure body's call was
+    // reachable, unapplied, from the function frame); the branch is a
+    // match arm.
+    const DOWN: &str = "def down(n):\n    if n == 0:\n        return 0\n    return down(n - 1) + 1\n\n";
+    for f_src in [
+        "def f(k, c):\n    g = lambda x: fib(x) + k\n    if c > 0:\n        t = down(c)\n        return g(t)\n    return 0\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, k - 10) + f(k, 3)\n",
+        "def f(k, c):\n    g = lambda x: down(x) + k\n    if c < 0:\n        return 0\n    return g(c)\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, k - 10) + f(k, k)\n",
+        "@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\ndef f(k, l, c):\n    g = lambda x: down(x) + k\n    match l:\n        case Cons(h, r):\n            return h\n        case Nil():\n            return g(c)\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, Cons(k, Nil()), k - 10) + f(k, Nil(), k)\n",
+    ] {
+        let src = format!("{DOWN}{FIB}{f_src}");
+        let (m, s) = spec(&src);
+        assert_scoped(&s);
+        assert_eq!(oracle(&m), oracle(&s), "{f_src}");
+        let b = body(&s, "f");
+        let dn = fid(&s, "down");
+        fn under_branch(e: &Core, g: u32, under: bool) -> bool {
+            match e {
+                Core::Call(f, _) if *f == g => under,
+                Core::If(c, t, f) => under_branch(c, g, under) || under_branch(t, g, true) || under_branch(f, g, true),
+                Core::Match(sc, arms) => under_branch(sc, g, under) || arms.iter().any(|(_, _, a)| under_branch(a, g, true)),
+                _ => e.kids().into_iter().any(|k| under_branch(k, g, under)),
+            }
+        }
+        assert!(under_branch(b, dn, false), "down left its branch in {f_src}: {b:?}");
+    }
+}
+
+/// Open (the reviewer's probe q2b): a closure created in an arm that
+/// captures a pattern binder, applied twice, hits "residual wire class has
+/// no producer" in the reader.
+#[test]
+#[ignore = "open: ICE in the reader (see design.md 3b-3)"]
+fn a_closure_capturing_an_arm_binder_applied_twice() {
+    let src = format!("@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\n{FIB}def f(k, l, c):\n    match l:\n        case Cons(h, t):\n            g = lambda x: fib(x + h) + k\n            return g(c) + g(1)\n        case Nil():\n            return 0\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, Cons(k, Nil()), k) + f(k, Nil(), k)\n");
+    let (m, s) = spec(&src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+}
+
+#[test]
+fn an_arm_binder_flowing_into_a_closure_body_binds_after_the_match() {
+    for body_src in ["fib(x) + k", "sq(fib(x) + k)"] {
+        let src = format!("@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\n{FIB}def sq(y):\n    return y * y\n\ndef f(k, l):\n    g = lambda x: {body_src}\n    match l:\n        case Cons(h, t):\n            return g(h)\n        case Nil():\n            return 0\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, Cons(k, Nil())) + f(k, Nil())\n");
+        let (m, s) = spec(&src);
+        assert_scoped(&s);
+        assert_eq!(oracle(&m), oracle(&s), "{body_src}");
+    }
+}

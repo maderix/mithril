@@ -290,11 +290,11 @@ pub enum Val {
 /// Wrap a 64-bit result down to the signed 56-bit `int` range, matching
 /// `mithril_core::port::Port::as_i64`'s sign-extension trick: shift the
 /// low 56 bits to the top of the word and arithmetic-shift back down.
-fn wrap56(v: i64) -> i64 {
+pub fn wrap56(v: i64) -> i64 {
     ((v as u64) << 8) as i64 >> 8
 }
 
-fn floor_div(a: i64, b: i64) -> i64 {
+pub fn floor_div(a: i64, b: i64) -> i64 {
     let q = a.wrapping_div(b);
     let r = a.wrapping_rem(b);
     if r != 0 && (r < 0) != (b < 0) {
@@ -304,7 +304,7 @@ fn floor_div(a: i64, b: i64) -> i64 {
     }
 }
 
-fn py_mod(a: i64, b: i64) -> i64 {
+pub fn py_mod(a: i64, b: i64) -> i64 {
     let r = a.wrapping_rem(b);
     if r != 0 && (r < 0) != (b < 0) {
         r + b
