@@ -816,57 +816,48 @@ and two Core-level rewrites in the code generator (tail inlining,
 if-conversion) that the core constraint forbids at that layer: those get
 their own commit and note.
 
-### 3i. Feasibility for ML and graph-compiler work (note, 2026-09-29)
+### 3i. Mithril as the irregular half of Blaze (note, 2026-09-29)
 
-Assessed against the user's domain: ML runtimes and graph compilers
-(Blaze at ../simple-lang: typed arrays, loops, a schedule language,
-native kernels called from a host). Mithril is the other shape: a
-functional program whose meaning is net rewrites, parallel by confluence.
-Fit is by task shape, not by domain.
+The role, as the user states it: Mithril does not generate kernels. It
+generates graphs that Blaze lowers efficiently, and is eventually
+integrated into Blaze natively for irregular and sparse computation.
+Blaze (../simple-lang) owns dense math: typed arrays, loops, schedules,
+native kernels. Mithril owns the part whose shape is data-dependent.
 
-Fits natively:
-* MoE routing as an algorithm: top-k gating per token, capacity-limited
-  dispatch, overflow, load balancing. Data-dependent, irregular, list and
-  tree shaped: the k-d tree probe's shape (a shared read-only structure
-  across forks, partitioning, data-dependent branching). A router over
-  2^16 tokens and 64 experts is a fork tree over tokens with a partition
-  per expert; the scheduler does the balancing a CUDA router does with
-  atomics and sorts. Expected: near C on the CPU, ahead of reference on the
-  device, far from a hand-tuned radix-sort router for the dense part.
-* Fabric and collective algorithms as models: ring/tree all-reduce,
-  all-to-all for expert exchange, hierarchical reductions over a chip
-  topology are interaction nets (local rules on a graph); confluence is
-  the property to prove about them. Mithril expresses and checks such an
-  algorithm oracle-equal, same rules on CPU and GPU: an executable
-  specification and a schedule simulator, not the thing driving the NICs.
-* Graph-compiler passes: rewrite systems over an IR are rule tables,
-  confluent by construction, run by the compile-time reducer. The
-  strongest fit, and where Mithril and Blaze meet: Blaze's graph-level
-  rewriting as Mithril rules.
+Why the fit is structural, not incidental:
+* The residual net after compile-time reduction is already a graph: every
+  static decision has been taken by rule firings, and what remains is the
+  data-dependent structure. Exporting it as a Blaze graph (ops over
+  buffers, with the routing or sparsity decided) is a lowering of the
+  residual net, which the core constraint already allows: lowering never
+  changes meaning, and any region can fall back to the rule engine.
+* Irregular planning is what the net does well: MoE routing (top-k gating,
+  capacity, overflow, load balance), sparsity patterns, graph traversals,
+  collective schedules over a chip topology. The k-d tree probe is this
+  shape: a shared read-only structure, partitioning, data-dependent
+  branching, balanced by the scheduler rather than by atomics and sorts.
+* Graph-compiler passes are rule tables. A pass written as net rules is
+  confluent by construction and runs in the compile-time reducer; Blaze's
+  graph rewriting can live there.
 
-Does not fit:
-* Dense math (matmul, attention, expert FFNs): no tensors, layouts or
-  tensor cores; floats are boxed f64 or f32 bit patterns. Blaze's job;
-  Mithril calls out, never replaces.
-* Real cross-chip execution: no I/O, one device, no fabric bindings. It
-  models a fabric algorithm; it cannot run one across chips.
-* In-place state: arrays are functional; a router that mutates expert
-  buffers is a fold producing new values (ownership reclaims in place
-  when it can).
+The interface, in order of need:
+1. A graph export from the residual net: nodes are Blaze calls on buffers
+   (dense work), edges are data dependencies, and the irregular structure
+   (which tokens go to which expert, which blocks are nonzero) is either
+   decided at compile time or computed by a residual Mithril region that
+   produces index buffers Blaze consumes.
+2. Buffers as values: f32/int arrays crossing the boundary without copies
+   (the array value type exists on both devices; the boundary is an engine
+   rule that hands a buffer out and takes one back).
+3. The static f32 type and f32 arrays, so gating and scores are arithmetic.
+4. A probe, done like the k-d tree: a MoE router (top-2 gating, capacity
+   overflow, hashed logits), C twin, oracle-checked, CPU and GPU, whose
+   output is the dispatch plan (index buffers) a Blaze expert kernel would
+   consume. Then the same router emitting the graph.
 
-What makes the combination real, in order:
-1. A foreign-call boundary: a Mithril program invokes a Blaze-compiled
-   kernel on an array (routing in Mithril, expert compute in Blaze). The
-   array value type exists on both devices; the boundary is an engine
-   rule that hands a buffer out and takes one back.
-2. The static f32 type (planned) plus f32 arrays, so gating scores read
-   as arithmetic.
-3. One probe program, done like the k-d tree: a MoE router with top-2
-   gating and capacity overflow over hashed logits, C twin,
-   oracle-checked, CPU and GPU. The standing in a day, not by argument.
-Order: folds, f32 type, Cornell box demo, then the MoE router as the next
-generality probe (a better second probe than path tracing for this
-domain; the f32 type serves both).
+What Mithril does not do: dense kernels, tensor layouts, multi-chip I/O.
+Those are Blaze's and the runtime's. Order: folds, f32 type, Cornell box
+demo, MoE router probe, graph export.
 
 Every reference number in this document is reference (reference/reference, the reference
 runtime with the task cube, `bench/reference.csv` on this 4090), never reference
