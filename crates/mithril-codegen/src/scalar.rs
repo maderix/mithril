@@ -645,7 +645,7 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     }
     let n = m.fns.len();
     let mut calls = vec![Vec::new(); n];
-    let mut need: Vec<bool> = (0..n)
+    let need: Vec<bool> = (0..n)
         .map(|f| {
             let Some(sig) = &sigs[f] else { return true };
             let mut p = false;
@@ -653,18 +653,7 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
             p || sig.params.iter().any(|t| matches!(t, PTy::A | PTy::B)) || sig.ra.iter().any(|a| *a)
         })
         .collect();
-    loop {
-        let mut changed = false;
-        for f in 0..n {
-            if !need[f] && calls[f].iter().any(|g| need[*g as usize]) {
-                need[f] = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            return need;
-        }
-    }
+    crate::fixpoint(need, |f, s| calls[f].iter().any(|g| s[*g as usize]))
 }
 
 thread_local! {
@@ -769,13 +758,6 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     // call edges between native functions, weighted by the int values
     // crossing them (args and results): each converts when the two sides
     // differ
-    fn calls(e: &Core, out: &mut Vec<u32>) {
-        e.walk(&mut |e| {
-            if let Core::Call(g, _) = e {
-                out.push(*g);
-            }
-        });
-    }
     let ints = |g: usize| -> usize {
         let s = sigs[g].as_ref().unwrap();
         let ps: usize = s.params.iter().map(|p| match p {
@@ -790,9 +772,7 @@ pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
         if sigs[f].is_none() {
             continue;
         }
-        let mut cs = Vec::new();
-        calls(&m.fns[f].body, &mut cs);
-        for g in cs {
+        for g in crate::call_sites(&m.fns[f].body) {
             let g = g as usize;
             if g != f && sigs[g].is_some() {
                 let w = ints(g);

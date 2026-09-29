@@ -77,8 +77,6 @@ pub enum Combiner {
     /// 2^32; the join must re-mask its result to the low 32 bits.
     WrapAdd32,
     TupleWrapAdd32(usize),
-    /// Never constructed; kept until codegen's `fold.rs` drops its arm.
-    Fn(u32),
 }
 
 #[derive(Clone, PartialEq, Debug)]

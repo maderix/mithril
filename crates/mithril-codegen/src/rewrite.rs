@@ -13,7 +13,7 @@
 //!   before other work runs), and every path that does not reuse a token
 //!   releases it at its terminal (the emitter emits that release).
 
-use crate::{has_call, max_var};
+use crate::has_call;
 use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
 use std::collections::HashMap;
 
@@ -28,13 +28,6 @@ pub(crate) fn size(e: &Core) -> usize {
 /// self tail recursion (a loop); semantics are unchanged (pure bodies).
 pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
     const MAX_SIZE: usize = 64;
-    fn calls_of(e: &Core, out: &mut Vec<u32>) {
-        e.walk(&mut |e| {
-            if let Core::Call(g, _) = e {
-                out.push(*g);
-            }
-        });
-    }
     let leaf: Vec<bool> = m.fns.iter().map(|f| !has_call(&f.body)).collect();
     // g qualifies for inlining into f's tail sites
     let fits = |f: u32, g: u32| -> bool {
@@ -45,8 +38,7 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
         if size(gb) > MAX_SIZE {
             return false;
         }
-        let mut cs = Vec::new();
-        calls_of(gb, &mut cs);
+        let cs = crate::call_sites(gb);
         cs.contains(&f)
             && cs.iter().all(|h| *h == f || (*h != g && leaf[*h as usize]))
             && mithril_front::desugar::compute_self_tail_rec(f, gb)
@@ -58,7 +50,7 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
                 let base = *next;
                 *next += callee.arity as u32;
                 let shift = *next;
-                *next += max_var(&callee.body).max(callee.arity as u32) + 1;
+                *next += callee.body.max_var().max(callee.arity as u32) + 1;
                 let mut map = HashMap::new();
                 for p in 0..callee.arity as u32 {
                     match &args[p as usize] {
@@ -85,7 +77,7 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
     }
     let mut out = m.clone();
     for (fid, f) in out.fns.iter_mut().enumerate() {
-        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
+        let mut next = f.body.max_var().max(f.arity as u32) + 1;
         let nb = rewrite_tail(&f.body, fid as u32, m, &fits, &mut next);
         if nb != f.body {
             f.body = nb;
@@ -435,7 +427,7 @@ pub(crate) fn if_convert(m: &CoreModule) -> CoreModule {
     }
     let mut out = m.clone();
     for (fid, f) in out.fns.iter_mut().enumerate() {
-        let mut next = max_var(&f.body).max(f.arity as u32) + 1;
+        let mut next = f.body.max_var().max(f.arity as u32) + 1;
         f.body = tail(&f.body, &mut next, fid as u32, &tys);
     }
     out

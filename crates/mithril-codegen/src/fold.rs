@@ -8,8 +8,7 @@
 //!
 //! Combiners: WrapAdd (mod 2^56), WrapAdd32 (join re-masks to the low 32
 //! bits), TupleWrapAdd / TupleWrapAdd32 (elementwise over the accumulator
-//! tuple). `Fn` combiners are not parallelized (sequential fallback is
-//! always sound).
+//! tuple).
 
 use crate::lir::{as_i, bin, c, do_, i64_, let_, num, p, rec_addr, ret, u16_, u32_, u64_, v, Bop, FnDef, Inline, Ty, E, S};
 use crate::seq::{dive_args, dive_params, vn};
@@ -38,7 +37,6 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
         Combiner::WrapAdd32 => (true, None),
         Combiner::TupleWrapAdd(n) => (false, Some(*n)),
         Combiner::TupleWrapAdd32(n) => (true, Some(*n)),
-        Combiner::Fn(_) => return None,
     };
     let ar = f.arity;
     if ar < 3 || !f.self_tail_rec {
