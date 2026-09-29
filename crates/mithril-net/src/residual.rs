@@ -174,9 +174,11 @@ fn is_consumer(p: Port) -> bool {
     matches!(p.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup | Tag::App)
 }
 
-/// Typed walk from the roots; fills the index. `free` are the unknown
-/// input wires with their Core variables.
-pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[(Port, Port)]) -> Index {
+/// Typed walk from the roots (the root wire, the unknown inputs, the
+/// residual pairs); fills the index. `free` are the unknown input wires
+/// with their Core variables.
+pub(crate) fn scan(net: &Net, free: &[(Port, u32)]) -> Index {
+    let residual = &net.residual;
     let n = net.cells.len();
     let mut ix = Index { uf: (0..n as u32).collect(), stored: vec![None; n], producer: vec![None; n], input_of: vec![None; n], parked: Vec::new(), dup_labels: HashMap::new(), lam_only: HashSet::new(), dup_side: HashMap::new(), dup_parent: HashMap::new(), sup_labels: HashSet::new() };
     let params: Vec<Port> = free.iter().map(|(p, _)| *p).collect();
@@ -185,7 +187,7 @@ pub(crate) fn scan(net: &Net, roots: &[Port], free: &[(Port, u32)], residual: &[
         ix.producer[p.payload() as usize] = Some(Producer::Free(*v));
     }
     let mut seen: PortSet = PortSet::default();
-    let mut work: Vec<Port> = roots.to_vec();
+    let mut work: Vec<Port> = vec![crate::root_port()];
     work.extend(params.iter().copied());
     for (a, b) in residual {
         match a.tag() {
@@ -492,14 +494,13 @@ impl<'a> Reader<'a> {
     pub(crate) fn new(
         net: &'a Net,
         prog: &'a NetProg,
-        roots: &[Port],
         free: &[(Port, u32)],
         next: u32,
         dup_frame: &'a HashMap<u32, usize>,
         ref_frame: &'a HashMap<u32, usize>,
         arms: &'a HashMap<(u32, usize), ArmInfo>,
     ) -> Reader<'a> {
-        let ix = scan(net, roots, free, &net.residual);
+        let ix = scan(net, free);
         let mut arm_binders: HashMap<usize, Vec<u32>> = HashMap::new();
         for a in arms.values() {
             arm_binders.entry(a.frame).or_default().extend(a.binders.iter().copied());

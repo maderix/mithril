@@ -197,7 +197,7 @@ fn close(prog: &mut NetProg, body: &Core, binders: &[u32]) -> ClosureSpec {
     ClosureSpec { entry, caps }
 }
 
-fn ctag_of(cid: u32) -> u16 {
+pub(crate) fn ctag_of(cid: u32) -> u16 {
     if cid == UNREACHABLE_CTOR {
         CTAG_UNREACHABLE
     } else {

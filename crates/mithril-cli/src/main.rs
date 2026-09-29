@@ -138,6 +138,12 @@ fn to_core(m: &Module) -> Result<CoreModule, CliErr> {
     Ok(mithril_front::desugar(m)?)
 }
 
+/// The front stages and the net specialization, with its reports.
+fn specialized(o: &Opts) -> Result<(CoreModule, Vec<mithril_net::SpecReport>), CliErr> {
+    let (m, _) = front(&o.file)?;
+    Ok(mithril_net::specialize(&to_core(&m)?, REDUCE_FUEL))
+}
+
 // -------------------------------------------------------- paths and cache
 
 fn workspace_root() -> PathBuf {
@@ -192,11 +198,9 @@ fn rustc_rlib(out_dir: &Path, name: &str, src: &Path) -> Result<(), CliErr> {
         .arg(out_dir)
         .arg("-L")
         .arg(out_dir);
-    for dep in ["mithril_core"] {
-        let rlib = out_dir.join(format!("lib{}.rlib", dep));
-        if name != dep && rlib.exists() {
-            c.arg("--extern").arg(format!("{}={}", dep, rlib.display()));
-        }
+    let core = out_dir.join("libmithril_core.rlib");
+    if name != "mithril_core" && core.exists() {
+        c.arg("--extern").arg(format!("mithril_core={}", core.display()));
     }
     run_tool(c, &format!("rustc ({})", name))
 }
@@ -236,9 +240,8 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
     let tmp = base.join(format!("tmp-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
-    let crates = workspace_root().join("crates");
-    rustc_rlib(&tmp, "mithril_core", &crates.join("mithril-core/src/lib.rs"))?;
-    rustc_rlib(&tmp, "mithril_rt", &crates.join("mithril-rt/src/lib.rs"))?;
+    rustc_rlib(&tmp, "mithril_core", &crates_root.join("mithril-core/src/lib.rs"))?;
+    rustc_rlib(&tmp, "mithril_rt", &crates_root.join("mithril-rt/src/lib.rs"))?;
     match fs::rename(&tmp, &dir) {
         Ok(()) => {}
         // A concurrent invocation won the race; use its cache.
@@ -276,12 +279,10 @@ fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
 
 fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
-    let (m, _) = front(&o.file)?;
-    let cm = to_core(&m)?;
+    let (sm, _) = specialized(&o)?;
     if o.gpu {
-        return run_gpu(&cm);
+        return run_gpu(&sm);
     }
-    let (sm, _) = mithril_net::specialize(&cm, REDUCE_FUEL);
     let tmp = make_temp_dir()?;
     let bin = tmp.join("prog");
     compile_program(&sm, &bin)?;
@@ -297,19 +298,14 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
 fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
     let out = o.out.as_deref().ok_or("build requires -o <out>")?;
-    let (m, _) = front(&o.file)?;
-    let cm = to_core(&m)?;
-    let (sm, _) = mithril_net::specialize(&cm, REDUCE_FUEL);
+    let (sm, _) = specialized(&o)?;
     compile_program(&sm, out)?;
     println!("wrote {}", out.display());
     Ok(0)
 }
 
 fn cmd_net(args: &[String]) -> Result<i32, CliErr> {
-    let o = parse_opts(args)?;
-    let (m, _) = front(&o.file)?;
-    let cm = to_core(&m)?;
-    let (sm, reports) = mithril_net::specialize(&cm, REDUCE_FUEL);
+    let (sm, reports) = specialized(&parse_opts(args)?)?;
     println!("{:<20} {:>9} {:>6} {:>5} {:>5} {:>7} {:>7}", "function", "rewrites", "calls", "ops", "evald", "before", "after");
     for r in &reports {
         println!("{:<20} {:>9} {:>6} {:>5} {:>5} {:>7} {:>7}", r.name, r.rewrites, r.calls_kept, r.ops_kept, r.calls_evaluated, r.size_before, r.size_after);
@@ -362,10 +358,9 @@ fn lean_binary() -> Option<PathBuf> {
 // -------------------------------------------------------------------- gpu
 
 #[cfg(feature = "gpu")]
-fn run_gpu(cm: &CoreModule) -> Result<i32, CliErr> {
+fn run_gpu(sm: &CoreModule) -> Result<i32, CliErr> {
     // the same lowering as the CPU program, printed for the device
-    let (sm, _) = mithril_net::specialize(cm, REDUCE_FUEL);
-    let cu = match mithril_gpu::emit_cuda(&sm) {
+    let cu = match mithril_gpu::emit_cuda(sm) {
         Ok(cu) => cu,
         Err(constant) => {
             println!("{constant}");
@@ -381,7 +376,7 @@ fn run_gpu(cm: &CoreModule) -> Result<i32, CliErr> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn run_gpu(_cm: &CoreModule) -> Result<i32, CliErr> {
+fn run_gpu(_sm: &CoreModule) -> Result<i32, CliErr> {
     eprintln!("gpu support not built; rebuild with --features gpu");
     Ok(1)
 }

@@ -5,7 +5,7 @@ use crate::rules::process;
 use crate::{flo_bits, Mode, NetProg, CTAG_TUPLE, CTAG_UNREACHABLE, EMPTY};
 use mithril_core::net::Net;
 use mithril_core::port::{Port, Tag};
-use mithril_front::core::{Core, CoreModule, Val};
+use mithril_front::core::{CoreModule, Val};
 use std::collections::{HashMap, HashSet};
 
 /// Run interaction rules on the net's redex worklist, in FIFO order, until
@@ -15,16 +15,21 @@ use std::collections::{HashMap, HashSet};
 /// fuel-starved reduction can be resumed by calling `reduce` again.
 /// Returns the number of rewrites performed.
 pub fn reduce(net: &mut Net, m: &CoreModule, fuel: u64) -> u64 {
-    let prog = NetProg::new(m);
-    let mut done = 0u64;
-    let mut i = 0usize;
-    while done < fuel && i < net.redexes.len() {
+    let mut done = 0;
+    drain(net, &NetProg::new(m), fuel, &mut done);
+    done
+}
+
+/// Fire queued redexes FIFO until none is left or `*done >= fuel`;
+/// unfired ones stay queued.
+fn drain(net: &mut Net, prog: &NetProg, fuel: u64, done: &mut u64) {
+    let mut i = 0;
+    while *done < fuel && i < net.redexes.len() {
         let (a, b) = net.redexes[i];
         i += 1;
-        done += process(net, &prog, a, b);
+        *done += process(net, prog, a, b);
     }
     net.redexes.drain(..i);
-    done
 }
 
 /// Follow filled wires without consuming them (readback is `&Net`).
@@ -114,7 +119,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
         let mut net = Net::new();
         let params = crate::build::build_fn(&mut net, &prog, fid);
         let free: Vec<(Port, u32)> = params.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
-        let mut fx = Fx { net, free, arms: HashMap::new(), dup_frame: HashMap::new(), ref_frame: HashMap::new(), nframes: 1, next_var: max_var(&f.body).max(f.arity as u32) + 1 };
+        let mut fx = Fx { net, free, arms: HashMap::new(), dup_frame: HashMap::new(), ref_frame: HashMap::new(), nframes: 1, next_var: f.body.max_var().max(f.arity as u32) + 1 };
         let mut done = 0u64;
         let mut evaluated = 0usize;
         let mut memo = Spec::default();
@@ -123,7 +128,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
         let calls_kept = fx.net.residual.iter().filter(|(a, _)| a.tag() == Tag::Ref).count();
         let ops_kept = fx.net.residual.len() - calls_kept;
         let body = {
-            let mut rd = crate::residual::Reader::new(&fx.net, &prog, &ROOTS, &fx.free, fx.next_var, &fx.dup_frame, &fx.ref_frame, &fx.arms);
+            let mut rd = crate::residual::Reader::new(&fx.net, &prog, &fx.free, fx.next_var, &fx.dup_frame, &fx.ref_frame, &fx.arms);
             rd.read_frame(0, crate::root_port())
         };
         reports.push(SpecReport {
@@ -140,9 +145,6 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
     }
     (out, reports)
 }
-
-/// The root wire, the only root of a function's net.
-const ROOTS: [Port; 1] = [Port(0)];
 
 /// The state of one function's specialization: its net and everything
 /// the readback needs to interpret it. Cloned to speculate.
@@ -189,9 +191,9 @@ fn settle(
     if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, frame) || new_call(fx) {
         return false;
     }
-    assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, &mut fx.ref_frame, frame);
+    assign_dups(fx, frame);
     loop {
-        let ix = crate::residual::scan(&fx.net, &ROOTS, &fx.free, &fx.net.residual);
+        let ix = crate::residual::scan(&fx.net, &fx.free);
         let todo: Vec<(u32, bool)> = ix.parked.iter().copied().filter(|(a, _)| !skip.contains(a) && !fx.arms.contains_key(&(*a, 0))).collect();
         if todo.is_empty() {
             return true;
@@ -237,7 +239,7 @@ fn settle(
                 if !run(fx, prog, eval_prog, fuel, done, evaluated, memo, depth, f) || new_call(fx) {
                     return false;
                 }
-                assign_dups(&fx.net, &ROOTS, &fx.free, &mut fx.dup_frame, &mut fx.ref_frame, f);
+                assign_dups(fx, f);
             }
         }
     }
@@ -261,15 +263,8 @@ fn run(
     frame: usize,
 ) -> bool {
     loop {
-        let net = &mut fx.net;
-        let mut i = 0usize;
-        while *done < fuel && i < net.redexes.len() {
-            let (a, b) = net.redexes[i];
-            i += 1;
-            *done += process(net, prog, a, b);
-        }
-        net.redexes.drain(..i);
-        if !net.redexes.is_empty() || (memo.cap != usize::MAX && agents(net) > memo.cap) {
+        drain(&mut fx.net, prog, fuel, done);
+        if !fx.net.redexes.is_empty() || (memo.cap != usize::MAX && agents(&fx.net) > memo.cap) {
             return false;
         }
         // settle in place: the list stays complete on the net while a
@@ -374,7 +369,7 @@ fn unfold_call(
     let live_before = agents(&fx.net);
     let data_before = data_nodes(&fx.net);
     // what is parked or residual before the unfold is not its doing
-    let before = crate::residual::scan(&fx.net, &ROOTS, &fx.free, &fx.net.residual);
+    let before = crate::residual::scan(&fx.net, &fx.free);
     let old_parked: HashSet<u32> = before.parked.iter().map(|(a, _)| *a).collect();
     let old_refs: HashSet<u64> = fx.net.residual.iter().filter(|(a, _)| a.tag() == Tag::Ref).map(|(a, _)| a.0).collect();
     let mut clone = fx.clone();
@@ -398,28 +393,28 @@ fn unfold_call(
         (ok, *done - before)
     };
     memo.cap = outer_cap;
-    let reject = |_why: &str| {
-        false
-    };
+    // rejected: out of budget, or a call remains
     if !ok {
-        return reject("out of budget, or a call remains");
+        return false;
     }
-    let live_after = agents(&clone.net);
-    if live_after.saturating_sub(live_before) > SPEC_UNFOLD_AGENTS {
-        return reject(&format!("too big (+{} agents)", live_after - live_before));
+    // rejected: too big
+    if agents(&clone.net).saturating_sub(live_before) > SPEC_UNFOLD_AGENTS {
+        return false;
     }
+    // rejected: a call remains
     if clone.net.residual.iter().any(|(a, _)| a.tag() == Tag::Ref && !old_refs.contains(&a.0)) {
-        return reject("a call remains");
+        return false;
     }
-    // a partial unfold specializes control, it does not build data: a
-    // constructor left over unknown fields would be allocation code
-    // (a tuple is loop state and is fine)
+    // rejected: builds data. A partial unfold specializes control, it does
+    // not build data: a constructor left over unknown fields would be
+    // allocation code (a tuple is loop state and is fine)
     if data_nodes(&clone.net) > data_before {
-        return reject("builds data");
+        return false;
     }
-    let ix = crate::residual::scan(&clone.net, &ROOTS, &clone.free, &clone.net.residual);
+    // rejected: a match remains
+    let ix = crate::residual::scan(&clone.net, &clone.free);
     if ix.parked.iter().any(|(a, is_match)| *is_match && !old_parked.contains(a)) {
-        return reject("a match remains");
+        return false;
     }
     if depth == 0 {
         *done += sub_done;
@@ -448,7 +443,7 @@ fn args_known(net: &Net, head: Port) -> bool {
             Tag::Con => crate::con_fields(net, p).into_iter().all(|f| known(net, f)),
             Tag::Var => {
                 let s = Port(net.cell(p.payload() as u32)[0]);
-                s != EMPTY && s.tag() != Tag::Var && !matches!(s.tag(), Tag::Op | Tag::Swi | Tag::Mat | Tag::Dup | Tag::Ref) && known(net, s)
+                s.tag() != Tag::Var && known(net, s)
             }
             _ => false,
         }
@@ -467,14 +462,8 @@ fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Option<Port> {
     let ps: Vec<Port> = args.iter().map(|v| alloc_val(&mut scratch, v)).collect();
     let head = crate::list_alloc(&mut scratch, &ps);
     scratch.redexes.push((crate::ref_port(head, crate::ref_entry(r)), crate::root_port()));
-    let mut done = 0u64;
-    let mut i = 0usize;
-    while done < SPEC_CALL_FUEL && i < scratch.redexes.len() {
-        let (a, b) = scratch.redexes[i];
-        i += 1;
-        done += process(&mut scratch, eval_prog, a, b);
-    }
-    if i < scratch.redexes.len() || !scratch.residual.is_empty() {
+    drain(&mut scratch, eval_prog, SPEC_CALL_FUEL, &mut 0);
+    if !scratch.redexes.is_empty() || !scratch.residual.is_empty() {
         return None;
     }
     // a large value is not worth embedding in the program
@@ -492,14 +481,10 @@ fn alloc_val(net: &mut Net, v: &Val) -> Port {
     match v {
         Val::I(n) => Port::num(*n),
         Val::F(f) => mithril_core::agents::Cells::alloc_flo(net, *f),
-        Val::C(cid, fields) => {
+        Val::C(_, fields) | Val::T(fields) => {
             let ps: Vec<Port> = fields.iter().map(|f| alloc_val(net, f)).collect();
-            let tag = if *cid == mithril_front::core::UNREACHABLE_CTOR { CTAG_UNREACHABLE } else { *cid as u16 };
+            let tag = if let Val::C(cid, _) = v { crate::ctag_of(*cid) } else { CTAG_TUPLE };
             crate::con_alloc(net, tag, &ps)
-        }
-        Val::T(items) => {
-            let ps: Vec<Port> = items.iter().map(|f| alloc_val(net, f)).collect();
-            crate::con_alloc(net, CTAG_TUPLE, &ps)
         }
         Val::A(_) | Val::L(..) => panic!("ICE: an array or closure value at compile time"),
     }
@@ -507,20 +492,17 @@ fn alloc_val(net: &mut Net, v: &Val) -> Port {
 
 /// Every Dup agent and pending call reachable now that has no frame yet
 /// belongs to `frame`.
-fn assign_dups(net: &Net, roots: &[Port], free: &[(Port, u32)], dup_frame: &mut HashMap<u32, usize>, ref_frame: &mut HashMap<u32, usize>, frame: usize) {
-    let ix = crate::residual::scan(net, roots, free, &net.residual);
+fn assign_dups(fx: &mut Fx, frame: usize) {
+    let ix = crate::residual::scan(&fx.net, &fx.free);
     for p in ix.producers() {
         match p {
             crate::residual::Producer::Dup(d) if !ix.lam_only.contains(d) => {
-                dup_frame.entry(*d).or_insert(frame);
+                fx.dup_frame.entry(*d).or_insert(frame);
             }
             crate::residual::Producer::Ref(_, ret) if !ix.lam_only.contains(ret) => {
-                ref_frame.entry(*ret).or_insert(frame);
+                fx.ref_frame.entry(*ret).or_insert(frame);
             }
             _ => {}
         }
     }
-}
-fn max_var(e: &Core) -> u32 {
-    e.max_var()
 }
