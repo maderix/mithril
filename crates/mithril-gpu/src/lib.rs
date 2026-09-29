@@ -21,7 +21,7 @@
 mod cuda;
 mod runner;
 
-pub use runner::{compile_and_run, GpuResult, GpuRunner};
+pub use runner::{compile_and_run, compile_to_cubin, run_cubin, GpuResult, GpuRunner};
 
 /// `program.cu` for a specialized module (see `mithril_codegen::lower`).
 /// A program that reduced to a constant at compile time has nothing to

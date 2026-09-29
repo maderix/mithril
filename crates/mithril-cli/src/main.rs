@@ -68,7 +68,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove> f.py [--threads N] [--gpu] [-o out]";
+const USAGE: &str = "usage: mithril <run|build|net|prove> f.py [--threads N] [--gpu] [-o out] | mithril exec <artefact>";
 
 fn dispatch(args: &[String]) -> Result<i32, CliErr> {
     match args.first().map(String::as_str) {
@@ -76,6 +76,7 @@ fn dispatch(args: &[String]) -> Result<i32, CliErr> {
         Some("build") => cmd_build(&args[1..]),
         Some("net") => cmd_net(&args[1..]),
         Some("prove") => cmd_prove(&args[1..]),
+        Some("exec") => cmd_exec(&args[1..]),
         Some(other) => Err(format!("unknown subcommand '{}'\n{}", other, USAGE).into()),
         None => Err(USAGE.into()),
     }
@@ -279,7 +280,11 @@ fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
 
 fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
+    let t0 = std::time::Instant::now();
     let (sm, _) = specialized(&o)?;
+    if std::env::var_os("MITHRIL_TIMING").is_some() {
+        eprintln!("mithril: front end + specialization {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
     if o.gpu {
         return run_gpu(&sm);
     }
@@ -299,9 +304,25 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
     let o = parse_opts(args)?;
     let out = o.out.as_deref().ok_or("build requires -o <out>")?;
     let (sm, _) = specialized(&o)?;
-    compile_program(&sm, out)?;
+    if o.gpu {
+        build_gpu(&sm, out)?;
+    } else {
+        compile_program(&sm, out)?;
+    }
     println!("wrote {}", out.display());
     Ok(0)
+}
+
+/// `mithril exec <artefact>`: run a program `build --gpu` compiled, with no
+/// front end (what a timed run of a built program measures).
+fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
+    let path = Path::new(args.first().ok_or("exec needs the built artefact")?);
+    let bytes = fs::read(path)?;
+    if let Some(v) = bytes.strip_prefix(b"MITHRIL-CONST ") {
+        println!("{}", String::from_utf8_lossy(v).trim());
+        return Ok(0);
+    }
+    exec_gpu(path)
 }
 
 fn cmd_net(args: &[String]) -> Result<i32, CliErr> {
@@ -370,9 +391,44 @@ fn run_gpu(sm: &CoreModule) -> Result<i32, CliErr> {
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     let cache = target_dir().join("mithril-cache").join("gpu");
     fs::create_dir_all(&cache)?;
+    let t0 = std::time::Instant::now();
     let r = mithril_gpu::compile_and_run(&cu, boot, &cache).map_err(CliErr::Other)?;
+    if std::env::var_os("MITHRIL_TIMING").is_some() {
+        eprintln!("mithril: device compile-or-load + run + readback {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
     println!("{}", r.text);
     Ok(0)
+}
+
+#[cfg(feature = "gpu")]
+fn build_gpu(sm: &CoreModule, out: &Path) -> Result<(), CliErr> {
+    match mithril_gpu::emit_cuda(sm) {
+        Err(constant) => fs::write(out, format!("MITHRIL-CONST {constant}\n"))?,
+        Ok(cu) => {
+            let cache = target_dir().join("mithril-cache").join("gpu");
+            fs::create_dir_all(&cache)?;
+            fs::copy(mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn exec_gpu(path: &Path) -> Result<i32, CliErr> {
+    let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
+    let r = mithril_gpu::run_cubin(path, boot).map_err(CliErr::Other)?;
+    println!("{}", r.text);
+    Ok(0)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<(), CliErr> {
+    Err("gpu support not built; rebuild with --features gpu".into())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn exec_gpu(_path: &Path) -> Result<i32, CliErr> {
+    Err("gpu support not built; rebuild with --features gpu".into())
 }
 
 #[cfg(not(feature = "gpu"))]

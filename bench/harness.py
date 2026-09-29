@@ -393,6 +393,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=1200.0,
                     help="per-run timeout in seconds; exceeding it records DNF (default 1200)")
     ap.add_argument("--skip-gpu", action="store_true", help="never run the GPU lane")
+    ap.add_argument("--skip-cpu", action="store_true", help="skip the C, SEQ and PAR16 lanes (GPU only)")
     ap.add_argument("--no-build", action="store_true",
                     help="skip `cargo build` of mithril-cli (use existing binary)")
     ap.add_argument("--only", nargs="+", metavar="NAME")
@@ -427,7 +428,7 @@ def main():
             row = {"name": name, "expected": exp, "lanes": {}, "notes": [],
                    "build_error": None, "build_time": None}
 
-            if name in c_twins:
+            if name in c_twins and not args.skip_cpu:
                 binary, err = compile_c(name, tmpdir)
                 if err:
                     row["lanes"]["C"] = {"label": "C", "status": "FAILED", "time": None,
@@ -436,9 +437,11 @@ def main():
                     row["lanes"]["C"] = run_lane("C", [binary], exp, args.n, args.timeout)
             print("[harness]   C     : %s" % fmt_lane(row["lanes"].get("C")), flush=True)
 
-            mbin, btime, berr = compile_mithril(name, tmpdir, args.timeout)
+            mbin, btime, berr = (None, 0.0, None) if args.skip_cpu else compile_mithril(name, tmpdir, args.timeout)
             row["build_time"] = btime
-            if berr:
+            if args.skip_cpu:
+                pass
+            elif berr:
                 row["build_error"] = berr
                 print("[harness]   BUILD FAILED: %s" % berr, flush=True)
             else:
@@ -450,10 +453,15 @@ def main():
                     print("[harness]   %-6s: %s" % (label, fmt_lane(row["lanes"][label])),
                           flush=True)
                 if gpu_enabled:
+                    # the device lane times a built artefact (`build --gpu`
+                    # once, `exec` per run), as the CPU lanes and reference do
                     port = os.path.join(PORTS_DIR, name + ".py")
-                    row["lanes"]["GPU"] = run_lane(
-                        "GPU", [MITHRIL_BIN, "run", port, "--threads", str(PAR_THREADS),
-                                "--gpu"], exp, args.n, args.timeout, env="mithril", warm=True)
+                    art = os.path.join(tmpdir, name + ".gpu")
+                    b = subprocess.run([MITHRIL_BIN, "build", port, "--gpu", "-o", art], capture_output=True, text=True, timeout=args.timeout)
+                    if b.returncode != 0:
+                        row["lanes"]["GPU"] = {"label": "GPU", "cmd": "", "status": "FAILED", "time": None, "runs": [], "notes": "", "error": "build --gpu: " + b.stderr.strip()[-300:]}
+                    else:
+                        row["lanes"]["GPU"] = run_lane("GPU", [MITHRIL_BIN, "exec", art], exp, args.n, args.timeout, env="mithril")
             for l in row["lanes"].values():
                 if l["status"] != "ok":
                     print("[harness]   %s %s: %s" % (l["label"], l["status"], l["error"]),

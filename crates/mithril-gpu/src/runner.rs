@@ -208,6 +208,11 @@ fn nvcc_compile(dir: &Path) -> Result<(), String> {
 /// hit), load it through the driver API and run it (`k_run`). Returns the
 /// result port raw delivered to ROOT.
 pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<GpuResult, String> {
+    run_cubin(&compile_to_cubin(cu_src, cache_dir)?, boot)
+}
+
+/// The cached .cubin of a generated program (compiled on a cache miss).
+pub fn compile_to_cubin(cu_src: &str, cache_dir: &Path) -> Result<std::path::PathBuf, String> {
     // MITHRIL_GPU_CU=<file>: run a hand-edited program.cu instead (the SOP's
     // proof step before a change becomes a lowering)
     let edited = std::env::var("MITHRIL_GPU_CU").ok().map(|p| fs::read_to_string(&p).map_err(|e| format!("mithril-gpu: read {p}: {e}"))).transpose()?;
@@ -224,8 +229,18 @@ pub fn compile_and_run(cu_src: &str, boot: Redex, cache_dir: &Path) -> Result<Gp
             .map_err(|e| format!("mithril-gpu: write engine.cu: {e}"))?;
         nvcc_compile(&dir)?;
     }
-    let cubin = fs::read(&cubin_path).map_err(|e| format!("mithril-gpu: read cubin: {e}"))?;
-    GpuRunner::run(&cubin, boot)
+    Ok(cubin_path)
+}
+
+/// Run a compiled program (a prebuilt artefact: no front end).
+pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
+    let cubin = fs::read(cubin_path).map_err(|e| format!("mithril-gpu: read cubin: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let r = GpuRunner::run(&cubin, boot);
+    if std::env::var_os("MITHRIL_GPU_STATS").is_some() {
+        eprintln!("mithril-gpu: context create + run + destroy {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    r
 }
 
 /// Driver-API runner: loads a compiled .cubin and drives the wave loop.
@@ -238,10 +253,14 @@ impl GpuRunner {
             let mut dev = 0i32;
             cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
             let mut ctx: *mut c_void = std::ptr::null_mut();
+            let tc = std::time::Instant::now();
             cu(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate")?;
+            if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: cuCtxCreate {:.0} ms", tc.elapsed().as_secs_f64() * 1e3); }
             let r = run_in_ctx(cubin, boot, dev);
             // Destroying the context releases every allocation made in it.
+            let td = std::time::Instant::now();
             let _ = cuCtxDestroy_v2(ctx);
+            if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: cuCtxDestroy {:.0} ms", td.elapsed().as_secs_f64() * 1e3); }
             r
         }
     }
@@ -269,6 +288,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
 
     let mut module: *mut c_void = std::ptr::null_mut();
     cu(cuModuleLoadData(&mut module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
+    let t_load = t0.elapsed();
 
     // number of rules, published by the generated program
     let mut nr_ptr: CUdeviceptr = 0;
@@ -328,11 +348,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let budget = budget0.saturating_sub(8 * hcap);
     let max_ncap = (budget / 20).max(1 << 10).min(u32::MAX as u64 - 1);
     let ncap = if ncap_req > max_ncap {
-        eprintln!(
-            "mithril-gpu: warning: MITHRIL_GPU_NODES={ncap_req} does not fit in free VRAM \
-             ({} MiB); capping the cell arena to {max_ncap} cells",
-            vfree >> 20
-        );
+        // the default asks for more than most devices have: only a value the
+        // user set is worth a warning
+        if std::env::var_os("MITHRIL_GPU_NODES").is_some() {
+            eprintln!(
+                "mithril-gpu: warning: MITHRIL_GPU_NODES={ncap_req} does not fit in free VRAM \
+                 ({} MiB); capping the cell arena to {max_ncap} cells",
+                vfree >> 20
+            );
+        }
         max_ncap as u32
     } else {
         ncap_req as u32
@@ -545,7 +569,11 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     if ab != 0 {
         return Err(abort_message(ab));
     }
+    let t_before_read = t0.elapsed();
     let res = dtoh::<u64>(d.result, 2, "read result")?;
+    if std::env::var_os("MITHRIL_GPU_STATS").is_some() {
+        eprintln!("mithril-gpu: phases: module load {:.0} ms, arenas {:.0} ms, to readback {:.0} ms", t_load.as_secs_f64() * 1e3, (t_setup - t_load).as_secs_f64() * 1e3, (t_before_read - t_setup).as_secs_f64() * 1e3);
+    }
     if res[0] == 0 {
         return Err("mithril-gpu: run finished without delivering a result to ROOT".to_string());
     }
