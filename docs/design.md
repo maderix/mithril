@@ -1,205 +1,161 @@
-# Mithril — design as built (2026-09-28)
+# Mithril design
 
-This is the design *as implemented*, with the numbers that justify each
-part. The original spec is `docs/superpowers/specs/2026-09-27-mithril-design.md`;
-where this document disagrees with it, this document is what the code does.
+This document describes Mithril as the code implements it, with the
+measurements that justify each decision. The original intent is in
+`docs/superpowers/specs/`; where the two disagree, this document is what
+the code does. The core constraint and the working rules are in
+`CLAUDE.md`; nothing here overrides them. Every reference number is reference
+(reference/reference, the reference runtime), never reference 1 or HVM.
 
-## 1. Thesis and verdict
+Contents:
 
-Thesis: a language whose semantic core is interaction nets can be
-compiled to code that matches a state-of-the-art strict compiler (reference)
-sequentially, gets parallelism for free from the net model, and keeps the
-one thing nets give that strict compilers cannot: lazy sharing
-(`DUP`) as automatic runtime staging (spike 5: 40x on unstaged
-precomputation).
+1. Thesis and what it claims
+2. Pipeline
+3. Semantic core: the rule table, specialization, readback
+4. Types and ownership
+5. Lowering
+6. CPU runtime
+7. Device runtime
+8. Verification
+9. Measurement method
+10. Standings
+11. Use cases and scope
+12. Open items
+13. Process rules
 
-Derisk benchmark: tree-bitonic, depth 23 (8M leaves), same box as reference.
+## 1. Thesis and what it claims
 
-| | SEQ | PAR (16 threads, 8 cores) |
-|---|---|---|
-| reference (compiled C) | 10.78 s | 1.78 s |
-| C twin | 8.41 s | — |
-| Mithril, hand-written engine on the real runtime | 10.39 s | — |
-| Mithril, generated | **10.46 s** | **2.82 s** |
+Mithril is a language whose meaning is defined by interaction-net rules.
+One rule table runs at compile time on the part of the net that does not
+depend on runtime input, and at runtime on the rest.
 
-Verdict, stated plainly:
+The thesis has three claims.
 
-* **Sequential: the approach works.** Generated code reaches reference with
-  no per-benchmark logic. Every mechanism that got it there is a static
-  property the compiler proves about the program (§3) — the net runtime
-  costs nothing on the sequential path because the compiler removes it.
-* **Parallel: the net model gives parallelism without annotations, at a
-  cost.** 2.82 s vs 1.78 s is the price of the *wave* runtime (§4): work
-  becomes visible to other workers one barrier at a time, and each
-  dependency hop across a suspension costs a wave. A work-stealing pool
-  on the same protocol measured 2.05 s; it was reverted because it made
-  the CPU and GPU runtimes different machines. The gap is a property of
-  the wave model and is reported as such, not tuned around.
-* The genuine IN value (lazy sharing) is demonstrated by spike 5, not by
-  this suite; every port here is first-order strict code where reference's
-  design (no runtime nets) is the natural fit. This suite proves
-  *viability*, not superiority.
+* **Sequential parity.** A program whose semantic core is a net compiles
+  to code that matches a strict compiler (reference) at one thread. The net
+  costs nothing on the sequential path because the compiler proves the
+  static properties that let it remove the runtime machinery (sections 4
+  and 5).
+* **Parallelism from the model.** The rules are confluent, so any redex
+  order gives the same result. Work runs in parallel without annotations:
+  the lowering finds the fork sites in the program's own dependencies, and
+  the scheduler decides where redexes fire.
+* **Lazy sharing as runtime staging.** A value copied through `DUP` is
+  computed once, however many consumers it has. Work under a closure that
+  does not depend on the closure's parameter runs once. Strict compilers
+  cannot do this across data structures. Spike 5 measured 40x on unstaged
+  precomputation; the product's rule table reproduces the effect (section
+  3.4).
+
+What the benchmark suite proves: viability, not superiority. Every port
+is first-order strict code, the shape reference is designed for. The
+sharing claim is shown by the closure corpus (section 11), not by the
+suite.
 
 ## 2. Pipeline
 
 ```
 Python-subset source
-  -> parse -> desugar (loops -> tail-recursive fns; if/match statements
-     become one join continuation, not one copy of the rest per arm)
-  -> Core IR (mithril-front::core; reference interpreter = oracle)
+  -> parse, desugar (loops become tail-recursive functions; an if/match
+     statement becomes one join continuation, not a copy of the rest
+     per arm)
+  -> Core IR (mithril-front::core; eval_core is the reference oracle)
   -> specialization by the interaction rules (mithril-net::specialize):
-     every function's body is a net over unknown parameters, reduced to
-     quiescence; the residual net is read back as the new body (3b)
-  -> Core->Core shapes codegen owns (mithril-codegen::rewrite): mutual
-     tail recursion into loops, if-conversion of loop back-edges
-  -> type inference (ty.rs, monomorphic) -> unboxing, linearity
-  -> ANF normalize -> reuse marking
-  -> dual-mode lowering to `lir` (mithril-codegen::lir): native
-     sequential "dive" form + net "rule" form + native scalar form, one
-     statement IR over a fixed helper vocabulary (3c)
-  -> a printer per backend: `lir::rust` -> rustc -O against mithril-rt
-     (CPU); the CUDA printer is stage 2 (mithril-gpu today is a separate
-     v1 prototype)
+     each function body is a net over unknown parameters, reduced to
+     quiescence and read back as Core
+  -> Core rewrites codegen owns (mithril-codegen::rewrite): tail
+     inlining, if-conversion of loop back-edges, reuse marking
+  -> type inference (monomorphic), unboxing, linearity, borrowing
+  -> ANF normalization
+  -> lowering to LIR (mithril-codegen::lower -> LirProgram): dive forms,
+     rule forms, native scalar forms, the rule table, the net region
+  -> printers: lir::rust (rustc -O against mithril-rt, CPU) and
+     mithril_gpu::emit_cuda (program.cu against engine.cu, device)
 ```
 
-## 3. General mechanisms (each applies to every program)
+Nothing is decided twice. The CPU and the device run the same
+`LirProgram`; the printers differ only in syntax and in the runtime they
+call.
 
-Every item below is decided from the program's static structure; none
-inspects a benchmark name or shape.
+## 3. Semantic core
 
-| mechanism | what it proves / does | measured effect (tree-bitonic SEQ) |
-|---|---|---|
-| native scalar lowering (`scalar.rs`) | a function whose params/returns are ints or int tuples is emitted as plain `i64` Rust (`s_<f>`), incl. tuple-valued join points | mandelbrot 175 s -> 4.4 s |
-| unboxed unary int ctors | `Leaf(v)`-style ctors ride in the port word; no cell | part of 762G -> 254G instr |
-| static linearity (`LIN`) | a type never shared anywhere in the program carries no refcount traffic | " |
-| in-place reuse (`mark_reuse`) | a ctor built on a call-free path after a match consumed a same-arity cell reuses that cell | " |
-| leaf inlining (now the net's inline policy, 3b), join-point desugar | smaller hot functions (warp: 2235 -> 471 asm lines) | 254G -> 241G |
-| bounded functions | a function on no call cycle can never run out of fuel: plain call, no capture | no cost on nbody-style helper chains |
-| register-returned dives, out-of-line cold capture | `Result<u64,u64>`; suspension code never bloats the hot frame | 257G -> 241G |
-| Lean-checked reassociation | fold combiners proven associative are split in parallel | (fold ports) |
+### 3.1 The rule table
 
-Arrays (`array_new/get/set/len`; a heap block `[rc, len|boxed, elems]`,
-value semantics, in place when unique). Measured on bfs, 2^19 mazes (reference
-4.75 / 0.555 s):
+The rules live in `mithril_core::rules`, behind two traits. `Cells` is
+the store: cells, a redex worklist, a label supply. `Prog` is what a
+`Ref` unfolds into, how a builtin computes, where an uncomputable op
+goes, and the runtime's own value forms. The instantiation of a program
+into a net is `mithril_core::lower`.
 
-| mechanism | what it proves / does | bfs SEQ / PAR16 |
-|---|---|---|
-| (arrays in dive form, heap tuples) | | 26.7 / 3.72 |
-| native multi-value returns (`n_<f>`) | a dive function returning a k-tuple returns `[u64; k]`; `x = g(..)` followed by `xi = x[i]` bindings takes the components, no heap tuple; a suspension still delivers the boxed tuple to the continuation | 12.7 / 1.42 |
-| borrowed array reads | a read (`get`/`len`) lends the array; a param only read is borrowed (same escape analysis as shared ADTs); inlining substitutes variable args instead of alias lets | (in the above) |
-| int-element arrays | `Arr(true)` from inference (the element tyvar resolves to `Int`): tag-free reads, writes that free no old element; the `boxed` bit lets drop/copy skip element scans | 10.4 / 1.13 |
-| native code over int arrays (`scalar.rs`) | params are borrowed (only read) or owned (inferred by fixpoint); owned arrays are linear on every path (consumed at most once, never read after, freed at path end); tuple results carry an array mask | 9.65 / 0.94 |
-| small call-free functions inline always | rustc declines multi-site helpers; the loop body helper is the hot path | 5.63 / 0.59 |
-| static uniqueness | inside native code arrays are linear, and the bridge makes an owned array unique once (`arr_own`), so writes skip the refcount check | 5.19 / 0.52 |
-| leaf fuel at the call site | a call-free native function settles no fuel through the pointer; its one unit is a register increment in the caller (fuel keeps measuring the same work, so parallel split granularity is unchanged) | 4.85 / 0.48 |
-| selects as mask arithmetic | an `if` choosing between computed atoms (what if-conversion leaves) is emitted as `(a & m) \| (b & !m)`, which the backend cannot turn back into a branch on a loop-carried chain | **4.48 / 0.45** |
+The same implementation serves two stores. The compile-time reducer is
+`Net: Cells` with the specialization policy as its `Prog`. A CPU runtime
+worker is `Wctx: Cells` (the same two-word cells) with the generated
+program as its `Prog`. It is compiled once, in `mithril-rt`
+(`reduce_net` takes `&dyn Prog`).
 
-Native int representation (editdist, whose DP cell is a loop-carried
-add/min chain over array words: 4.05 s -> 2.80 s SEQ, 0.53 -> 0.35 s PAR):
-native functions hold ints either *plain* (canonical i56 in an i64; an op
-whose range is not proven re-wraps with two shifts; masked 32-bit
-arithmetic runs in u32) or *pre-shifted* (`x << 8`: i64 wrapping is i56
-wrapping, so add/sub/compare/min need no wrap; a var-by-var multiply, a
-right shift, an array index and division cost one op). Int arrays store
-the pre-shifted word (`ARR_RAW`), tagged <-> shifted is one op. Each
-function takes the representation with the lower static op count,
-charging the conversions on call edges to functions of the other
-representation (so a recursive pair never splits: queens stays all
-plain). The context argument is passed only to native functions that
-touch arrays (argument registers matter for recursive natives), and
-`#[inline(always)]` is decided on literally call-free bodies plus
-single-site `while`/`for` helpers (a function's own loop); without the
-latter, which member of a recursive cycle absorbs the other was an
-accident of ordering (queens 4.8 vs 5.3 s).
+The rules: `REF` unfold, erase and closure copy; wiring as the static
+gate; `Kont` delivery; beta; `OP` with the operand-swap half step and
+`OP-SUP`; `SWI`; `MAT` with projections and unboxed constructors; `DUP`
+of values and lambdas; the `DUP` commutations (`Dup-Op`, `Dup-App`,
+`Dup-Swi`, `Dup-Mat`); `DUP-DUP`; `ERA`.
 
-Length locals (editdist 2.80 -> 2.27 s): in a call-free native loop that
-writes one array and also accesses another, each array's length is held
-in a loop variable, because the write may alias the other array's header
-and would force a length reload per access. Elsewhere the backend already
-hoists the header load, and a register length only obstructs it: it
-blocked vectorization of bfs's fill loop and caused spills in its BFS loop,
-which carries four inlined helpers. Measured, not assumed: every variant
-was built by hand first.
+Dup labels are dynamic. Every sharing site takes a fresh 24-bit label. A
+copy of a dup (through a constructor, a lambda or a commutation) carries
+the copier's label. The same label means the two halves of one copy meet
+and annihilate; different labels commute. A single label class is wrong
+as soon as a copied closure shares its own parameter (`twice(sq, 3)`).
+Each fan-out cell has its own label.
 
-Known inference weakness: ints are unified through arithmetic, so one
-heterogeneous array (ints and lists in the same array) poisons the element
-type and every int connected to it becomes `Dyn` (correct, tagged code;
-slower). No port does this; `tests/fixtures/hetero_array.py` covers the
-runtime conversion separately.
+The device carries a second, hand-written implementation of the same
+rules in `crates/mithril-gpu/cuda/engine.cu`. It is held to the first by
+the oracle tests (section 8). One source for both is an open item.
 
-Each step was first proven on hand-edited generated code (the same
-runtime helpers), then made a codegen rule; the final generated code
-matches the hand proof.
-
-Refcounting is Perceus-style (u8 saturating), used only where linearity
-cannot be proven; chained (arity > 2) constructors move their fields on
-consume like arity <= 2 ones do.
-
-## 3b. The net as the optimizer of record (`mithril-net::specialize`)
+### 3.2 Specialization: the net as the optimizer of record
 
 Constant folding, inlining, branch selection, static evaluation and
-unrolling are not passes: they are the interaction rules firing early, on
-the redexes that do not depend on runtime input. `mithril net f.py` prints
-what reduction did per function (rewrites, calls kept, ops kept, calls
-evaluated, size before/after; `MITHRIL_NET_CORE=1` dumps the bodies,
-`MITHRIL_NET_TRACE=1` narrates). The Core rewrites that duplicated this
-(`inline_leaves`, `unfold_static`, constant folding) are deleted.
+unrolling are not passes. They are the rules firing early, on redexes
+that do not depend on runtime input. `mithril net f.py` prints what
+reduction did per function (rewrites, calls kept, ops kept, calls
+evaluated, size before and after). `MITHRIL_NET_CORE=1` dumps the bodies;
+`MITHRIL_NET_TRACE=1` narrates.
 
-How a function is specialized:
+A function is specialized as follows.
 
-* its body is built as a net whose parameters are unfilled wires; the
+* Its body is built as a net whose parameters are unfilled wires. The
   static gate lets a rule fire only between two non-variable ports, so
-  everything independent of the parameters reduces (ops on constants,
-  branches and matches on known values, sharing, calls the inline policy
-  unfolds: call-free callees of size <= 96);
-* a call the policy did not unfold is *settled*: all arguments known ->
-  evaluated in a scratch net (fuel 200k, value <= 4096 cells) and replaced
-  by its value; some known -> unfolded speculatively (below); else kept;
-* every branch parked on an unknown value has its arms instantiated (each
-  in its own scope frame, pattern binders as fresh unknown wires) and
-  reduced the same way, to a fixpoint: code under runtime branches is
-  specialized too;
-* the residual net is read back as Core: single-use scalar expressions
-  nest, calls / projections / data / matches are let-bound where used,
-  a value shared through `Dup` is bound once in the frame it was created
-  in (let-normal form only where sharing or evaluation order needs it,
-  because codegen's cost models read the shape: if-conversion measures
-  arm *work*, not bindings, for this reason).
+  everything independent of the parameters reduces: ops on constants,
+  branches and matches on known values, sharing, and calls the inline
+  policy unfolds (call-free callees of size at most 96).
+* A call the policy did not unfold is settled. If all arguments are
+  known, it is evaluated in a scratch net (200,000 rewrites, a value of
+  at most 4,096 cells) and replaced by its value. If some are known, it
+  is unfolded speculatively (below). Otherwise it is kept.
+* A branch parked on an unknown value has its arms instantiated, each in
+  its own scope frame with pattern binders as fresh unknown wires, and
+  reduced the same way to a fixpoint. Code under runtime branches is
+  specialized too.
 
-Speculative unfolding (the old `unfold_static`, as rules): a call with
-some known arguments is instantiated in a clone of the whole state and
-specialized to its fixpoint, its own calls unfolded in turn (a loop with
-a static bound unrolls as a chain, a branch inside it keeps both arms).
-It is accepted, replacing the state, only when its control was static:
-no call of its own remains, no match on a runtime value, no constructor
-over unknown fields (a data builder is not code to unroll: `symreg`'s
-`gen(5, ..)` doubled the program for no instruction gain), and the growth
-is within 2000 agents (ops, branches, data; wires are free — the old
-2000-binding limit). Budgets: 50k rewrites per top-level attempt shared
-by everything nested in it, 400k per function; a failed attempt is
-memoized by (callee, which-arguments-known) so it is not retried per
-arm; the growth ceiling is inherited by nested attempts so a 300-iteration
-chain stops at the ceiling, not at the depth limit (256). Inside a
-speculation only the branches the speculated body parked are
-instantiated, and the first new residual call aborts it (a rejected
-attempt used to instantiate every arm of its 2^k paths first).
+Speculative unfolding instantiates the call in a clone of the whole state
+and specializes it to its fixpoint, unfolding its own calls in turn. A
+loop with a static bound unrolls as a chain; a branch inside it keeps
+both arms. The attempt is accepted only when its control was static: no
+call of its own remains, no match on a runtime value, no constructor over
+unknown fields, and growth within 2,000 agents (ops, branches, data;
+wires are free). A data builder is not code to unroll: symreg's
+`gen(5, ..)` doubled the program for no instruction gain, hence the
+constructor condition. Budgets: 50,000 rewrites per top-level attempt,
+shared by everything nested in it; 400,000 per function; nesting depth
+256. A failed attempt is memoized by (callee, which arguments are known).
+The growth ceiling is inherited by nested attempts, so a 300-iteration
+chain stops at the ceiling. Inside a speculation only the branches the
+speculated body parked are instantiated, and the first new residual call
+aborts it.
 
-Evidence (tests/ci/fast.py vs the pre-specializer baseline): 16/16
-checksums; instructions within 3 % everywhere (gameoflife's `board_step`
-16-iteration unroll and merkle's `spk(22, ..)` chain recovered exactly
-the old numbers, 3.54G and 0.27G); code size within the gate. `alias`
-(one array lent and moved into the same call) is now inlined and lowered
-natively: the native body reads the array before the in-place write.
-A loop with one state variable returns the value itself (no 1-tuple, no
-`Proj`; the fold join combines bare partial results), which also made
-mandelbrot/terrain's loop helpers native-scalar.
-
-The thesis on a spike-5 shape, with the first-order stack: an expression
-interpreter (`ev`/`look` over an AST with `Let`/`If`/arith and an
-association-list environment) applied to a constant program and a
-dynamic input specializes, by the rules alone, to the program's own
-arithmetic — no match, no call, no constructor left (the first Futamura
-projection, `specialize_test::interpreter_over_a_static_program_...`):
+The first Futamura projection falls out of the rules. An expression
+interpreter (`ev`/`look` over an AST with `Let`, `If` and arithmetic, the
+environment an association list) applied to a constant program and a
+dynamic input specializes to the program's own arithmetic, with no match,
+call or constructor left:
 
 ```
 run(x) = ev(prog(), Bind(0, x, Emp()))          # 605 rewrites
@@ -207,818 +163,871 @@ run(x) = ev(prog(), Bind(0, x, Emp()))          # 605 rewrites
         if v != 0 { (v + ((x * x) & M)) & M } else { 7 }
 ```
 
-Nothing in the specializer knows what an interpreter is: matches on
-known constructors select, `look`'s recursion over the known environment
-unfolds, the `Let` case's environment cell is consumed by the lookup that
-reads it, and only the branch and ops on the input stay. Phase B
-(closures shared by `DUP` at runtime) extends the same mechanism to
-programs whose static part is only known at runtime.
+Nothing in the specializer knows what an interpreter is. Test:
+`specialize_test::interpreter_over_a_static_program_...`.
 
-### Phase B derisk: sharing on the real rule table (`examples/spike_w2.rs`)
+### 3.3 Readback
 
-Before building closures into the language, spike 5's W2 shape was run on
-the product's rules and reducer (not the spike's toy evaluator): `g = λx.
-x + heavy(k)` built once, copied through a chain of DUPs, applied N times.
-This needed the Dup commutations the first-order rule set lacked
-(Dup–Op/App/Swi/Mat: the consumer passes through the superposition; a
-Ref facing a Dup just unfolds once with the Dup as its ret). k = 24,
-W = 1,500,491 rewrites:
+The residual net is read back as Core. Single-use scalar expressions
+nest. Calls, projections, data and matches are let-bound where used. A
+value shared through `Dup` is bound once. Let-normal form is used only
+where sharing or evaluation order needs it, because codegen's cost models
+read the shape (if-conversion measures arm work, not bindings).
 
-| N | rewrites | strict N·W | per application | time |
-|---|---|---|---|---|
-| 1 | 1,500,491 | 1.5M | — | 0.094 s |
-| 256 | 1,502,531 | 384M | 8.0 | 0.111 s |
-| 4096 | 1,533,251 | 6.1G | 8.0 | 0.111 s |
-| 65536 | 2,024,771 | 98G | 8.0 | 0.135 s |
+Placement is one rule, `place`, for plain, shared and call values.
 
-Exactly W + 8N on both schedules (heavy before or after the copies are
-queued), values oracle-equal; the reducer runs ~16M rewrites/s. So the
-runtime claim is a property of the rules, not of the spike's evaluator,
-and the constant per shared application is 8 rewrites. Regression:
-`reduce_test::shared_closure_computes_its_free_work_once`.
+* The specializer records the scope frame in which the net created each
+  pending call, keyed by the call's result wire. The key is the result
+  wire because it is unique per residual call; the `Ref` port is not
+  (every nullary call to one function shares it).
+* A value created in an outer frame is bound in that frame: the arms
+  above it are skipped, because the net made the value there
+  unconditionally. A frame read this way is a floor, not a push, so the
+  closures between stay visible.
+* A value is never bound below the innermost frame that binds something
+  it reads.
+* A closure keeps a value exactly when the value reads something the
+  closure binds (its parameter, or a value bound in it or in a frame
+  nested in it). Otherwise the value moves out and every application
+  shares it: `mk(k) = λx. x + heavy(k)` reads back as
+  `let h = heavy(k) in λx. x + h`.
+* A pending call or `Dup` whose value depends on an unapplied closure's
+  parameter (`needs_param`) is not stamped at the first settle that
+  reaches it; it is stamped at the settle where the application fires.
+* A call created in the frame that uses it is read in place, so tail
+  calls stay tail calls.
+* A shared `Dup` binding is cached by (cell, selection), because one Dup
+  read under different superposition sides is different values.
 
-### Phase B, steps 1–2: closures in Core and in the net
+Placement matters for parallelism, not only for scope. The net fires a
+call as soon as its arguments exist. Binding the call where its result is
+first used adds a dependency the net does not have: in bitonic's `warp`
+it nested the second recursive call inside the match on the first, and
+the rule form could not fork the pair. With calls placed where the net
+created them, a 2^16-leaf warp on the device took 12 ms against 1,454 ms,
+and bitonic CPU instructions went from 0.965 G to 0.912 G.
 
-`Core::Lam(x, body)` / `Core::App(f, a)`; desugar curries `lambda a, b:`,
-compiles a call on a local variable to `App`s, and eta-expands a
-top-level function used as a value. Capture is wiring: a closure's free
-variables are the enclosing `Var`s, lowered to the wires they already
-flow through (dup-fanned by the same `bind` as every other shared value).
-`eval_core` gets closure values (parameter, body, captured env) for the
-oracle only.
+A residual `Lam` reads as `Core::Lam` with its own frame. A parked `App`
+on an unknown function reads as `App`. The reader un-superposes lazily
+copied closures by selecting sides per copy label, with superpositions
+classified to a fixpoint.
 
-Net: `Lam` cells `[param, body]` built eagerly (the body is a net region;
-work in it that does not depend on the parameter fires when the closure is
-built — once), `App` cells `[arg, ret]`; beta was there. Dup labels are
-dynamic: every sharing site takes a fresh 24-bit label, a copy of a dup
-(through a constructor, a lambda, a commutation) carries the copier's
-label; same label = the two halves of one copy meeting = annihilate,
-different = commute (Dup–Dup, Dup–Op/App/Swi/Mat). A single label class
-was wrong the moment a copied closure shared its own parameter
-(`twice(sq, 3)`). Clone discipline (`check_clone_discipline`): no closure
-applied to itself (`App(f, Var v)` with `v` free in `f`, through `Let`
-aliases) — the oracle-needing cases; `f(f(x))`, factories, closures
-capturing closures, `map` with a lambda are in.
+### 3.4 Closures and runtime sharing
 
-Readback: a residual `Lam` reads as `Core::Lam` with its own frame; a
-compound read inside a closure is bound in the innermost frame that needs
-it — closure frames whose parameter it does not mention are peeled (so
-`mk(k) = λx. x + heavy(k)` reads back as `let h = heavy(k) in λx. x + h`:
-the sharing the net computed survives into the residual program), branch
-frames never are. A parked `App` on an unknown function reads as `App`.
+`Core::Lam(x, body)` and `Core::App(f, a)`. Desugar curries
+`lambda a, b:`, compiles a call on a local variable to `App`s, and
+eta-expands a top-level function used as a value. Capture is wiring: a
+closure's free variables are the wires they already flow through,
+dup-fanned by the same binding as every other shared value.
 
-Evidence: source programs (factory, `twice`, `compose`, `map` with a
-capturing lambda) reduce to the oracle value; W2 from source is linear in
-N (`reduce_test`); `mk(3)` applied twice specializes to a constant; a
-returned closure specializes to a lambda; fast.py unchanged (first-order
-paths untouched). Codegen refuses `Lam`/`App` until step 3.
+In the net a `Lam` cell `[param, body]` is built eagerly: work in the
+body that does not depend on the parameter fires when the closure is
+built, once. The clone discipline (`check_clone_discipline`) rejects a
+closure applied to itself (`App(f, Var v)` with `v` free in `f`, through
+`Let` aliases). `f(f(x))`, factories, closures capturing closures and
+`map` with a lambda are accepted.
 
-### Phase B, step 3: the runtime runs the same rule table
+The runtime runs the same table. A compiled program has a net region:
 
-The rules moved to `mithril_core::rules` behind two traits — `Cells` (the
-store: cells, a redex worklist, a label supply) and `Prog` (what a `Ref`
-unfolds into, how a builtin computes, where an uncomputable op goes, the
-runtime's own value forms) — and the derived program's instantiation to
-`mithril_core::lower`. The compile-time reducer is `Net: Cells` with the
-specialization policy as its `Prog`; a runtime worker is `Wctx: Cells`
-(its arena is the same two-word cells) with the generated program as its
-`Prog`. One implementation, compiled once in `mithril-rt`
-(`reduce_net` takes `&dyn Prog`).
-
-A compiled program's *net region*:
-
-* its entry table (`net_entries`: the closures compiled code builds and,
-  transitively, the branches/arms their bodies mention; a real function
-  is never instantiated — a `Ref` to it spawns its CALL rule, and a FILL
-  record links the result back into the wire the net was waiting on);
+* an entry table (`net_entries`): the closures compiled code builds and,
+  transitively, the branches and arms their bodies mention. A real
+  function is never instantiated as a net; a `Ref` to it spawns its CALL
+  rule, and a FILL record links the result back into the waiting wire;
 * two engine rules: NET (generic redexes spilled on fuel-out, or a value
-  delivered into the net from another worker) and FILL;
-* the bridge: `build_closure` (instantiate the closure's entry over the
-  captured values), `apply` (dive form: an App cell reduced in place,
-  the value returned when it arrives within budget, otherwise a
-  forwarding record the result is delivered to through a `Kont` port —
-  the dive suspends like on a call), `apply_spawn` (rule form: the
-  continuation waits in a record), `dup_closure` (sharing a closure
-  value from compiled code *is* the DUP–LAM rule, `copy_lam`, with the
-  original cell as the first copy so the caller's port stays valid),
-  and erasure of a dropped closure by the Era rule.
+  delivered into the net) and FILL;
+* the bridge: `build_closure`, `apply` (dive form: the App cell reduced
+  in place, the value returned within budget, otherwise a forwarding
+  record fed through a `Kont` port), `apply_spawn` (rule form),
+  `dup_closure` (the `DUP-LAM` rule, with the original cell as the first
+  copy so the caller's port stays valid), and erasure of a dropped
+  closure by `ERA`.
 
-Value forms meet across the boundary unchanged (Num/Con encodings are
-the same; arrays moved to tag 14, unboxed constructors are the runtime's
-ext values the rules copy/erase/match through the program's helpers).
-Closures in compiled code are opaque `Lam` ports until applied.
+Value forms cross the boundary unchanged. Closures in compiled code are
+opaque `Lam` ports until applied. On the device, entries are printed as
+straight-line net builders (`inst_<e>`) from the same `NExpr` bodies the
+CPU interprets.
 
-Evidence (`codegen_test`): every closure shape (factory, `twice` on a
-top-level function and on a lambda, `compose`, `map` with a capturing
-lambda, a closure shared and applied in a loop, closures in data) is
-oracle-equal at 1/4/16 threads and under fuel starvation; W2 at runtime
-(`mk(k) = λx. x + heavy(k)`, k opaque) applied 4096 times: the oracle
-value, 20,485 rewrites (5 per application, `heavy` once, 0.00 s) against
-a strict twin that calls `heavy` per iteration (0.61 s); 65,536
-applications: 327,685 rewrites, 0.01 s. Same value and same rewrite
-count at 16 threads. fast.py: instruction counts unchanged; generated
-programs carry the region's fixed cost in rustc time (bfs 0.6 → 0.8 s).
+The sharing constant, measured on the W2 shape (`g = λx. x + heavy(k)`
+built once, copied through a chain of DUPs, applied N times):
 
-### Phase B, step 4: the proof programs (`bench/general`)
+| engine | condition | rewrites | per application |
+|---|---|---|---|
+| compile-time reducer (`examples/spike_w2.rs`) | k = 24, W = 1,500,491, N = 1 to 65,536, both schedules | exactly W + 8N | 8 |
+| generated program, CPU runtime | `heavy` opaque, 4,096 applications | 20,485 | 5 |
+| generated program, CPU runtime | 65,536 applications | 327,685 | 5 |
 
-Three closure programs joined the generality corpus, each with a Python
-oracle and an idiomatic Rust twin written the way the source is written
-(closures recompute what is under them; nobody hoists by hand):
+The reducer runs about 16 M rewrites/s. The 4,096-application run takes
+0.00 s against 0.61 s for a strict twin that calls `heavy` per
+iteration; the rewrite count is the same at 16 threads. Regression tests:
+`reduce_test::shared_closure_computes_its_free_work_once` and the
+`w2_runtime` fixture.
 
-| program | shape | Rust twin | Mithril t1 / t16 | note |
-|---|---|---|---|---|
-| `stage_closure` | W2: `mk(k) = λx. x + heavy(k)`, 20k applications | 0.00 s | 0.00 / 0.00 s | LLVM hoists the pure call out of the loop inside one function; both do the work once |
-| `pipeline_cfg` | stage closures built from a runtime config, in a list, applied to 20k inputs | 0.29 s | **0.01 / 0.01 s** | closures stored in data: Rust cannot hoist across the `Box<dyn Fn>`; the net runs each stage's setup once (20–29× faster than the Rust program as written) |
-| `interp_closure` | closure compilation of a runtime AST, applied to 20k environments | 0.01 s | 5.8 / 6.1 s | no work to share (everything depends on the environment): every application copies the closure tree by the DUP rules — the cost of the model on closure-heavy code with no sharing win, ~450× |
+## 4. Types and ownership
 
-All oracle-equal, parallel == sequential. The first two are the thesis
-at runtime: work under a closure that does not depend on its parameter
-is done once by the rules, wherever the closure is composed. The third
-is the price: a closure whose whole body depends on its parameter gains
-nothing from lazy copying and pays the per-rewrite constant on every
-application. That is the next target (a closure body with no
-parameter-free work can be applied by compiled code directly, the same
-rule table deciding when), not a tuning question.
+### 4.1 Types
 
-reference on these shapes: its closures are affine (used once), so a
-closure applied n times must be rewritten to recompute — reference runs the
-strict twin, which is what the Rust column measures. A timed reference lane
-for the corpus is not set up (the reference toolchain lives in a container;
-see reference/reference-notes.md).
+Inference (`ty.rs`) is monomorphic. It has a function type, so an ADT
+field holding both ints and closures poisons to `Dyn` (a closure is never
+an immediate). Ints are unified through arithmetic, so one heterogeneous
+array (ints and lists in one array) poisons every connected int to
+`Dyn`: correct tagged code, slower. No port does this;
+`hetero_array.py` covers the runtime conversion.
 
-Sound-ness notes from getting here (all in the rule table or the
-reader, none in a benchmark): a `Ref` to a compiled function waits for
-produced arguments (a call met inside a closure being built runs as a net
-instead); a `Dup` meeting an arm closure copies it (never unfolds it);
-`Dup–Mat/Swi` commutations copy the arm closures eagerly so arm slots
-always hold closures; `Op` with a superposed operand commutes (OP–SUP);
-each fan-out cell has its own label; the reader un-superposes lazily
-copied closures by selecting sides per copy label (sup/dup readback),
-with superpositions classified to a fixpoint; type inference has a
-function type so an ADT field holding both ints and closures poisons to
-Dyn (a closure is never an immediate); applying a closure consumes it,
-so one read from a borrowed structure is copied first (`dup_val` on a
-closure is the DUP–LAM rule with the original cell as the first copy).
+Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
+f32 bit patterns operated on by builtins; a static f32 type is planned.
+Comparisons with NaN follow IEEE (only `!=` holds), one definition shared
+by the oracle and the reducer. A variable stays boolean across loops and
+joins when every assignment to it is boolean.
 
-Oracle checks: `specialize_test.rs` (every fixture: specialized ==
-original under `eval_core`; the policy cases above) and
-`examples/spec_oracle.rs` (bisects a whole program to the function whose
-specialization changed its value).
+### 4.2 Representation
 
-### 3b-2. Readback places calls where the net created them
+* Unary constructors over an int (`Leaf(v)`) are unboxed: they ride in
+  the port word, no cell.
+* Arrays are heap blocks `[count, len | flags, elems]` with value
+  semantics, written in place when unique. `Arr(true)` (element type
+  resolved to `Int`) gives tag-free reads and writes that free no old
+  element; the `boxed` flag lets drop and copy skip element scans. Int
+  arrays store the pre-shifted word (`ARR_RAW`).
+* A type never shared anywhere in the program is linear (`LIN`) and
+  carries no count traffic.
 
-The net fires a call as soon as its arguments exist. The reader used to
-write a call where its result was first used, so in bitonic's `warp`
-(whose inlined zip matches the first recursive result before touching the
-second) the second call was nested inside the match on the first: a
-dependency the net does not have, and one that stops the rule form from
-forking the pair. The specializer records the scope frame of each pending
-call, keyed by the call's result wire (unique per residual call; the Ref
-port is not, every nullary call to a function shares one), and the reader
-binds the call there. Frames are recorded per settle and a closure body
-is not one, so the recorded frame alone cannot decide closures. One rule
-places every bound value, plain, shared (Dup) or a call (`place`): while
-a value created in an outer frame is read, the arms above that frame are
-skipped (the net made the value there, unconditionally), and a closure
-keeps the value exactly when the value reads something the closure binds
-(its parameter, a value bound in it or in a frame nested in it);
-otherwise the value moves out and every application shares it, which is
-the net's DUP sharing. A call created in the frame that uses it is read
-in place, so tail calls stay tail calls.
+### 4.3 The access model
 
-Two independent reviews shaped this. The first found a closure escape
-and a key collision (nullary calls shared the Ref port as key; calls are
-now keyed by their result wire). The second found that the first fix
-still let a shared value escape a closure (`lambda x: sq(fib(x) + k)`,
-pre-existing) and, worse, rebuilt a call the net computes once outside a
-closure inside it, once per application (a sharing regression). Pushing
-the recorded frame on top of the reader's stack hid the closures between;
-reading "in frame F" is now a floor, not a push.
+Shared data is lent. Counts move only when ownership moves.
 
-Numbers: a 2^16-leaf warp on the GPU 1454 ms -> 12 ms; bitonic CPU
-instructions 0.965 G -> 0.912 G. Tests (specialize_test): independence of
-the pair (fails with the hoist disabled), tail calls, closure-body calls
-in scope (3 shapes), branch-only nullary call stays in its branch, shared
-call stays in its arm, shared values in closure bodies stay in scope (2
-shapes), a call outside a closure is shared by every application. Each
-bug test fails on the commit it guards.
+* A lent value costs no atomic. Field reads and pattern matches on a
+  borrowed parameter touch no count.
+* A stored, returned or owned-passed value costs one O(1) increment. A
+  drop is a decrement; the last one tears the value down.
+* A parameter only read is borrowed (escape analysis, a fixpoint over the
+  program). An integer is an immediate and never escapes; counting an int
+  field returned from a lent tree as an escape made the k-d tree's
+  `nearest` own the tree and pay three atomics per node visit on cells
+  every lane shares.
+* A binding is owned unless it aliases a lent value. A lent read bound by
+  a branch (`p = lft(a)` after the net inlines `lft`) is therefore copied
+  (one increment). Fixture `lent_pick.py`.
+* Applying a closure consumes it, so a closure read from a borrowed
+  structure is copied first (`dup_val` on a closure is `DUP-LAM`).
+* Counts are 32-bit atomics on both runtimes. Saturating 8-bit counts
+  (fetch_add then store) let a count pass through zero under concurrent
+  increments, so a reader saw a shared root as unique and freed it.
+  Fixture `shared_tree.py` at 16 threads.
 
-### 3b-3. Placement follows what a value reads; sharing per selection
+Refcounting is used only where linearity cannot be proven (Perceus
+style). Constructors of any arity move their fields on consume.
 
-The third review of 3b-2 found three readback bugs, two of them wrong
-answers with no error. (1) A shared Dup's binding was cached by its cell
-alone: a closure applied twice at compile time to different arguments
-reads the same Dup under different superposition sides, and the second
-application reused the first's value (oracle 1157, program 2). The cache
-is keyed by (cell, selection); the key is the whole selection, so a
-captured shared value read under three selections is bound three times
-(duplicated work, not a wrong answer; keying by the selections a read
-consults is the pending refinement). (2) A pending call inside an
-unapplied closure's body was stamped with the frame of the first settle
-that reached it, so when the closure was applied inside an arm the call
-bound outside the arm: a diverging call then ran on the other path, or a
-match binder was read before its match. The specializer now stamps no
-pending call or Dup whose value depends on an unapplied closure's
-parameter (`needs_param`, a walk over the producers); it is stamped at
-the settle where the application fired. In the reader, `place` also never
-binds a value below the innermost frame binding something it reads, and
-a frame read as the floor is exactly that frame's position. Tests: the
-shapes (the call's argument made in the branch, a parameter, a match
-arm), oracle-equal, scoped, the call kept under its branch. Open: a
-closure created in an arm capturing a pattern binder, applied twice,
-ICEs in the reader (an ignored test); two specializer crashes on nested
-closures with conditionals (`mithril-core` net.rs:54 and rules.rs:290,
-the reviewer's probes b4/b5).
+### 4.4 Reuse
 
-The device stack guard (with 3f): a native scalar function's non-tail
-recursion has no budget, so on the device its frames overflowed the
-32 KiB thread stack as a driver fault. Every dive form and every native
-function whose frames can pile up (a non-tail self call, or a cycle
-through other functions) now begins with `stack_guard`, a no-op on the
-CPU; the device compares the PTX stack pointer with the one at kernel
-entry against the runner's limit and leaves the frame with a named abort
-("recursion too deep for the device"). Guarding every non-leaf native
-function cost raytrace 3x (isect is called 10^8 times), hence the
-recursion test; with it, raytrace and bitonic are unchanged.
+`mark_reuse`: a constructor built on a call-free straight-line path after
+a match consumed a same-arity cell is built in that cell. The token never
+crosses a call, a value-position branch or a loop back-edge, and every
+path that does not use a token releases it at its terminal.
 
-### 3c. One lowering, printers per backend (stage 1 of the shared backend)
+Inside native code arrays are linear, and the bridge makes an owned array
+unique once (`arr_own`), so writes skip the count check. Owned arrays in
+native code are consumed at most once on every path, never read after,
+and freed at path end.
 
-Decided 2026-09-28, after Phase B. Every emitter used to print Rust text
-directly, and the GPU crate carried its own weaker lowering of Core. The
-three stages toward one backend: (1) pull the decisions out of the
-printers into an IR; (2) a device runtime and a CUDA printer of the same
-IR; (3) the rule table (closures, DUP) on the device, GPU lane in the gate.
+## 5. Lowering
 
-Stage 1, done (b890872..b1a8372):
+### 5.1 LIR and printers
 
-* `Core` carries its traversal once (`kids/any/walk/fold/rename/
-  free_vars/max_var`); 40 hand-written walkers across codegen, net and gpu
-  became one-line predicates.
-* `mithril-codegen::lir`: locals with declared types; `If`/`Switch`/`Loop`
-  at statement level (value branches lower to a declaration plus
-  assignments); `Try` = a call that may suspend, with the handler that
-  leaves the function; `Res` = a two-outcome match; nested cold functions
-  for suspension captures (their parameters come from `free_locals` on the
-  IR, not from scanning text). Every emitter (dive, rule/segment, fold
-  split/join, CALL and hole rules, base-case wrappers, native scalar)
-  builds it; `lir::rust::func` prints it. Generated code names the worker
-  context only through free functions of `mithril_rt::prelude` (`alloc2`,
-  `alloc_rec`, `deliver`, `dive_to`, `dive_res`, `pop_chain`, `rec_*`, ..),
-  so a backend without a context object supplies the same names over its
-  own arena. The IR's helper vocabulary is the device runtime contract of
-  stage 2.
-* The value helpers (`mk_con`, `consume*`, `dup_val`, `free_val`,
-  `take_field`, `untup`, `arr_*`, `bin`, `cmp`, `show`) left the generated
-  prelude for `mithril_rt::prelude`, generic over a `Tables` trait the
-  program implements (`lin`, `unbox_cid`, closure dup/drop). They were
-  pasted into every program only for `lin(k)` to constant-fold; it still
-  does, per instantiation.
+`mithril-codegen::lir` is one statement IR: typed locals; `If`, `Switch`
+and `Loop` at statement level (value branches lower to a declaration plus
+assignments); `Try`, a call that may suspend, with the handler that
+leaves the function; `Res`, a two-outcome match; nested cold functions
+for suspension captures, whose parameters come from the IR's free
+locals. Every emitter builds LIR: dive forms, rule forms and segments,
+fold split and join, CALL and hole rules, base-case wrappers, native
+scalar forms.
 
-Numbers: oracle-equal on all 31 codegen tests and all 16 ports at every
-step; instruction counts identical to the baseline on every measured
-port (the moved helpers carry `#[inline]`; without it lexer/tree-radix
-ran 16-21% more instructions, i.e. it restores the previous placement,
-not a new choice). Language crates (front, core, net, reassoc, codegen,
-cli): 15,229 -> 14,798 lines; runtime 1,527 -> 2,093.
+Generated code names the runtime only through a fixed helper vocabulary
+(`alloc2`, `alloc_rec`, `deliver`, `dive_to`, `dive_res`, `pop_chain`,
+`rec_*`, `mk_con`, `consume*`, `dup_val`, `free_val`, `take_field`,
+`arr_*`, ...). The CPU implements it in `mithril_rt::prelude`, generic
+over a `Tables` trait the program implements; the device implements it
+in `engine.cu`. The program templates (net region, `Program` impl,
+`main`) live in `mithril_rt::template`.
 
-Not done in stage 1: the net region (`net_region`), the `Program` impl
-and `main` are still Rust templates in lib.rs (program data + generic
-glue); `fold::est_static` is a text static. The CUDA printer decides
-their device form.
+The CUDA printer: tuples are `T<k>`/`P2` structs, capture functions are
+lambdas, slice arguments are hoisted to local arrays, and C operand
+widths come from the IR's declared local types. Device code is compiled
+by nvcc in a container and cached by source hash.
 
-### 3d. Stage 2: the device runtime and the CUDA printer (25b156d)
+Device inlining follows two measured rules. Non-trivial runtime functions
+are `__noinline__`: inlining the rule table into every caller produced
+437K lines of PTX and a 5-minute ptxas for a 3-function program, against
+29K lines and 4 s. Small helpers are inlined: a `__noinline__` call out of
+a 200-register function spills through local memory, 1.7M cycles per
+tree-node visit (clock64 profile). Float arithmetic on the device uses
+the `_rn` intrinsics, so it never contracts into fma; with contraction
+nbody printed a different checksum.
 
-`mithril_codegen::lower` returns the program as data (`LirProgram`:
-functions, rule table, dive table, linearity and unbox tables); the CPU
-`emit_rust` prints it, and `mithril_gpu::emit_cuda` prints the same value
-as `program.cu`. Nothing decides anything twice: the v1 GPU prototype,
-which lowered Core on its own (no arrays, no ownership, no TRMC, no
-native scalar), is deleted.
+### 5.2 Forms
 
-* `crates/mithril-gpu/cuda/engine.cu` is the device runtime: the IR's
-  helper vocabulary over the wave engine (cells with a refcount array,
-  records and delivery, dives under a per-dive fuel with `R`/`RA<k>`
-  suspension results, constructors and sharing, arrays on a device bump
-  heap, TRMC holes, dynamic and native arithmetic). Float arithmetic uses
-  the `_rn` intrinsics so the device never contracts into fma: nbody
-  printed a different checksum until it did.
-* The printer (`mithril_gpu::cuda`): tuples are `T<k>`/`P2` structs
-  (declared per width used), capture functions are lambdas, slice
-  arguments are hoisted to local arrays, a `Let` of a name already in
-  scope prints as assignment (Rust shadowing), operand widths for C's
-  arithmetic come from the IR's declared local types.
-* Gate: `tests/ci/gpu.py` runs all 16 ports at their small size through
-  `mithril run --gpu` and checks the CPU checksum; `MITHRIL_GPU=1 cargo
-  test -p mithril-gpu --release -- --include-ignored --test-threads=1`
-  runs the 22 closure-free codegen fixtures against the oracle plus the
-  capacity/abort tests. All pass on the RTX 4090. A cold run is dominated
-  by nvcc (5-77 s per port); warm runs are cached by source hash.
-* Known limits after stage 2: the array heap is a bump allocator (blocks
-  are never freed); per-dive fuel is 64 by default (device stack), so the
-  device suspends far more often than the CPU (fuel 4096+), which is the
-  parallelism the wave engine wants but also more records per program.
+Each function is emitted in the forms its uses need.
 
-### 3e. Stage 3: the net region on the device (e6638ed)
+* **Dive form** (`d_<f>`): the function runs natively under a budget and
+  returns `Result<u64, u64>` in registers: a value, or the record of its
+  suspended residue. Suspension code lives in out-of-line cold functions,
+  so it never bloats the hot frame.
+* **Multi-value dive form** (`n_<f>`): a function returning a k-tuple
+  returns `[u64; k]`; `x = g(..)` followed by projections takes the
+  components with no heap tuple. A suspension delivers the boxed tuple.
+* **Rule form** (segments): the function as rules over records. It dives
+  too and allocates records only on suspension. At most 4 dives nest
+  inline in one rule-form body before the rest is deferred to a memoized
+  record, so generated code is linear in chain length.
+* **Native scalar form** (`s_<f>`, `scalar.rs`): a function whose
+  parameters and results are ints, int tuples or int arrays becomes plain
+  `i64` code, including tuple-valued join points. Array parameters are
+  borrowed or owned by fixpoint; tuple results carry an array mask.
+* **Bounded functions**: a function on no call cycle cannot run out of
+  budget, so it is a plain call with no capture.
 
-The rule table runs on the device: `cuda/engine.cu` carries
-`mithril_core::rules` rule for rule (REF unfold / erase / closure copy,
-wiring as the static gate, Kont delivery, beta, OP with the operand-swap
-half-step and OP-SUP, SWI, MAT with projections and unboxed constructors,
-DUP of values and lambdas, the DUP commutations, DUP-DUP) over per-lane
-redex worklists that spill to the program's net rule, and the closure
-bridge compiled code uses (`build_closure`, `apply`, `apply_spawn`,
-`dup_closure`, `drop_closure`). A generated program supplies its entries
-as straight-line net builders (`inst_<e>`) printed from the same `NExpr`
-bodies the CPU interprets with `instantiate`, its match tables, and the
-FILL/NET rule ids. The CPU and the device are now checked against each
-other on every closure program: the third implementation of the rules is
-held to the first two by the oracle, as the core constraint asks.
+The native int representation is chosen per function. Plain holds the
+canonical i56 in an i64 and re-wraps an op whose range is not proven with
+two shifts; masked 32-bit arithmetic runs in u32. Pre-shifted holds
+`x << 8`, where i64 wrapping is i56 wrapping, so add, sub, compare and
+min need no wrap; a var-by-var multiply, a right shift, an array index
+and division cost one op. Each function takes the representation with
+the lower static op count, charging conversions on call edges to
+functions of the other representation, so a recursive pair never splits.
+The worker context is passed only to native functions that touch arrays.
 
-Numbers: 24/24 codegen fixtures (closures and W2 sharing included), the
-closure corpus (stage_closure, pipeline_cfg, interp_closure at run.py's
-small sizes) and 16/16 ports print the CPU's result on the 4090. The GPU
-gate (`tests/ci/gpu.py`, ports + corpus) runs in about two minutes warm.
+Two static emission rules follow measurements on hand-edited generated
+code.
 
-Found on the way: the device compiler inlined the rule table into every
-caller (437K lines of PTX and a 5-minute ptxas for a 3-function
-program); every non-trivial runtime function is `__noinline__` now (29K
-lines, 4 s). Performance of the device path is not measured yet: that is
-the next use case to prove, not a number to tune (the runtime helpers as
-calls, the 64-fuel dives, the bump heap are the known costs).
+* **Selects as mask arithmetic.** An `if` choosing between computed atoms
+  is emitted as `(a & m) | (b & !m)`, which the backend cannot turn back
+  into a branch on a loop-carried chain.
+* **Length locals.** In a call-free native loop that writes one array and
+  also reads another, each array's length is a loop variable, because
+  the write may alias the other header and force a reload per access.
+  Elsewhere the backend already hoists the header load, and a register
+  length blocked vectorization of bfs's fill loop and caused spills in
+  its search loop.
 
-Open after stage 3: device-side memory for arrays is never reclaimed;
-`interp_closure` remains the closure-copying case on both backends.
+The measured gains that justified the scalar and array mechanisms, each
+on the tree at the time it was adopted:
 
-### 3f. The device path measured, and a cost model of the slowdown
+| mechanism | measurement |
+|---|---|
+| native scalar lowering | mandelbrot SEQ 175 s to 4.4 s |
+| unboxed ctors, `LIN`, reuse | tree-bitonic 762 G to 254 G instructions |
+| register-returned dives, cold capture | tree-bitonic 257 G to 241 G instructions |
+| native multi-value returns | bfs SEQ / PAR16 26.7 / 3.72 s to 12.7 / 1.42 s |
+| int-element arrays | bfs 12.7 / 1.42 s to 10.4 / 1.13 s |
+| native code over int arrays | bfs to 9.65 / 0.94 s |
+| static uniqueness | bfs to 5.19 / 0.52 s |
+| leaf budget at the call site | bfs to 4.85 / 0.48 s |
+| selects as mask arithmetic | bfs to 4.48 / 0.45 s |
+| pre-shifted int representation | editdist SEQ 4.05 s to 2.80 s |
+| length locals | editdist SEQ 2.80 s to 2.27 s |
 
-`bench/gpu_vs_cpu.py`: every port at fast.py's mid size, CPU binary vs
-the device, results equal on all 16 (two device bugs that only showed at
-this size were fixed first: a 16-bit record field truncating the TRMC
-hole cell, and records never recycled). Wall times were then 10-1000x
-slower than the CPU. The per-fire cost, replicated standalone
-(`bench/gpu/fire_cost.cu`, the real `engine.cu` with a stub program, a
-synthetic fire: ~24 cell allocs, ~24 frees, ~31 reads, a record, a spawn
-and a delivery; cycles per fire):
+### 5.3 Fork sites and the frame split
 
-| component | one thread | full grid (65,536 threads), per thread |
-|---|---|---|
-| 24 cell allocs | 23,300 | 331,000 |
-| 24 allocs + 24 frees | 18,300 | 350,000 |
-| the whole fire | 30,000 | 560,000 |
+Parallelism comes from suspension. When a dive runs out of budget, the
+pending call is re-spawned as a task and every native frame on the way up
+splits its continuation (a let chain around the pending value x):
 
-so a lane's step costs 30k cycles alone and ~560k under load (memory
-round-trips: 80 cycles per cell read, 300-1000 per allocation, and no
-allocator variant gets below ~24k alone). The model that held up:
+* P, the bindings independent of x, ending in their live-out. P runs at
+  once as a ready record.
+* J, the rest, a record with pend 2 that joins x and P's result.
+
+J splits again (`split_dep`): D, the bindings that need x but not P's
+result, ending in one live-out m, a pend-1 record fired when x arrives;
+and J2, the join of m and P's result. Without D, a call that needs only x
+waits for all of P, a sequential dependency the net does not have. On
+tree-bitonic depth 16 the two-way split made every merge run
+right-then-left, a chain of 2^15 steps and 92,844 device rounds; the
+three-way split gave 461. `split_dep` requires one live-out for D and a
+J2 that does not read x; otherwise the frame falls back to the two-way
+split.
+
+`split_chain` decides the parts by two rules.
+
+* **Projection rule.** A projection of an independent value is a read the
+  join does, so it goes on the dependent side and the independent value
+  itself is the one live-out. Without it a tuple-returning fork tree had
+  k live-outs, did not split and never forked: gameoflife, nbody, queens
+  and symreg ran at one-thread speed at 16 threads (gameoflife 8.45 s,
+  queens 4.79 s at t16) and fork now (1.12 s and 0.45 s).
+* **Multi-value join.** Several live values cross the join as one tuple,
+  bound to a fresh variable and projected in J. A 4-way fork is then
+  three nested fork sites rather than one fork and two sequential cuts.
+  Without it tree-matmul's `gen` had one fork site and the device ran
+  49,890 grow sweeps with a flat frontier. Code size grows (tree-matmul:
+  77 to 155 segments, recorded in the fast-CI baseline). `split_dep`
+  does not use the tuple join.
+
+A **fork site** is a call whose continuation splits. The lowering marks
+it by passing `fork_fuel(fuel)` as the callee's budget (`fork_site` in
+`seq.rs`; native multi-value callees are fork sites too). The rule form
+uses `dive_res_fork` at fork sites and `tail_to` for a segment's tail
+call (the sibling in the independent part); `let x = g(..) in x` at any
+rule-form position is a tail call. A **cut** is a call whose result the
+next statement needs; it runs inline with the caller's budget. On the
+CPU `fork_fuel`, `dive_res_fork` and `tail_to` are identities. On the
+device they separate the two worlds (section 7.2). The same lowered
+program runs on both; only the schedule differs.
+
+### 5.4 TRMC
+
+A function whose tail builds a constructor around a recursive call is
+emitted in destination-passing form (`dp_<f>`): a loop that writes each
+new cell into the hole of the previous one (`th_head`, `th_hole`,
+`hole_wrap`). A suspended TRMC loop carries its hole in the capture.
+Fixtures `trmc_list.py`, `trmc_tree.py`.
+
+### 5.5 Budget charging
+
+One budget, two kinds of charge.
+
+* A **dive entry** is one depth unit (`burn_fuel`), charged at the entry
+  of every non-leaf dive form, loop form and destination-passing form.
+  A fork-site callee handed a zero budget therefore suspends at entry.
+  Without the charge at loop-form entries, tree-radix's `merge` (a TRMC
+  loop) ran whole on one lane in the parallel world, 6 to 22 G cycles
+  per sweep; with it the device run is 373 ms.
+* A **loop iteration** and a native leaf call are one work unit
+  (`work_fuel`). A loop checks the budget, then charges the iteration,
+  so a budget of one still runs one iteration. Charging before the check
+  livelocked at budget 1 (the entry charge plus the iteration charge
+  re-spawned `main` forever until the record arena was exhausted).
+* A call-free function does bounded work: no budget check, one work unit
+  charged by the caller as a register decrement.
+
+The CPU burns both kinds: its suspension is the split mechanism that
+exposes work to idle workers. The device burns only depth: a dive-form
+call refunds its budget when it returns, so the budget bounds native
+recursion depth, not work (section 7.3).
+
+Every dive form and every native function whose frames can pile up (a
+non-tail self call, or a cycle through other functions) begins with
+`stack_guard`: a no-op on the CPU; on the device a comparison of the
+stack pointer with the one at kernel entry, which aborts with a named
+error ("recursion too deep for the device"). Guarding every non-leaf
+native function cost raytrace 3x (`isect` is called 10^8 times), hence
+the recursion test.
+
+### 5.6 Fold splitting
+
+`mithril-reassoc` detects folds, proves the combiner associative with an
+identity (polynomial normal form), and emits Lean obligations for each
+proven fold (section 8). A proven fold heavier than one budget is split:
+chunks run in parallel and their results are combined in order. The
+split estimate reads the phase's budget.
+
+### 5.7 Core rewrites owned by codegen
+
+Two Core-to-Core rewrites run in codegen, not in the rules:
+
+* `tail_inline`: a small (size at most 64), non-self-recursive `g`
+  tail-called from `f`, whose own calls are tail calls back to `f` or
+  calls to call-free functions, is inlined at that site, so mutual tail
+  recursion becomes a loop.
+* `if_convert`: a tail if-tree whose leaves are the function's own
+  back-edge and whose arms are cheap (at most 32 ops, 128 bindings, int
+  selects only) becomes one call with selected arguments.
+
+The core constraint forbids Core-level rewrites that duplicate what a
+rule does. Whether these two are rules, lowering decisions with a stated
+cost model, or tunables to be marked is undecided (section 12). The same
+holds for the `#[inline(always)]` decision: a call-free body of size at
+most 192, plus a `__while`/`__for` helper with a single call site on a
+recursive cycle with its caller (without the latter, which member of a
+recursive cycle absorbed the other depended on ordering: queens 4.8 s
+against 5.3 s).
+
+## 6. CPU runtime
+
+One model on CPU and device: redexes are pending rule applications;
+records are continuations waiting for `pend` values; dives run functions
+natively under a budget and split on suspension (section 5.3).
+
+**Waves.** Each wave the coordinator merges every worker's spawn buffers
+into per-rule buckets and picks the bucket with the largest
+`entries x rule_cost` (ties to the lowest rule; anything that may dive
+costs a full budget). A bucket whose work is at least 2^14 and that holds
+at least two entries is drained across the pool; workers claim blocks of
+entries from a shared cursor. Otherwise the coordinator drains it alone,
+keeping its caches. Pool workers are spawned once per run and park
+between waves.
+
+**Records.** The delivery that completes a record fires it at once on
+that worker, up to 64 nested levels; beyond that it waits for the next
+wave. A chain of nested joins then completes in one wave. A ready record
+(no inputs, the rest of a body after a fork) is queued for the next wave.
+
+**Budget.** Sequential runs use a budget of 2^40 per dive (one dive). A
+parallel run uses 16,384 per dive while a wave holds at most four entries
+per worker, and `16384 x ceil(entries / (4 x workers))` (capped at 2^10
+times) beyond that (`wave_fuel`), because suspension exists to expose
+work to idle workers and splitting past that only costs records and
+locality. hashmap PAR16 measured 0.49 s without this rule and 0.23 s with
+it: every suspension in the batch spine had split off a sibling subtree
+until all 2,048 tables were in flight (20 M live cells). The **boost**
+covers sequential chains: while a wave's frontier did not grow and is
+narrower than the workers, the budget doubles per wave, up to 64x; any
+growth resets it.
+
+**Cost model.** On tree-bitonic PAR16 the per-wave barrier is about
+70 us, and every dependency hop across a suspension is one wave. The
+frontier grows exponentially only while suspended frames have large
+independent siblings.
+
+**Arenas.** Cells (16 bytes plus a 4-byte count) and records are carved
+from reserved arenas in chunks of 2^16 slots by a global bump; memory is
+committed only as chunks are touched, with transparent huge pages
+requested. Freed cells and records go on the worker's intrusive free
+list: unbounded, no atomic on the alloc or free path. Defaults are 2^26
+cells (`MITHRIL_NODES`) and 2^27 records (`MITHRIL_RECS`), at most 2^32
+each, and capped at half of the memory available at start, so a runaway
+program ends in "arena exhausted", not in swap. Teardown runs in place on
+the worker that drops the last reference.
+
+Diagnostics: `MITHRIL_STATS` (cells, waves, rewrites), `MITHRIL_TRACE_PICK`
+(every bucket pick with its size, work, boost and time).
+
+## 7. Device runtime
+
+`crates/mithril-gpu/cuda/engine.cu` implements the helper vocabulary, the
+rule table and the scheduler. `crates/mithril-gpu/src/runner.rs` sizes the
+arenas, launches, waits and reports.
+
+### 7.1 Cost model
+
+A lane's step is expensive. A synthetic fire (about 24 cell allocations,
+24 frees, 31 reads, a record, a spawn and a delivery; `bench/gpu/fire_cost.cu`
+with the real engine) costs about 30,000 cycles on one thread and about
+560,000 cycles per thread with the full grid of 65,536 threads (memory
+round trips: 80 cycles per cell read, 300 to 1,000 per allocation). The
+model that holds:
 
     T = sum over rounds of (the slowest lane's steps x cost per step)
 
-Every slowdown found was in the first factor. In order (tree-bitonic,
-depth 16 unless said; CPU t1 0.04 s; reference on this 4090: 0.576 s at
-depth 23):
+Every scheduler rule below reduces the first factor.
 
-1. Host wave loop: 7,764 rounds (one launch and one sync per round,
-   ~130 us of host per round): 1.8 s. Runtime unchanged.
-2. Fork sites hand-edited into the program (a callee suspends at entry
-   and becomes a task, the rest of the body goes on): 196,511 rounds,
-   12 s. A completed join was queued globally, so every join level cost a
-   round; running it at once on the completing lane (the CPU runtime's
-   rule, and reference's): 4,586 rounds, 3.8 s.
-3. The lowering's two-way frame split: after `warp_node(a)` suspends in
-   `flow`, `flow(left)` (which needs only that result) sat in the same
-   join as `Node(left, right)` and so waited for the whole right half:
-   every merge ran right-then-left, a chain of 2^15 steps, three rounds
-   each, 92,844 rounds. Fixed in the lowering (`split_dep`, 3f-1 below):
-   461 rounds.
-4. The driver on the device (`k_run`, one cooperative launch, grid
-   barriers between phases; the rounds are now 10-20 us) and reference's grow
-   rule (a sweep grew when it pushed anything; stop when it pushed at
-   least a lane's worth): 833 sweeps, no work phase, 0.12 s. Depth 20
-   still 2.6 s and depth 23 did not finish: the first WORK phase ran one
-   lane for 40 s.
-5. Static dealing in WORK (every lane gets every nl-th pending task; the
-   claim race had left 90% of lanes idle) and, at first, no fuel-out
-   suspension in the sequential world (superseded by 7): all 32,768
-   lanes busy, the slowest lane a few dozen steps.
-6. reference's fork in the parallel world (3f-2 below): the independent part
-   of a body used to run its sibling call inline with the dive budget, so
-   one side of every fork unfolded several levels per sweep and lanes got
-   subtrees of wildly different sizes. A fork's children are now both
-   tasks (`let x = f(..) in x` in the independent part is a tail call)
-   and a cut runs inline. Depth 23: 0.84 s. (Every call a task, with no
-   cuts, gave 0.62 s here, the frontier doubling exactly, but a
-   sequential chain then cost a round per step: 100,000 steps, 100,001
-   rounds, 1.3 s; with cuts inline it is 1,563 rounds and 0.3 s.)
-7. The sequential world keeps the dive budget (an unbounded budget gave
-   0.84 s against 1.03 s, but the budget is the only bound on native
-   recursion depth on a 32 KiB device stack), and on the device a
-   dive-form call refunds its budget when it returns, so the budget
-   bounds the depth of the native recursion, not the work of a subtree:
-   raytrace's work phase went 1.42 s (a suspension per 64 rewrites in
-   every lane's subtree) back to 0.06 s, bitonic 23 to 0.86 s. The budget
-   is a per-backend scheduling parameter, not semantics: the CPU keeps
-   the work budget because its suspension is the split mechanism that
-   exposes work to idle threads (the refund was not measured there; a
-   depth budget would suspend only at depth 4096 and expose nothing on
-   a wide, shallow tree). Fold estimates read the phase's budget.
+### 7.2 One cooperative kernel, grow and work
 
-Standing (device, this box, default caps): tree-bitonic depth 8 6 ms,
-16 64 ms, 23 860 ms (reference GPU 576 ms; CPU t16 2.46 s); raytrace big
-61 ms (reference GPU 544 ms; CPU t16 2.84 s); a boxed chain of 100,000
-steps 0.3 s. Results equal the oracle on every fixture, port and corpus
-program. The frontier at the first WORK is 49,152 tasks on 32,768 lanes
-(a fork step of x1.5 on average), so half the lanes carry two subtrees:
-that quantization is the gap to reference on bitonic.
+`k_run` is one cooperative launch (all lanes resident; 32,768 lanes on
+the RTX 4090) with grid barriers between phases. A host loop with one
+launch and one sync per round cost about 130 us per round; a device round
+costs 10 to 20 us. The host launches once and waits.
 
-#### 3f-1. The frame split follows the net's dependencies
+A round, in reference's rhythm:
 
-A suspended frame's continuation is a let chain. `split_frame` gives P,
-the bindings independent of the pending value x (they run at once, as a
-ready record) ending in one live-out l, and J, the rest. J now splits
-again (`split_dep`): D, the bindings that need x but not l, ending in
-one live-out m (a pend-1 record chained under the join, fired when x
-arrives), and J2, the join of m and l (pend 2). `join_records` builds
-these for both forms. Without D, a call in J that needed only x waited
-for P to finish: a sequential dependency the net does not have (in the
-net the call node fires when its own input arrives). The three-way split
-is exact dataflow for the shape `Node(f(g(a)), f(g(b)))`; a J that
-reads x in J2, or a D with several live-outs, falls back to the two-way
-split. Fixture `fork_chain.py`; every fixture stays oracle-equal on
-every thread count and fuel.
+* The leader snapshots the per-rule rings: pending tasks, forkable tasks
+  (tasks whose rule can fork, and `ERA`), and the frontier (tasks pushed
+  by the last phase).
+* **GROW** while some pending task can fork, the frontier is narrower
+  than the grow width (default: the lane count), and the last grow sweep
+  pushed anything. Every forkable task below the snapshot fires in the
+  **parallel world**: a fork site's callee gets `fork_fuel`, a zero
+  budget, so it suspends at entry and becomes a task; a segment's tail
+  call is a task; a cut runs inline with the phase's budget; the
+  continuation is captured as records. The frontier widens by one fork
+  level per sweep.
+* **WORK** otherwise. Every lane is dealt every nl-th pending task of the
+  snapshot (dealt, not claimed: a claim race left 90% of lanes idle) and
+  drains it and everything it spawns depth-first on its lane stack in the
+  **sequential world**, with the dive budget. After `WORK_STEPS` fires
+  (default 2^30) a lane hands its remaining tasks back to the global
+  rings.
+* The run ends when nothing is pending or the run aborted.
 
-#### 3f-2. Two worlds, one lowering
+Making every call a task (no cuts) doubles the frontier exactly but
+costs a sequential chain one round per step: 100,000 steps took 100,001
+rounds and 1.3 s, against 1,563 rounds and 0.3 s with cuts inline.
 
-The device runtime runs reference's rhythm. GROW: every forkable pending
-task fires in the parallel world. There a fork site's callee is a task at
-once (`fork_fuel` hands it no budget, so it suspends at entry;
-`dive_res_fork` in the rule form) and so is a segment's tail call
-(`tail_to`, reference's marked call: the sibling in the independent part),
-while a cut (a call whose result the next statement needs) runs inline
-with the task's budget; the continuation is captured as records. (Two
-fork sites still run as cuts: a native multi-value callee, and a call
-past the rule form's inline-nesting limit; performance only.) A
-`let x = g(..) in x` at any rule-form position is a tail call. The
-frontier widens by one fork level per sweep. When a sweep pushed at
-least as many tasks as there are lanes, or nothing, WORK: every lane
-gets every nl-th pending task and drains it and everything it spawns
-depth-first with the dive budget on its own stack; a cross-lane join it
-completes runs at once in the parallel world, and what that forks goes to
-the global rings for the next round. On the CPU `fork_fuel`,
-`dive_res_fork` and `tail_to` are identities (one world, the wave runtime
-as before), so the same lowered program runs on both; the schedule is
-the only difference, as the core constraint requires. Records freed by a
-lane past its list spill to a global ring (as cells do; a push never
-overwrites an unread slot; a pop that finds an empty slot leaves the
-entries below it stranded until later pops pass it: a leak bounded by
-the ring, never a double hand-out). `k_run` needs a cooperative launch (all lanes
-resident); the host launches once and reads the rounds back. A run that
-does not converge stops at `MITHRIL_GPU_ROUNDS` rounds with an error, and
-any device fault ends the run. Known limit: a native scalar function's
-non-tail recursion has no budget and overflows the device stack (32 KiB
-per thread) past a few thousand frames, as a driver fault that loses the
-context. reference has the same kind of limit (a fixed value stack of 2048
-words per device lane) but checks every push and fails with a numbered
-error; a depth counter in the scalar lowering with a named abort is the
-pending fix.
+**Join at once.** A join completed by a delivery runs at once on the
+completing lane. A record created in the parallel world is marked `par`:
+its continuation runs in the parallel world (`PAR_TASK`), and what it
+forks goes to the global rings for the next GROW. A record created in
+WORK is the lane's own and continues there. A ready record runs at once
+the same way, so a body reaches all its fork sites in one step. Queuing
+completed joins globally cost a round per join level: tree-bitonic depth
+16 with hand-edited fork sites took 196,511 rounds, and 4,586 with join
+at once.
 
-The old host loop, its kernels and the sequential-tail pump are gone;
-the regression comparison is the round count: `gpu_schedule_is_bounded_
-by_fork_levels` (tree-bitonic depth 8 in under 400 rounds; the host loop
-took thousands at depth 8 and 7,764 at depth 16) and
-`gpu_chain_costs_a_round_per_budget_not_per_step`. Fixtures
-`fork_split_shapes.py` (every split shape and fallback, a boxed value
-shared by the three records), `chain_boxed.py`, `deep_leaves.py` (deep
-recursion inside a WORK lane).
+### 7.3 Budgets on the device
 
-### 3g. A use case outside the corpus: the k-d tree (generality probe)
+* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). The device stack
+  is 32 KiB per thread (the driver refuses 128 KiB), and the budget is
+  the only bound on native recursion depth. An unbounded budget in WORK
+  measured 0.84 s against 1.03 s on tree-bitonic depth 23; the bound is
+  kept because of the stack.
+* A dive-form call refunds its budget when it returns. The budget bounds
+  depth, not the work of a subtree. With a work budget, raytrace's work
+  phase suspended every 64 rewrites in every lane's subtree (1.42 s);
+  with the refund it runs in 0.06 s.
+* Work units do not touch the depth budget. A loop in the parallel world
+  runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
+  the frame's next budget check to suspend, so no fire runs unbounded; a
+  runaway loop cycles rounds to the round limit instead of freezing the
+  device, which the desktop shares.
+* `stack_guard` compares against the thread's stack less a 4 KiB margin.
+
+The budget is a per-backend scheduling parameter, not semantics.
+
+### 7.4 Erasure is work
+
+The net's `ERA` rewrites are independent, so teardown is parallel work.
+The engine owns one rule past the program's table, `ERA`: a teardown past
+256 nodes, or past 32 nested frames (its frames stack on the caller's),
+spills its subtrees as `ERA` tasks dealt like any other. The k-d tree's
+end-of-run teardown (2^19 cells) cost 3.1 G cycles on one lane, the whole
+work phase, as a walk; it is parallel as a rule. The CPU tears down in
+place; the rules are the same either way.
+
+### 7.5 Arenas and sizing
+
+| arena | structure | size |
+|---|---|---|
+| cells | 16-byte cells plus a 4-byte count; per-lane intrusive free list (link in the first word), per-lane bump chunks from a global counter | the rest of the budget at 20 bytes per cell, or `MITHRIL_GPU_NODES` (default request 2^28, capped to fit) |
+| records | per-lane intrusive free list (link in `d`), global bump | 2^24 (`MITHRIL_GPU_RECS`) |
+| task rings | one ring per rule, a power of two | 2^27 / rules entries, clamped to [2^14, 2^21] (`MITHRIL_GPU_BUCKET`) |
+| lane stacks | 64 tasks per lane, overflow to the global rings | fixed |
+| net worklists | 64 redex pairs per lane, spill to the program's net rule | fixed |
+| array heap | blocks in size classes, 8 per octave (a block is at most 1/8 larger than its array, minimum 8 words); per-lane intrusive free list per class (link in word 0, class in word 1 bits 48 to 55); global bump | a third of the budget, clamped to [2^26, 2^32] words (`MITHRIL_GPU_HEAP`) |
+
+The budget is free VRAM at start, less the fixed buffers, less the
+driver's stack reserve for all resident threads (SMs x threads per SM x
+32 KiB), less 1 GiB of slack. No free path takes an atomic. A bump-only
+heap leaked every array block; bfs and terrain exhausted it at the big
+size and run (255 ms, 296 ms) with the free lists.
+
+### 7.6 Bounds
+
+* Round limit: `MITHRIL_GPU_ROUNDS`, default 2^24; a run that does not
+  converge stops with an error.
+* Deadline: the host waits at most `MITHRIL_GPU_TIMEOUT` (300 s) and
+  tears the context down past it.
+* Any arena exhaustion, out-of-bounds index, bad cell index or stack
+  overflow sets the abort flag; every lane stops at its next check and
+  the host reports the named cause.
+
+Diagnostics: `MITHRIL_GPU_STATS` (setup and run time, rounds, grow sweeps
+and work phases with their cycles, widest frontier, cells and records
+issued); `MITHRIL_GPU_TRACE` adds the per-round log (phase, pending,
+frontier, K cycles, slowest lane, busy lanes) and per-rule pending counts
+for the first rounds.
+
+## 8. Verification
+
+Correctness is by construction and checked by oracle. What is proved,
+what is checked and what is only claimed:
+
+| property | status | how |
+|---|---|---|
+| fold reassociation: each proven combiner is associative with an identity; folding chunk results equals folding the concatenation | **proved** | Lean 4 obligations emitted per fold by `mithril-reassoc`, checked by `lean` in `reassoc_test` and `cli_test` (skipped when lean is not installed); the generic `chunked_foldl` lemma proved once |
+| specialization preserves meaning | checked | `specialize_test` (every fixture: specialized equals original under `eval_core`); `examples/spec_oracle.rs` bisects a program to the function whose specialization changed its value |
+| generated code equals the oracle | checked | `codegen_test` over the fixtures in `crates/mithril-codegen/tests/fixtures`, at 1, 4 and 16 threads and under budget starvation |
+| parallel equals sequential | checked | the same tests; fast.py compares t1 and t16 checksums per port |
+| both int representations equal the oracle | checked | forced-representation runs (`int_reps.py`) |
+| device equals CPU | checked | `tests/ci/gpu.py` (every port at its small size, plus the closure corpus); `MITHRIL_GPU=1 cargo test -p mithril-gpu --release -- --include-ignored --test-threads=1` (the codegen fixtures against the oracle, plus capacity and abort tests) |
+| ports compute the right answer | checked | every run's checksum against `bench/expected.txt`, which the C twin and the CPython shim agree with |
+| the rule table is confluent | **claimed** | the parallelism argument rests on it; no proof exists |
+| the device rule table equals `mithril_core::rules` | **claimed**, checked by tests only | two implementations held together by the oracle |
+| lowering preserves meaning | **claimed**, checked by tests only | oracle equality of generated code |
+
+The oracle agrees with the net, not the other way round: an unused
+binding is never evaluated. `eval_core` shares payloads (`Arc`), so a
+clone copies nothing; a deep copy per variable read cost 21 GB on the
+shared-tree fixture. Test suites run under a memory watcher that kills
+them past a cap.
+
+Every bug fix lands with a fixture that fails on the tree before the fix.
+
+## 9. Measurement method
+
+**Machine.** AMD Ryzen 7 7800X3D (8 cores, 16 threads), 62 GiB, RTX 4090
+(driver 580.82.09), Ubuntu 22.04, rustc 1.86.0, gcc 11.4.0.
+
+**Mithril harness** (`bench/harness.py`, results in `bench/results.md`).
+Lanes: `C` (the C twin, `gcc -O2`), `SEQ` (`--threads 1`), `PAR16`
+(`--threads 16`), `GPU` (`--gpu`, when `MITHRIL_GPU=1`). Programs are
+built once with `mithril build`; build time is reported, not timed. Times
+are wall clock, minimum of n runs (n = 1 by default), timeout 300 s.
+Every run's output is checked against `bench/expected.txt`. On "arena
+exhausted" at defaults the lane is retried with
+`MITHRIL_NODES=2^32 MITHRIL_RECS=2^28` and the retry is recorded.
+
+**GPU timing.** The device program is compiled by nvcc in a container on
+first use (5 to 77 s per port) and cached by source hash; the harness
+runs the GPU lane once untimed to warm that cache. Two numbers exist:
+
+* **kernel time**: the runner's `run` time, from the cooperative launch
+  to completion (`MITHRIL_GPU_STATS`). It excludes process start, context
+  creation, module load, and arena allocation and clearing, which
+  together cost about 0.4 s;
+* **wall**: the whole process, warm cache.
+
+**Instruction counts.** fast.py measures a mid-size run with `perf stat`
+(noise-free) and compares against `tests/ci/baseline.json`.
+
+**reference** (`bench/reference-notes.md`, results in `bench/reference.csv`). reference
+2.0.31 (the exact revision is in `bench/reference-notes.md`), C emitted by
+`reference -o`, compiled with clang 21 `-O3` in a container (the generated C
+needs clang 19+), run on the host. seq: `--threads 1 --gpu off`; par:
+`--threads 16 --gpu off`; gpu: `--gpu <mem>` from reference's own memory
+table, the CUDA device code built by NVRTC. Minimum of 3 timed runs after
+one warm-up, wall clock including process start; for gpu that includes
+context creation and cubin load (0.05 to 0.1 s). The machine was shared:
+every run waited for a 1-minute load of 8 or lower; load at run start
+averaged 5.1 (max 7.97). This most likely inflates reference's par numbers.
+The JS lane was not measured. These are same-machine numbers for
+comparison, not a reproduction of reference's own pins (Apple M4 Max), which
+are 1.2 to 3.8x faster sequentially than this x86 box.
+
+## 10. Standings
+
+All at the big size, on the machine of section 9. Times in seconds
+unless marked ms.
+
+| port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device kernel | reference gpu wall |
+|---|---|---|---|---|---|---|---|
+| bfs | 4.56 | 4.87 b | 0.428 b | 4.543 | 0.397 | 255 ms | 0.217 |
+| editdist | 2.20 | 2.45 b | 0.252 b | 2.389 | 0.308 | 212 ms | 0.234 |
+| gameoflife | 28.29 | 8.48 a | 1.12 a | 9.706 | 1.146 | 18 ms | 0.089 |
+| hashmap | 0.769 | 1.83 b | 0.226 b | 3.112 | 0.288 | fails: a rule ring (2^21) exhausted by a 7.5 M-task frontier | 0.662 |
+| kdtree | 0.341 | 0.416 b | 0.109 b | no port | no port | 603 ms | no port |
+| kmeans | 10.18 | 11.81 a | 1.45 a | 5.610 | 0.677 | 339 ms | 0.299 |
+| lexer | 1.07 | 2.52 b | 0.358 b | 2.868 | 0.310 | 157 ms | 0.348 |
+| mandelbrot | 1.95 | 3.55 b | 0.827 b, r | 4.806 | 0.468 | 76 ms | 0.093 |
+| merkle | 5.78 | 5.40 b | 0.612 b | 5.463 | 0.535 | 14 ms | 0.101 |
+| nbody | fails: gcc 11 rejects `musttail` | 5.84 a | 0.53 a | 6.220 | 0.521 | 4 ms | 0.086 |
+| queens | 3.91 | 4.73 a | 0.45 a | 8.118 | 0.911 | 1,204 ms | 0.760 |
+| raytrace | 9.04 | 7.69 b | 0.852 b | 7.263 | 0.724 | 58 ms | 0.545 |
+| symreg | 2.96 | 3.06 a | 0.40 a | 4.608 | 0.431 | 2,028 ms | 0.261 |
+| terrain | 4.17 | 4.59 b | 0.560 b | 3.040 | 0.346 | 296 ms | 0.212 |
+| tree-bitonic | 8.46 | 10.75 b | 1.58 b | 10.077 | 1.455 | 990 ms | 0.568 |
+| tree-matmul | 4.24 | 3.84 a | 0.66 a | 4.094 | 0.460 | 383 ms | 0.225 |
+| tree-radix | 2.67 | 3.95 b | 0.589 b | 4.622 | 0.537 | 373 ms | 0.333 |
+Conditions:
+
+* C twin: `bench/results.md`, harness at `15f51dd`, one run.
+* **a**: clean build at `723be4c`; one run per lane; quiet machine.
+* **b**: `bench/results.md`, harness at `15f51dd`, one run. These ports'
+  generated code is unaffected by the later frame-split changes except
+  for the dive-entry depth charge; not re-measured.
+* **r**: default arenas exhausted; run with `MITHRIL_NODES=2^32
+  MITHRIL_RECS=2^28`.
+* reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
+  compiler output rebuilt, a load below 2, min of 3 runs, wall clock.
+* Mithril device kernel: kernel time (section 9), warm cache, default
+  arenas, the same tree as **a**. It excludes about 0.4 s of fixed cost
+  that reference's gpu wall includes an equivalent of (0.05 to 0.1 s). The
+  comparison with reference's gpu wall therefore favours Mithril.
+
+Warm wall clock on the device, same tree: gameoflife 0.47 s, nbody
+0.42 s, kmeans 0.62 s, mandelbrot 0.55 s (reference gpu wall 0.148, 0.090,
+0.301, 0.095). On wall clock the small ports are slower than reference
+because of the fixed startup cost.
+
+Read plainly:
+
+* **CPU, one thread.** At or under reference seq on 10 of 16 ports. Over it:
+  bfs (4.87 against 4.54), editdist (2.45 against 2.39), kmeans (11.81 against 5.61), raytrace (7.69 against 7.26), terrain (4.59 against 3.04), tree-bitonic (10.75 against 10.08).
+* **CPU, 16 threads.** At or under reference par on 5 of 16 ports. Over it:
+  bfs (0.43 against 0.40), kmeans (1.45 against 0.68), lexer (0.36 against 0.31), mandelbrot (0.83 against 0.47), merkle (0.61 against 0.54), nbody (0.53 against 0.52), raytrace (0.85 against 0.72), terrain (0.56 against 0.35), tree-bitonic (1.58 against 1.46), tree-matmul (0.66 against 0.46), tree-radix (0.59 against 0.54).
+* **Device.** Every measured port is checksum-equal. Kernel time is under
+  reference's gpu wall on 7 of 15 measured ports, and the comparison
+  favours Mithril (section 9). Over it: bfs (0.26 against 0.22), kmeans (0.34 against 0.30), queens (1.20 against 0.76), symreg (2.03 against 0.26), terrain (0.30 against 0.21), tree-bitonic (0.99 against 0.57), tree-matmul (0.38 against 0.23), tree-radix (0.37 against 0.33).
+  symreg and tree-bitonic are round-bound: 17,902 grow sweeps and 966
+  rounds, because a sweep counts as growth when it pushed anything
+  (section 12). hashmap fails.
+
+## 11. Use cases and scope
+
+### 11.1 Generality corpus
+
+`bench/general/run.py`: programs unlike the suite, each checked against
+the Python oracle at a small size and against an idiomatic Rust twin
+(`rust/*.rs`, `Rc`/`Vec`, written the way the source is written; nobody
+hoists by hand), then timed. Times in seconds, measured by `run.py` when
+each program was added; not re-measured on the current tree.
+
+| program | shape | Rust | Mithril t1 | Mithril t16 |
+|---|---|---|---|---|
+| collatz_mutual | mutual recursion | 0.30 | 0.43 | 0.43 |
+| cow_versions | copy-on-write array versions | 1.00 | 0.98 | 0.97 |
+| dag_share | heavily shared DAG | 1.68 | 1.87 | 0.29 |
+| graph_dfs | DFS over an array of adjacency lists | 0.86 | 1.20 | 0.27 |
+| interp | expression interpreter, env as a list | 2.36 | 1.21 | 0.14 |
+| persist_map | persistent BST with live old versions | 1.47 | 1.49 | 1.49 |
+| sorts | list merge sort and quicksort | 6.21 | 1.41 | 0.60 |
+| stage_closure | W2: `mk(k) = λx. x + heavy(k)`, 20k applications | 0.00 | 0.00 | 0.00 |
+| pipeline_cfg | stage closures from a runtime config, in a list, over 20k inputs | 0.29 | 0.01 | 0.01 |
+| interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 5.8 | 6.1 |
+
+Sequentially Mithril is within 1.0 to 1.4x of idiomatic Rust, faster
+where Rust pays per-node refcounting; 16 threads are never slower than
+one. `stage_closure`: LLVM hoists the pure call out of the loop inside
+one function, so both do the work once. `pipeline_cfg` is the thesis at
+runtime: Rust cannot hoist across `Box<dyn Fn>`, and the net runs each
+stage's setup once. `interp_closure` is the price: every application
+copies a closure whose whole body depends on its parameter, so lazy
+copying gains nothing and costs about 450x. reference's closures are affine,
+so on these shapes reference runs the strict twin, which the Rust column
+measures; a reference lane for the corpus is not set up.
+
+### 11.2 The k-d tree probe
 
 `bench/ports/kdtree.py` (C twin `kdtree.c`): a 2-d tree over 2^18 hashed
-points, built by midpoint splits over a list (subtrees as unequal as the
-data makes them, a bucket for coincident points), then 2^18 nearest
-neighbour queries with pruning, forked as a batch that only reads the
-shared tree. Nothing in the corpus shares a large read-only structure
-across every fork, or partitions lists, or chases pointers data-
-dependently. C, CPython (the port shim) and Mithril agree at every size.
-It found six general defects; none of the fixes looks at the program.
+points built by midpoint splits over a list (subtrees as unequal as the
+data makes them, a bucket for coincident points), then 2^18
+nearest-neighbour queries with pruning, forked as a batch that only reads
+the shared tree. No other port shares a large read-only structure across
+every fork, partitions lists, or chases pointers data-dependently.
 
-The access model, stated once (it was already the rule; two places broke
-it):
+It is a generality result: the program ran oracle-equal at every size
+after six general fixes, none of which looks at the program. They are the
+access model of section 4.3 (lent data, int immediates, owned-unless-
+aliasing bindings, 32-bit counts), per-lane intrusive arenas, erasure as
+a rule, and bounds on both runtimes. CPU (condition b): 0.416 s at one
+thread, 0.109 s at 16, C twin 0.341 s. The device run is dominated by the
+build's sequential prefix (partitioning a 2^18 list on one lane), a
+property of the program's shape that reference shares; the last device
+measurement (0.54 s, of which about 0.45 s was the prefix, taken while
+another process held 6 GB of VRAM) predates the current device arenas.
 
-* Shared data is lent. A lent value costs no atomic: `field` reads and
-  pattern matches on a borrowed parameter touch no count. Counts move
-  only when ownership moves (a stored, returned or owned-passed value: an
-  O(1) increment; a drop: a decrement, the last one tears down). The
-  escape analysis counted an integer field returned from a lent tree as
-  an escape, so `nearest` owned the tree and every node visit paid three
-  atomics on cells every lane shares; an integer is an immediate and
-  never escapes. `nearest` and the batch now borrow the tree end to end.
-  Borrowing more widely exposed a hole in the emitter: a `let` whose
-  right-hand side is a branch (`p = lft(a)` after the net inlines `lft`)
-  bound the arm's raw read of the lent tree without copying it, and the
-  owned binding was then consumed or freed: kmeans freed a subtree of the
-  shared stats tree and overflowed its stack on the corrupted cycle. A
-  binding is owned unless it aliases a lent value, so a lent read bound by
-  a branch is copied (an O(1) count increment). Fixture `lent_pick.py`
-  fails on the old emitter (wrong sum) and is oracle-equal on this one,
-  at every thread count and suspension budget.
-* Counts are 32-bit plain atomics on both runtimes. The CPU's were 8-bit,
-  saturating at 255 by a fetch_add then a store: under concurrent
-  increments the count passed through 0 for a moment, a reader saw the
-  root as unique and freed the shared tree (a panic at 16 threads, never
-  at one). Fixture `shared_tree.py`, oracle-equal at 16 threads.
-* Allocation is a per-lane arena: a global bump hands out chunks, freed
-  cells and records go on the lane's intrusive free list (the link in
-  the freed cell's first word, the record's `d`): unbounded, lock-free,
-  no atomic on the alloc or free path. The device's lists were bounded
-  (64, then a 1M ring, then dropped): the sequential build leaked its
-  way to the arena cap on every program.
-* Erasure is work. The net's ERA rewrites are independent; the runtime's
-  teardown was one lane walking a value. The engine owns one rule past
-  the program's table, ERA: a teardown past 256 nodes spills its
-  subtrees as ERA tasks, dealt like any other. The k-d tree's end-of-run
-  teardown (2^19 cells, 3.1G cycles on one lane, the whole work phase)
-  became parallel.
-* The device budget bounds recursion depth only: work units (loop
-  iterations, native leaf calls) burn nothing there, a loop in the
-  parallel world runs to its end (reference's), and a dive refunds its budget
-  on return. The CPU keeps the work budget (its suspension is the split).
-  tree-bitonic depth 23: 876 ms -> ~100 ms.
-* Bounds on both sides. A device fire is bounded: every 2^20 work units
-  force the frame's next budget check to suspend, so a runaway loop
-  cycles rounds to the round limit instead of freezing the device (which
-  is shared with the desktop); the host waits with a deadline
-  (`MITHRIL_GPU_TIMEOUT`, 300 s) and tears the context down past it. The
-  CPU arenas are capped at half of the memory available at start, so a
-  runaway program ends in "arena exhausted", not in swap. A teardown also
-  spills past 32 nested frames (its frames stack on the caller's): that
-  was the 256-lane fault.
-* The oracle interpreter deep-copied a value on every variable read
-  (`Val::C(id, Vec<Val>)`): the shared-tree fixture cost it 21 GB and
-  hung the machine twice under the test suite. Payloads are now shared
-  (`Arc`), a clone copies nothing; the same fixture takes 69 MB. Test
-  suites run under a memory watcher that kills them past a cap.
-* Small runtime helpers are inlined on the device: a `__noinline__` call
-  out of a 200-register function spills through local memory (1.7M
-  cycles per tree-node visit, profiled with clock64; Nsight needs the
-  admin counter permission on this box and could not attach to the
-  cooperative launch).
+### 11.3 Scope: ML runtimes and graph compilers
 
-Standing (this box; the device numbers were taken while a game held 6 GB
-of VRAM, so they are upper bounds): CPU 0.42 s at one thread, 0.115 s at
-16, C twin 0.35 s; device 0.54 s, of which ~0.45 s is the build's
-sequential prefix (partitioning a 2^18 list on one lane, a property of
-the model that reference shares). Open: tree-bitonic depth 23 can overflow
-a rule ring (2M entries) now that work phases run whole subtrees: a
-level of its merge is 2^22 tasks of one rule; the fix is one shared task
-ring (reference's cube is 16M tasks), not per-rule rings: a regression at
-that one size against b738538 (the loop budget kept the frontier small
-by suspending work phases), traded for the 10x on every other size.
-The ERA spill and the device work cap are device-only scheduling; the
-CPU tears down in place and burns work units (its suspension is the
-split), the same rules either way.
-
-### 3h. Harness standing at 15f51dd, and the source review
-
-The full harness (`bench/harness.py`, one run per lane, 300 s timeout,
-default arenas, this 4090 with the desktop holding ~1 GB of VRAM):
-
-* CPU, 17 ports: at or under reference seq on 12; ahead of reference par on 10 at
-  16 threads. Four ports do not scale at all (gameoflife, nbody, queens,
-  symreg run at one-thread speed): the sequential-prefix shapes.
-* GPU, the honest number: raytrace 0.78 s (reference 0.54), kdtree 1.7 s,
-  editdist 4.3 s, lexer 6.2 s, mandelbrot 15 s, merkle 18 s, nbody 70 s,
-  tree-radix 72 s, kmeans 142 s, gameoflife 262 s, queens past 300 s;
-  bfs, hashmap, symreg, terrain, tree-bitonic and tree-matmul exhaust a
-  per-rule ring, the array heap or the record arena at defaults. Every
-  finished run is checksum-equal. The device-only times quoted in 3f/3g
-  (bitonic ~0.1 s, raytrace 0.056 s) were hand-picked sizes with raised
-  arenas; the lane as a whole is not competitive yet. The two structural
-  items are one shared task ring and the work-phase cycling on
-  sequential prefixes.
-
-Three independent full-source reviews (one per crate group, 2026-09-29)
-found 16 defects, of which 10 were confirmed with probes and fixed in one
-commit, each with a fixture: `range(a, b)` re-evaluated `a` every
-iteration; a bool variable lost its boolness across a loop or a join and
-was rejected in a later condition (now kept when every assignment to it
-is boolean); an int `match` with no matching case fell into an
-unreachable constructor instead of continuing (Python falls through); a
-NaN comparison was an ICE (now IEEE: only `!=` holds, one definition
-shared by the oracle and the reducer); hex literals from 2^63 wrapped
-negative; a native tuple projected after a suspendable call did not
-compile; `return ()` in a dive tail did not compile; a loop-form dive
-leaked an owned parameter its body never read on every iteration; a
-function whose only floats were parameters was classified as a native
-scalar form and computed on the ports' bits. Unconfirmed (argued from the
-code, kept on the list): an array leaking through an if-arm tuple mask, a
-thread-local read before it is set on the device path, a borrow-inference
-round cap. The reviews also list about 1500 lines of folds at low risk
-(two batches applied: 15000 to 13843 lines, generated Rust byte-identical)
-and two Core-level rewrites in the code generator (tail inlining,
-if-conversion) that the core constraint forbids at that layer: those get
-their own commit and note.
-
-### 3i. Feasibility for ML and graph-compiler work (note, 2026-09-29)
-
-Assessed against the user's domain: ML runtimes and graph compilers
-(Blaze at ../simple-lang: typed arrays, loops, a schedule language,
-native kernels called from a host). Mithril is the other shape: a
-functional program whose meaning is net rewrites, parallel by confluence.
 Fit is by task shape, not by domain.
 
-Fits natively:
-* MoE routing as an algorithm: top-k gating per token, capacity-limited
-  dispatch, overflow, load balancing. Data-dependent, irregular, list and
-  tree shaped: the k-d tree probe's shape (a shared read-only structure
-  across forks, partitioning, data-dependent branching). A router over
-  2^16 tokens and 64 experts is a fork tree over tokens with a partition
-  per expert; the scheduler does the balancing a CUDA router does with
-  atomics and sorts. Expected: near C on the CPU, ahead of reference on the
-  device, far from a hand-tuned radix-sort router for the dense part.
-* Fabric and collective algorithms as models: ring/tree all-reduce,
-  all-to-all for expert exchange, hierarchical reductions over a chip
-  topology are interaction nets (local rules on a graph); confluence is
-  the property to prove about them. Mithril expresses and checks such an
-  algorithm oracle-equal, same rules on CPU and GPU: an executable
-  specification and a schedule simulator, not the thing driving the NICs.
-* Graph-compiler passes: rewrite systems over an IR are rule tables,
-  confluent by construction, run by the compile-time reducer. The
-  strongest fit, and where Mithril and Blaze meet: Blaze's graph-level
-  rewriting as Mithril rules.
+Fits:
+
+* **Irregular planning.** MoE routing (top-k gating per token,
+  capacity-limited dispatch, overflow, load balancing), sparsity
+  patterns, graph traversals. This is the k-d tree's shape: a shared
+  read-only structure, partitioning, data-dependent branching, balanced
+  by the scheduler rather than by atomics and sorts.
+* **Collective and fabric algorithms as models.** Ring and tree
+  all-reduce, all-to-all for expert exchange, hierarchical reductions over
+  a chip topology are local rules on a graph. Mithril expresses and
+  checks such an algorithm oracle-equal with the same rules on CPU and
+  GPU: an executable specification and a schedule simulator, not a driver
+  of real links.
+* **Graph-compiler passes.** A rewrite system over an IR is a rule table,
+  run by the compile-time reducer.
 
 Does not fit:
+
 * Dense math (matmul, attention, expert FFNs): no tensors, layouts or
-  tensor cores; floats are boxed f64 or f32 bit patterns. Blaze's job;
-  Mithril calls out, never replaces.
-* Real cross-chip execution: no I/O, one device, no fabric bindings. It
-  models a fabric algorithm; it cannot run one across chips.
-* In-place state: arrays are functional; a router that mutates expert
-  buffers is a fold producing new values (ownership reclaims in place
-  when it can).
+  tensor cores.
+* Cross-chip execution: no I/O, one device.
+* In-place mutable state: arrays are values; ownership reclaims in place
+  when it can.
 
-What makes the combination real, in order:
-1. A foreign-call boundary: a Mithril program invokes a Blaze-compiled
-   kernel on an array (routing in Mithril, expert compute in Blaze). The
-   array value type exists on both devices; the boundary is an engine
-   rule that hands a buffer out and takes one back.
-2. The static f32 type (planned) plus f32 arrays, so gating scores read
-   as arithmetic.
-3. One probe program, done like the k-d tree: a MoE router with top-2
-   gating and capacity overflow over hashed logits, C twin,
-   oracle-checked, CPU and GPU. The standing in a day, not by argument.
-Order: folds, f32 type, Cornell box demo, then the MoE router as the next
-generality probe (a better second probe than path tracing for this
-domain; the f32 type serves both).
+What a combination with Blaze (`../simple-lang`: typed arrays, loops, a
+schedule language, native kernels) would need, in order: the static f32
+type and f32 arrays; buffers crossing a foreign-call boundary without
+copies (an engine rule that hands a buffer out and takes one back); a
+probe done like the k-d tree (a MoE router with top-2 gating and capacity
+overflow over hashed logits, C twin, oracle-checked, CPU and device)
+whose output is a dispatch plan of index buffers. Whether Mithril's role
+is to generate graphs that Blaze lowers (the residual net exported as a
+graph of Blaze calls on buffers, the irregular structure decided at
+compile time or by a residual Mithril region) is undecided.
 
-Under discussion (2026-09-29): Mithril as the irregular half of Blaze.
-The role, as the user put it: Mithril does not generate kernels. It
-generates graphs that Blaze lowers efficiently, and is eventually
-integrated into Blaze natively for irregular and sparse computation.
-Blaze (../simple-lang) owns dense math: typed arrays, loops, schedules,
-native kernels. Mithril owns the part whose shape is data-dependent.
+## 12. Open items
 
-Why the fit is structural, not incidental:
-* The residual net after compile-time reduction is already a graph: every
-  static decision has been taken by rule firings, and what remains is the
-  data-dependent structure. Exporting it as a Blaze graph (ops over
-  buffers, with the routing or sparsity decided) is a lowering of the
-  residual net, which the core constraint already allows: lowering never
-  changes meaning, and any region can fall back to the rule engine.
-* Irregular planning is what the net does well: MoE routing (top-k gating,
-  capacity, overflow, load balance), sparsity patterns, graph traversals,
-  collective schedules over a chip topology. The k-d tree probe is this
-  shape: a shared read-only structure, partitioning, data-dependent
-  branching, balanced by the scheduler rather than by atomics and sorts.
-* Graph-compiler passes are rule tables. A pass written as net rules is
-  confluent by construction and runs in the compile-time reducer; Blaze's
-  graph rewriting can live there.
+Device:
 
-The interface, in order of need:
-1. A graph export from the residual net: nodes are Blaze calls on buffers
-   (dense work), edges are data dependencies, and the irregular structure
-   (which tokens go to which expert, which blocks are nonzero) is either
-   decided at compile time or computed by a residual Mithril region that
-   produces index buffers Blaze consumes.
-2. Buffers as values: f32/int arrays crossing the boundary without copies
-   (the array value type exists on both devices; the boundary is an engine
-   rule that hands a buffer out and takes one back).
-3. The static f32 type and f32 arrays, so gating and scores are arithmetic.
-4. A probe, done like the k-d tree: a MoE router (top-2 gating, capacity
-   overflow, hashed logits), C twin, oracle-checked, CPU and GPU, whose
-   output is the dispatch plan (index buffers) a Blaze expert kernel would
-   consume. Then the same router emitting the graph.
+1. Grow policy: a sweep counts as growth when it pushed anything; it
+   should count only when a fork happened. symreg runs 17,902 grow sweeps
+   and tree-bitonic 966 rounds.
+2. hashmap: per-rule rings of 2^21 entries overflow on a 7.5 M-task
+   frontier. Replace them with one chunked shared task ring (reference's
+   cube holds 16 M tasks).
+3. Fixed startup cost of about 0.4 s (arena allocation and clearing),
+   which makes every small port slower than reference on wall clock.
+4. Not measured on the current tree: tree-matmul and kdtree.
+5. The runner still allocates the cell and record overflow rings, which
+   the allocators no longer use.
 
-What Mithril does not do: dense kernels, tensor layouts, multi-chip I/O.
-Those are Blaze's and the runtime's. Open for discussion, not decided.
+CPU:
 
-Every reference number in this document is reference (reference/reference, the reference
-runtime with the task cube, `bench/reference.csv` on this 4090), never reference
-1 or HVM.
+6. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
+   0.771. It needs lane-level (u32) vectorization; a hand-edited proof
+   reached 5.81 s at one thread.
+7. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
+   (0.827 s against 0.616, and default arenas exhausted); tree-matmul at
+   16 threads (0.66 s against 0.61).
+8. `interp_closure`: a closure body with no parameter-free work should be
+   applied by compiled code directly, the rule table deciding when.
+9. Inference: one heterogeneous array poisons connected ints to `Dyn`.
 
-## 4. Runtime: waves, dives, records
+Semantic core:
 
-The runtime is one model on CPU and GPU:
+10. Readback: a closure created in an arm, capturing a pattern binder and
+    applied twice, is an ICE in the reader (the ignored test in
+    `specialize_test.rs`). Two specializer crashes on nested closures with
+    conditionals (in `mithril-core` `net.rs` and `rules.rs`).
+11. The Dup cache is keyed by the whole selection, so a captured shared
+    value read under three selections is bound three times (duplicated
+    work, not a wrong answer). Keying by the selections a read consults
+    fixes it.
 
-* A **redex** is a pending rule application; a **record** is a
-  continuation waiting for `pend` values.
-* A **dive** runs a function natively under a fuel budget. On fuel-out it
-  *captures*: the pending call is re-spawned as a redex, and every native
-  frame on the way up splits its continuation into the part independent
-  of the pending value (spawned now as a task) and the dependent rest
-  (a record, pend 2). This is where parallelism comes from: nothing in
-  the source says "fork".
-* The rule form (segments) dives too; it only allocates records on
-  suspension, nests at most 4 inline dives before deferring the rest to a
-  (memoized) record, so generated code is linear in chain length.
-* **Waves**: the coordinator merges every worker's spawn buffer into
-  per-rule buckets and drains the heaviest bucket across the pool
-  (`entries x rule_cost`, where anything that may dive costs a full
-  budget). Records whose last child delivers fire immediately on that
-  worker (bounded nesting) instead of waiting for the next wave — this is
-  part of the wave model, on every backend.
-* Sequential runs use fuel 2^40 (one dive); parallel runs 16384 per dive
-  while the frontier is thin, and `16384 x ceil(entries / (4 x workers))`
-  once a wave holds more than four entries per worker (`wave_fuel`):
-  suspension exists to expose work to idle workers, and splitting past
-  that only costs records and locality. hashmap PAR16 0.49 -> 0.23 s (every
-  suspension in the batch spine used to split off a sibling subtree until
-  all 2048 tables were in flight, 20M live cells, cache-bound even on one
-  worker); other ports within noise.
+Constraint and proofs:
 
-Cost model, measured on tree-bitonic PAR16: per-wave barrier ~70 us;
-every dependency hop across a suspension is one wave; the frontier grows
-exponentially only while suspended frames have large independent siblings.
-The remaining gap to reference (2.82 vs 1.78 s) is waves with fewer ready
-entries than workers.
+12. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
+    with unmarked thresholds (64, 32, 128), and the inline decision uses a
+    threshold (192) and a name prefix (`__while`/`__for`). Undecided:
+    move into the rules, justify by a stated cost model, or mark as
+    tunables with their evidence.
+13. Lean proof of confluence of the core rule table: not started.
+14. One rule-table source for the CPU and the device: not started.
 
-## 5. Gate: `tests/ci/fast.py` (~60 s)
+Measurement:
 
-Run before every commit. Per port, in parallel: small-size exact checksum
-at 1 and 16 threads; the set of scalar-lowered functions must not shrink;
-generated lines / segment count / build time within tolerance; instruction
-count of a mid-size run within 15% of `tests/ci/baseline.json`; arena
-exhaustion reported as its own failure class. `--update` rewrites the
-baseline — only from a state verified against reference (`--update --only X`
-refreshes X's entry and keeps the rest).
+15. reference re-measured on a quiet machine: not done.
+16. The efficiency study: work per port against the C twin and a hand
+    CUDA kernel; speedup per core; lanes busy per phase. Not started.
+17. The nbody C twin does not compile with gcc 11 (`musttail` placement).
+18. A reference lane for the generality corpus is not set up.
 
-Why it exists: one day of tree-bitonic tuning silently dropped mandelbrot
-off the scalar path (6x), double-freed in merkle, and made nbody's
-generated code exponential; all were found hours later by full runs.
+Unconfirmed findings from source review (argued from the code, no
+failing probe yet): an array leaking through an if-arm tuple mask; a
+thread-local read before it is set on the device path; the borrow
+inference's round cap.
 
-## 6. Standings vs reference (big sizes, this box; ours = wave runtime)
+Planned: the static f32 type and f32 arrays; a Cornell box demo; the MoE
+router probe (section 11.3).
 
-| bench | ours SEQ / PAR16 | reference SEQ / PAR16 | state |
-|---|---|---|---|
-| bfs | 4.42 / 0.45 | 4.75 / 0.555 | met |
-| mandelbrot | 3.8 / 0.50 | 4.96 / 0.62 | met |
-| tree-radix | 4.3 / 0.70 | 4.84 / 0.75 | met |
-| lexer | 2.4 / 0.31 | 2.96 / 0.40 | met |
-| symreg | 2.95 / 0.41 | 4.76 / 0.60 | met |
-| tree-matmul | 3.6 / 0.58 | 4.16 / 0.61 | met |
-| merkle | 5.2 / 0.58 | 5.67 / 0.72 | met |
-| gameoflife | 9.07 / 1.19 | 9.89 / 1.50 | met |
-| queens | 4.73 / 0.47 | 8.32 / 1.23 | met |
-| tree-bitonic | 10.3 / 2.73 | 10.78 / 1.78 | SEQ met; PAR wave-bound |
-| kmeans | 10.7 / 1.47 | 7.84 / 0.77 | needs lane-level (u32) vectorization; hand proof 5.81 |
-| editdist | 2.27 / 0.27 | 2.44 / 0.39 | met |
-| hashmap | 1.82 / 0.23 | 3.22 / 0.40 | met |
-| terrain | | 3.21 / 0.46 | being ported to arrays |
-| nbody, raytrace | | 6.29 / 0.67, 7.60 / 0.96 | need native f32 |
+Undecided: Mithril's role as the graph generator for Blaze's irregular
+and sparse computation (section 11.3).
 
-## 6b. Generality corpus (`bench/general/run.py`)
+## 13. Process rules
 
-Seven programs deliberately unlike the suite: a heavily shared DAG, a
-persistent BST map with live old versions, copy-on-write array versions,
-list merge/quick sort, an expression interpreter (many constructors, env
-as a list), graph DFS over an array of adjacency lists, and mutual
-recursion. Each is checked against the Python oracle (small size) and an
-idiomatic Rust twin (`rust/*.rs`, Rc/Vec; same checksum), then timed.
+The working rules are in `CLAUDE.md`. The ones that shape this design:
 
-| program | Rust | ours t1 | ours t16 |
-|---|---|---|---|
-| collatz_mutual | 0.30 | 0.43 | 0.43 |
-| cow_versions | 1.00 | 0.98 | 0.97 |
-| dag_share | 1.68 | 1.87 | 0.29 |
-| graph_dfs | 0.86 | 1.20 | 0.27 |
-| interp | 2.36 | 1.21 | 0.14 |
-| persist_map | 1.47 | 1.49 | 1.49 |
-| sorts | 6.21 | 1.41 | 0.60 |
-
-Sequentially within 1.0-1.4x of idiomatic Rust (faster where Rust pays
-per-node refcounting); 16 threads never slower than 1, and 4-9x faster
-where iterations are independent. What the corpus found (all general
-fixes): value-position `if`/`match` leaked every value whose last use was
-in an arm (cow_versions 6 GB -> 2 MB); a fold's split never fired when
-iterations were heavier than one budget; a sequential program paid for
-splits at 16 threads (waves that expose nothing now grow the budget);
-live dive bridges hid native call graphs from the backend; mutual tail
-recursion stayed calls (tail inlining makes it a loop); an array write
-evaluated the array before a value that reads it (dup + free per write).
-
-## 7. Process rules (from the user)
-
-* One runtime model everywhere; a component that is bad is bad globally.
-  No architecture swaps for small wins.
-* Wins come from changing usecase geometry: rewrites, types, codegen.
-* Every benchmark must meet reference with general mechanisms only.
-* `tests/ci/fast.py` before every commit; no full-suite runs until each
-  benchmark is individually cleared.
+* One rule table, one semantics, compile time and runtime. Every static
+  optimization is a rule firing; lowering never changes meaning.
+* One runtime model on CPU and device. A component that is bad is bad
+  globally; fix it, do not swap architectures for a local win. A
+  work-stealing CPU pool was not adopted for this reason.
+* Wins come from program geometry: rewrites, types, lowering. No
+  per-benchmark logic; nothing looks at a program's name or shape to pick
+  a strategy.
+* A change is proven on hand-edited generated code (or a hand net) first,
+  then made a rule or a lowering, then tested, with measurements before
+  and after.
+* Every benchmark is met with general mechanisms only.
+* `tests/ci/fast.py` (about a minute) runs before every commit. Per port,
+  in parallel: small-size checksum at 1 and 16 threads; the set of
+  native-scalar functions must not shrink; generated lines, segment count
+  and build time within tolerance; mid-size instruction count within 15%
+  of the baseline; arena exhaustion as its own failure class. `--update`
+  rewrites the baseline only from a state verified against the expected
+  checksums (`--update --only X` refreshes one entry). The gate exists
+  because unchecked tuning once dropped mandelbrot off the scalar path
+  (6x), double-freed in merkle and made nbody's generated code
+  exponential, found only by full runs.
+* `tests/ci/gpu.py` (about two minutes warm) runs for device changes.
+* The language crates (front, core, net, reassoc, codegen, cli) are held
+  under 15,000 lines; they are at 13,239.
+* Design decisions are recorded here with the numbers that justify them.
