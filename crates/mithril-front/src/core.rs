@@ -245,29 +245,11 @@ pub struct CoreFn {
     /// True iff every self-call is the last expression evaluated on its
     /// control-flow path (i.e. all self-calls are in tail position).
     pub self_tail_rec: bool,
-    /// Set by Task 4 on the `For` this function was generated from (if
-    /// any); Task 3's desugar only ever plumbs through whatever the
-    /// surface `For`'s `fold` field already carried (always `None` today,
-    /// since the parser never sets it).
+    /// The fold proof of the `For` this helper was generated from, if any.
     pub fold: Option<FoldInfo>,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct FoldInfo {
-    pub combiner: Combiner,
-    pub proven: bool,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum Combiner {
-    WrapAdd,
-    TupleWrapAdd(usize),
-    /// u32-emulation folds (`& 4294967295`-masked): wrapping add mod
-    /// 2^32; the join must re-mask its result to the low 32 bits.
-    WrapAdd32,
-    TupleWrapAdd32(usize),
-    Fn(FnId),
-}
+pub use crate::ast::{Combiner, FoldInfo};
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct CoreModule {

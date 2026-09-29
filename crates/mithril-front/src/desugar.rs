@@ -7,9 +7,8 @@
 //! `Expr`/`Stmt` types have no line field), so every `Diag` here uses
 //! line `0`; this is a known, documented limitation of the given AST.
 
-use crate::ast::{BinOp, BoolOp, CmpOp, Expr, FnDef, Module, Pat, Stmt};
-use crate::ast::{Combiner as AstCombiner, FoldInfo as AstFoldInfo};
-use crate::core::{self, Combiner, Core, CoreFn, CoreModule, CtorId, FnId, UNREACHABLE_CTOR};
+use crate::ast::{BinOp, BoolOp, CmpOp, Expr, FnDef, FoldInfo, Module, Pat, Stmt};
+use crate::core::{Core, CoreFn, CoreModule, CtorId, FnId, UNREACHABLE_CTOR};
 use crate::Diag;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -41,10 +40,7 @@ pub fn desugar(m: &Module) -> Result<CoreModule, Diag> {
         data_ctors.insert(d.name.clone(), names);
     }
     let t = Tables { fn_table, fn_arity, ctor_table, ctor_owner, data_ctors };
-    let mut g = Gen { out_fns: Vec::new() };
-    for _ in &m.fns {
-        g.out_fns.push(placeholder());
-    }
+    let mut g = Gen { out_fns: vec![placeholder(); m.fns.len()] };
     for (i, f) in m.fns.iter().enumerate() {
         let cf = compile_fn(f, &t, &mut g)?;
         g.out_fns[i] = cf;
@@ -84,19 +80,15 @@ impl Gen {
 /// Per-function variable resolution: name -> current `Core::Var` index,
 /// plus which names are currently known (by syntactic classification) to
 /// hold a `bool` value, used to enforce "only bool in conditions".
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Scope {
     vars: HashMap<String, u32>,
     bool_vars: HashSet<String>,
     next_idx: u32,
 }
 impl Scope {
-    fn new() -> Scope {
-        Scope { vars: HashMap::new(), bool_vars: HashSet::new(), next_idx: 0 }
-    }
     fn fresh(&mut self, name: &str) -> u32 {
-        let i = self.next_idx;
-        self.next_idx += 1;
+        let i = self.fresh_anon();
         self.vars.insert(name.to_string(), i);
         i
     }
@@ -268,7 +260,14 @@ fn free_reads_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
 
 // ---- expression compilation ----
 
+/// Curry `body` over `ps`, outermost first.
+fn lams(ps: Vec<u32>, body: Core) -> Core {
+    ps.into_iter().rev().fold(body, |b, p| Core::Lam(p, Box::new(b)))
+}
+
 fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
+    let c = |e: &Expr| compile_expr(e, scope, t).map(Box::new);
+    let num = |n| Box::new(Core::Num(n));
     match e {
         Expr::Int(n) => Ok(Core::Num(*n)),
         Expr::Float(n) => Ok(Core::Flo(*n)),
@@ -282,35 +281,20 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
                     let arity = t.fn_arity[fid as usize];
                     let mut s = scope.clone();
                     let params: Vec<u32> = (0..arity).map(|_| s.fresh_anon()).collect();
-                    let mut body = Core::Call(fid, params.iter().map(|p| Core::Var(*p)).collect());
-                    for p in params.into_iter().rev() {
-                        body = Core::Lam(p, Box::new(body));
-                    }
-                    Ok(body)
+                    let call = Core::Call(fid, params.iter().map(|p| Core::Var(*p)).collect());
+                    Ok(lams(params, call))
                 }
                 None => Err(e),
             },
         },
-        Expr::Bin(op, a, b) => {
-            Ok(Core::Op2(*op, Box::new(compile_expr(a, scope, t)?), Box::new(compile_expr(b, scope, t)?)))
-        }
-        Expr::Cmp(op, a, b) => {
-            Ok(Core::Cmp(*op, Box::new(compile_expr(a, scope, t)?), Box::new(compile_expr(b, scope, t)?)))
-        }
-        Expr::Bool2(BoolOp::And, a, b) => {
-            Ok(Core::If(Box::new(compile_expr(a, scope, t)?), Box::new(compile_expr(b, scope, t)?), Box::new(Core::Num(0))))
-        }
-        Expr::Bool2(BoolOp::Or, a, b) => {
-            Ok(Core::If(Box::new(compile_expr(a, scope, t)?), Box::new(Core::Num(1)), Box::new(compile_expr(b, scope, t)?)))
-        }
-        Expr::Not(a) => Ok(Core::If(Box::new(compile_expr(a, scope, t)?), Box::new(Core::Num(0)), Box::new(Core::Num(1)))),
-        Expr::IfExp(c, then, els) => {
-            check_cond(c, scope)?;
-            Ok(Core::If(
-                Box::new(compile_expr(c, scope, t)?),
-                Box::new(compile_expr(then, scope, t)?),
-                Box::new(compile_expr(els, scope, t)?),
-            ))
+        Expr::Bin(op, a, b) => Ok(Core::Op2(*op, c(a)?, c(b)?)),
+        Expr::Cmp(op, a, b) => Ok(Core::Cmp(*op, c(a)?, c(b)?)),
+        Expr::Bool2(BoolOp::And, a, b) => Ok(Core::If(c(a)?, c(b)?, num(0))),
+        Expr::Bool2(BoolOp::Or, a, b) => Ok(Core::If(c(a)?, num(1), c(b)?)),
+        Expr::Not(a) => Ok(Core::If(c(a)?, num(0), num(1))),
+        Expr::IfExp(cond, then, els) => {
+            check_cond(cond, scope)?;
+            Ok(Core::If(c(cond)?, c(then)?, c(els)?))
         }
         Expr::Call(name, args) => {
             let cargs: Vec<Core> = args.iter().map(|a| compile_expr(a, scope, t)).collect::<Result<_, _>>()?;
@@ -344,18 +328,14 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         }
         Expr::Tuple(items) => Ok(Core::Tuple(items.iter().map(|it| compile_expr(it, scope, t)).collect::<Result<_, _>>()?)),
         Expr::Index(base, idx) => match idx.as_ref() {
-            Expr::Int(n) if *n >= 0 => Ok(Core::Proj(Box::new(compile_expr(base, scope, t)?), *n as usize)),
+            Expr::Int(n) if *n >= 0 => Ok(Core::Proj(c(base)?, *n as usize)),
             _ => Err(Diag::new(0, "tuple index must be a non-negative integer literal")),
         },
         Expr::Lambda(params, body) => {
             // curried: each parameter is a fresh variable of an inner scope
             let mut s = scope.clone();
             let idxs: Vec<u32> = params.iter().map(|p| { s.bool_vars.remove(p); s.fresh(p) }).collect();
-            let mut e = compile_expr(body, &s, t)?;
-            for i in idxs.into_iter().rev() {
-                e = Core::Lam(i, Box::new(e));
-            }
-            Ok(e)
+            Ok(lams(idxs, compile_expr(body, &s, t)?))
         }
     }
 }
@@ -441,18 +421,14 @@ fn bind_join_and_continue(
         if bools.contains(n) { scope.bool_vars.insert(n.clone()); } else { scope.bool_vars.remove(n); }
         scope.fresh(n)
     };
-    if names.len() == 1 {
-        let idx = bind(scope, &names[0]);
-        let core = compile_block(rest, scope, t, g, k)?;
-        return Ok(Core::Let(idx, Box::new(producer), Box::new(core)));
-    }
-    let tup_idx = scope.fresh_anon();
+    let tup = (names.len() != 1).then(|| scope.fresh_anon());
     let idxs: Vec<u32> = names.iter().map(|n| bind(scope, n)).collect();
     let mut core = compile_block(rest, scope, t, g, k)?;
+    let Some(tup) = tup else { return Ok(Core::Let(idxs[0], Box::new(producer), Box::new(core))) };
     for (i, idx) in idxs.iter().enumerate().rev() {
-        core = Core::Let(*idx, Box::new(Core::Proj(Box::new(Core::Var(tup_idx)), i)), Box::new(core));
+        core = Core::Let(*idx, Box::new(Core::Proj(Box::new(Core::Var(tup)), i)), Box::new(core));
     }
-    Ok(Core::Let(tup_idx, Box::new(producer), Box::new(core)))
+    Ok(Core::Let(tup, Box::new(producer), Box::new(core)))
 }
 
 /// Compile the arms of an `if`/`match` statement that appears mid-block.
@@ -501,13 +477,7 @@ fn compile_dispatch_arms(
         let idxs: Vec<u32> = binds.iter().map(|n| s.fresh(n)).collect();
         let core = if joinable {
             let m = mutated.clone();
-            compile_block(body, &mut s, t, g, &move |sc: &Scope, _g2: &mut Gen| {
-                Ok(if m.len() == 1 {
-                    Core::Var(sc.vars[&m[0]])
-                } else {
-                    Core::Tuple(m.iter().map(|n| Core::Var(sc.vars[n])).collect())
-                })
-            })?
+            compile_block(body, &mut s, t, g, &move |sc: &Scope, _g2: &mut Gen| Ok(state_value(&m, sc)))?
         } else if always_returns(body) {
             compile_block(body, &mut s, t, g, &unreachable_tail)?
         } else {
@@ -592,27 +562,31 @@ fn check_exhaustive(cases: &[(Pat, Vec<Stmt>)], t: &Tables) -> Result<(), Diag> 
 
 // ---- while / for -> fresh self-recursive helper functions ----
 
+/// A loop helper's parameters (names it mutates or reads that exist outside
+/// it, sorted) and the mutated ones among them.
+fn loop_state(mutated: BTreeSet<String>, free: &BTreeSet<String>, scope: &Scope) -> (Vec<String>, Vec<String>) {
+    let params = mutated.union(free).filter(|n| scope.vars.contains_key(*n)).cloned().collect();
+    (params, mutated.into_iter().filter(|n| scope.vars.contains_key(n)).collect())
+}
+
+/// The state `names` in scope `s`: a bare value for one name, a tuple otherwise.
+fn state_value(names: &[String], s: &Scope) -> Core {
+    let mut vs: Vec<Core> = names.iter().map(|n| Core::Var(s.vars[n])).collect();
+    if vs.len() == 1 { vs.pop().unwrap() } else { Core::Tuple(vs) }
+}
+
 fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut Gen) -> Result<(Core, Vec<String>), Diag> {
     check_cond(cond, scope)?;
     if contains_return(body) {
         return Err(Diag::new(0, "`return` inside a `while` body is not supported"));
     }
-    let mutated_set = assigned_names(body);
     let mut free = BTreeSet::new();
     free_reads_expr(cond, &mut free);
     free_reads_stmts(body, &mut free);
-    let params_all: Vec<String> = mutated_set
-        .iter()
-        .chain(free.iter())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|n| scope.vars.contains_key(n))
-        .collect();
-    let mutated: Vec<String> = mutated_set.into_iter().filter(|n| params_all.contains(n)).collect();
+    let (params_all, mutated) = loop_state(assigned_names(body), &free, scope);
 
     let helper_id = g.fresh_fn_id();
-    let mut hscope = Scope::new();
+    let mut hscope = Scope::default();
     for p in &params_all {
         hscope.fresh(p);
     }
@@ -625,9 +599,7 @@ fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut 
             Ok(Core::Call(helper_id, params_cl.iter().map(|p| Core::Var(sc.vars[p])).collect()))
         })?
     };
-    // the loop state: a bare value for one variable, a tuple otherwise
-    let else_core = if mutated.len() == 1 { Core::Var(hscope.vars[&mutated[0]]) } else { Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect()) };
-    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(else_core));
+    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(state_value(&mutated, &hscope)));
     let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);
     g.out_fns[helper_id as usize] = CoreFn {
         name: format!("__while{}", helper_id),
@@ -644,7 +616,7 @@ fn compile_for(
     var: &str,
     bound: &Expr,
     body: &[Stmt],
-    fold: &Option<AstFoldInfo>,
+    fold: &Option<FoldInfo>,
     scope: &mut Scope,
     t: &Tables,
     g: &mut Gen,
@@ -655,22 +627,13 @@ fn compile_for(
     let cbound = compile_expr(bound, scope, t)?;
     let bound_idx = scope.fresh_anon();
 
-    let mutated_set: BTreeSet<String> = assigned_names(body).into_iter().filter(|n| n != var).collect();
     let mut free = BTreeSet::new();
     free_reads_stmts(body, &mut free);
     free.remove(var);
-    let extra: Vec<String> = mutated_set
-        .iter()
-        .chain(free.iter())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|n| scope.vars.contains_key(n))
-        .collect();
-    let mutated: Vec<String> = mutated_set.into_iter().filter(|n| extra.contains(n)).collect();
+    let (extra, mutated) = loop_state(assigned_names(body).into_iter().filter(|n| n != var).collect(), &free, scope);
 
     let helper_id = g.fresh_fn_id();
-    let mut hscope = Scope::new();
+    let mut hscope = Scope::default();
     let v_idx = hscope.fresh(var);
     let bnd_idx = hscope.fresh("__bound");
     for p in &extra {
@@ -686,21 +649,15 @@ fn compile_for(
             Ok(Core::Call(helper_id, args))
         })?
     };
-    // the loop state: a bare value for one variable, a tuple otherwise
-    let else_core = if mutated.len() == 1 { Core::Var(hscope.vars[&mutated[0]]) } else { Core::Tuple(mutated.iter().map(|n| Core::Var(hscope.vars[n])).collect()) };
     let hcond = Core::Cmp(CmpOp::Lt, Box::new(Core::Var(v_idx)), Box::new(Core::Var(bnd_idx)));
-    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(else_core));
+    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(state_value(&mutated, &hscope)));
     let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);
-    let core_fold = match fold {
-        None => None,
-        Some(fi) => Some(core::FoldInfo { combiner: convert_combiner(&fi.combiner, &t.fn_table)?, proven: fi.proven }),
-    };
     g.out_fns[helper_id as usize] = CoreFn {
         name: format!("__for{}", helper_id),
         arity: 2 + extra.len(),
         body: helper_body,
         self_tail_rec,
-        fold: core_fold,
+        fold: fold.clone(),
     };
 
     let mut call_args = vec![Core::Num(0), Core::Var(bound_idx)];
@@ -709,25 +666,13 @@ fn compile_for(
     Ok((call, mutated))
 }
 
-fn convert_combiner(c: &AstCombiner, fn_table: &HashMap<String, FnId>) -> Result<Combiner, Diag> {
-    Ok(match c {
-        AstCombiner::WrapAdd => Combiner::WrapAdd,
-        AstCombiner::TupleWrapAdd(n) => Combiner::TupleWrapAdd(*n),
-        AstCombiner::WrapAdd32 => Combiner::WrapAdd32,
-        AstCombiner::TupleWrapAdd32(n) => Combiner::TupleWrapAdd32(*n),
-        AstCombiner::Fn(name) => Combiner::Fn(
-            *fn_table.get(name).ok_or_else(|| Diag::new(0, format!("unknown fold combiner function: {}", name)))?,
-        ),
-    })
-}
-
 // ---- top-level function compilation ----
 
 fn compile_fn(f: &FnDef, t: &Tables, g: &mut Gen) -> Result<CoreFn, Diag> {
     if !always_returns(&f.body) {
         return Err(Diag::new(0, format!("function '{}' does not return on all control-flow paths", f.name)));
     }
-    let mut scope = Scope::new();
+    let mut scope = Scope::default();
     for p in &f.params {
         scope.fresh(p);
     }
@@ -741,51 +686,11 @@ fn compile_fn(f: &FnDef, t: &Tables, g: &mut Gen) -> Result<CoreFn, Diag> {
 
 /// Every self call of `fid` in `body` is in tail position.
 pub fn compute_self_tail_rec(fid: FnId, body: &Core) -> bool {
-    let mut ok = true;
-    walk_tail(fid, body, true, &mut ok);
-    ok
-}
-
-fn walk_tail(fid: FnId, c: &Core, is_tail: bool, ok: &mut bool) {
-    match c {
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            walk_tail(fid, a, false, ok);
-            walk_tail(fid, b, false, ok);
-        }
-        Core::If(c1, then, els) => {
-            walk_tail(fid, c1, false, ok);
-            walk_tail(fid, then, is_tail, ok);
-            walk_tail(fid, els, is_tail, ok);
-        }
-        Core::Let(_, rhs, body) => {
-            walk_tail(fid, rhs, false, ok);
-            walk_tail(fid, body, is_tail, ok);
-        }
-        Core::Call(callee, args) => {
-            for a in args {
-                walk_tail(fid, a, false, ok);
-            }
-            if *callee == fid && !is_tail {
-                *ok = false;
-            }
-        }
-        Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            for a in args {
-                walk_tail(fid, a, false, ok);
-            }
-        }
-        Core::Match(scrut, arms) => {
-            walk_tail(fid, scrut, false, ok);
-            for (_, _, b) in arms {
-                walk_tail(fid, b, is_tail, ok);
-            }
-        }
-        Core::Proj(e, _) => walk_tail(fid, e, false, ok),
-        Core::Lam(_, b) => walk_tail(fid, b, false, ok),
-        Core::App(f, a) => {
-            walk_tail(fid, f, false, ok);
-            walk_tail(fid, a, false, ok);
-        }
+    // the tail passes into every child but the first of If, Let and Match
+    fn ok(fid: FnId, c: &Core, tail: bool) -> bool {
+        let passes = matches!(c, Core::If(..) | Core::Let(..) | Core::Match(..));
+        !matches!(c, Core::Call(g, _) if *g == fid && !tail)
+            && c.kids().into_iter().enumerate().all(|(i, k)| ok(fid, k, tail && passes && i > 0))
     }
+    ok(fid, body, true)
 }
