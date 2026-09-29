@@ -85,7 +85,7 @@ struct Infer<'m> {
     fields: HashMap<&'m str, Vec<usize>>,
     /// tuple projections whose tuple's width is not known yet
     projs: Vec<(usize, usize, usize)>,
-    /// arguments of `f32()` and `int()`: a float literal there is f32
+    /// float literals written as the argument of `f32()` or `int()`
     conv: Vec<usize>,
     /// destructuring assignments: the tuple and the number of names
     unpacks: Vec<(usize, usize)>,
@@ -213,6 +213,11 @@ impl<'m> Infer<'m> {
             }
             Expr::Call(f, args) => {
                 let xs: Vec<usize> = args.iter().map(|a| self.expr(a, env)).collect();
+                // a float literal written as the argument of f32() or int()
+                // is f32 (a float variable keeps its own type)
+                if let ([Expr::Float(_)], "f32" | "int") = (args.as_slice(), f.as_str()) {
+                    self.conv.push(xs[0]);
+                }
                 self.call(f, &xs, env)
             }
         };
@@ -250,14 +255,8 @@ impl<'m> Infer<'m> {
                 self.fresh_is(xs[0], Ty::F32);
                 xs[0]
             }
-            ("f32", 1) => {
-                self.conv.push(xs[0]);
-                self.node(Ty::F32)
-            }
-            ("int", 1) => {
-                self.conv.push(xs[0]);
-                self.node(Ty::Int)
-            }
+            ("f32", 1) => self.node(Ty::F32),
+            ("int", 1) => self.node(Ty::Int),
             ("array_len", 1) => self.node(Ty::Int),
             ("array_new", 2) => {
                 int(self, xs.first());
@@ -441,7 +440,7 @@ impl<'m> Infer<'m> {
                     "sqrt" => Expr::Call("f32_sqrt".into(), vec![x]),
                     "int" if on32 => self.helper("__int_of_f32", vec![x]),
                     _ if on32 => x,
-                    _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': {f}() of a value used both as an int and as a float", self.cur))),
+                    _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': {f}() of an f64 value (write the literal as f32, or keep the value f32)", self.cur))),
                     "int" => x,
                     _ => self.helper("__f32_of_int", vec![x]),
                 }

@@ -762,6 +762,17 @@ fn nested_tuples_stay_native_and_cross_the_bridge() {
     }
 }
 
+#[test]
+fn tuples_with_non_int_leaves_are_not_read_as_ints() {
+    let (cm, rs) = pipeline(&fixture("tuple_leaves.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert_eq!(want, "(22, 50, (7, 2.5), 408)");
+    let bin = compile(&rs, "tuple_leaves");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "tuple_leaves --threads {t}");
+    }
+}
+
 /// The Cornell box demo at a small size (its `size()` replaced).
 fn cornell_small(n: u32) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demos/cornell_whitted.py");

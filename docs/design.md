@@ -285,8 +285,9 @@ it is boolean.
 inference, over the surface AST: every variable, parameter, result,
 constructor field, tuple component and array element has one type, found
 by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
-assignments, operators, calls and returns, and a float literal passed to
-`f32()` or `int()` is f32. Where a value is f32, a literal becomes its bit
+assignments, operators, calls and returns, and a float literal written as
+the argument of `f32()` or `int()` is f32 (an f64 variable passed to
+either is an error, not a retyping). Where a value is f32, a literal becomes its bit
 pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
 Core, the net and every backend see ints and the existing rules: `x + y`
 on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
@@ -415,7 +416,9 @@ Each function is emitted in the forms its uses need.
   `i64` code, including tuple-valued join points. Array parameters are
   borrowed or owned by fixpoint; tuple results carry an array mask. A
   tuple is held as its leaves: a nested one (a record such as
-  `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`), and a
+  `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`: every
+  leaf an int, nesting at most 8 deep; a tuple parameter holding anything
+  else keeps the function boxed), and a
   projection of a nested component is a view of its leaves. A tuple may
   be used whole (returned, passed on, aliased, joined). Parameter and
   result layouts come from type inference, so a parameter that is only
@@ -466,7 +469,7 @@ on the tree at the time it was adopted:
 | selects as mask arithmetic | bfs to 4.48 / 0.45 s |
 | pre-shifted int representation | editdist SEQ 4.05 s to 2.80 s |
 | length locals | editdist SEQ 2.80 s to 2.27 s |
-| tuples used whole, nested tuples | Cornell Whitted 512 x 512, CPU t16 0.33 s to 0.077 s, device 1.25 s to 0.145 s |
+| tuples used whole, nested tuples | Cornell Whitted 512 x 512, CPU t16 0.33 s to 0.077 s, device 1.25 s (after the readback fix) to 0.145 s |
 
 ### 5.3 Fork sites and the frame split
 
@@ -720,9 +723,11 @@ at once.
   runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
   a dive form's next budget check to suspend, so no dive runs unbounded;
   a runaway loop cycles rounds to the round limit instead of freezing the
-  device, which the desktop shares. A native loop never suspends: once
-  per `WORK_CAP` iterations it checks whether the host asked the run to
-  stop (a no-op on the CPU).
+  device, which the desktop shares. Native code never suspends: each
+  native loop iteration and recursive native entry counts one unit per
+  thread, and once per `WORK_CAP` units it checks whether the host asked
+  the run to stop; once seen, the stop holds and every frame leaves (a
+  no-op on the CPU).
 * The stack guard (`stack_deep` on the device) compares against the
   thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives
@@ -789,11 +794,15 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
 * Round limit: `MITHRIL_GPU_ROUNDS`, default 2^24; a run that does not
   converge stops with an error.
 * Deadline: at `MITHRIL_GPU_TIMEOUT` (300 s) the host writes a stop code
-  into the abort flag (managed memory, written while the kernel runs);
+  into the abort flag (managed memory, written while the kernel runs, on
+  devices with concurrent managed access, and only when no abort is set);
   every lane stops at its next check and the run ends with a named error.
-  A kernel still running at twice the deadline is abandoned and the
-  context reset. (A context reset alone does not stop a running kernel;
-  measured.)
+  Measured: a runaway native loop stops within the deadline plus about
+  3 s. A runaway forking recursion does not stop (a dive form that leaves
+  early reads as suspended, and its work keeps expanding as tasks): at
+  twice the deadline the run returns an error and the kernel is
+  abandoned until the process exits. A context reset does not stop a
+  running kernel (measured), so none is attempted.
 * A failed run that left a sticky device error (700) in the context
   resets it; a clean abort leaves the context as it is.
 * Any arena exhaustion, out-of-bounds index, bad cell index or stack
@@ -1082,47 +1091,54 @@ Device:
 5. The grow/work policy (section 7.2) is reference's design. It is to be
    replaced by a policy derived from Mithril's own cost model (section
    14).
+6. Register pressure: the whole program is one kernel (`k_run` inlines
+   the dispatch of every rule). With the Cornell demos it takes 255
+   registers per thread (Whitted; path 144) and spills to a 1,200-byte
+   stack, so an SM holds 256 resident threads. Whitted's kernel runs in
+   19 ms and its wall clock is fixed cost; the path tracer's kernel takes
+   0.97 s. A register budget or out-of-line functions would be a tuning
+   knob; it needs a cost model (spill traffic against occupancy) first.
 
 CPU:
 
-6. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
+7. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
    0.771. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
-7. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
+8. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
    (0.827 s against 0.616, and default arenas exhausted); tree-matmul at
    16 threads (0.66 s against 0.61).
-8. `interp_closure`: a closure body with no parameter-free work should be
+9. `interp_closure`: a closure body with no parameter-free work should be
    applied by compiled code directly, the rule table deciding when.
-9. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
 
 Semantic core:
 
-10. Readback: a closure created in an arm, capturing a pattern binder and
+11. Readback: a closure created in an arm, capturing a pattern binder and
     applied twice, is an ICE in the reader (the ignored test in
     `specialize_test.rs`). Two specializer crashes on nested closures with
     conditionals (in `mithril-core` `net.rs` and `rules.rs`).
-11. The Dup cache is keyed by the whole selection, so a captured shared
+12. The Dup cache is keyed by the whole selection, so a captured shared
     value read under three selections is bound three times (duplicated
     work, not a wrong answer). Keying by the selections a read consults
     fixes it.
 
 Constraint and proofs:
 
-12. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
+13. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
     with unmarked thresholds (64, 32, 128), and the inline decision uses a
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
-13. Lean proof of confluence of the core rule table: not started.
-14. One rule-table source for the CPU and the device: not started.
+14. Lean proof of confluence of the core rule table: not started.
+15. One rule-table source for the CPU and the device: not started.
 
 Measurement:
 
-15. reference re-measured on a quiet machine: not done.
-16. The efficiency study: work per port against the C twin and a hand
+16. reference re-measured on a quiet machine: not done.
+17. The efficiency study: work per port against the C twin and a hand
     CUDA kernel; speedup per core; lanes busy per phase. Not started.
-17. The nbody C twin does not compile with gcc 11 (`musttail` placement).
-18. A reference lane for the generality corpus is not set up.
+18. The nbody C twin does not compile with gcc 11 (`musttail` placement).
+19. A reference lane for the generality corpus is not set up.
 
 Unconfirmed findings from source review (argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a

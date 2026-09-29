@@ -413,7 +413,7 @@ pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
 /// The device aborts a frame past its thread's stack; the CPU's stacks are large.
 #[inline] pub fn stack_guard() {}
 /// A native loop's stop check: the CPU never stops a run early.
-#[inline(always)] pub fn loop_guard(_fl: i64) {}
+#[inline(always)] pub fn loop_guard() {}
 /// `n` units of work charged to the budget (the device charges none: see lir::work_fuel)
 #[inline] pub fn work_fuel(fuel: &mut i64, n: i64) { *fuel -= n; }
 /// A fork site's call in the rule form: the same on the CPU.

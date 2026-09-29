@@ -922,6 +922,9 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
         .map(|fi| {
             tys.params[fi].iter().chain(std::iter::once(&tys.ret[fi])).any(|t| matches!(t, Ty::Arr(false)))
                 || tys.locals[fi].iter().any(|t| matches!(t, Ty::Flo | Ty::Adt(_)))
+                // a tuple parameter holding more than ints (native code holds
+                // a parameter's leaves as i64s)
+                || tys.params[fi].iter().zip(&tys.pshape[fi]).any(|(t, sh)| matches!(t, Ty::Tup(_)) && sh.is_none())
         })
         .collect();
     let mut sigs: Vec<Option<Sig>> = m
@@ -936,11 +939,11 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
                 .map(|p| {
                     match tys.params[fi].get(p as usize) {
                         Some(Ty::Arr(true)) => return PTy::B, // optimistic: demoted when consumed
-                        // the width type inference found: exact, and the
-                        // parameter may then be used whole
-                        Some(Ty::Tup(_)) => {
-                            let sh = tys.pshape[fi][p as usize].clone();
-                            return PTy::T(sh.map_or(0, |s| s.width()));
+                        // a tuple with an int layout (type inference): exact,
+                        // and the parameter may then be used whole; a tuple
+                        // holding other values takes the width its body reads
+                        Some(Ty::Tup(_)) if tys.pshape[fi][p as usize].is_some() => {
+                            return PTy::T(tys.pshape[fi][p as usize].as_ref().map_or(0, Shape::width));
                         }
                         _ => {}
                     }
@@ -956,7 +959,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             // seed the return kind from type inference: mutually recursive
             // functions returning tuples cannot discover it from each other
             let (ret, ra) = match tys.ret.get(fi) {
-                Some(Ty::Tup(_)) => {
+                Some(Ty::Tup(_)) if tys.rshape[fi].is_some() => {
                     let k = tys.rshape[fi].as_ref().map_or(0, Shape::width);
                     (Kind::SK(k), vec![false; k])
                 }
@@ -1055,7 +1058,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
     // MITHRIL_WHY_BOXED: why each function has no native form (a diagnostic)
     if std::env::var_os("MITHRIL_WHY_BOXED").is_some() {
         for fid in (0..n).filter(|&f| sigs[f].is_none()) {
-            let why = if forbid[fid] { "a float, constructor or boxed array value".to_string() } else { whys[fid].clone().unwrap_or_else(|| "signature did not settle".into()) };
+            let why = if forbid[fid] { "a float, constructor, boxed array or non-int tuple value".to_string() } else { whys[fid].clone().unwrap_or_else(|| "signature did not settle".into()) };
             eprintln!("boxed {}: {why} (params {:?}, result {:?})", m.fns[fid].name, tys.params[fid], tys.ret[fid]);
         }
     }
@@ -1763,7 +1766,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     if lp {
         // a native loop never suspends: on the device it leaves the frame
         // when the host asked the run to stop (checked once per work cap)
-        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1))), do_(p("loop_guard", vec![v("fl")]))];
+        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1))), do_(p("loop_guard", vec![]))];
         lb.extend(bb);
         body.push(S::Loop(lb));
     } else {

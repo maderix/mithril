@@ -89,6 +89,7 @@ extern "C" {
 const CU_LIMIT_STACK_SIZE: i32 = 0;
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+const CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: i32 = 89;
 
 fn cu(r: CUresult, what: &str) -> Result<(), String> {
     if r == 0 {
@@ -365,12 +366,14 @@ impl GpuRunner {
             };
             let exiting = r.is_ok() && EXITING.load(std::sync::atomic::Ordering::Relaxed);
             if !exiting {
+                // an abandoned kernel still runs: nothing here would return
+                if matches!(&r, Err(e) if e.starts_with(TIMEOUT) && e.ends_with(ABANDONED)) {
+                    return r;
+                }
                 // a device fault (700) leaves a sticky error in the context,
-                // which every later call reports: only then is it reset, and
-                // a timed-out kernel is killed by the reset (a synchronize
-                // would wait for it). A clean abort leaves it usable.
-                let timed_out = matches!(&r, Err(e) if e.starts_with(TIMEOUT));
-                if timed_out || (r.is_err() && cuCtxSynchronize() != 0) {
+                // which every later call reports: only then is it reset. A
+                // clean abort (a stop at the deadline too) leaves it usable.
+                if r.is_err() && cuCtxSynchronize() != 0 {
                     let _ = cuDevicePrimaryCtxReset_v2(dev);
                 }
                 let td = std::time::Instant::now();
@@ -471,6 +474,8 @@ unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Res
 const DEEP: &str = "mithril-gpu: recursion too deep";
 /// The error of a run stopped at its deadline.
 const TIMEOUT: &str = "mithril-gpu: the device run exceeded";
+/// The end of the error of a run that did not stop by twice its deadline.
+const ABANDONED: &str = "and did not stop; abandoned until the process exits";
 /// The abort code the host writes at the deadline (engine.cu `AB_TIMEOUT`).
 const AB_TIMEOUT: u32 = 12;
 
@@ -720,6 +725,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     // shared with the desktop; a stuck kernel freezes it)
     let deadline = std::time::Duration::from_secs(env_cap("MITHRIL_GPU_TIMEOUT", 300));
     let mut stop_sent = false;
+    let mut concurrent = 0i32;
+    cu(cuDeviceGetAttribute(&mut concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, dev), "attr(concurrent managed access)")?;
+    let concurrent = concurrent != 0;
     loop {
         let r = cuStreamQuery(std::ptr::null_mut());
         if r == 0 {
@@ -731,14 +739,19 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         if t_run.elapsed() > deadline && !stop_sent {
             // ask the lanes to stop: the abort flag, which every lane reads
             // at its next check (a fire yields at least every 2^20 units)
-            std::ptr::write_volatile(d.abortf as *mut u32, AB_TIMEOUT);
+            // (only where the host may write managed memory while a kernel
+            // runs, and only when no abort is set: the first abort wins)
+            if concurrent && std::ptr::read_volatile(d.abortf as *const u32) == 0 {
+                std::ptr::write_volatile(d.abortf as *mut u32, AB_TIMEOUT);
+            }
             stop_sent = true;
         }
         if t_run.elapsed() > 2 * deadline {
-            // the lanes did not stop: the kernel still runs, freeing would
-            // wait for it; the caller resets the context
+            // the lanes did not stop: the kernel still runs, and freeing,
+            // releasing or resetting would each wait for it; the run is
+            // abandoned (the process's exit ends the kernel)
             mem.abandon = true;
-            return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT) and did not stop", deadline.as_secs()));
+            return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT) {ABANDONED}", deadline.as_secs()));
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }

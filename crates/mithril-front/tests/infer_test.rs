@@ -231,10 +231,19 @@ fn f32_as_a_tuple_or_constructor_is_an_error() {
 }
 
 #[test]
-fn converting_a_float_variable_makes_it_f32() {
-    assert_eq!(int("def main():\n    a = 0.5\n    b = a * 7.0\n    return int(b)\n"), 3);
-    let e = err("def main():\n    a = 0.5\n    a = 1\n    return int(a)\n");
-    assert!(e.contains("used both as an int and as a float"), "{e}");
+fn converting_an_f64_variable_is_an_error_not_a_retyping() {
+    // only a literal written as the argument is f32
+    assert_eq!(int("def main():\n    return int(2.75) + int(f32(3) * 0.5)\n"), 3);
+    for src in [
+        "def main():\n    a = 0.5\n    b = a * 7.0\n    return int(b)\n",
+        "def main():\n    x = 0.1\n    y = x * 3.0\n    return (y, int(x * 1000.0))\n",
+        "def main():\n    a = 0.5\n    return f32(a)\n",
+    ] {
+        let e = err(src);
+        assert!(e.contains("of an f64 value"), "{src}: {e}");
+    }
+    // an f64 program stays f64
+    assert_eq!(run("def main():\n    x = 0.1\n    return x * 3.0\n"), Val::F(0.1 * 3.0));
 }
 
 // ---- one type per function, field and slot (review of 4b01016) ----

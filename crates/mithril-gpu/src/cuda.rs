@@ -320,11 +320,9 @@ impl<'a> P<'a> {
                 self.line(format!("(*{x}) = {v};"));
             }
             // the stack guard leaves the frame (value-initialized return)
-            S::Do(E::Call { f, .. }) if f == "stack_guard" => self.line(format!("if (stack_deep()) return{};", if self.ret == Ty::Unit { "" } else { " {}" })),
-            S::Do(E::Call { f, args, .. }) if f == "loop_guard" => {
-                let n = self.ex(&args[0]);
-                self.line(format!("if (stop_asked({n})) return{};", if self.ret == Ty::Unit { "" } else { " {}" }))
-            }
+            // (a recursive entry also counts toward the stop check)
+            S::Do(E::Call { f, .. }) if f == "stack_guard" => self.line(format!("if (stack_deep() || stop_asked()) return{};", if self.ret == Ty::Unit { "" } else { " {}" })),
+            S::Do(E::Call { f, .. }) if f == "loop_guard" => self.line(format!("if (stop_asked()) return{};", if self.ret == Ty::Unit { "" } else { " {}" })),
             S::Do(e) => {
                 let v = self.ex(e);
                 self.line(format!("{v};"));

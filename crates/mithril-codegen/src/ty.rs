@@ -257,14 +257,26 @@ impl Inf {
         res
     }
 
-    /// The layout of a tuple-typed tyvar (nesting bounded: a type that
-    /// reaches itself is no tuple layout).
-    fn shape(&mut self, v: u32, depth: u32) -> Option<Shape> {
+    /// The native layout of a tuple-typed tyvar: every leaf an int (native
+    /// code holds leaves as i64s), nesting bounded (a type that reaches
+    /// itself has no layout). `None` when it has no such layout.
+    fn shape(&mut self, v: u32) -> Option<Shape> {
+        match self.leaf(v, 0)? {
+            Some(sh) => Some(sh),
+            None => None, // an int, not a tuple
+        }
+    }
+
+    /// `Some(None)`: an int leaf; `Some(Some(s))`: a tuple of layout `s`;
+    /// `None`: neither (a non-int leaf, or nesting past the bound).
+    fn leaf(&mut self, v: u32, depth: u32) -> Option<Option<Shape>> {
         let r = self.uf.find(v);
         match self.uf.n[r as usize] {
+            Node::Int => Some(None),
             Node::Tup(_, c) if depth < 8 => {
                 let comps = self.tups[c as usize].clone();
-                Some(Shape(comps.into_iter().map(|t| self.shape(t, depth + 1)).collect()))
+                let leaves: Option<Vec<Option<Shape>>> = comps.into_iter().map(|t| self.leaf(t, depth + 1)).collect();
+                Some(Some(Shape(leaves?)))
             }
             _ => None,
         }
@@ -520,7 +532,7 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
     let ret = rd(&inf.fret);
     let field = inf.cfield.iter().map(|fs| rd(fs)).collect();
     let locals = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
-    let pshape = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| inf.shape(t, 0)).collect()).collect();
-    let rshape = inf.fret.clone().iter().map(|&t| inf.shape(t, 0)).collect();
+    let pshape = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| inf.shape(t)).collect()).collect();
+    let rshape = inf.fret.clone().iter().map(|&t| inf.shape(t)).collect();
     Types { class_of, params, ret, field, locals, pshape, rshape }
 }
