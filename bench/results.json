@@ -6,12 +6,12 @@
   "kernel": "6.17.4-76061704-generic",
   "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
   "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0",
-  "git_head": "15f51dd97461f01564662d327165150b9a2b7bc6",
+  "git_head": "7b6e11384cf6bb8ca0d94d1e2dc9632b9a202534",
   "git_branch": "mithril-v1",
-  "date": "2026-09-29 19:11:46 IST"
+  "date": "2026-09-29 23:10:26 IST"
  },
  "timeout": 300.0,
- "n": 1,
+ "n": 3,
  "rows": [
   {
    "name": "kdtree",
@@ -20,12 +20,14 @@
     "C": {
      "label": "C",
      "cmd": [
-      "/tmp/mithril-bench-gh72dzo4/kdtree.c.bin"
+      "/tmp/mithril-bench-k4z6z3al/kdtree.c.bin"
      ],
      "status": "ok",
-     "time": 0.340644083999905,
+     "time": 0.33333607700114953,
      "runs": [
-      0.340644083999905
+      0.33513098799812724,
+      0.33917731800102047,
+      0.33333607700114953
      ],
      "notes": [],
      "error": null
@@ -33,14 +35,16 @@
     "SEQ": {
      "label": "SEQ",
      "cmd": [
-      "/tmp/mithril-bench-gh72dzo4/kdtree.mithril.bin",
+      "/tmp/mithril-bench-k4z6z3al/kdtree.mithril.bin",
       "--threads",
       "1"
      ],
      "status": "ok",
-     "time": 0.41560832199957076,
+     "time": 0.4061769979998644,
      "runs": [
-      0.41560832199957076
+      0.41160649100129376,
+      0.4061769979998644,
+      0.41112745400096173
      ],
      "notes": [],
      "error": null
@@ -48,14 +52,16 @@
     "PAR16": {
      "label": "PAR16",
      "cmd": [
-      "/tmp/mithril-bench-gh72dzo4/kdtree.mithril.bin",
+      "/tmp/mithril-bench-k4z6z3al/kdtree.mithril.bin",
       "--threads",
       "16"
      ],
      "status": "ok",
-     "time": 0.10866058800002065,
+     "time": 0.08961783799895784,
      "runs": [
-      0.10866058800002065
+      0.08961783799895784,
+      0.09045850499751396,
+      0.08969171799981268
      ],
      "notes": [],
      "error": null
@@ -71,9 +77,11 @@
       "--gpu"
      ],
      "status": "ok",
-     "time": 1.6966828120002901,
+     "time": 1.6877482910022081,
      "runs": [
-      1.6966828120002901
+      1.6883187879975594,
+      1.6988865159983106,
+      1.6877482910022081
      ],
      "notes": [],
      "error": null
@@ -83,7 +91,7 @@
     "build 1.0s"
    ],
    "build_error": null,
-   "build_time": 0.9640159529999437
+   "build_time": 0.9674394619978557
   }
  ]
 }
