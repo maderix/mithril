@@ -270,25 +270,30 @@ impl<'m> Ex<'m> {
         v(t)
     }
 
+    /// Take one use of `i`: `Some(true)` on its last use (count now 0),
+    /// `Some(false)` while uses remain, `None` when untracked or spent.
+    fn take_use(&mut self, i: u32) -> Option<bool> {
+        let r = self.rem.get_mut(&i).filter(|r| **r >= 1)?;
+        *r -= 1;
+        Some(*r == 0)
+    }
+
+    /// One read of an owned `i`: a non-last read shares its type. True on
+    /// the last use (the read moves).
+    fn read_owned(&mut self, i: u32) -> bool {
+        if self.rem.get(&i).copied().map_or(true, |r| r >= 2) {
+            self.note_share(i);
+        }
+        self.take_use(i) == Some(true)
+    }
+
     /// Read `e` without taking ownership (an array operand of a read): a
     /// variable is lent raw, and released after the read at its last use;
     /// any other expression is evaluated to a temporary released after.
     fn borrow_read(&mut self, e: &Core, b: &mut Vec<S>) -> (E, Option<E>) {
         if let Core::Var(i) = e {
-            if self.bset.contains(i) || (self.pinned > 0 && self.pinset.contains(i)) {
-                return (v(vn(*i)), None);
-            }
-            match self.rem.get_mut(i) {
-                Some(r) if *r >= 2 => {
-                    *r -= 1;
-                    return (v(vn(*i)), None);
-                }
-                Some(r) if *r == 1 => {
-                    *r = 0;
-                    return (v(vn(*i)), Some(v(vn(*i))));
-                }
-                _ => return (v(vn(*i)), None),
-            }
+            let last = !self.bset.contains(i) && !self.pinset.contains(i) && self.take_use(*i) == Some(true);
+            return (v(vn(*i)), last.then(|| v(vn(*i))));
         }
         let t = self.val(e, true, b);
         (t.clone(), Some(t))
@@ -381,7 +386,8 @@ impl<'m> Ex<'m> {
     fn let_app(&mut self, x: u32, f: &Core, a: &Core, bo: &Core, b: &mut Vec<S>) {
         let ef = self.val(f, true, b);
         let ea = self.val(a, true, b);
-        self.let_try(x, c("apply", vec![ef, ea]), Vec::new(), bo, b);
+        let t = self.try_call(c("apply", vec![ef, ea]), Vec::new(), false, Some((x, bo)), b);
+        self.emit_bind(x, v(t), b);
     }
 
     fn let_call(&mut self, x: u32, g: u32, args: &[Core], bo: &Core, b: &mut Vec<S>) {
@@ -395,20 +401,53 @@ impl<'m> Ex<'m> {
                 args[0] = p("fork_fuel", vec![v("fuel")]);
             }
         }
-        self.let_try(x, call, post, bo, b);
+        let t = self.try_call(call, post, false, Some((x, bo)), b);
+        self.emit_bind(x, v(t), b);
     }
 
-    /// `let x = <call>` that may suspend: bind the value, or capture the
-    /// continuation `bo` (releasing `post`, the borrowed reads, on both paths).
-    fn let_try(&mut self, x: u32, call: E, post: Vec<E>, bo: &Core, b: &mut Vec<S>) {
+    /// `t = <call>`, returning `t`: on suspension (unless `bounded`, which
+    /// never suspends) release `post`, the borrowed reads, and capture the
+    /// continuation `own` plus the enclosing frames; release `post` after.
+    fn try_call(&mut self, call: E, post: Vec<E>, bounded: bool, own: Option<(u32, &Core)>, b: &mut Vec<S>) -> String {
         let t = self.fresh();
-        let mut h: Vec<S> = post.iter().map(|q| free(q.clone())).collect();
-        self.emit_capture("r", Some((x, bo)), &mut h);
-        b.push(S::Try(Pat::One(t.clone()), call, "r".into(), h));
-        for q in post {
-            b.push(free(q));
+        let h = if bounded {
+            vec![S::Unreachable]
+        } else {
+            let mut h: Vec<S> = post.iter().map(|q| free(q.clone())).collect();
+            self.emit_capture("r", own, &mut h);
+            h
+        };
+        b.push(S::Try(Pat::One(t.clone()), call, (if bounded { "_" } else { "r" }).into(), h));
+        b.extend(post.into_iter().map(free));
+        t
+    }
+
+    /// Evaluate `r` into the let binder `x`, released at once if never used.
+    pub(crate) fn bind_val(&mut self, x: u32, r: &Core, b: &mut Vec<S>) {
+        self.cur_let = Some(x);
+        let er = self.val(r, !self.bset.contains(&x), b);
+        self.cur_let = None;
+        self.emit_bind(x, er, b);
+    }
+
+    /// The binding of `let x = r` (`bo`: the continuation a suspension
+    /// captures); a call nested in the RHS suspends through a kframe.
+    fn let_bind(&mut self, x: u32, r: &Core, bo: &Core, b: &mut Vec<S>) {
+        if self.dive {
+            match r {
+                Core::Call(g, args) if !crate::is_bounded(*g) => return self.let_call(x, *g, args, bo, b),
+                Core::App(f, a) => return self.let_app(x, f, a, bo, b),
+                _ => {}
+            }
         }
-        self.emit_bind(x, v(t), b);
+        let frame = self.dive && has_call(r);
+        if frame {
+            self.kframes.push((x, bo.clone()));
+        }
+        self.bind_val(x, r, b);
+        if frame {
+            self.kframes.pop();
+        }
     }
 
     /// `e` is an array whose elements are proven ints.
@@ -438,7 +477,7 @@ impl<'m> Ex<'m> {
     }
 
     fn is_braw(&self, e: &Core) -> bool {
-        self.dive && matches!(e, Core::Var(i) if self.bset.contains(i))
+        matches!(e, Core::Var(i) if self.bset.contains(i))
     }
 
     /// Read variable `i`. `esc` = the value escapes into a structure /
@@ -446,37 +485,21 @@ impl<'m> Ex<'m> {
     pub fn use_var(&mut self, i: u32, esc: bool, b: &mut Vec<S>) -> E {
         if self.ints.contains(&i) {
             // immediates: no ownership, no copy
-            if let Some(r) = self.rem.get_mut(&i) {
-                *r = (*r - 1).max(0);
-            }
+            let _ = self.take_use(i);
             return v(vn(i));
         }
-        if self.dive && self.bset.contains(&i) {
+        if self.bset.contains(&i) {
             if esc {
                 self.note_share(i);
                 return self.dup_into(i, b);
             }
             return v(vn(i));
         }
-        if self.pinned > 0 && self.pinset.contains(&i) {
+        if self.pinset.contains(&i) {
             self.note_share(i);
             return self.dup_into(i, b);
         }
-        let r0 = self.rem.get(&i).copied();
-        if r0.map_or(true, |r| r >= 2) {
-            self.note_share(i);
-        }
-        match self.rem.get_mut(&i) {
-            Some(r) if *r >= 2 => {
-                *r -= 1;
-                self.dup_into(i, b)
-            }
-            Some(r) if *r == 1 => {
-                *r = 0;
-                v(vn(i))
-            }
-            _ => self.dup_into(i, b),
-        }
+        if self.read_owned(i) { v(vn(i)) } else { self.dup_into(i, b) }
     }
 
     /// Entering one branch of a tail-position branch point: `live` are the
@@ -504,7 +527,7 @@ impl<'m> Ex<'m> {
     }
 
     /// Bind `let v{x} = expr;` and free it right away if it is never used.
-    fn emit_bind(&mut self, x: u32, expr: E, b: &mut Vec<S>) {
+    pub(crate) fn emit_bind(&mut self, x: u32, expr: E, b: &mut Vec<S>) {
         if self.ints.contains(&x) {
             b.push(let_(vn(x), Ty::U64, expr));
             return;
@@ -519,27 +542,15 @@ impl<'m> Ex<'m> {
     /// Evaluate a match/proj scrutinee and decide its hold mode.
     pub(crate) fn scrutinee(&mut self, s: &Core, b: &mut Vec<S>) -> (E, Hold) {
         if let Core::Var(i) = s {
-            if self.dive && self.bset.contains(i) {
+            if self.bset.contains(i) {
                 return (v(vn(*i)), Hold::BorrowRaw);
             }
-            if self.pinned > 0 && self.pinset.contains(i) {
+            if self.pinset.contains(i) {
                 self.note_share(*i);
                 return (v(vn(*i)), Hold::BorrowDup);
             }
-            if self.rem.get(i).copied().map_or(true, |r| r >= 2) {
-                self.note_share(*i);
-            }
-            return match self.rem.get_mut(i) {
-                Some(r) if *r >= 2 => {
-                    *r -= 1;
-                    (v(vn(*i)), Hold::BorrowDup)
-                }
-                Some(r) if *r == 1 => {
-                    *r = 0;
-                    (v(vn(*i)), Hold::Consume)
-                }
-                _ => (v(vn(*i)), Hold::BorrowDup),
-            };
+            let hold = if self.read_owned(*i) { Hold::Consume } else { Hold::BorrowDup };
+            return (v(vn(*i)), hold);
         }
         let e = self.val(s, false, b);
         (e, Hold::Consume)
@@ -614,34 +625,11 @@ impl<'m> Ex<'m> {
         let mut es = vec![fuel_arg(self.dive)];
         for (j, a) in args.iter().enumerate() {
             if modes[j] {
-                // borrowed parameter: lend a read
-                match a {
-                    Core::Var(i) if self.bset.contains(i) => es.push(v(vn(*i))),
-                    Core::Var(i) => {
-                        if self.pinned > 0 && self.pinset.contains(i) {
-                            es.push(v(vn(*i)));
-                        } else {
-                            match self.rem.get_mut(i) {
-                                Some(r) if *r >= 2 => {
-                                    *r -= 1;
-                                    es.push(v(vn(*i)));
-                                }
-                                Some(r) if *r == 1 => {
-                                    // last use: we still own it after the call
-                                    *r = 0;
-                                    es.push(v(vn(*i)));
-                                    post.push(v(vn(*i)));
-                                }
-                                _ => es.push(v(vn(*i))),
-                            }
-                        }
-                    }
-                    _ => {
-                        let t = self.val(a, true, b);
-                        post.push(t.clone());
-                        es.push(t);
-                    }
-                }
+                // borrowed parameter: lend a read (released after the call
+                // at our last use: we still own it)
+                let (e, q) = self.borrow_read(a, b);
+                es.push(e);
+                post.extend(q);
             } else {
                 let t = self.val(a, true, b);
                 es.push(t);
@@ -800,34 +788,9 @@ impl<'m> Ex<'m> {
             }
             // a binding is owned unless it aliases a lent value: copy a lent read into it
             Core::Let(x, r, bo) => {
-                if self.native_let(*x, r, bo, b) {
-                    return self.val(bo, esc, b);
+                if !self.native_let(*x, r, bo, b) {
+                    self.let_bind(*x, r, bo, b);
                 }
-                if self.dive {
-                    if let Core::Call(g, args) = &**r {
-                        if !crate::is_bounded(*g) {
-                            self.let_call(*x, *g, args, bo, b);
-                            return self.val(bo, esc, b);
-                        }
-                    }
-                    if let Core::App(f, a) = &**r {
-                        self.let_app(*x, f, a, bo, b);
-                        return self.val(bo, esc, b);
-                    }
-                    if has_call(r) {
-                        self.kframes.push((*x, (**bo).clone()));
-                        self.cur_let = Some(*x);
-                        let er = self.val(r, !self.bset.contains(x), b);
-                        self.cur_let = None;
-                        self.kframes.pop();
-                        self.emit_bind(*x, er, b);
-                        return self.val(bo, esc, b);
-                    }
-                }
-                self.cur_let = Some(*x);
-                let er = self.val(r, !self.bset.contains(x), b);
-                self.cur_let = None;
-                self.emit_bind(*x, er, b);
                 self.val(bo, esc, b)
             }
             Core::Call(g, args) if crate::scalar::native_sig(*g).is_some_and(|s| s.ret == crate::scalar::Kind::S1) => {
@@ -837,23 +800,10 @@ impl<'m> Ex<'m> {
                 v(t)
             }
             Core::Call(g, args) => {
+                // a suspendable call in a value-position arm (`let x = (if c
+                // then f(a) else 0)`): its frames are the enclosing kframes
                 let (call, post) = self.dive_call(*g, args, b);
-                let t = self.fresh();
-                if crate::is_bounded(*g) {
-                    // bounded callee: cannot suspend
-                    b.push(S::Try(Pat::One(t.clone()), call, "_".into(), vec![S::Unreachable]));
-                } else {
-                    // Only reachable for a suspendable call in bare value
-                    // position, which ANF forbids; the tail/let paths own
-                    // every real call site.
-                    let mut h: Vec<S> = post.iter().map(|q| free(q.clone())).collect();
-                    self.emit_capture("r", None, &mut h);
-                    b.push(S::Try(Pat::One(t.clone()), call, "r".into(), h));
-                }
-                for q in post {
-                    b.push(free(q));
-                }
-                v(t)
+                v(self.try_call(call, post, crate::is_bounded(*g), None, b))
             }
             Core::Ctor(cid, args) => {
                 if *cid == UNREACHABLE_CTOR {
@@ -896,9 +846,7 @@ impl<'m> Ex<'m> {
             }
             Core::Proj(x, i) if matches!(&**x, Core::Var(y) if self.ntup.contains(y)) => {
                 let Core::Var(y) = &**x else { unreachable!() };
-                if let Some(r) = self.rem.get_mut(y) {
-                    *r = (*r - 1).max(0);
-                }
+                let _ = self.take_use(*y);
                 let q = v(format!("q{y}_{i}"));
                 if self.ntup_sh.contains(y) {
                     p("retag", vec![q])
@@ -1183,29 +1131,7 @@ impl<'m> Ex<'m> {
                 if let Some(rest) = self.ntup_let(*x, r, bo, b) {
                     return self.dive_tail(rest, b);
                 }
-                if let Core::Call(g, args) = &**r {
-                    if !crate::is_bounded(*g) {
-                        self.let_call(*x, *g, args, bo, b);
-                        return self.dive_tail(bo, b);
-                    }
-                }
-                if let Core::App(f, a) = &**r {
-                    self.let_app(*x, f, a, bo, b);
-                    return self.dive_tail(bo, b);
-                }
-                if has_call(r) {
-                    self.kframes.push((*x, (**bo).clone()));
-                    self.cur_let = Some(*x);
-                    let er = self.val(r, !self.bset.contains(x), b);
-                    self.cur_let = None;
-                    self.kframes.pop();
-                    self.emit_bind(*x, er, b);
-                    return self.dive_tail(bo, b);
-                }
-                self.cur_let = Some(*x);
-                let er = self.val(r, !self.bset.contains(x), b);
-                self.cur_let = None;
-                self.emit_bind(*x, er, b);
+                self.let_bind(*x, r, bo, b);
                 self.dive_tail(bo, b);
             }
             Core::If(cd, th, el) => {
@@ -1361,18 +1287,7 @@ impl<'m> Ex<'m> {
         }
         let (binds, rest) = proj_prefix(x, k, bo)?;
         let (call, post) = self.dive_call_as(*g, args, true, b);
-        let t = self.fresh();
-        if crate::is_bounded(*g) {
-            // bounded work never suspends
-            b.push(S::Try(Pat::One(t.clone()), call, "_".into(), vec![S::Unreachable]));
-        } else {
-            let mut h: Vec<S> = post.iter().map(|q| free(q.clone())).collect();
-            self.emit_capture("r", Some((x, bo)), &mut h);
-            b.push(S::Try(Pat::One(t.clone()), call, "r".into(), h));
-        }
-        for q in post {
-            b.push(free(q));
-        }
+        let t = self.try_call(call, post, crate::is_bounded(*g), Some((x, bo)), b);
         // x itself is never materialized
         self.rem.insert(x, 0);
         for i in 0..k {

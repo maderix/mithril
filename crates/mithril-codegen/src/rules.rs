@@ -234,14 +234,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
     match e {
         Core::Let(x, r, bo) => {
             if !has_call(r) {
-                ex.cur_let = Some(*x);
-                let er = ex.val(r, false, b);
-                ex.cur_let = None;
-                if ex.rem.get(x).copied().unwrap_or(0) == 0 {
-                    b.push(free(er));
-                } else {
-                    b.push(let_(vn(*x), Ty::U64, er));
-                }
+                ex.bind_val(*x, r, b);
                 return rtail(ex, bo, par, b, sq);
             }
             match r.as_ref() {
@@ -272,11 +265,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     es.insert(0, E::Const("NONE".into()));
                     ex.inline_calls += 1;
                     let mut done = Vec::new();
-                    if ex.rem.get(x).copied().unwrap_or(0) == 0 {
-                        done.push(free(v("v")));
-                    } else {
-                        done.push(let_(vn(*x), Ty::U64, v("v")));
-                    }
+                    ex.emit_bind(*x, v("v"), &mut done);
                     rtail(ex, bo, par, &mut done, sq);
                     ex.inline_calls -= 1;
                     ex.rem = saved.clone();
