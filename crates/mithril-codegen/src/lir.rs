@@ -60,6 +60,24 @@ pub enum Bop {
     Ne,
 }
 
+impl Bop {
+    /// The operator symbol of a non-wrapping (bit or comparison) op.
+    pub fn sym(self) -> &'static str {
+        match self {
+            Bop::And => "&",
+            Bop::Or => "|",
+            Bop::Xor => "^",
+            Bop::Lt => "<",
+            Bop::Le => "<=",
+            Bop::Gt => ">",
+            Bop::Ge => ">=",
+            Bop::Eq => "==",
+            Bop::Ne => "!=",
+            _ => unreachable!("wrapping op {self:?} has no symbol"),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum E {
     /// integer literal of a type
@@ -247,75 +265,73 @@ pub fn pat_names(p: &Pat) -> Vec<String> {
     }
 }
 
+impl E {
+    /// Pre-order visit of every sub-expression.
+    pub fn walk(&self, f: &mut dyn FnMut(&E)) {
+        f(self);
+        match self {
+            E::Call { args, .. } | E::Tup(args) | E::Arr(args) | E::Slice(args) => args.iter().for_each(|a| a.walk(f)),
+            E::Bin(_, a, b) => {
+                a.walk(f);
+                b.walk(f)
+            }
+            E::Not(a) | E::Neg(a) | E::Cast(a, _) | E::Idx(a, _) | E::Ok(a) | E::Err(a) => a.walk(f),
+            E::Int(..) | E::Bool(_) | E::Flo(_) | E::V(_) | E::Deref(_) | E::Ref(_) | E::Addr(_) | E::Const(_) => {}
+        }
+    }
+}
+
+impl S {
+    /// A statement's own expression and its nested blocks, in execution
+    /// order (a nested `Fn` is neither).
+    fn parts(&self) -> (Option<&E>, Vec<&[S]>) {
+        match self {
+            S::Let(_, _, e) | S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) => (Some(e), vec![]),
+            S::If(e, a, b) | S::Res(e, _, a, _, b) => (Some(e), vec![&a[..], &b[..]]),
+            S::Switch(e, arms, d) => (Some(e), arms.iter().map(|(_, b)| &b[..]).chain(d.as_deref()).collect()),
+            S::Try(_, e, _, h) => (Some(e), vec![&h[..]]),
+            S::Loop(b) => (None, vec![&b[..]]),
+            S::Decl(..) | S::Continue | S::Fn(_) | S::Unreachable | S::Comment(_) => (None, vec![]),
+        }
+    }
+}
+
 /// Locals a statement list reads that it does not itself bind (name
-/// filter `f`): the parameters an out-of-line copy of it needs.
+/// filter `f`): the parameters an out-of-line copy of it needs, in first-read
+/// order (a nested `cap_*` signature follows it).
 pub fn free_locals(body: &[S], f: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut used = Vec::new();
     let mut bound = std::collections::HashSet::new();
-    fn ex(e: &E, used: &mut Vec<String>, f: &dyn Fn(&str) -> bool) {
-        match e {
-            E::V(x) | E::Deref(x) | E::Ref(x) | E::Addr(x) => {
-                if f(x) && !used.contains(x) {
-                    used.push(x.clone());
-                }
-            }
-            E::Int(..) | E::Bool(_) | E::Flo(_) | E::Const(_) => {}
-            E::Call { args, .. } | E::Tup(args) | E::Arr(args) | E::Slice(args) => args.iter().for_each(|a| ex(a, used, f)),
-            E::Bin(_, a, b) => {
-                ex(a, used, f);
-                ex(b, used, f);
-            }
-            E::Not(a) | E::Neg(a) | E::Cast(a, _) | E::Idx(a, _) | E::Ok(a) | E::Err(a) => ex(a, used, f),
-        }
-    }
     fn st(s: &S, used: &mut Vec<String>, bound: &mut std::collections::HashSet<String>, f: &dyn Fn(&str) -> bool) {
-        match s {
-            S::Let(pt, _, e) => {
-                ex(e, used, f);
-                bound.extend(pat_names(pt));
-            }
-            S::Decl(x, _) => {
-                bound.insert(x.clone());
-            }
-            S::Set(x, e) | S::Store(x, e) => {
-                ex(e, used, f);
-                if f(x) && !used.contains(x) && !bound.contains(x) {
-                    used.push(x.clone());
+        if let S::Fn(d) = s {
+            for x in free_locals(&d.body, f) {
+                if !d.params.iter().any(|(pn, _)| *pn == x) && !used.contains(&x) {
+                    used.push(x);
                 }
             }
-            S::Do(e) | S::Ret(e) => ex(e, used, f),
-            S::If(cnd, a, b) => {
-                ex(cnd, used, f);
-                a.iter().for_each(|s| st(s, used, bound, f));
-                b.iter().for_each(|s| st(s, used, bound, f));
-            }
-            S::Switch(e, arms, d) => {
-                ex(e, used, f);
-                arms.iter().flat_map(|(_, b)| b).for_each(|s| st(s, used, bound, f));
-                d.iter().flatten().for_each(|s| st(s, used, bound, f));
-            }
-            S::Loop(b) => b.iter().for_each(|s| st(s, used, bound, f)),
-            S::Try(pt, e, r, h) => {
-                ex(e, used, f);
-                bound.insert(r.clone());
-                h.iter().for_each(|s| st(s, used, bound, f));
-                bound.extend(pat_names(pt));
-            }
-            S::Res(e, o, a, r, b) => {
-                ex(e, used, f);
-                bound.insert(o.clone());
-                bound.insert(r.clone());
-                a.iter().for_each(|s| st(s, used, bound, f));
-                b.iter().for_each(|s| st(s, used, bound, f));
-            }
-            S::Fn(d) => {
-                for x in free_locals(&d.body, f) {
-                    if !d.params.iter().any(|(pn, _)| *pn == x) && !used.contains(&x) {
-                        used.push(x);
+            return;
+        }
+        let (e, bs) = s.parts();
+        if let Some(e) = e {
+            e.walk(&mut |e| {
+                if let E::V(x) | E::Deref(x) | E::Ref(x) | E::Addr(x) = e {
+                    if f(x) && !used.contains(x) {
+                        used.push(x.clone());
                     }
                 }
+            });
+        }
+        match s {
+            S::Decl(x, _) | S::Try(_, _, x, _) => {
+                bound.insert(x.clone());
             }
-            S::Continue | S::Unreachable | S::Comment(_) => {}
+            S::Res(_, o, _, r, _) => bound.extend([o.clone(), r.clone()]),
+            S::Set(x, _) | S::Store(x, _) if f(x) && !used.contains(x) && !bound.contains(x) => used.push(x.clone()),
+            _ => {}
+        }
+        bs.into_iter().flatten().for_each(|s| st(s, used, bound, f));
+        if let S::Let(pt, ..) | S::Try(pt, ..) = s {
+            bound.extend(pat_names(pt));
         }
     }
     body.iter().for_each(|s| st(s, &mut used, &mut bound, f));
@@ -325,49 +341,19 @@ pub fn free_locals(body: &[S], f: &dyn Fn(&str) -> bool) -> Vec<String> {
 
 /// Locals assigned or mutably borrowed after their binding.
 fn assigned(body: &[S], out: &mut std::collections::HashSet<String>) {
-    fn ex(e: &E, out: &mut std::collections::HashSet<String>) {
-        match e {
-            E::Ref(x) => {
-                out.insert(x.clone());
-            }
-            E::Call { args, .. } | E::Tup(args) | E::Arr(args) | E::Slice(args) => args.iter().for_each(|a| ex(a, out)),
-            E::Bin(_, a, b) => {
-                ex(a, out);
-                ex(b, out);
-            }
-            E::Not(a) | E::Neg(a) | E::Cast(a, _) | E::Idx(a, _) | E::Ok(a) | E::Err(a) => ex(a, out),
-            _ => {}
-        }
-    }
     for s in body {
-        match s {
-            S::Set(x, e) => {
-                out.insert(x.clone());
-                ex(e, out);
-            }
-            S::Let(_, _, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) => ex(e, out),
-            S::If(e, a, b) => {
-                ex(e, out);
-                assigned(a, out);
-                assigned(b, out);
-            }
-            S::Switch(e, arms, d) => {
-                ex(e, out);
-                arms.iter().for_each(|(_, b)| assigned(b, out));
-                d.iter().for_each(|b| assigned(b, out));
-            }
-            S::Loop(b) => assigned(b, out),
-            S::Try(_, e, _, h) => {
-                ex(e, out);
-                assigned(h, out);
-            }
-            S::Res(e, _, a, _, b) => {
-                ex(e, out);
-                assigned(a, out);
-                assigned(b, out);
-            }
-            _ => {}
+        if let S::Set(x, _) = s {
+            out.insert(x.clone());
         }
+        let (e, bs) = s.parts();
+        if let Some(e) = e {
+            e.walk(&mut |e| {
+                if let E::Ref(x) = e {
+                    out.insert(x.clone());
+                }
+            });
+        }
+        bs.into_iter().for_each(|b| assigned(b, out));
     }
 }
 
@@ -400,12 +386,8 @@ pub mod rust {
     pub fn ex(e: &E) -> String {
         match e {
             E::Int(n, t) => match t {
-                Ty::I64 => format!("{n}i64"),
                 Ty::U64 => format!("{}u64", *n as u64),
-                Ty::U32 => format!("{n}u32"),
-                Ty::U16 => format!("{n}u16"),
-                Ty::U8 => format!("{n}u8"),
-                Ty::Usize => format!("{n}usize"),
+                Ty::I64 | Ty::U32 | Ty::U16 | Ty::U8 | Ty::Usize => format!("{n}{}", ty(*t)),
                 _ => format!("{n}"),
             },
             E::Bool(b) => b.to_string(),
@@ -424,22 +406,15 @@ pub mod rust {
             }
             E::Bin(op, a, b) => {
                 let (a, b) = (ex(a), ex(b));
+                let w = |m: &str| format!("{a}.wrapping_{m}({b})");
                 match op {
-                    Bop::Add => format!("{a}.wrapping_add({b})"),
-                    Bop::Sub => format!("{a}.wrapping_sub({b})"),
-                    Bop::Mul => format!("{a}.wrapping_mul({b})"),
-                    Bop::Div => format!("{a}.wrapping_div({b})"),
+                    Bop::Add => w("add"),
+                    Bop::Sub => w("sub"),
+                    Bop::Mul => w("mul"),
+                    Bop::Div => w("div"),
                     Bop::Shl => format!("{a}.wrapping_shl({b} as u32)"),
                     Bop::Shr => format!("{a}.wrapping_shr({b} as u32)"),
-                    Bop::And => format!("({a} & {b})"),
-                    Bop::Or => format!("({a} | {b})"),
-                    Bop::Xor => format!("({a} ^ {b})"),
-                    Bop::Lt => format!("({a} < {b})"),
-                    Bop::Le => format!("({a} <= {b})"),
-                    Bop::Gt => format!("({a} > {b})"),
-                    Bop::Ge => format!("({a} >= {b})"),
-                    Bop::Eq => format!("({a} == {b})"),
-                    Bop::Ne => format!("({a} != {b})"),
+                    _ => format!("({a} {} {b})", op.sym()),
                 }
             }
             E::Not(a) => format!("!{}", ex(a)),
@@ -466,14 +441,10 @@ pub mod rust {
     pub fn stmts(body: &[S], muts: &std::collections::HashSet<String>, out: &mut String) {
         for s in body {
             match s {
-                S::Let(pt, t, e) => match t {
-                    Ty::Infer => {
-                        let _ = writeln!(out, "let {} = {};", pat(pt, muts), ex(e));
-                    }
-                    _ => {
-                        let _ = writeln!(out, "let {}: {} = {};", pat(pt, muts), ty(*t), ex(e));
-                    }
-                },
+                S::Let(pt, t, e) => {
+                    let ann = if *t == Ty::Infer { String::new() } else { format!(": {}", ty(*t)) };
+                    let _ = writeln!(out, "let {}{ann} = {};", pat(pt, muts), ex(e));
+                }
                 S::Decl(x, t) => {
                     let _ = writeln!(out, "let {}: {};", pat(&Pat::One(x.clone()), muts), ty(*t));
                 }

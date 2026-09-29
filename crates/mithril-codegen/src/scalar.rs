@@ -495,7 +495,7 @@ pub(crate) fn recursive_via_others(m: &CoreModule, fid: u32) -> bool {
 /// `e` calls a function other than `g` that does not always inline.
 fn calls_other_real(m: &CoreModule, e: &Core, g: u32) -> bool {
     e.any(&mut |e| match e {
-        Core::Call(h, _) if *h != g && crate::inline_attr(&m.fns[*h as usize].body).is_empty() => Some(true),
+        Core::Call(h, _) if *h != g && !crate::inline_attr(&m.fns[*h as usize].body) => Some(true),
         _ => None,
     })
 }
@@ -1745,7 +1745,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     } else {
         body.extend(bb);
     }
-    let inl = crate::seq::inline_of(crate::inline_attr_fn(m, fid));
+    let inl = if crate::inline_attr_fn(m, fid) { Inline::Always } else { Inline::Default };
     let native = FnDef { name: format!("s_{fid}"), ctx: !ctx_arg(fid).is_empty(), params, ret: ret_ty, body, inline: inl, cold: false };
     if !bridge {
         return vec![native];

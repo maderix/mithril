@@ -380,15 +380,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
                 if i == pf.acc {
                     continue;
                 }
-                let mut sh = shared.borrow_mut();
-                match tys.params[fid][i] {
-                    ty::Ty::Adt(c) => {
-                        sh.classes.insert(c);
-                    }
-                    ty::Ty::Tup(_) => sh.tuples = true,
-                    ty::Ty::Dyn => sh.poison = true,
-                    _ => {}
-                }
+                shared.borrow_mut().note(&tys.params[fid][i]);
             }
         }
     }
@@ -486,7 +478,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        emit(vec![rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
+        emit(vec![rules::segment_fn(&seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
     }
 
     // the net region: generic redexes and the records that feed a call's
@@ -534,17 +526,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
                     continue;
                 }
                 for ft in &tys.field[c] {
-                    match *ft {
-                        ty::Ty::Adt(d) => changed |= sh.classes.insert(d),
-                        ty::Ty::Tup(_) => {
-                            if !sh.tuples {
-                                sh.tuples = true;
-                                changed = true;
-                            }
-                        }
-                        ty::Ty::Dyn => sh.poison = true,
-                        _ => {}
-                    }
+                    changed |= sh.note(ft);
                 }
             }
         }
@@ -1108,31 +1090,25 @@ pub(crate) fn any_call(e: &Core) -> bool {
 /// Inlining attribute for an emitted function: a small call-free body
 /// (bounded work, typically a loop body helper) always inlines into its
 /// callers; rustc's heuristic declines multi-site helpers.
-pub(crate) fn inline_attr(body: &Core) -> &'static str {
+pub(crate) fn inline_attr(body: &Core) -> bool {
     const MAX: usize = 192;
-    let any = any_call(body);
-    if !any && body.size() <= MAX {
-        "#[inline(always)]\n"
-    } else {
-        ""
-    }
+    !any_call(body) && body.size() <= MAX
 }
 
 /// `inline_attr` plus: a loop helper desugared from a `while`/`for` with a
 /// single call site from another function is that function's own loop, so
 /// it always inlines there (without this the backend picks which member of
 /// a recursive cycle absorbs the other by accident of ordering).
-pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
+pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> bool {
     let f = &m.fns[fid as usize];
-    let a = inline_attr(&f.body);
-    if !a.is_empty() {
-        return a;
+    if inline_attr(&f.body) {
+        return true;
     }
     fn count(e: &Core, g: u32, n: &mut usize) {
         *n += e.sum(&mut |e| matches!(e, Core::Call(h, _) if *h == g) as usize);
     }
     if !(f.name.starts_with("__while") || f.name.starts_with("__for")) {
-        return "";
+        return false;
     }
     let mut n = 0;
     let mut caller = None;
@@ -1149,15 +1125,8 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
     // caller again): there the backend must pick which member absorbs the
     // other, and the source says the loop belongs to its function.
     // Elsewhere the backend's own inlining decision stands.
-    let Some(c) = caller else { return "" };
-    if !reaches(m, fid, c) {
-        return "";
-    }
-    if n == 1 {
-        "#[inline(always)]\n"
-    } else {
-        ""
-    }
+    let Some(c) = caller else { return false };
+    reaches(m, fid, c) && n == 1
 }
 
 /// Register a closure built by compiled code: an entry over its free
@@ -1238,37 +1207,24 @@ pub(crate) fn merge_max(into: &mut Cnt, branches: Vec<Cnt>) {
     }
 }
 
-/// Use counts of a dive-form body: tail If/Match branches merge by max.
-pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
+/// Use counts of a tail-form body: tail If/Match branches merge by max. In
+/// the rule form (`rule`) a let RHS carrying calls is itself a tail form: a
+/// call dives inline (continuation runs here) or suspends (continuation
+/// moves into a record taking exactly its uses), both consuming the same.
+fn cnt_tail(e: &Core, m: &mut Cnt, rule: bool) {
+    let arm = |a: &Core| { let mut mm = Cnt::new(); cnt_tail(a, &mut mm, rule); mm };
     match e {
         Core::Let(_, r, b) => {
-            cnt_expr(r, m);
-            cnt_dive(b, m);
+            if rule && has_call(r) { cnt_tail(r, m, rule) } else { cnt_expr(r, m) }
+            cnt_tail(b, m, rule);
         }
-        Core::If(c, t, f) => {
-            cnt_expr(c, m);
-            let mut mt = Cnt::new();
-            cnt_dive(t, &mut mt);
-            let mut mf = Cnt::new();
-            cnt_dive(f, &mut mf);
-            merge_max(m, vec![mt, mf]);
-        }
-        Core::Match(s, arms) => {
-            cnt_expr(s, m);
-            let bs: Vec<Cnt> = arms
-                .iter()
-                .map(|(_, _, b)| {
-                    let mut mm = Cnt::new();
-                    cnt_dive(b, &mut mm);
-                    mm
-                })
-                .collect();
-            merge_max(m, bs);
-        }
-        Core::Call(_, xs) => xs.iter().for_each(|x| cnt_expr(x, m)),
+        Core::If(c, t, f) => { cnt_expr(c, m); merge_max(m, vec![arm(t), arm(f)]); }
+        Core::Match(s, arms) => { cnt_expr(s, m); merge_max(m, arms.iter().map(|(_, _, b)| arm(b)).collect()); }
         other => cnt_expr(other, m),
     }
 }
+pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) { cnt_tail(e, m, false) }
+pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) { cnt_tail(e, m, true) }
 
 // ---- borrow inference (read-only parameters) ----
 //

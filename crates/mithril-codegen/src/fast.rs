@@ -15,7 +15,7 @@
 //! sites in dive forms call `q_f` instead of `d_f`.
 
 use crate::lir::{as_i, bin, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, u32_, u64_, u8_, v, Bop, FnDef, Inline, Ty, E, S};
-use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
+use crate::seq::{arith, bin_code, cmp_code, compare, dive_args, dive_params, vn};
 use crate::ty::{Ty as CTy, Types};
 use mithril_front::core::{Core, CoreModule};
 use std::collections::{HashMap, HashSet};
@@ -60,9 +60,7 @@ impl Fp<'_> {
 
     fn fallback(&mut self, b: &mut Vec<S>) {
         self.falls += 1;
-        let mut args = vec![v("fuel")];
-        args.extend((0..self.arity()).map(|i| v(vn(i as u32))));
-        b.push(ret(E::Call { f: format!("d_{}", self.fid), ctx: true, args }));
+        b.push(ret(E::Call { f: format!("d_{}", self.fid), ctx: true, args: dive_args(self.arity()) }));
     }
 
     /// Whether `e` is a pure int expression.
@@ -121,6 +119,13 @@ impl Fp<'_> {
                 b.push(free(v(vn(pp))));
             }
         }
+    }
+
+    /// Commit the path: release what it does not return, return `x`.
+    fn commit(&mut self, keep: Option<u32>, x: E, b: &mut Vec<S>) {
+        self.frees(keep, b);
+        self.tails += 1;
+        b.push(ret(ok(x)));
     }
 
     fn tail(&mut self, e: &Core, b: &mut Vec<S>) {
@@ -186,31 +191,20 @@ impl Fp<'_> {
                 if let (Some(slot), [a]) = (self.unbox.get(cid), args.as_slice()) {
                     if self.pure(a) {
                         let s = self.pexpr(a, false, b);
-                        self.frees(None, b);
-                        self.tails += 1;
-                        return b.push(ret(ok(p("ic", vec![u64_(*slot as u64), s]))));
+                        return self.commit(None, p("ic", vec![u64_(*slot as u64), s]), b);
                     }
                 } else if args.is_empty() {
-                    self.frees(None, b);
-                    self.tails += 1;
-                    return b.push(ret(ok(p("con", vec![u32_(0), u16_(*cid as u64), u8_(0)]))));
+                    return self.commit(None, p("con", vec![u32_(0), u16_(*cid as u64), u8_(0)]), b);
                 }
                 self.fallback(b)
             }
             Core::Var(pp) if self.is_param(*pp) && !self.int_param(*pp) => {
-                self.frees(Some(*pp), b);
-                self.tails += 1;
-                if self.bor[*pp as usize] {
-                    b.push(ret(ok(c("dup_val", vec![v(vn(*pp))]))));
-                } else {
-                    b.push(ret(ok(v(vn(*pp)))));
-                }
+                let x = if self.bor[*pp as usize] { c("dup_val", vec![v(vn(*pp))]) } else { v(vn(*pp)) };
+                self.commit(Some(*pp), x, b);
             }
             other if self.pure(other) => {
                 let s = self.pexpr(other, false, b);
-                self.frees(None, b);
-                self.tails += 1;
-                b.push(ret(ok(num(s))));
+                self.commit(None, num(s), b);
             }
             _ => self.fallback(b),
         }
@@ -231,7 +225,5 @@ pub(crate) fn fast_fn(m: &CoreModule, fid: u32, body: &Core, tys: &Types, unbox:
         return None;
     }
     b.push(S::Unreachable);
-    let mut params = vec![("fuel".to_string(), Ty::RefI64)];
-    params.extend(vparams(m.fns[fid as usize].arity));
-    Some(FnDef { name: format!("q_{fid}"), ctx: true, params, ret: Ty::Res, body: b, inline: Inline::Always, cold: false })
+    Some(FnDef { name: format!("q_{fid}"), ctx: true, params: dive_params(m.fns[fid as usize].arity), ret: Ty::Res, body: b, inline: Inline::Always, cold: false })
 }

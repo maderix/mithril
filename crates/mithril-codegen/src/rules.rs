@@ -16,14 +16,12 @@
 //! Cell discipline (mirrors the dive form, see seq.rs): a fire owns its
 //! inputs; matches on last uses free the constructor spine, shared reads
 //! deep-copy, spawned arguments transfer ownership to the callee's CALL
-//! rule. Frees are deferred into a local `fr` and flushed when the fire
-//! returns (fires are committed, so this is just batching).
+//! rule.
 
-use crate::lir::{c, do_, free, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
+use crate::lir::{c, do_, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
 use crate::seq::{vn, vparams, Ex};
-use crate::{cnt_expr, free_vars, has_call, merge_max, Cnt};
+use crate::{cnt_rule, free_vars, has_call};
 use mithril_front::core::{Core, CoreModule};
-use std::collections::BTreeSet;
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -50,14 +48,19 @@ pub(crate) struct SegQ {
 }
 
 impl SegQ {
+    fn alloc(&mut self) -> u16 {
+        let id = self.next;
+        self.next += 1;
+        assert!(self.next != 0, "codegen: more than 65535 rules");
+        id
+    }
+
     pub(crate) fn add(&mut self, fid: u32, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
         let key = format!("{fid} {slots:?} {env:?} {body:?}");
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
-        let id = self.next;
-        self.next += 1;
-        assert!(self.next != 0, "codegen: more than 65535 rules");
+        let id = self.alloc();
         self.memo.insert(key, id);
         self.q.push(Seg { id, fid, slots, env, body });
         id
@@ -67,9 +70,7 @@ impl SegQ {
         if let Some((id, _)) = self.holes.iter().find(|(_, c)| *c == cid) {
             return *id;
         }
-        let id = self.next;
-        self.next += 1;
-        assert!(self.next != 0, "codegen: more than 65535 rules");
+        let id = self.alloc();
         self.holes.push((id, cid));
         id
     }
@@ -87,53 +88,12 @@ fn wrap(lets: Vec<(u32, Core)>, tail: Core) -> Core {
     lets.into_iter().rev().fold(tail, |acc, (x, r)| Core::Let(x, Box::new(r), Box::new(acc)))
 }
 
-/// Normalize a function body (tail position).
+/// Normalize a function body (tail position): its prerequisite bindings
+/// wrap the let-RHS shape of the body.
 pub(crate) fn normalize(e: &Core, c: &mut u32) -> Core {
-    norm_tail(e, c)
-}
-
-fn norm_tail(e: &Core, c: &mut u32) -> Core {
-    if !has_call(e) {
-        return e.clone();
-    }
-    match e {
-        Core::Call(f, args) => {
-            let mut lets = Vec::new();
-            let args2: Vec<Core> = args.iter().map(|a| norm_pure(a, c, &mut lets)).collect();
-            wrap(lets, Core::Call(*f, args2))
-        }
-        Core::If(cd, t, f) => {
-            let mut lets = Vec::new();
-            let c2 = norm_pure(cd, c, &mut lets);
-            wrap(
-                lets,
-                Core::If(Box::new(c2), Box::new(norm_tail(t, c)), Box::new(norm_tail(f, c))),
-            )
-        }
-        Core::Match(s, arms) => {
-            let mut lets = Vec::new();
-            let s2 = norm_pure(s, c, &mut lets);
-            let arms2 =
-                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), norm_tail(b, c))).collect();
-            wrap(lets, Core::Match(Box::new(s2), arms2))
-        }
-        Core::Let(x, r, bo) => {
-            let mut lets = Vec::new();
-            let r2 = norm_bind(r, c, &mut lets);
-            wrap(lets, Core::Let(*x, Box::new(r2), Box::new(norm_tail(bo, c))))
-        }
-        Core::App(f, a) => {
-            let mut lets = Vec::new();
-            let f2 = norm_pure(f, c, &mut lets);
-            let a2 = norm_pure(a, c, &mut lets);
-            wrap(lets, Core::App(Box::new(f2), Box::new(a2)))
-        }
-        _ => {
-            let mut lets = Vec::new();
-            let p = norm_pure(e, c, &mut lets);
-            wrap(lets, p)
-        }
-    }
+    let mut lets = Vec::new();
+    let t = norm_bind(e, c, &mut lets);
+    wrap(lets, t)
 }
 
 /// Normalize into a let-RHS shape: pure | Call | If | Match; prerequisite
@@ -149,13 +109,13 @@ fn norm_bind(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         Core::App(f, a) => Core::App(Box::new(norm_pure(f, c, lets)), Box::new(norm_pure(a, c, lets))),
         Core::If(cd, t, f) => {
             let c2 = norm_pure(cd, c, lets);
-            Core::If(Box::new(c2), Box::new(norm_tail(t, c)), Box::new(norm_tail(f, c)))
+            Core::If(Box::new(c2), Box::new(normalize(t, c)), Box::new(normalize(f, c)))
         }
         Core::Match(s, arms) => {
             let s2 = norm_pure(s, c, lets);
             Core::Match(
                 Box::new(s2),
-                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), norm_tail(b, c))).collect(),
+                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), normalize(b, c))).collect(),
             )
         }
         Core::Let(x, r, bo) => {
@@ -212,49 +172,6 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
     }
 }
 
-// ---- fork detection (shared by counting and emission) ----
-
-/// `Let(x, Call g, Let(y, Call h, bo2))` with `h`'s args independent of `x`.
-// ---- use counting for the rule form (mirrors rtail's structure) ----
-
-pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) {
-    match e {
-        Core::Let(_, r, bo) => {
-            // A call dives inline (continuation runs here) or suspends
-            // (continuation moves into a record taking exactly its uses):
-            // both paths consume the same counts.
-            if has_call(r) {
-                cnt_rule(r, m);
-            } else {
-                cnt_expr(r, m);
-            }
-            cnt_rule(bo, m);
-        }
-        Core::If(c, t, f) => {
-            cnt_expr(c, m);
-            let mut mt = Cnt::new();
-            cnt_rule(t, &mut mt);
-            let mut mf = Cnt::new();
-            cnt_rule(f, &mut mf);
-            merge_max(m, vec![mt, mf]);
-        }
-        Core::Match(s, arms) => {
-            cnt_expr(s, m);
-            let bs: Vec<Cnt> = arms
-                .iter()
-                .map(|(_, _, b)| {
-                    let mut mm = Cnt::new();
-                    cnt_rule(b, &mut mm);
-                    mm
-                })
-                .collect();
-            merge_max(m, bs);
-        }
-        Core::Call(_, xs) => xs.iter().for_each(|x| cnt_expr(x, m)),
-        other => cnt_expr(other, m),
-    }
-}
-
 // ---- rule-form emission ----
 
 /// Allocate a waiting record for segment `rule` with the given spilled
@@ -272,31 +189,29 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &E, 
     rn
 }
 
+/// A record for segment `body` waiting on `slots` (pend = their number);
+/// the rest of its free variables (sorted) spill into the env chain.
+pub(crate) fn wait_rec(ex: &mut Ex, sq: &mut SegQ, slots: Vec<u32>, body: Core, par: &E, b: &mut Vec<S>) -> String {
+    let env: Vec<u32> = free_vars(&body).into_iter().filter(|v| !slots.contains(v)).collect();
+    let pend = slots.len() as u32;
+    let sid = sq.add(ex.self_fid, slots, env.clone(), body);
+    emit_rec(ex, &env, sid, pend, par, b)
+}
+
 /// The records a split frame's dependent rest waits in: the pend-2 join
 /// `rn` and the record x is delivered to (a pend-1 D under the join when a
 /// call needs only x, else the join itself).
 pub(crate) fn join_records(ex: &mut Ex, sq: &mut SegQ, x: u32, live: u32, j_body: &Core, par: &E, b: &mut Vec<S>) -> (String, String) {
-    if let Some((d_body, m, j2)) = crate::seq::split_dep(x, live, j_body) {
-        let mut env: BTreeSet<u32> = free_vars(&j2);
-        env.remove(&m);
-        env.remove(&live);
-        let env: Vec<u32> = env.into_iter().collect();
-        let sid = sq.add(ex.self_fid, vec![m, live], env.clone(), j2);
-        let rn = emit_rec(ex, &env, sid, 2, par, b);
-        let mut env_d: BTreeSet<u32> = free_vars(&d_body);
-        env_d.remove(&x);
-        let env_d: Vec<u32> = env_d.into_iter().collect();
-        let sid_d = sq.add(ex.self_fid, vec![x], env_d.clone(), d_body);
-        let rd = emit_rec(ex, &env_d, sid_d, 1, &rec_addr(&rn), b);
-        (rn, rd)
-    } else {
-        let mut env: BTreeSet<u32> = free_vars(j_body);
-        env.remove(&x);
-        env.remove(&live);
-        let env: Vec<u32> = env.into_iter().collect();
-        let sid = sq.add(ex.self_fid, vec![x, live], env.clone(), j_body.clone());
-        let rn = emit_rec(ex, &env, sid, 2, par, b);
-        (rn.clone(), rn)
+    match crate::seq::split_dep(x, live, j_body) {
+        Some((d_body, m, j2)) => {
+            let rn = wait_rec(ex, sq, vec![m, live], j2, par, b);
+            let rd = wait_rec(ex, sq, vec![x], d_body, &rec_addr(&rn), b);
+            (rn, rd)
+        }
+        None => {
+            let rn = wait_rec(ex, sq, vec![x, live], j_body.clone(), par, b);
+            (rn.clone(), rn)
+        }
     }
 }
 
@@ -304,37 +219,17 @@ pub(crate) fn join_records(ex: &mut Ex, sq: &mut SegQ, x: u32, live: u32, j_body
 /// to a record (see `rtail`).
 const MAX_INLINE_CALLS: u32 = 4;
 
-/// The continuation record of `bo` after `x` (a one-slot segment).
-pub(crate) fn cont_rec(ex: &mut Ex, x: u32, bo: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) -> String {
-    let mut env = free_vars(bo);
-    env.remove(&x);
-    let env: Vec<u32> = env.into_iter().collect();
-    let sid = sq.add(ex.self_fid, vec![x], env.clone(), bo.clone());
-    emit_rec(ex, &env, sid, 1, par, b)
-}
-
 /// Emit `e` (normalized) in rule-form tail position, delivering to `par`.
 fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
     match e {
         Core::Let(x, r, bo) => {
             if !has_call(r) {
-                ex.cur_let = Some(*x);
-                let er = ex.val(r, false, b);
-                ex.cur_let = None;
-                if ex.rem.get(x).copied().unwrap_or(0) == 0 {
-                    b.push(free(er));
-                } else {
-                    b.push(let_(vn(*x), Ty::U64, er));
-                }
+                ex.bind_val(*x, r, b);
                 return rtail(ex, bo, par, b, sq);
             }
             match r.as_ref() {
-                Core::Call(g, gargs) if matches!(&**bo, Core::Var(y) if y == x) => {
-                    // `let x = g(..) in x`: a tail call
-                    let mut es: Vec<E> = gargs.iter().map(|a| ex.val(a, true, b)).collect();
-                    es.insert(0, par.clone());
-                    b.push(do_(c("tail_to", vec![u16_(*g as u64), E::Slice(es)])));
-                }
+                // `let x = g(..) in x`: a tail call
+                Core::Call(..) if matches!(&**bo, Core::Var(y) if y == x) => rtail(ex, r, par, b, sq),
                 Core::Call(g, gargs) => {
                     // Dive inline; the continuation runs right here when the
                     // callee finishes within fuel. On suspension the frame
@@ -347,7 +242,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                         // record (its own memoized segment) instead of being
                         // nested inline again — code stays linear in the
                         // chain length, and a finished dive just delivers.
-                        let rn = cont_rec(ex, *x, bo, par, b, sq);
+                        let rn = wait_rec(ex, sq, vec![*x], (**bo).clone(), par, b);
                         es.insert(0, rec_addr(&rn));
                         b.push(do_(c("dive_to", vec![u16_(*g as u64), E::Slice(es)])));
                         return;
@@ -356,11 +251,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     es.insert(0, E::Const("NONE".into()));
                     ex.inline_calls += 1;
                     let mut done = Vec::new();
-                    if ex.rem.get(x).copied().unwrap_or(0) == 0 {
-                        done.push(free(v("v")));
-                    } else {
-                        done.push(let_(vn(*x), Ty::U64, v("v")));
-                    }
+                    ex.emit_bind(*x, v("v"), &mut done);
                     rtail(ex, bo, par, &mut done, sq);
                     ex.inline_calls -= 1;
                     ex.rem = saved.clone();
@@ -372,7 +263,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                         susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rx)])));
                         rtail(ex, &p_body, &bin(Bop::Or, rec_addr(&rn), u64_(1)), &mut susp, sq);
                     } else {
-                        let rn = cont_rec(ex, *x, bo, par, &mut susp, sq);
+                        let rn = wait_rec(ex, sq, vec![*x], (**bo).clone(), par, &mut susp);
                         susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rn)])));
                     }
                     ex.rem = saved;
@@ -380,7 +271,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     b.push(S::Res(c(dive, vec![u16_(*g as u64), E::Slice(es)]), "v".into(), done, "rec".into(), susp));
                 }
                 Core::If(..) | Core::Match(..) => {
-                    let rn = cont_rec(ex, *x, bo, par, b, sq);
+                    let rn = wait_rec(ex, sq, vec![*x], (**bo).clone(), par, b);
                     rtail(ex, r, &rec_addr(&rn), b, sq);
                 }
                 Core::App(f, a) => {
@@ -389,7 +280,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     // delivered to through a Kont port
                     let ef = ex.val(f, true, b);
                     let ea = ex.val(a, true, b);
-                    let rn = cont_rec(ex, *x, bo, par, b, sq);
+                    let rn = wait_rec(ex, sq, vec![*x], (**bo).clone(), par, b);
                     b.push(do_(c("apply_spawn", vec![ef, ea, rec_addr(&rn)])));
                 }
                 _ => unreachable!("codegen bug: non-normalized let RHS carrying a call"),
@@ -438,16 +329,9 @@ pub(crate) fn expand_fn(
     let ar = m.fns[fid as usize].arity;
     let mut params = vec![("parent".to_string(), Ty::U64)];
     params.extend(vparams(ar));
-    let mut rem = Cnt::new();
-    cnt_rule(body, &mut rem);
-    let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(false, fid, false, rem, HashSet::new(), bor, ints, None, unbox, iret, tys, shared);
+    let mut ex = Ex::new(false, fid, false, body, HashSet::new(), bor, None, unbox, iret, tys, shared);
     let mut bb = vec![fuel_local()];
-    for i in 0..ar as u32 {
-        if ex.rem.get(&i).copied().unwrap_or(0) == 0 {
-            bb.push(free(v(vn(i))));
-        }
-    }
+    ex.free_dead(0..ar as u32, &mut bb);
     rtail(&mut ex, body, &v("parent"), &mut bb, sq);
     FnDef { name: format!("x_{fid}"), ctx: true, params, ret: Ty::Unit, body: bb, inline: Inline::Default, cold: false }
 }
@@ -461,15 +345,13 @@ pub(crate) fn rule_params() -> Vec<(String, Ty)> {
 /// A continuation segment: fires when its record fills; slots arrive in
 /// `a` / `b` (owned), the spilled environment is read back off the cell
 /// chain (owned; the chain cells are freed as they are read).
-pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &std::collections::HashMap<u32, u8>, tys: &crate::ty::Types, iret: &[bool], shared: &std::cell::RefCell<crate::seq::Shared>) -> FnDef {
-    let _ = m;
+pub(crate) fn segment_fn(seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &std::collections::HashMap<u32, u8>, tys: &crate::ty::Types, iret: &[bool], shared: &std::cell::RefCell<crate::seq::Shared>) -> FnDef {
     let mut s = vec![
         S::Comment(format!("segment of fn {} slots {:?} env {:?}", seg.fid, seg.slots, seg.env)),
         fuel_local(),
         let_("parent", Ty::U64, c("rec_parent", vec![cast(v("aux"), Ty::U32)])),
     ];
-    let mut rem = Cnt::new();
-    cnt_rule(&seg.body, &mut rem);
+    let mut ex = Ex::new(false, seg.fid, false, &seg.body, HashSet::new(), bor, None, unbox, iret, tys, shared);
     if !seg.slots.is_empty() {
         s.push(let_(vn(seg.slots[0]), Ty::U64, v("a")));
     }
@@ -483,17 +365,7 @@ pub(crate) fn segment_fn(m: &CoreModule, seg: &Seg, bor: &[Vec<bool>], sq: &mut 
         }
     }
     // Unused owned inputs die immediately.
-    for sv in &seg.slots {
-        if rem.get(sv).copied().unwrap_or(0) == 0 {
-            s.push(free(v(vn(*sv))));
-        }
-    }
-    let ints = if seg.fid == u32::MAX {
-        HashSet::new()
-    } else {
-        crate::ints_of(tys, seg.fid as usize)
-    };
-    let mut ex = Ex::new(false, seg.fid, false, rem, HashSet::new(), bor, ints, None, unbox, iret, tys, shared);
+    ex.free_dead(seg.slots.iter().copied(), &mut s);
     rtail(&mut ex, &seg.body, &v("parent"), &mut s, sq);
     FnDef { name: format!("sg_{}", seg.id), ctx: true, params: rule_params(), ret: Ty::Unit, body: s, inline: Inline::Default, cold: false }
 }
