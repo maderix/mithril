@@ -11,9 +11,7 @@
 //! constructor spine (tree_drop-on-match), non-last uses of owned variables
 //! deep-copy (`dup_val`), and read-only ("borrowed") parameters — inferred in
 //! `lib.rs` — are passed raw, never freed by the callee, and reclaimed by the
-//! caller (dive) or the CALL rule (fire) after completion. All frees inside a
-//! dive are *deferred* into `fr` and applied only when the dive completes or
-//! commits, so a fuel-out unwind never invalidates the original arguments.
+//! caller (dive) or the CALL rule (fire) after completion.
 
 use crate::lir::{work_fuel, self, as_i, bin, burn_fuel, c, cast, do_, err, free, i64_, idx, let_, num, ok, p, rec_addr, ret, set, truthy, u16_, u32_, u64_, u8_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::rules::{emit_rec, SegQ};
@@ -96,15 +94,6 @@ pub(crate) fn arith(code: u8, a: E, b: E) -> E {
 /// A comparison of a `cmp_code`.
 pub(crate) fn compare(code: u8, a: E, b: E) -> E {
     bin([Bop::Lt, Bop::Le, Bop::Gt, Bop::Ge, Bop::Eq, Bop::Ne][code as usize], a, b)
-}
-
-/// The `Inline` of an attribute string from `lib.rs`.
-pub(crate) fn inline_of(attr: &str) -> Inline {
-    if attr.is_empty() {
-        Inline::Default
-    } else {
-        Inline::Always
-    }
 }
 
 /// The fuel argument of a dive call: the enclosing dive's budget, or a
@@ -195,12 +184,13 @@ thread_local! {
     pub(crate) static FOLDS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
     /// the in-dive split code of each proven fold (see fold.rs)
     pub(crate) static FOLD_SPLIT: std::cell::RefCell<Vec<Option<Vec<S>>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
     /// `NTUP[g] = k > 0`: dive function `g` has a native multi-value entry
     /// `n_<g>(..) -> Result<[u64; k], u64>` (see `ntup_fns`).
     pub(crate) static NTUP: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Destination-passing callees of the module being emitted:
+    /// `DPS[g] = Some((p, ctor))` when `g` only appends `ctor` cells onto
+    /// its parameter `p` (see `dps_param`).
+    pub(crate) static DPS: std::cell::RefCell<Vec<Option<(usize, u32)>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn ntup_of(g: u32) -> usize {
@@ -341,7 +331,7 @@ impl<'m> Ex<'m> {
             let mut left: Vec<u32> = self.rem.iter().filter(|(_, r)| **r > 0).map(|(v, _)| *v).collect();
             left.sort_unstable();
             for x in left {
-                if !self.ints.contains(&x) && !self.bset.contains(&x) && self.captured.contains(&x) {
+                if self.owned(x) && self.captured.contains(&x) {
                     cb.push(free(v(vn(x))));
                 }
             }
@@ -494,6 +484,12 @@ impl<'m> Ex<'m> {
         format!("t{}", self.tmp)
     }
 
+    /// A boxed value this frame owns (not an immediate, not lent, not a
+    /// native tuple's locals).
+    fn owned(&self, x: u32) -> bool {
+        !self.ints.contains(&x) && !self.bset.contains(&x) && !self.ntup.contains(&x)
+    }
+
     fn is_braw(&self, e: &Core) -> bool {
         matches!(e, Core::Var(i) if self.bset.contains(i))
     }
@@ -530,11 +526,7 @@ impl<'m> Ex<'m> {
         for x in live {
             let l = local.get(x).copied().unwrap_or(0);
             let r = self.rem.get(x).copied().unwrap_or(0);
-            let owned = self.pinned == 0
-                && !self.ints.contains(x)
-                && !self.bset.contains(x)
-                && !self.ntup.contains(x)
-                && self.pending.as_ref().map_or(true, |(y, _)| y != x);
+            let owned = self.pinned == 0 && self.owned(*x) && self.pending.as_ref().map_or(true, |(y, _)| y != x);
             if l == 0 && r > 0 && owned {
                 b.push(free(v(vn(*x))));
             }
@@ -901,11 +893,10 @@ impl<'m> Ex<'m> {
         for a in arms {
             crate::cnt_expr(a, &mut used);
         }
-        let owned = |me: &Self, x: u32| !me.ints.contains(&x) && !me.bset.contains(&x) && !me.ntup.contains(&x);
         let dying: Vec<u32> = outer
             .iter()
             .copied()
-            .filter(|x| owned(self, *x) && self.rem.get(x).copied().unwrap_or(0) == used.get(x).copied().unwrap_or(0) && used.get(x).copied().unwrap_or(0) > 0)
+            .filter(|x| self.owned(*x) && self.rem.get(x).copied().unwrap_or(0) == used.get(x).copied().unwrap_or(0) && used.get(x).copied().unwrap_or(0) > 0)
             .collect();
         outer.retain(|x| !dying.contains(x));
         for x in &outer {
@@ -953,15 +944,9 @@ impl<'m> Ex<'m> {
                 continue;
             }
             if let Some(r) = self.rem.get_mut(&x) {
-                let before = *r;
+                let now_dead = *r > 0 && *r <= k;
                 *r = (*r - k).max(0);
-                if before > 0
-                    && *r == 0
-                    && self.pinned == 0
-                    && !self.ints.contains(&x)
-                    && !self.bset.contains(&x)
-                    && !self.ntup.contains(&x)
-                {
+                if now_dead && self.pinned == 0 && self.owned(x) {
                     b.push(free(v(vn(x))));
                 }
             }
@@ -998,6 +983,17 @@ impl<'m> Ex<'m> {
         }
     }
 
+    /// Enter one arm `body` of a tail branch point from the saved state.
+    fn tail_arm(&mut self, live: &std::collections::BTreeSet<u32>, saved: &Cnt, tk: &[String], body: &Core, cnt: fn(&Core, &mut Cnt)) -> Vec<S> {
+        self.rem = saved.clone();
+        self.toks = tk.to_vec();
+        let mut local = Cnt::new();
+        cnt(body, &mut local);
+        let mut ab = Vec::new();
+        self.enter_branch(live, &local, &mut ab);
+        ab
+    }
+
     /// The two arms of an `if` in tail position (`e` = the whole `if`), each
     /// entered as its own branch and emitted by `emit`; `cnt` counts a
     /// body's uses for the form (`cnt_dive` / `cnt_rule`). Reuse tokens
@@ -1006,19 +1002,10 @@ impl<'m> Ex<'m> {
         let ec = self.val(cd, false, b);
         // tail branches inherit pending tokens; every arm ends in a
         // terminal (call/return/back-edge) that releases its unused ones
-        let tk = self.toks.clone();
-        let saved = self.rem.clone();
-        let live = free_vars(e);
-        let (mut lt, mut lf) = (Cnt::new(), Cnt::new());
-        cnt(th, &mut lt);
-        cnt(el, &mut lf);
-        let mut bt = Vec::new();
-        self.enter_branch(&live, &lt, &mut bt);
+        let (tk, saved, live) = (self.toks.clone(), self.rem.clone(), free_vars(e));
+        let mut bt = self.tail_arm(&live, &saved, &tk, th, cnt);
         emit(self, th, &mut bt);
-        self.rem = saved.clone();
-        self.toks = tk;
-        let mut bf = Vec::new();
-        self.enter_branch(&live, &lf, &mut bf);
+        let mut bf = self.tail_arm(&live, &saved, &tk, el, cnt);
         emit(self, el, &mut bf);
         self.rem = saved;
         self.toks.clear();
@@ -1039,12 +1026,7 @@ impl<'m> Ex<'m> {
         let unbox = self.unbox;
         let sw = plan_arms(&sv, arms, unbox, |i| {
             let (cid, binders, body) = &arms[i];
-            self.rem = saved.clone();
-            self.toks = tk.clone();
-            let mut ab = Vec::new();
-            let mut local = Cnt::new();
-            cnt(body, &mut local);
-            self.enter_branch(&live, &local, &mut ab);
+            let mut ab = self.tail_arm(&live, &saved, &tk, body, cnt);
             self.bind_fields(&sv, hold, *cid, binders, body, &mut ab);
             emit(self, body, &mut ab);
             ab
@@ -1105,24 +1087,14 @@ impl<'m> Ex<'m> {
                 let es: Vec<E> = args
                     .iter()
                     .enumerate()
-                    .map(|(j, a)| {
-                        if modes[j] && self.is_braw(a) {
-                            if let Core::Var(i) = a {
-                                v(vn(*i))
-                            } else {
-                                unreachable!()
-                            }
-                        } else {
-                            self.val(a, true, b)
-                        }
+                    .map(|(j, a)| match a {
+                        Core::Var(i) if modes[j] && self.is_braw(a) => v(vn(*i)),
+                        _ => self.val(a, true, b),
                     })
                     .collect();
-                for (i, ea) in es.iter().enumerate() {
-                    b.push(let_(format!("n{i}"), Ty::U64, ea.clone()));
-                }
-                for i in 0..es.len() {
-                    b.push(set(vn(i as u32), v(format!("n{i}"))));
-                }
+                let n = es.len();
+                b.extend(es.into_iter().enumerate().map(|(i, ea)| let_(format!("n{i}"), Ty::U64, ea)));
+                b.extend((0..n).map(|i| set(vn(i as u32), v(format!("n{i}")))));
                 self.flush_toks(b);
                 b.push(S::Continue);
             }
@@ -1200,31 +1172,21 @@ impl<'m> Ex<'m> {
                 // Tail call: pass our own destination through, so a downstream
                 // suspension spawns its pending call against the right parent.
                 let (call, post) = self.dive_call(*g, args, b);
-                if post.is_empty() {
-                    b.push(ret(call));
-                } else {
-                    b.push(let_("tr", Ty::Res, call));
-                    for q in post {
-                        b.push(free(q));
-                    }
-                    b.push(ret(v("tr")));
-                }
+                b.push(let_("tr", Ty::Res, call));
+                b.extend(post.into_iter().map(free));
+                b.push(ret(v("tr")));
             }
             Core::Tuple(items) if self.nret > 0 && self.nret == items.len() => {
                 let es: Vec<E> = items.iter().map(|a| self.val(a, true, b)).collect();
                 self.flush_toks(b);
                 b.push(ret(ok(E::Arr(es))));
             }
-            other if self.nret > 0 => {
-                let x = self.val(other, true, b);
-                self.flush_toks(b);
-                b.push(ret(ok(c(&format!("untup::<{}>", self.nret), vec![x]))));
-            }
             other => {
+                // a native multi-value form is never TRMC (no hole)
                 let x = self.val(other, true, b);
                 self.flush_toks(b);
-                let hv = self.hole_value(x);
-                b.push(ret(ok(hv)));
+                let r = if self.nret > 0 { c(&format!("untup::<{}>", self.nret), vec![x]) } else { self.hole_value(x) };
+                b.push(ret(ok(r)));
             }
         }
     }
@@ -1469,8 +1431,7 @@ pub(crate) fn dive_fn<'m>(
     // A call-free body does bounded work: no fuel check, and it inlines
     // into its (recursive) callers.
     let leafy = !has_call(body);
-    let inl = if crate::inline_attr(body).is_empty() { crate::inline_attr_fn(m, fid) } else { crate::inline_attr(body) };
-    let inline = inline_of(inl);
+    let inline = if crate::inline_attr(body) || crate::inline_attr_fn(m, fid) { Inline::Always } else { Inline::Default };
     let mut out = Vec::new();
     let mut params = vec![("fuel".to_string(), Ty::RefI64)];
     params.extend(vparams(ar));
@@ -1525,13 +1486,6 @@ pub(crate) fn dive_fn<'m>(
     }
     out.push(FnDef { name, ctx: true, params, ret: ret_ty, body: s, inline, cold: false });
     out
-}
-
-thread_local! {
-    /// Destination-passing callees of the module being emitted:
-    /// `DPS[g] = Some((p, ctor))` when `g` only appends `ctor` cells onto
-    /// its parameter `p` (see `dps_param`).
-    pub(crate) static DPS: std::cell::RefCell<Vec<Option<(usize, u32)>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn dps_of(g: u32) -> Option<(usize, u32)> {

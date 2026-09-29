@@ -16,8 +16,7 @@
 //! Cell discipline (mirrors the dive form, see seq.rs): a fire owns its
 //! inputs; matches on last uses free the constructor spine, shared reads
 //! deep-copy, spawned arguments transfer ownership to the callee's CALL
-//! rule. Frees are deferred into a local `fr` and flushed when the fire
-//! returns (fires are committed, so this is just batching).
+//! rule.
 
 use crate::lir::{c, do_, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
 use crate::seq::{vn, vparams, Ex};
@@ -49,14 +48,19 @@ pub(crate) struct SegQ {
 }
 
 impl SegQ {
+    fn alloc(&mut self) -> u16 {
+        let id = self.next;
+        self.next += 1;
+        assert!(self.next != 0, "codegen: more than 65535 rules");
+        id
+    }
+
     pub(crate) fn add(&mut self, fid: u32, slots: Vec<u32>, env: Vec<u32>, body: Core) -> u16 {
         let key = format!("{fid} {slots:?} {env:?} {body:?}");
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
-        let id = self.next;
-        self.next += 1;
-        assert!(self.next != 0, "codegen: more than 65535 rules");
+        let id = self.alloc();
         self.memo.insert(key, id);
         self.q.push(Seg { id, fid, slots, env, body });
         id
@@ -66,9 +70,7 @@ impl SegQ {
         if let Some((id, _)) = self.holes.iter().find(|(_, c)| *c == cid) {
             return *id;
         }
-        let id = self.next;
-        self.next += 1;
-        assert!(self.next != 0, "codegen: more than 65535 rules");
+        let id = self.alloc();
         self.holes.push((id, cid));
         id
     }

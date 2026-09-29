@@ -1090,31 +1090,25 @@ pub(crate) fn any_call(e: &Core) -> bool {
 /// Inlining attribute for an emitted function: a small call-free body
 /// (bounded work, typically a loop body helper) always inlines into its
 /// callers; rustc's heuristic declines multi-site helpers.
-pub(crate) fn inline_attr(body: &Core) -> &'static str {
+pub(crate) fn inline_attr(body: &Core) -> bool {
     const MAX: usize = 192;
-    let any = any_call(body);
-    if !any && body.size() <= MAX {
-        "#[inline(always)]\n"
-    } else {
-        ""
-    }
+    !any_call(body) && body.size() <= MAX
 }
 
 /// `inline_attr` plus: a loop helper desugared from a `while`/`for` with a
 /// single call site from another function is that function's own loop, so
 /// it always inlines there (without this the backend picks which member of
 /// a recursive cycle absorbs the other by accident of ordering).
-pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
+pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> bool {
     let f = &m.fns[fid as usize];
-    let a = inline_attr(&f.body);
-    if !a.is_empty() {
-        return a;
+    if inline_attr(&f.body) {
+        return true;
     }
     fn count(e: &Core, g: u32, n: &mut usize) {
         *n += e.sum(&mut |e| matches!(e, Core::Call(h, _) if *h == g) as usize);
     }
     if !(f.name.starts_with("__while") || f.name.starts_with("__for")) {
-        return "";
+        return false;
     }
     let mut n = 0;
     let mut caller = None;
@@ -1131,15 +1125,8 @@ pub(crate) fn inline_attr_fn(m: &CoreModule, fid: u32) -> &'static str {
     // caller again): there the backend must pick which member absorbs the
     // other, and the source says the loop belongs to its function.
     // Elsewhere the backend's own inlining decision stands.
-    let Some(c) = caller else { return "" };
-    if !reaches(m, fid, c) {
-        return "";
-    }
-    if n == 1 {
-        "#[inline(always)]\n"
-    } else {
-        ""
-    }
+    let Some(c) = caller else { return false };
+    reaches(m, fid, c) && n == 1
 }
 
 /// Register a closure built by compiled code: an entry over its free
