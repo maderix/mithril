@@ -1362,6 +1362,14 @@ pub(crate) fn vparams(ar: usize) -> Vec<(String, Ty)> {
     (0..ar).map(|i| (vn(i as u32), Ty::U64)).collect()
 }
 
+/// A dive entry's parameters `fuel, v0..v<ar>`, and its arguments.
+pub(crate) fn dive_params(ar: usize) -> Vec<(String, Ty)> {
+    std::iter::once(("fuel".to_string(), Ty::RefI64)).chain(vparams(ar)).collect()
+}
+pub(crate) fn dive_args(ar: usize) -> Vec<E> {
+    std::iter::once(v("fuel")).chain((0..ar).map(|i| v(vn(i as u32)))).collect()
+}
+
 /// The dive form of function `fid`: fuel per call / loop iteration; on
 /// exhaustion with a known destination the pending call is spawned as a
 /// redex (suspension), otherwise the dive unwinds and the caller falls back
@@ -1433,12 +1441,10 @@ pub(crate) fn dive_fn<'m>(
     let leafy = !has_call(body);
     let inline = if crate::inline_attr(body) || crate::inline_attr_fn(m, fid) { Inline::Always } else { Inline::Default };
     let mut out = Vec::new();
-    let mut params = vec![("fuel".to_string(), Ty::RefI64)];
-    params.extend(vparams(ar));
+    let params = dive_params(ar);
     let (name, ret_ty) = if nret > 0 {
         // boxing entry for the runtime and callers outside the native shape
-        let mut a = vec![v("fuel")];
-        a.extend(argl.clone());
+        let a = dive_args(ar);
         out.push(FnDef {
             name: format!("d_{fid}"),
             ctx: true,

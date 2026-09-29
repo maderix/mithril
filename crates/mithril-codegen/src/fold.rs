@@ -12,7 +12,7 @@
 //! always sound).
 
 use crate::lir::{as_i, bin, c, do_, i64_, let_, num, p, rec_addr, ret, u16_, u32_, u64_, v, Bop, FnDef, Inline, Ty, E, S};
-use crate::seq::{vn, vparams};
+use crate::seq::{dive_args, dive_params, vn};
 use mithril_front::core::{Combiner, Core, CoreModule};
 
 pub(crate) struct ParFold {
@@ -22,15 +22,6 @@ pub(crate) struct ParFold {
     pub mask32: bool,
     /// Accumulator is an n-tuple (TupleWrapAdd modes).
     pub tuple: Option<usize>,
-}
-
-fn collect_self_calls<'e>(e: &'e Core, fid: u32, out: &mut Vec<&'e Vec<Core>>) {
-    if let Core::Call(g, args) = e {
-        if *g == fid {
-            out.push(args);
-        }
-    }
-    e.kids().into_iter().for_each(|k| collect_self_calls(k, fid, out));
 }
 
 /// Decide whether `fid` gets the chunked par_fold shape, and find its
@@ -63,8 +54,14 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
         _ => return None,
     };
     // Every self call must pass the bound and all non-acc extras through.
-    let mut calls = Vec::new();
-    collect_self_calls(th, fid, &mut calls);
+    let mut calls: Vec<Vec<Core>> = Vec::new();
+    th.walk(&mut |e| {
+        if let Core::Call(g, a) = e {
+            if *g == fid {
+                calls.push(a.clone());
+            }
+        }
+    });
     if calls.is_empty() {
         return None;
     }
@@ -153,12 +150,8 @@ pub(crate) fn est_static(fid: u32) -> String {
 /// loop-head measurement ran more than a budget within one iteration, so
 /// its iterations are at least that heavy.
 pub(crate) fn heavy_wrapper(fid: u32, ar: usize) -> FnDef {
-    let mut params = vec![("fuel".to_string(), Ty::RefI64)];
-    params.extend(vparams(ar));
-    let mut args = vec![v("fuel")];
-    args.extend((0..ar).map(|i| v(vn(i as u32))));
     let body = vec![
-        let_("r", Ty::Res, E::Call { f: format!("dd_{fid}"), ctx: true, args }),
+        let_("r", Ty::Res, E::Call { f: format!("dd_{fid}"), ctx: true, args: dive_args(ar) }),
         S::If(
             p("is_err", vec![E::Addr("r".into())]),
             vec![S::If(E::Not(Box::new(p("flag_load", vec![E::Addr(format!("FOLD_MEAS_{fid}"))]))), vec![do_(p("atomic_max", vec![E::Addr(format!("FOLD_EST_{fid}")), c("fuel_of", vec![])]))], vec![])],
@@ -166,7 +159,7 @@ pub(crate) fn heavy_wrapper(fid: u32, ar: usize) -> FnDef {
         ),
         ret(v("r")),
     ];
-    FnDef { name: format!("d_{fid}"), ctx: true, params, ret: Ty::Res, body, inline: Inline::Default, cold: false }
+    FnDef { name: format!("d_{fid}"), ctx: true, params: dive_params(ar), ret: Ty::Res, body, inline: Inline::Default, cold: false }
 }
 
 pub(crate) fn est_update(fid: u32) -> Vec<S> {

@@ -228,12 +228,8 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                 return rtail(ex, bo, par, b, sq);
             }
             match r.as_ref() {
-                Core::Call(g, gargs) if matches!(&**bo, Core::Var(y) if y == x) => {
-                    // `let x = g(..) in x`: a tail call
-                    let mut es: Vec<E> = gargs.iter().map(|a| ex.val(a, true, b)).collect();
-                    es.insert(0, par.clone());
-                    b.push(do_(c("tail_to", vec![u16_(*g as u64), E::Slice(es)])));
-                }
+                // `let x = g(..) in x`: a tail call
+                Core::Call(..) if matches!(&**bo, Core::Var(y) if y == x) => rtail(ex, r, par, b, sq),
                 Core::Call(g, gargs) => {
                     // Dive inline; the continuation runs right here when the
                     // callee finishes within fuel. On suspension the frame
