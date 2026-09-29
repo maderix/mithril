@@ -22,6 +22,7 @@ use std::thread;
 
 /// Cap of the sequential-chain budget boost (x base fuel).
 const MAX_BOOST: i64 = 64;
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 /// A bucket is drained in parallel when `entries x cost` reaches this.
 const PAR_WORK: u128 = 1 << 14;
 /// Stack for pool workers (native recursion inside fuel-bounded dives).
@@ -108,6 +109,7 @@ impl Engine {
                 let Some((rule, work)) = pick(&buckets, &recs, &costs) else { break };
                 let k = rule as usize;
                 let n = buckets[k].len() + recs[k].len();
+                if std::env::var_os("MITHRIL_TRACE_PICK").is_some() { eprintln!("pick rule={rule} n={n} work={work} boost={boost} t={:.3}", T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()); }
                 if threads > 1 {
                     boost = if n > prev_n || n >= threads { 1 } else { (boost * 2).min(MAX_BOOST) };
                     prev_n = n;

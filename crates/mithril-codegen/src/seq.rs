@@ -398,17 +398,22 @@ impl<'m> Ex<'m> {
         self.emit_bind(x, v(t), b);
     }
 
-    fn let_call(&mut self, x: u32, g: u32, args: &[Core], bo: &Core, b: &mut Vec<S>) {
-        let (mut call, post) = self.dive_call(g, args, b);
-        // a fork site (the continuation has an independent part): the
-        // device's parallel world makes the callee a task at once
-        // (`fork_fuel` hands it no budget); a cut runs inline with the
-        // caller's budget; the CPU has one world
+    /// A fork site (the continuation has an independent part): the
+    /// device's parallel world makes the callee a task at once
+    /// (`fork_fuel` hands it no budget); a cut runs inline with the
+    /// caller's budget; the CPU has one world.
+    fn fork_site(call: &mut E, x: u32, bo: &Core) {
+        if std::env::var_os("MITHRIL_DBG_FORK").is_some() { eprintln!("fork_site x={x} split={} bo={:?}", split_frame(x, bo).is_some(), bo); }
         if split_frame(x, bo).is_some() {
-            if let E::Call { args, .. } = &mut call {
+            if let E::Call { args, .. } = call {
                 args[0] = p("fork_fuel", vec![v("fuel")]);
             }
         }
+    }
+
+    fn let_call(&mut self, x: u32, g: u32, args: &[Core], bo: &Core, b: &mut Vec<S>) {
+        let (mut call, post) = self.dive_call(g, args, b);
+        Self::fork_site(&mut call, x, bo);
         let t = self.try_call(call, post, false, Some((x, bo)), b);
         self.emit_bind(x, v(t), b);
     }
@@ -1206,7 +1211,9 @@ impl<'m> Ex<'m> {
             return None;
         }
         let (binds, rest) = proj_prefix(x, k, bo)?;
-        let (call, post) = self.dive_call_as(*g, args, true, b);
+        let (mut call, post) = self.dive_call_as(*g, args, true, b);
+        // a native multi-value callee forks like any other
+        Self::fork_site(&mut call, x, bo);
         let t = self.try_call(call, post, crate::is_bounded(*g), Some((x, bo)), b);
         // x itself is never materialized
         self.rem.insert(x, 0);
@@ -1660,8 +1667,12 @@ fn split_chain(seed: u32, e: &Core) -> Option<(Core, u32, Core)> {
     }
     let mut dep: HashSet<u32> = HashSet::from([seed]);
     let (mut ind, mut de): (Vec<(u32, &Core)>, Vec<(u32, &Core)>) = (Vec::new(), Vec::new());
+    // a projection of an independent value is a read the join can do
+    // (the value itself is the one live-out), not independent work
+    let mut ind_vars: HashSet<u32> = HashSet::new();
     for (v, r) in binds {
-        if free_vars(r).iter().any(|f| dep.contains(f)) { dep.insert(v); de.push((v, r)); } else { ind.push((v, r)); }
+        let reads_ind = matches!(r, Core::Proj(a, _) if matches!(&**a, Core::Var(u) if ind_vars.contains(u)));
+        if reads_ind || free_vars(r).iter().any(|f| dep.contains(f)) { dep.insert(v); de.push((v, r)); } else { ind_vars.insert(v); ind.push((v, r)); }
     }
     if !ind.iter().any(|(_, r)| has_call(r)) { return None; }
     let wrap = |bs: &[(u32, &Core)], t: Core| bs.iter().rev().fold(t, |acc, (v, r)| Core::Let(*v, Box::new((*r).clone()), Box::new(acc)));

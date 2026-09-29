@@ -792,3 +792,19 @@ fn a_function_with_float_parameters_is_not_a_native_form() {
     assert!(!rs.contains(&format!("fn s_{fid}(")), "dbl became a native scalar form on float ports");
     golden("float_params.py", 0, &["1", "4"]);
 }
+
+#[test]
+fn a_tuple_returning_fork_tree_has_a_fork_site_and_parallel_waves() {
+    // the projections of the first result are reads the join does, not
+    // independent work: the split keeps one live value and the site forks
+    let (cm, rs) = pipeline(&fixture("tuple_fork.py"), 0);
+    let fid = cm.fns.iter().position(|f| f.name == "tree").unwrap();
+    assert!(dive_form(&cm, &rs, "tree").contains("fork_fuel(fuel)"), "tree (fn {fid}) has no fork site");
+    let want = oracle(&cm);
+    let bin = compile(&rs, "tuple_fork");
+    assert_eq!(run(&bin, &["1"]), want);
+    let (got, err) = run_env(&bin, &["16"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(got, want);
+    let waves: u64 = err.split("waves=").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(0);
+    assert!(waves >= 2, "no parallel waves at 16 threads: {err}");
+}

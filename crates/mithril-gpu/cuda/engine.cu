@@ -1978,6 +1978,8 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
           if (rule_forks(r)) G.bdone[r] = g_snap[r];
         g_rounds[1]++;
         g_rounds[4] += clock64() - c0;
+        u64 i = g_rounds[0] - 1;
+        if (i < LOGCAP) g_wlog[i * 6 + 2] = (u32)((clock64() - c0) >> 10);
       }
     } else {
       work_phase(work_steps);

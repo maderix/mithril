@@ -142,7 +142,15 @@ def mithril_env(big_arenas=False):
     return env
 
 
-def run_lane(label, cmd, expected, n_fixed, timeout, env=None, arena_retry=False):
+def run_lane(label, cmd, expected, n_fixed, timeout, env=None, arena_retry=False, warm=False):
+    # the GPU lane compiles its device program on first use (docker nvcc,
+    # cached by source hash): one untimed run warms the cache, as the CPU
+    # lanes' binaries are built once before timing
+    if warm:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except Exception:
+            pass
     """Run one lane; return a lane record dict.
 
     status: "ok" | "DNF" | "FAILED".  time: min wall of ok runs.
@@ -445,7 +453,7 @@ def main():
                     port = os.path.join(PORTS_DIR, name + ".py")
                     row["lanes"]["GPU"] = run_lane(
                         "GPU", [MITHRIL_BIN, "run", port, "--threads", str(PAR_THREADS),
-                                "--gpu"], exp, args.n, args.timeout, env="mithril")
+                                "--gpu"], exp, args.n, args.timeout, env="mithril", warm=True)
             for l in row["lanes"].values():
                 if l["status"] != "ok":
                     print("[harness]   %s %s: %s" % (l["label"], l["status"], l["error"]),
