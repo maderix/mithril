@@ -217,21 +217,34 @@ pub(crate) fn vn(i: u32) -> String {
 }
 
 impl<'m> Ex<'m> {
+    /// An emitter for `body`: use counts for its form (`cnt_dive` in the
+    /// dive form, `cnt_rule` in the rule form) and its proven ints.
     pub fn new(
         dive: bool,
         self_fid: u32,
         loop_form: bool,
-        rem: Cnt,
+        body: &Core,
         bset: HashSet<u32>,
         bor: &'m [Vec<bool>],
-        ints: HashSet<u32>,
         sq: Option<&'m mut SegQ>,
         unbox: &'m std::collections::HashMap<u32, u8>,
         iret: &'m [bool],
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
+        let mut rem = Cnt::new();
+        if dive { cnt_dive(body, &mut rem) } else { crate::cnt_rule(body, &mut rem) }
+        let ints = if self_fid == u32::MAX { HashSet::new() } else { crate::ints_of(tys, self_fid as usize) };
         Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), unbox, iret, tys, shared, toks: Vec::new() }
+    }
+
+    /// Owned inputs the body never reads die at once.
+    pub(crate) fn free_dead(&self, xs: impl IntoIterator<Item = u32>, b: &mut Vec<S>) {
+        for x in xs {
+            if !self.bset.contains(&x) && self.rem.get(&x).copied().unwrap_or(0) == 0 {
+                b.push(free(v(vn(x))));
+            }
+        }
     }
 
     /// Release every pending reuse token (before a call, branch, return or
@@ -342,13 +355,8 @@ impl<'m> Ex<'m> {
     /// of the outermost record (see `emit_capture`).
     fn capture_chain(&mut self, rv: &str, own: Option<(u32, &Core)>, b: &mut Vec<S>) -> String {
         self.captured.clear();
-        let mut frames: Vec<(u32, Core)> = Vec::new();
-        if let Some((x, bo)) = own {
-            frames.push((x, bo.clone()));
-        }
-        for f in self.kframes.iter().rev() {
-            frames.push(f.clone());
-        }
+        let frames: Vec<(u32, Core)> = own.map(|(x, bo)| (x, bo.clone())).into_iter().chain(self.kframes.iter().rev().cloned()).collect();
+        let mut sq = self.sq.take().expect("dive capture without a segment registry");
         let mut child = rv.to_string();
         // Each frame's continuation splits into P, the bindings that do not
         // (transitively) need the pending value x, and J, the rest plus the
@@ -360,23 +368,21 @@ impl<'m> Ex<'m> {
         // happens on fuel-out.
         for (x, bo) in &frames {
             if let Some((p_body, live, j_body)) = split_frame(*x, bo) {
-                let mut sq = self.sq.take().expect("dive capture without a segment registry");
+                // P's segment is registered before J's (segment id order)
                 let env_p: Vec<u32> = free_vars(&p_body).into_iter().collect();
-                let sid_p = sq.add(self.self_fid, vec![], env_p.clone(), p_body.clone());
+                let sid_p = sq.add(self.self_fid, vec![], env_p.clone(), p_body);
                 let (rn, rx) = crate::rules::join_records(self, &mut sq, *x, live, &j_body, &E::Const("NONE".into()), b);
-                self.sq = Some(sq);
                 b.push(do_(c("set_parent", vec![v(&child), rec_addr(&rx)])));
                 let rp = emit_rec(self, &env_p, sid_p, 0, &bin(Bop::Or, rec_addr(&rn), u64_(1)), b);
                 b.push(do_(c("ready_rec", vec![v(rp)])));
                 child = rn;
             } else {
-                let mut sq = self.sq.take().expect("dive capture without a segment registry");
-                let rn = crate::rules::cont_rec(self, *x, bo, &E::Const("NONE".into()), b, &mut sq);
-                self.sq = Some(sq);
+                let rn = crate::rules::wait_rec(self, &mut sq, vec![*x], bo.clone(), &E::Const("NONE".into()), b);
                 b.push(do_(c("set_parent", vec![v(&child), rec_addr(&rn)])));
                 child = rn;
             }
         }
+        self.sq = Some(sq);
         child
     }
 
@@ -1481,10 +1487,7 @@ pub(crate) fn dive_fn<'m>(
         out.push(ret(err(exit)));
         vec![do_(p("stack_guard", vec![])), burn_fuel(), S::If(bin(Bop::Lt, E::Deref("fuel".into()), i64_(0)), out, vec![])]
     };
-    let mut rem = Cnt::new();
-    cnt_dive(body, &mut rem);
-    let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(true, fid, lp, rem, bset.clone(), bor, ints, Some(sq), unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, lp, body, bset.clone(), bor, Some(sq), unbox, iret, tys, shared);
     ex.trmc = trmc.zip(hole_rule);
     ex.nret = nret;
     // the fuel-out spawn takes references to borrowed params
@@ -1496,11 +1499,7 @@ pub(crate) fn dive_fn<'m>(
     let mut bb = Vec::new();
     // Owned parameters that the body never reads die immediately (in a
     // loop form: on every iteration, after the budget check).
-    for i in 0..ar as u32 {
-        if !ex.bset.contains(&i) && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
-            bb.push(free(v(vn(i))));
-        }
-    }
+    ex.free_dead(0..ar as u32, &mut bb);
     ex.dive_tail(body, &mut bb);
     // A call-free body does bounded work: no fuel check, and it inlines
     // into its (recursive) callers.
@@ -1708,19 +1707,12 @@ pub(crate) fn dps_fn<'m>(
     params.extend((0..ar).filter(|i| *i != pp).map(|i| (vn(i as u32), Ty::U64)));
     params.push(("head_out".into(), Ty::RefU64));
     params.push(("hole_out".into(), Ty::RefU32));
-    let mut rem = Cnt::new();
-    cnt_dive(body, &mut rem);
-    rem.remove(&(pp as u32));
-    let ints = crate::ints_of(tys, fid as usize);
-    let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, true, body, HashSet::new(), bor, Some(sq), unbox, iret, tys, shared);
+    ex.rem.remove(&(pp as u32));
     ex.trmc = Some((cid, 0));
     ex.dps_param = Some(pp);
     let mut bb = vec![do_(p("stack_guard", vec![])), work_fuel(i64_(1))];
-    for i in 0..ar as u32 {
-        if i as usize != pp && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
-            bb.push(free(v(vn(i))));
-        }
-    }
+    ex.free_dead((0..ar as u32).filter(|i| *i as usize != pp), &mut bb);
     ex.dive_tail(body, &mut bb);
     let body = vec![
         let_("th_head", Ty::U64, E::Deref("head_out".into())),

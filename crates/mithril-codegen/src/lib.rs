@@ -486,7 +486,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        emit(vec![rules::segment_fn(m, &seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
+        emit(vec![rules::segment_fn(&seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)], &mut fns_code);
     }
 
     // the net region: generic redexes and the records that feed a call's
