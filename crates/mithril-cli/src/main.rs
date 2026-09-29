@@ -392,6 +392,7 @@ fn run_gpu(sm: &CoreModule) -> Result<i32, CliErr> {
     let cache = target_dir().join("mithril-cache").join("gpu");
     fs::create_dir_all(&cache)?;
     let t0 = std::time::Instant::now();
+    mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
     let r = mithril_gpu::compile_and_run(&cu, boot, &cache).map_err(CliErr::Other)?;
     if std::env::var_os("MITHRIL_TIMING").is_some() {
         eprintln!("mithril: device compile-or-load + run + readback {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
@@ -416,6 +417,7 @@ fn build_gpu(sm: &CoreModule, out: &Path) -> Result<(), CliErr> {
 #[cfg(feature = "gpu")]
 fn exec_gpu(path: &Path) -> Result<i32, CliErr> {
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
+    mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
     let r = mithril_gpu::run_cubin(path, boot).map_err(CliErr::Other)?;
     println!("{}", r.text);
     Ok(0)

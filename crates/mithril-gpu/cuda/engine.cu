@@ -27,7 +27,6 @@ typedef long long i64;
 typedef unsigned long long usize;
 
 #define MAXLANES (1 << 16)
-#define FREECAP 64
 
 // abort codes (host maps each to a message); arena outranks the rest via
 // atomicMax so the root cause wins.
@@ -61,11 +60,8 @@ struct Dev {
   Rec *recs;   // rcap records (0 = ROOT sink)
   u32 *nbump;  // cell bump (starts at 1: cell 0 reserved)
   u32 *rbump;  // record bump (starts at 1: rec 0 = ROOT)
-  u32 *nfree;  // MAXLANES * FREECAP per-lane free lists
-  u32 *nfreen; // MAXLANES free-list lengths
+  u32 *nfreen; // MAXLANES free-list heads (index+1)
   u32 *nchunk; // MAXLANES * 2 (cur, end) bump chunks
-  u32 *ovf;    // global overflow ring of freed cells (idx+1; 0 = empty)
-  int *ovftop;
   u64 *ebuf;   // PROG_NRULES buckets of bcap 3-word entries
   u32 *blen;   // PROG_NRULES append counters (host drains by prefix)
   u32 *bdone;  // PROG_NRULES drained prefixes (shared with the host; a
@@ -78,18 +74,14 @@ struct Dev {
   u64 *nw;     // MAXLANES * NWCAP * 2: per-lane net worklists (redex pairs)
   u32 *nwn;    // MAXLANES worklist lengths
   u32 *labels; // Dup label supply
-  u32 *rfree;  // MAXLANES * RFREECAP per-lane record free lists
-  u32 *rfreen; // MAXLANES record free-list lengths
+  u32 *rfreen; // MAXLANES record free-list heads (index+1)
   u64 *lstk;   // MAXLANES * LSCAP lane-local tasks (rule, a, b, c), WORK phase
   u32 *lsn;    // MAXLANES lane-local task counts
-  u32 *rovf;   // global overflow ring of freed records (idx; 0 = empty)
-  int *rovftop;
-  u32 ncap, rcap, bcap, ovfcap, chunksz, nrules;
+  u32 ncap, rcap, bcap, chunksz, nrules;
   int fuel;    // per-dive budget
   int net_fuel; // rewrites per net reduction before spilling to the net rule
 };
 #define NWCAP 64
-#define RFREECAP 64
 #define LSCAP 64
 
 extern "C" {
@@ -191,7 +183,7 @@ __device__ inline u64 mith_unreachable() { g_abort(AB_UNREACHABLE); return 0; }
 // frame against the thread's stack (the pointer at kernel entry, the limit
 // from the runner) and aborts with AB_DEEP instead of faulting.
 __shared__ unsigned long long s_sp0[256];
-__device__ u32 g_stack_limit = 28 * 1024;
+__device__ u32 g_stack_limit = 4 * 1024; // set by the runner before any launch
 __device__ __forceinline__ unsigned long long sp_now() {
   unsigned long long v;
   asm volatile("stacksave.u64 %0;" : "=l"(v));
@@ -280,7 +272,11 @@ __device__ inline void cell_set(u32 i, usize slot, u64 v) { G.nodes[2 * (u64)ncl
 
 // Cells: a per-lane intrusive free list (the link in the cell's first
 // word, the head in `nfreen`, index+1, 0 = empty: unbounded, no atomics)
-// and a bump of `chunksz` cells per lane from the global counter.
+// and a bump of chunks per lane from the global counter. A lane's chunks
+// start at 64 cells and double up to `chunksz`: the arena is managed
+// memory committed on first touch, so the cells a program touches, not the
+// lane count, decide the memory it commits.
+__device__ u8 g_nclog[MAXLANES]; // log2 of the lane's next chunk size, minus 6
 __device__ __forceinline__ u32 alloc_node(u64 a, u64 b) {
   u32 L = lane();
   u32 h = G.nfreen[L];
@@ -292,13 +288,16 @@ __device__ __forceinline__ u32 alloc_node(u64 a, u64 b) {
   }
   u32 *ck = &G.nchunk[2 * L];
   if (ck[0] >= ck[1]) {
-    u32 base = atomicAdd(G.nbump, G.chunksz);
+    u32 lg = g_nclog[L];
+    u32 sz = min(64u << lg, G.chunksz);
+    if ((64u << lg) < G.chunksz) g_nclog[L] = lg + 1;
+    u32 base = atomicAdd(G.nbump, sz);
     if (base >= G.ncap) {
       g_abort(AB_ARENA);
       return 0;
     }
     ck[0] = base;
-    u64 end = (u64)base + G.chunksz;
+    u64 end = (u64)base + sz;
     ck[1] = end > (u64)G.ncap ? G.ncap : (u32)end;
   }
   u32 i = ck[0]++;
@@ -398,7 +397,7 @@ __device__ __noinline__ void spawn_global(u32 rule, u64 a, u64 b, u64 c) {
   e[2] = c;
 }
 
-// A cross-lane join just completed. The CPU runtime's rule (and reference's):
+// A cross-lane join just completed. The CPU runtime's rule (reference's design too):
 // the lane whose delivery completed it runs it at once, in the parallel
 // world (what it forks goes to the global rings for the next GROW), in
 // every kernel. It waits on the lane's own stack, not the C stack, and
@@ -421,8 +420,8 @@ __device__ inline void join_ready(u32 rule, u64 a, u64 b, u64 c) {
 }
 // A ready record (a task with no inputs: the rest of a body after a fork
 // site) runs at once on this lane: in the parallel world the body then
-// reaches all its fork sites in one step (reference's fork releases every
-// child at once); in WORK it is the lane's own.
+// reaches all its fork sites in one step (adopted from reference's runtime
+// design: a fork releases every child at once); in WORK it is the lane's own.
 __device__ inline void ready_rec(u32 rec) {
   Rec &r = G.recs[rclamp(rec)];
   if (r.par)
@@ -521,7 +520,7 @@ __device__ __noinline__ void tail_to(u16 f, const u64 *args, int n) {
 // Dive `f` with no destination (args[0] = NONE): ok = the value, else the
 // root record of its residue, whose parent the caller sets.
 //
-// The two worlds (reference's): in the sequential world (WORK) a callee gets
+// The two worlds (adopted from reference's runtime design; design.md s14): in the sequential world (WORK) a callee gets
 // the lane's budget and runs here; in the parallel world (a GROW sweep) a
 // callee gets no budget, so it suspends at entry and becomes a task at
 // once, and the caller captures its continuation as records. A task's own
@@ -766,6 +765,10 @@ __device__ inline bool is_heap(u64 v) { u64 t = tag(v); return t == T_CON || t =
 __device__ inline void arr_mark_boxed(u64 a, u64 v) { if (is_heap(v)) arr_block(a)[1] |= ARR_BOXED; }
 __device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return arr_raw(p) ? retag((i64)e) : e; }
 __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
+  if ((u64)n + 2 > G.hcap) { // before the class: a huge n has no class
+    g_abort(AB_HEAP);
+    return (T_ARR << 56) | 0;
+  }
   u32 cls = arr_cls(n);
   u32 *h = &g_afree[lane() * ACLS + cls];
   u64 base;
@@ -1545,7 +1548,7 @@ __device__ __noinline__ void dup_rule(u64 dup, u64 val) {
     link(val, o2);
   } else if (t == T_FLO) {
     u32 a = (u32)payload(val);
-    u32 copy = alloc_node(cell0(a), cell1(a));
+    u32 copy = alloc2(cell0(a), cell1(a)); // a new value: one reference
     link(val, o1);
     link(mkport(T_FLO, copy), o2);
   } else if (t == T_CON) {
@@ -1932,7 +1935,8 @@ __device__ void work_phase(u32 max_steps) {
 
 // ---- the driver on the device ----
 //
-// One cooperative launch runs the whole program in reference's rhythm. A round:
+// One cooperative launch runs the whole program in a grow/work rhythm adopted from
+// reference's runtime design (design.md s14; to be replaced). A round:
 // while the frontier (pending global tasks) is narrower than the lanes and
 // some pending task can fork, GROW sweeps: every forkable task below a
 // snapshot fires in the parallel world, one grid barrier per sweep, until
@@ -1963,7 +1967,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       }
       g_off[G.nrules] = off;
       g_woff[G.nrules] = total;
-      // reference's rule: a grow sweep grew when it pushed anything (some task
+      // reference's rule (adopted): a grow sweep grew when it pushed anything (some task
       // forked); growth stops when a sweep forks nothing or the frontier
       // is as wide as the lanes
       u64 pushed = 0;

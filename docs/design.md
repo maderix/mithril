@@ -22,6 +22,7 @@ Contents:
 11. Use cases and scope
 12. Open items
 13. Process rules
+14. Prior art and provenance
 
 ## 1. Thesis and what it claims
 
@@ -617,7 +618,8 @@ the RTX 4090) with grid barriers between phases. A host loop with one
 launch and one sync per round cost about 130 us per round; a device round
 costs 10 to 20 us. The host launches once and waits.
 
-A round, in reference's rhythm:
+A round (this grow/work policy is reference's published runtime design,
+adopted, not derived here; section 14):
 
 * The leader snapshots the per-rule rings: pending tasks, forkable tasks
   (tasks whose rule can fork, and `ERA`), and the frontier (tasks pushed
@@ -654,9 +656,15 @@ at once.
 
 ### 7.3 Budgets on the device
 
-* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). The device stack
-  is 32 KiB per thread (the driver refuses 128 KiB), and the budget is
-  the only bound on native recursion depth. An unbounded budget in WORK
+* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). The budget is the
+  only bound on native recursion depth.
+* The per-thread stack starts at 8 KiB and doubles, up to 64 KiB, when
+  the stack guard aborts a run. A run is deterministic, so re-running it
+  with more stack is sound. The size that worked is kept beside the
+  artefact (`<artefact>.stack`) and the next run starts there.
+  `MITHRIL_GPU_STACK` fixes it. The driver backs the stack with local
+  memory for every resident thread, so a large fixed stack costs setup
+  time on every run (16 GB eager arenas plus 32 KiB stack: 0.31 s). An unbounded budget in WORK
   measured 0.84 s against 1.03 s on tree-bitonic depth 23; the bound is
   kept because of the stack.
 * A dive-form call refunds its budget when it returns. The budget bounds
@@ -669,6 +677,8 @@ at once.
   runaway loop cycles rounds to the round limit instead of freezing the
   device, which the desktop shares.
 * `stack_guard` compares against the thread's stack less a 4 KiB margin.
+  The host writes the limit before the first launch (`k_boot` runs dives
+  too); a limit left at its default faulted small stacks with error 700.
 
 The budget is a per-backend scheduling parameter, not semantics.
 
@@ -695,7 +705,23 @@ place; the rules are the same either way.
 
 The budget is free VRAM at start, less the fixed buffers, less the
 driver's stack reserve for all resident threads (SMs x threads per SM x
-32 KiB), less 1 GiB of slack. No free path takes an atomic. A bump-only
+the stack size), less 1 GiB of slack.
+
+Setup cost is paid only for memory a run touches:
+
+* Arenas above 256 MiB are managed memory with the device as preferred
+  location, so pages are committed on first touch. Small buffers every
+  lane touches at once are ordinary device allocations.
+  `MITHRIL_GPU_EAGER=1` commits everything up front (a diagnostic).
+* No arena is cleared: every refcounted allocation writes its own count.
+* A lane's cell chunks start at 64 cells and double, so a lane holds
+  what it uses.
+* The runner uses the device's primary context with one hardware
+  connection (`CUDA_DEVICE_MAX_CONNECTIONS=1` unless set). A process
+  that is exiting skips the arena release; the driver reclaims it.
+
+Measured on a bare process: one connection 0.05 s; 16 GB eager arenas
+with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s. No free path takes an atomic. A bump-only
 heap leaked every array block; bfs and terrain exhausted it at the big
 size and run (255 ms, 296 ms) with the free lists.
 
@@ -705,6 +731,8 @@ size and run (255 ms, 296 ms) with the free lists.
   converge stops with an error.
 * Deadline: the host waits at most `MITHRIL_GPU_TIMEOUT` (300 s) and
   tears the context down past it.
+* A failed run resets the primary context: a sticky device error (700)
+  otherwise poisons every later run in the process.
 * Any arena exhaustion, out-of-bounds index, bad cell index or stack
   overflow sets the abort flag; every lane stops at its next check and
   the host reports the named cause.
@@ -944,11 +972,15 @@ Device:
 2. hashmap: per-rule rings of 2^21 entries overflow on a 7.5 M-task
    frontier. Replace them with one chunked shared task ring (reference's
    cube holds 16 M tasks).
-3. Fixed startup cost of about 0.4 s (arena allocation and clearing),
-   which makes every small port slower than reference on wall clock.
+3. Fixed startup cost: reduced by the mechanisms in section 7.5. Device
+   wall clock, harness, n=3, before and after: gameoflife 0.28 to 0.13 s
+   (reference 0.09), nbody 0.28 to 0.12 (0.09), raytrace 0.29 to 0.16 (0.55),
+   lexer 0.39 to 0.26 (0.35), terrain 0.47 to 0.29, symreg 2.34 to 1.68.
+   The standings table in section 10 predates this.
 4. Not measured on the current tree: tree-matmul and kdtree.
-5. The runner still allocates the cell and record overflow rings, which
-   the allocators no longer use.
+5. The grow/work policy (section 7.2) is reference's design. It is to be
+   replaced by a policy derived from Mithril's own cost model (section
+   14).
 
 CPU:
 
@@ -1032,3 +1064,37 @@ The working rules are in `CLAUDE.md`. The ones that shape this design:
 * The language crates (front, core, net, reassoc, codegen, cli) are held
   under 15,000 lines; they are at 13,239.
 * Design decisions are recorded here with the numbers that justify them.
+
+## 14. Prior art and provenance
+
+Mithril stands on published work and says where. An independent review
+(09-30) audited what came from reference. Findings:
+
+* **No runtime or compiler code is copied.** The rule table, lowering,
+  CPU runtime and device engine are written here.
+* **Device scheduling policy is reference's design** (the reference paper,
+  sections 3.1, 3.2, 5 and 6.3): the grow/work round, the frontier as
+  tasks pushed by the last phase, the sequential and parallel worlds, a
+  completed join run at once in the parallel world, fork-free tasks
+  skipped in grow, and the stop rule. It was adopted after reading
+  reference's paper and runtime. It will be replaced by a policy derived from
+  Mithril's own model (demand-driven sharing: a fork is shared only when
+  lanes are idle; classical work stealing, Blumofe and Leiserson 1999,
+  Arora, Blumofe and Plaxton 1998), on the CPU and the device together.
+* **Device setup** (primary context, one hardware connection, managed
+  arenas) is standard CUDA driver usage. The choice was prompted by
+  reading reference's host code; each effect was measured here (section 7.5).
+* **Benchmarks.** Except kdtree (Mithril's own), `bench/ports/*.c` are
+  reference's reference C programs (`bench/runtime/<name>/main.c`,
+  Apache-2.0), kept verbatim as the C baseline; `bench/ports/*.py` are
+  translations of reference's `main.reference` programs. Both carry reference's
+  license (`bench/ports/LICENSE.reference`, `bench/ports/NOTICE`). They are
+  to be rewritten as Mithril's own benchmark set once the device lane is
+  near reference.
+* **Mithril's own** (confirmed by the review): fork sites derived from
+  the net, suspension on an empty budget as the fork mechanism, borrowing
+  and reuse, erasure as parallel work, the stack guard and stack
+  doubling, static dealing, per-rule rings, the one-kernel driver.
+
+Rule from 09-30: reference is a measured baseline. Its runtime source is not
+read to design Mithril's.

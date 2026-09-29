@@ -290,7 +290,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
         Core::Match(s, arms) => ex.match_arms(e, s, arms, cnt_rule, |ex, body, ab| rtail(ex, body, par, ab, sq), b),
         Core::Call(g, args) => {
             // a tail call delivering to `par`: in the parallel world the
-            // device runtime spawns it as a task (reference's marked call);
+            // device runtime spawns it as a task (a marked call, as in reference);
             // otherwise it dives here
             let mut es: Vec<E> = args.iter().map(|a| ex.val(a, true, b)).collect();
             es.insert(0, par.clone());
