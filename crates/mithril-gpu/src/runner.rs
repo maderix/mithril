@@ -296,7 +296,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     };
     let bcap = bcap.next_power_of_two(); // rings: a power of two
     let ovfcap: u32 = 1 << 20;
-    let hcap = env_cap("MITHRIL_GPU_HEAP", 1 << 26);
+    let hcap_req = std::env::var("MITHRIL_GPU_HEAP").ok().map(|_| env_cap("MITHRIL_GPU_HEAP", 1 << 26));
     let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
     let net_fuel = env_cap("MITHRIL_GPU_NET_FUEL", 4096).clamp(1, i32::MAX as u64) as i32;
 
@@ -317,11 +317,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         + (4 * MAXLANES * FREECAP + 12 * MAXLANES) as u64
         + 8 * ovfcap as u64
         + 8 * nrules as u64
-        + 8 * hcap
         + (16 * NWCAP * MAXLANES + 4 * MAXLANES + 4 + 4 * RFREECAP * MAXLANES + 4 * MAXLANES + 32 * LSCAP * MAXLANES + 4 * MAXLANES) as u64
         + (1 << 20);
     let slack: u64 = 1 << 30;
-    let budget = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
+    let budget0 = (vfree as u64).saturating_sub(fixed + stack_reserve + slack);
+    // the array heap takes a third of what is left (a program is arrays or
+    // cells; neither arena is sized by the program: a parallel array
+    // program holds one working set per lane), the cells the rest
+    let hcap = hcap_req.unwrap_or((budget0 / 24).clamp(1 << 26, 1 << 32)); // block indices are u32 on the free lists
+    let budget = budget0.saturating_sub(8 * hcap);
     let max_ncap = (budget / 20).max(1 << 10).min(u32::MAX as u64 - 1);
     let ncap = if ncap_req > max_ncap {
         eprintln!(

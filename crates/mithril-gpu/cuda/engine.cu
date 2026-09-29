@@ -72,7 +72,7 @@ struct Dev {
                // fully drained bucket is recycled to 0 between waves)
   u64 *result; // [0] = delivered flag, [1] = ROOT value
   u32 *abortf;
-  u64 *heap;   // array blocks: [rc, len|flags, elems..] (bump, never freed)
+  u64 *heap;   // array blocks: [rc, len|cls|flags, elems..] (bump chunks, per-lane free lists)
   u64 *hbump;
   u64 hcap;
   u64 *nw;     // MAXLANES * NWCAP * 2: per-lane net worklists (redex pairs)
@@ -741,8 +741,24 @@ __device__ inline double flo_val(u64 p) { return __longlong_as_double(cell0((u32
 
 #define ARR_BOXED (1ull << 63)
 #define ARR_RAW (1ull << 62)
+#define ARR_LEN_MASK ((1ull << 48) - 1)
+#define ARR_CLS_SHIFT 48 // the block's size class (a power of two of words) in word 1
+// Freed blocks go on the lane's intrusive free list of their size class (the
+// link in word 0, the head index+1): the cells' access model, no atomics.
+// Eight classes per octave: a block is at most 1/8 larger than its array.
+#define ACLS 256
+__device__ u32 g_afree[MAXLANES * ACLS];
+__device__ inline u64 arr_cls_words(u32 c) { return c < 8 ? 8 : (8ull + (c & 7)) << (c / 8 - 3); }
+__device__ inline u32 arr_cls(usize n) {
+  u64 w = n + 2;
+  if (w <= 8) return 0;
+  u32 e = 63 - __clzll(w - 1);              // 2^e <= w-1
+  u64 step = 1ull << (e - 3);               // the octave [2^e, 2^(e+1)] in eighths
+  u32 sub = (u32)((w - (1ull << e) + step - 1) / step); // 1..8
+  return sub == 8 ? 8 * (e + 1) : 8 * e + sub;
+}
 __device__ inline u64 *arr_block(u64 p) { return &G.heap[p & M56]; }
-__device__ inline usize arr_len_of(u64 p) { return arr_block(p)[1] & ~(ARR_BOXED | ARR_RAW); }
+__device__ inline usize arr_len_of(u64 p) { return arr_block(p)[1] & ARR_LEN_MASK; }
 __device__ inline u64 *arr_elems(u64 p) { return arr_block(p) + 2; }
 __device__ inline bool arr_raw(u64 p) { return (arr_block(p)[1] & ARR_RAW) != 0; }
 __device__ inline bool arr_boxed(u64 p) { return (arr_block(p)[1] & ARR_BOXED) != 0; }
@@ -750,19 +766,34 @@ __device__ inline bool is_heap(u64 v) { u64 t = tag(v); return t == T_CON || t =
 __device__ inline void arr_mark_boxed(u64 a, u64 v) { if (is_heap(v)) arr_block(a)[1] |= ARR_BOXED; }
 __device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return arr_raw(p) ? retag((i64)e) : e; }
 __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
-  u64 base = atomicAdd(G.hbump, n + 2);
-  if (base + n + 2 > G.hcap) {
-    g_abort(AB_HEAP);
-    return (T_ARR << 56) | 0;
+  u32 cls = arr_cls(n);
+  u32 *h = &g_afree[lane() * ACLS + cls];
+  u64 base;
+  if (*h) {
+    base = *h - 1;
+    *h = (u32)G.heap[base];
+  } else {
+    u64 words = arr_cls_words(cls);
+    base = atomicAdd(G.hbump, words);
+    if (base + words > G.hcap) {
+      g_abort(AB_HEAP);
+      return (T_ARR << 56) | 0;
+    }
   }
   u64 *b = &G.heap[base];
   b[0] = 1;
-  b[1] = n;
+  b[1] = (u64)n | ((u64)cls << ARR_CLS_SHIFT);
   for (usize k = 0; k < n; k++) b[2 + k] = fill;
   return (T_ARR << 56) | base;
 }
 __device__ inline u64 arr_alloc(usize n) { return arr_alloc_fill(n, 0); }
-__device__ inline void arr_free_block(u64 p) { (void)p; } // bump heap: never freed
+__device__ inline void arr_free_block(u64 p) {
+  u64 base = p & M56;
+  u32 cls = (u32)(G.heap[base + 1] >> ARR_CLS_SHIFT) & 255;
+  u32 *h = &g_afree[lane() * ACLS + cls];
+  G.heap[base] = *h;
+  *h = (u32)base + 1;
+}
 __device__ inline void arr_oob(i64 i, usize n) { (void)i; (void)n; g_abort(AB_OOB); }
 __device__ inline u64 arr_new_raw(i64 n, i64 x) {
   if (n < 0) { g_abort(AB_OOB); n = 0; }
