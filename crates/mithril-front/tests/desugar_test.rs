@@ -242,11 +242,38 @@ def classify(n):
             return 100
         case 1:
             return 200
+    return 300
 ";
     let cm = dm(src);
     let f = fid(&cm, "classify");
     assert_eq!(eval_core(&cm, f, &[Val::I(0)]), Val::I(100));
     assert_eq!(eval_core(&cm, f, &[Val::I(1)]), Val::I(200));
+    assert_eq!(eval_core(&cm, f, &[Val::I(7)]), Val::I(300));
+}
+
+#[test]
+fn a_function_ending_in_an_int_match_without_a_fallthrough_return_is_rejected() {
+    // no case may match: the function would not return (as `if` without `else`)
+    let d = desugar_err("def f(x):\n    match x:\n        case 1:\n            return 2\n");
+    assert!(d.msg.contains("does not return on all control-flow paths"), "msg: {}", d.msg);
+}
+
+#[test]
+fn nested_range_loops_reusing_the_variable_keep_their_own_start() {
+    // Python: 1070207 (the inner `for i in range(7, 8)` must not reset the
+    // outer loop's start); the oracle shares desugar, so the value is fixed here
+    let src = "def main():\n    s = 0\n    for i in range(1, 3):\n        s = s * 100 + i\n        for i in range(7, 8):\n            s = s * 100 + i\n    return s\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(1070207));
+}
+
+#[test]
+fn a_loop_carries_a_local_closure_it_calls() {
+    // `f` is a local closure the loop body calls by name: the loop must carry
+    // it (by hand: f(i) = 2i + 1 over i = 0..3 sums to 16)
+    let src = "def main():\n    k = 1\n    f = lambda x: x * 2 + k\n    s = 0\n    for i in range(4):\n        s = s + f(i)\n    return s\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(16));
 }
 
 // ---- "only bool in conditions" ----

@@ -883,11 +883,15 @@ pub fn cmp<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     let o = if tag(a) == T_NUM && tag(b) == T_NUM {
         as_i(a).partial_cmp(&as_i(b))
     } else {
+        // read, then release (a freed cell's first word is its free-list link)
+        let o = flo_val(ctx, a).partial_cmp(&flo_val(ctx, b));
         if own & 1 != 0 { free_val::<T>(ctx, a); }
         if own & 2 != 0 { free_val::<T>(ctx, b); }
-        flo_val(ctx, a).partial_cmp(&flo_val(ctx, b))
+        o
     };
-    let o = o.expect("incomparable values (NaN?)");
+    // an unordered pair (a NaN) satisfies only `!=` (IEEE 754), as in the
+    // oracle and the reducer (`mithril_front::core::cmp_bool`)
+    let Some(o) = o else { return num((op == 5) as i64) };
     use std::cmp::Ordering::*;
     let r = match op {
         0 => o == Less,

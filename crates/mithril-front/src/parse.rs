@@ -8,10 +8,12 @@ use crate::Diag;
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// loops seen so far: makes each `range(a, b)` loop's hidden names unique
+    loops: usize,
 }
 
 pub fn parse_module(toks: &[Token]) -> Result<Module, Diag> {
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser { toks, pos: 0, loops: 0 };
     p.module()
 }
 
@@ -241,7 +243,10 @@ impl<'a> Parser<'a> {
         match end {
             None => Ok(vec![Stmt::For(var, first, body, None)]),
             Some(b) => {
-                let (ctr, lo) = (format!("__range_{var}"), format!("__lo_{var}"));
+                // per-loop names: a nested loop reusing `var` must not reset
+                // the outer loop's start
+                self.loops += 1;
+                let (ctr, lo) = (format!("__range{}_{var}", self.loops), format!("__lo{}_{var}", self.loops));
                 let lo_v = || Box::new(Expr::Var(lo.clone()));
                 body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), lo_v())));
                 Ok(vec![Stmt::Assign(lo.clone(), first), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])

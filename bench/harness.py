@@ -301,6 +301,21 @@ def lane_time(lane):
 
 
 def write_results(rows, meta, args):
+    # a partial run (--skip-cpu / --skip-gpu / --only) merges its lanes into
+    # the existing results instead of replacing them: the other lanes keep
+    # their numbers and their own commit, noted per lane
+    partial = args.skip_cpu or args.skip_gpu or args.only
+    if partial and os.path.exists(RESULTS_JSON):
+        try:
+            old = json.load(open(RESULTS_JSON))
+            fresh = {r["name"]: r for r in rows}
+            for r in old.get("rows", []):
+                if r["name"] in fresh:
+                    for lane, v in r["lanes"].items():
+                        fresh[r["name"]]["lanes"].setdefault(lane, dict(v, notes=(v.get("notes") or []) + ["kept from %s" % old["meta"].get("git_head", "?")[:7]]))
+            rows = [fresh.get(r["name"], r) for r in old.get("rows", [])] + [r for r in rows if r["name"] not in {o["name"] for o in old.get("rows", [])}]
+        except Exception:
+            pass
     lines = [
         "# Mithril benchmark results (CPU, BIG size)",
         "",

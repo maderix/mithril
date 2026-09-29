@@ -150,8 +150,11 @@ fn always_returns(stmts: &[Stmt]) -> bool {
     match stmts.last() {
         Some(Stmt::Return(_)) => true,
         Some(Stmt::If(_, t, e)) => always_returns(t) && always_returns(e),
-        // (an int match ending a function: no matching case is a runtime error)
-        Some(Stmt::Match(_, cases)) => !cases.is_empty() && cases.iter().all(|(_, b)| always_returns(b)),
+        // an int match may match no case (it falls through, like `if`
+        // without `else`); a constructor match is exhaustive
+        Some(Stmt::Match(_, cases)) => {
+            !cases.is_empty() && cases.iter().all(|(p, b)| p.as_int_lit().is_none() && always_returns(b))
+        }
         _ => false,
     }
 }
@@ -215,7 +218,15 @@ pub fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
             free_reads_expr(t, out);
             free_reads_expr(e2, out);
         }
-        Expr::Call(_, args) | Expr::Tuple(args) => {
+        Expr::Call(name, args) => {
+            // a local closure called by name is read (the scope filter drops
+            // top-level functions)
+            out.insert(name.clone());
+            for a in args {
+                free_reads_expr(a, out);
+            }
+        }
+        Expr::Tuple(args) => {
             for a in args {
                 free_reads_expr(a, out);
             }

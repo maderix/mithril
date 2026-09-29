@@ -808,3 +808,10 @@ fn a_tuple_returning_fork_tree_has_a_fork_site_and_parallel_waves() {
     let waves: u64 = err.split("waves=").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).unwrap_or(0);
     assert!(waves >= 2, "no parallel waves at 16 threads: {err}");
 }
+
+#[test]
+fn boxed_float_comparisons_read_before_release_and_are_ieee() {
+    // the runtime compare released its owned operands before reading them
+    // (a freed cell's first word is its free-list link) and panicked on NaN
+    golden("float_compare.py", 0, &["1", "4"]);
+}
