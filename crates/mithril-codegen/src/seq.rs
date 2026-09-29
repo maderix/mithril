@@ -1483,9 +1483,11 @@ pub(crate) fn dive_fn<'m>(
         let mut lb = if leafy { Vec::new() } else { fuel_check.clone() };
         if !leafy {
             // the entry is one depth unit (a zero-budget fork callee suspends
-            // here); an iteration is a work unit
+            // here); an iteration is a work unit, charged after its check so
+            // a budget of one still runs one iteration
             s.push(burn_fuel());
-            lb[1] = work_fuel(i64_(1));
+            lb.swap(1, 2);
+            lb[2] = work_fuel(i64_(1));
         }
         if is_fold {
             s.push(let_("fold_start", Ty::U64, v("v0")));
@@ -1662,7 +1664,7 @@ pub(crate) fn dps_fn<'m>(
 /// bindings independent of `seed` ending in their one live-out `l` (the
 /// single binder D reads), and D the dependent rest. `None` when I does no
 /// call or has zero or several live-outs.
-fn split_chain(seed: u32, e: &Core) -> Option<(Core, u32, Core)> {
+fn split_chain(seed: u32, e: &Core, tuple_ok: bool) -> Option<(Core, u32, Core)> {
     let mut binds: Vec<(u32, &Core)> = Vec::new();
     let mut cur = e;
     while let Core::Let(v, r, b) = cur {
@@ -1683,18 +1685,38 @@ fn split_chain(seed: u32, e: &Core) -> Option<(Core, u32, Core)> {
     let d_body = wrap(&de, cur.clone());
     let jf = free_vars(&d_body);
     let live: Vec<u32> = ind.iter().map(|(v, _)| *v).filter(|v| jf.contains(v)).collect();
-    if live.len() != 1 { return None; }
-    Some((wrap(&ind, Core::Var(live[0])), live[0], d_body))
+    match live.len() {
+        0 => None,
+        1 => Some((wrap(&ind, Core::Var(live[0])), live[0], d_body)),
+        _ if !tuple_ok => None,
+        // several live values cross the join as one tuple when the
+        // independent calls are siblings of one function (a fork tree: a
+        // 4-way fork is then three nested fork sites, not one fork and two
+        // chains); a chain of distinct calls keeps the one-live-out rule,
+        // since splitting every frame of it costs code cubic in its length
+        _ if !siblings(&ind) => None,
+        _ => {
+            let t = e.max_var() + 1; // fresh in this body (D and I are its parts)
+            let d_body = live.iter().enumerate().rev().fold(d_body, |acc, (i, v)| Core::Let(*v, Box::new(Core::Proj(Box::new(Core::Var(t)), i)), Box::new(acc)));
+            Some((wrap(&ind, Core::Tuple(live.iter().map(|v| Core::Var(*v)).collect())), t, d_body))
+        }
+    }
 }
+
 
 /// A suspended frame's continuation `bo` around the pending `x`: (P, P's
 /// live-out, J); frames that do not split wait as plain records.
-pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> { split_chain(x, bo) }
+/// The calls of a let chain's right-hand sides all target one function.
+fn siblings(binds: &[(u32, &Core)]) -> bool {
+    let mut g = None;
+    binds.iter().all(|(_, r)| !r.any(&mut |e| match e { Core::Call(f, _) => Some(*g.get_or_insert(*f) != *f), _ => None }))
+}
+pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> { split_chain(x, bo, true) }
 
 /// A frame's dependent rest `j` around P's live-out `live`: D (needs x, not
 /// `live`; one live-out `m`, a call) and J2 (reads `m`, `live`, not x).
 pub(crate) fn split_dep(x: u32, live: u32, j: &Core) -> Option<(Core, u32, Core)> {
-    split_chain(live, j).filter(|(_, _, j2)| !free_vars(j2).contains(&x))
+    split_chain(live, j, false).filter(|(_, _, j2)| !free_vars(j2).contains(&x))
 }
 
 /// Every occurrence of `x` in `e` is directly under a `Proj`.

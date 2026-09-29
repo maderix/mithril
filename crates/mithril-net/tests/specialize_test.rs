@@ -631,7 +631,7 @@ fn a_call_created_in_a_branch_stays_in_the_branch() {
 /// captures a pattern binder, applied twice, hits "residual wire class has
 /// no producer" in the reader.
 #[test]
-#[ignore = "open: ICE in the reader (see design.md 3b-3)"]
+#[ignore = "open: ICE in the reader (design.md, open items)"]
 fn a_closure_capturing_an_arm_binder_applied_twice() {
     let src = format!("@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\n{FIB}def f(k, l, c):\n    match l:\n        case Cons(h, t):\n            g = lambda x: fib(x + h) + k\n            return g(c) + g(1)\n        case Nil():\n            return 0\n\ndef main():\n    k = array_len(array_new(9, 0))\n    return f(k, Cons(k, Nil()), k) + f(k, Nil(), k)\n");
     let (m, s) = spec(&src);
