@@ -789,23 +789,23 @@ unless marked ms.
 
 | port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device kernel (wall) | reference gpu wall |
 |---|---|---|---|---|---|---|---|
-| bfs | 4.56 | 4.83 | 0.432 | 4.543 | 0.397 | 255 ms (0.65 wall) | 0.217 |
-| editdist | 2.20 | 2.25 | 0.255 | 2.389 | 0.308 | 212 ms (0.56 wall) | 0.234 |
-| gameoflife | 28.29 | 8.45 | 1.121 | 9.706 | 1.146 | 18 ms (0.49 wall) | 0.089 |
+| bfs | 4.56 | 4.83 | 0.432 | 4.543 | 0.397 | 255 ms (0.48 wall) | 0.217 |
+| editdist | 2.20 | 2.25 | 0.255 | 2.389 | 0.308 | 212 ms (0.48 wall) | 0.234 |
+| gameoflife | 28.29 | 8.45 | 1.121 | 9.706 | 1.146 | 18 ms (0.28 wall) | 0.089 |
 | hashmap | 0.769 | 1.82 | 0.237 | 3.112 | 0.288 | fails: a rule ring (2^21) exhausted by a 7.5 M-task frontier | 0.662 |
-| kdtree | 0.341 | 0.41 | 0.090 | no port | no port | 603 ms (1.69 wall) | no port |
-| kmeans | 10.18 | 11.86 | 1.462 | 5.610 | 0.677 | 339 ms (0.69 wall) | 0.299 |
-| lexer | 1.07 | 2.51 | 0.347 | 2.868 | 0.310 | 157 ms (0.57 wall) | 0.348 |
-| mandelbrot | 1.95 | 4.08 | 0.850 r | 4.806 | 0.468 | 76 ms (0.52 wall) | 0.093 |
-| merkle | 5.78 | 5.43 | 0.601 | 5.463 | 0.535 | 14 ms (0.52 wall) | 0.101 |
-| nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.524 | 6.220 | 0.521 | 4 ms (0.44 wall) | 0.086 |
-| queens | 3.91 | 4.71 | 0.454 | 8.118 | 0.911 | 1,204 ms (1.56 wall) | 0.760 |
-| raytrace | 9.04 | 7.68 | 0.849 | 7.263 | 0.724 | 58 ms (0.73 wall) | 0.545 |
-| symreg | 2.96 | 3.02 | 0.400 | 4.608 | 0.431 | 2,028 ms (2.31 wall) | 0.261 |
-| terrain | 4.17 | 4.58 | 0.559 | 3.040 | 0.346 | 296 ms (0.60 wall) | 0.212 |
-| tree-bitonic | 8.46 | 10.79 | 1.554 | 10.077 | 1.455 | 990 ms (1.38 wall) | 0.568 |
-| tree-matmul | 4.24 | 3.80 | 0.575 | 4.094 | 0.460 | 383 ms (0.82 wall) | 0.225 |
-| tree-radix | 2.67 | 4.05 | 0.579 | 4.622 | 0.537 | 373 ms (0.74 wall) | 0.333 |
+| kdtree | 0.341 | 0.41 | 0.090 | no port | no port | 603 ms (1.30 wall) | no port |
+| kmeans | 10.18 | 11.86 | 1.462 | 5.610 | 0.677 | 339 ms (0.63 wall) | 0.299 |
+| lexer | 1.07 | 2.51 | 0.347 | 2.868 | 0.310 | 157 ms (0.39 wall) | 0.348 |
+| mandelbrot | 1.95 | 4.08 | 0.850 r | 4.806 | 0.468 | 76 ms (0.29 wall) | 0.093 |
+| merkle | 5.78 | 5.43 | 0.601 | 5.463 | 0.535 | 14 ms (0.27 wall) | 0.101 |
+| nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.524 | 6.220 | 0.521 | 4 ms (0.28 wall) | 0.086 |
+| queens | 3.91 | 4.71 | 0.454 | 8.118 | 0.911 | 1,204 ms (1.45 wall) | 0.760 |
+| raytrace | 9.04 | 7.68 | 0.849 | 7.263 | 0.724 | 58 ms (0.29 wall) | 0.545 |
+| symreg | 2.96 | 3.02 | 0.400 | 4.608 | 0.431 | 2,028 ms (2.34 wall) | 0.261 |
+| terrain | 4.17 | 4.58 | 0.559 | 3.040 | 0.346 | 296 ms (0.47 wall) | 0.212 |
+| tree-bitonic | 8.46 | 10.79 | 1.554 | 10.077 | 1.455 | 990 ms (1.27 wall) | 0.568 |
+| tree-matmul | 4.24 | 3.80 | 0.575 | 4.094 | 0.460 | 383 ms (0.70 wall) | 0.225 |
+| tree-radix | 2.67 | 4.05 | 0.579 | 4.622 | 0.537 | 373 ms (0.65 wall) | 0.333 |
 Conditions:
 
 * C twin: `bench/results.md`, harness at `15f51dd`, one run.
@@ -816,9 +816,11 @@ Conditions:
 * reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
   compiler output rebuilt, a load below 2, min of 3 runs, wall clock.
 * Mithril device: kernel time (section 9), warm cache, default arenas,
-  at `723be4c`; the wall clock in parentheses is the harness's (min of
-  3, warm cache) and is what compares with reference's gpu wall. The
-  difference, about 0.4 s, is the fixed process and arena cost.
+  at `723be4c`; the wall clock in parentheses is the harness's timing of
+  the built artefact (`build --gpu` once, `exec` per run, min of 3), the
+  same measurement as reference's gpu lane. The difference between the two is
+  the fixed cost: CUDA context creation (73 ms) and teardown of the
+  arenas (133 ms), module load, arena setup and readback (about 45 ms).
 
 Warm wall clock on the device, same tree: gameoflife 0.47 s, nbody
 0.42 s, kmeans 0.62 s, mandelbrot 0.55 s (reference gpu wall 0.148, 0.090,
@@ -831,13 +833,13 @@ Read plainly:
   bfs (4.83 against 4.54), kmeans (11.86 against 5.61), raytrace (7.68 against 7.26), terrain (4.58 against 3.04), tree-bitonic (10.79 against 10.08).
 * **CPU, 16 threads.** At or under reference par on 5 of 16 ports. Over it:
   bfs (0.43 against 0.40), kmeans (1.46 against 0.68), lexer (0.35 against 0.31), mandelbrot (0.85 against 0.47), merkle (0.60 against 0.54), nbody (0.52 against 0.52), raytrace (0.85 against 0.72), terrain (0.56 against 0.35), tree-bitonic (1.55 against 1.46), tree-matmul (0.57 against 0.46), tree-radix (0.58 against 0.54).
-* **Device.** Every measured port is checksum-equal. Kernel time is under
-  reference's gpu wall on 7 of 15 measured ports; wall clock is over
-  it on 15 of 15, by 1.3x to 8.9x, and on the small ports the whole
-  difference is the fixed startup cost (section 12). symreg and
-  tree-bitonic are also round-bound: 17,902 grow sweeps and 966 rounds,
-  because a sweep counts as growth when it pushed anything. hashmap
-  fails.
+* **Device.** Every measured port is checksum-equal. Wall clock of the
+  built artefact is under reference's gpu wall on 1 of 15 measured ports
+  (raytrace 0.29 against 0.55) and over it on 14, by 1.1x to 9x. The
+  fixed cost (about 0.25 s) is most of the difference on the small
+  ports; symreg (17,902 grow sweeps), tree-bitonic (966 rounds), queens
+  and tree-matmul are also round-bound, because a sweep counts as growth
+  when it pushed anything (section 12). hashmap fails.
 
 ## 11. Use cases and scope
 

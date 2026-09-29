@@ -452,16 +452,16 @@ def main():
                         args.timeout, env="mithril", arena_retry=True)
                     print("[harness]   %-6s: %s" % (label, fmt_lane(row["lanes"][label])),
                           flush=True)
-                if gpu_enabled:
-                    # the device lane times a built artefact (`build --gpu`
-                    # once, `exec` per run), as the CPU lanes and reference do
-                    port = os.path.join(PORTS_DIR, name + ".py")
-                    art = os.path.join(tmpdir, name + ".gpu")
-                    b = subprocess.run([MITHRIL_BIN, "build", port, "--gpu", "-o", art], capture_output=True, text=True, timeout=args.timeout)
-                    if b.returncode != 0:
-                        row["lanes"]["GPU"] = {"label": "GPU", "cmd": "", "status": "FAILED", "time": None, "runs": [], "notes": "", "error": "build --gpu: " + b.stderr.strip()[-300:]}
-                    else:
-                        row["lanes"]["GPU"] = run_lane("GPU", [MITHRIL_BIN, "exec", art], exp, args.n, args.timeout, env="mithril")
+            if gpu_enabled:
+                # the device lane times a built artefact (`build --gpu`
+                # once, `exec` per run), as the CPU lanes and reference do
+                port = os.path.join(PORTS_DIR, name + ".py")
+                art = os.path.join(tmpdir, name + ".gpu")
+                b = subprocess.run([MITHRIL_BIN, "build", port, "--gpu", "-o", art], capture_output=True, text=True, timeout=args.timeout)
+                if b.returncode != 0:
+                    row["lanes"]["GPU"] = {"label": "GPU", "cmd": "", "status": "FAILED", "time": None, "runs": [], "notes": "", "error": "build --gpu: " + b.stderr.strip()[-300:]}
+                else:
+                    row["lanes"]["GPU"] = run_lane("GPU", [MITHRIL_BIN, "exec", art], exp, args.n, args.timeout, env="mithril")
             for l in row["lanes"].values():
                 if l["status"] != "ok":
                     print("[harness]   %s %s: %s" % (l["label"], l["status"], l["error"]),
