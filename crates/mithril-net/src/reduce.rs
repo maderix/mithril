@@ -161,8 +161,8 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
             calls_kept,
             ops_kept,
             calls_evaluated: evaluated,
-            size_before: crate::core_size(&f.body),
-            size_after: crate::core_size(&body),
+            size_before: f.body.size(),
+            size_after: body.size(),
         });
         out.fns[fid].self_tail_rec = mithril_front::desugar::compute_self_tail_rec(fid as u32, &body);
         out.fns[fid].body = body;

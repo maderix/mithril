@@ -464,9 +464,11 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
     }
 }
 
-fn cmp_bool(op: CmpOp, ord: Option<std::cmp::Ordering>) -> bool {
+/// The comparison's truth for an ordering; an unordered pair (a NaN) only
+/// satisfies `!=` (IEEE 754). One definition for the oracle and the reducer.
+pub fn cmp_bool(op: CmpOp, ord: Option<std::cmp::Ordering>) -> bool {
     use std::cmp::Ordering::*;
-    let ord = ord.expect("eval_core: incomparable values (NaN?)");
+    let Some(ord) = ord else { return op == CmpOp::Ne };
     match op {
         CmpOp::Lt => ord == Less,
         CmpOp::Le => ord != Greater,

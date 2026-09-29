@@ -173,13 +173,8 @@ pub struct NetProg {
     /// per real function: unfold its calls during specialization (it is
     /// on no call cycle and small, i.e. inlining it cannot recurse)
     pub inline: Vec<bool>,
-    /// per real function: the real functions it can (transitively) call
-    pub reach: Vec<BTreeSet<u32>>,
     /// entries registered by compiled code (`add_entry`)
     pub closures: Vec<usize>,
-    /// per entry (lifted ones included): the real functions its body calls
-    /// directly, closures' bodies included
-    pub direct: Vec<BTreeSet<u32>>,
 }
 
 impl NetProg {
@@ -187,7 +182,7 @@ impl NetProg {
     /// `reduce` agree on entry ids without storing the table in the `Net`.
     pub fn new(m: &CoreModule) -> NetProg {
         let nfns = m.fns.len();
-        let mut prog = NetProg { entries: Vec::new(), metas: Vec::new(), nfns, mode: Mode::Eval, inline: vec![false; nfns], reach: Vec::new(), closures: Vec::new(), direct: Vec::new() };
+        let mut prog = NetProg { entries: Vec::new(), metas: Vec::new(), nfns, mode: Mode::Eval, inline: vec![false; nfns], closures: Vec::new() };
         for f in &m.fns {
             prog.entries.push(Entry { params: (0..f.arity as u32).collect(), body: NExpr::Num(0) });
         }
@@ -195,109 +190,21 @@ impl NetProg {
             let body = lower(&f.body, &mut prog);
             prog.entries[i].body = body;
         }
-        prog.inline = inline_policy(m);
-        prog.reach = reach_relation(m);
-        prog.direct = prog.entries.iter().map(|e| { let mut s = BTreeSet::new(); nexpr_calls(&e.body, &prog, &mut s); s }).collect();
+        // unfold a call-free function whose body is small (a call-free body
+        // cannot recurse); larger or calling functions stay calls unless
+        // their arguments are all known (then they are evaluated)
+        prog.inline = m
+            .fns
+            .iter()
+            .enumerate()
+            .map(|(f, fd)| f as u32 != m.main && fd.body.size() <= INLINE_MAX && !fd.body.any(&mut |e| matches!(e, Core::Call(..)).then_some(true)))
+            .collect();
         prog
-    }
-}
-
-/// Real functions reachable from each real function through calls.
-fn reach_relation(m: &CoreModule) -> Vec<BTreeSet<u32>> {
-    let n = m.fns.len();
-    let callees: Vec<BTreeSet<u32>> = m.fns.iter().map(|f| { let mut s = BTreeSet::new(); calls_of(&f.body, &mut s); s }).collect();
-    (0..n)
-        .map(|f| {
-            let mut seen = BTreeSet::new();
-            let mut stack: Vec<u32> = callees[f].iter().copied().collect();
-            while let Some(g) = stack.pop() {
-                if seen.insert(g) {
-                    stack.extend(callees[g as usize].iter().copied());
-                }
-            }
-            seen
-        })
-        .collect()
-}
-
-/// Real functions called directly by a lowered body, looking through the
-/// closures of its branches and arms.
-fn nexpr_calls(e: &NExpr, prog: &NetProg, out: &mut BTreeSet<u32>) {
-    match e {
-        NExpr::Num(_) | NExpr::Flo(_) | NExpr::Var(_) => {}
-        NExpr::Op2(_, a, b) | NExpr::Let(_, a, b) => {
-            nexpr_calls(a, prog, out);
-            nexpr_calls(b, prog, out);
-        }
-        NExpr::Call(f, args) => {
-            out.insert(*f as u32);
-            args.iter().for_each(|a| nexpr_calls(a, prog, out));
-        }
-        NExpr::Ctor(_, args) | NExpr::Tuple(args) | NExpr::Prim(_, args) => args.iter().for_each(|a| nexpr_calls(a, prog, out)),
-        NExpr::If(c, t, e2) => {
-            nexpr_calls(c, prog, out);
-            nexpr_calls(&prog.entries[t.entry as usize].body, prog, out);
-            nexpr_calls(&prog.entries[e2.entry as usize].body, prog, out);
-        }
-        NExpr::Match(s, _, specs) => {
-            nexpr_calls(s, prog, out);
-            specs.iter().for_each(|sp| nexpr_calls(&prog.entries[sp.entry as usize].body, prog, out));
-        }
-        NExpr::Proj(a, _) => nexpr_calls(a, prog, out),
-        NExpr::Lam(_, b) => nexpr_calls(b, prog, out),
-        NExpr::App(f, a) => {
-            nexpr_calls(f, prog, out);
-            nexpr_calls(a, prog, out);
-        }
     }
 }
 
 /// Inlining budget for acyclic callees during specialization (Core nodes).
 const INLINE_MAX: usize = 96;
-
-/// Which real functions a specialization unfolds at their call sites:
-/// call-free functions whose body is small (the leaf rule this replaces;
-/// a call-free body cannot recurse). Larger or calling functions stay
-/// calls unless their arguments are all known (then they are evaluated).
-fn inline_policy(m: &CoreModule) -> Vec<bool> {
-    let n = m.fns.len();
-    let callees: Vec<BTreeSet<u32>> = m.fns.iter().map(|f| { let mut s = BTreeSet::new(); calls_of(&f.body, &mut s); s }).collect();
-    // cyclic: reaches itself
-    let mut cyclic = vec![false; n];
-    for f in 0..n {
-        let mut seen = vec![false; n];
-        let mut stack: Vec<u32> = callees[f].iter().copied().collect();
-        while let Some(g) = stack.pop() {
-            if g as usize == f { cyclic[f] = true; break; }
-            if std::mem::replace(&mut seen[g as usize], true) { continue; }
-            stack.extend(callees[g as usize].iter().copied());
-        }
-    }
-    let mut sites = vec![0usize; n];
-    for f in 0..n {
-        for g in &callees[f] {
-            sites[*g as usize] += count_calls(&m.fns[f].body, *g);
-        }
-    }
-    let _ = sites;
-    (0..n).map(|f| f as u32 != m.main && !cyclic[f] && callees[f].is_empty() && core_size(&m.fns[f].body) <= INLINE_MAX).collect()
-}
-
-fn calls_of(c: &Core, out: &mut BTreeSet<u32>) {
-    c.walk(&mut |e| {
-        if let Core::Call(f, _) = e {
-            out.insert(*f);
-        }
-    });
-}
-
-fn count_calls(c: &Core, g: u32) -> usize {
-    c.sum(&mut |e| matches!(e, Core::Call(f, _) if *f == g) as usize)
-}
-
-pub(crate) fn core_size(c: &Core) -> usize {
-    c.size()
-}
 
 impl NetProg {
     /// Lower `body` as a new entry over `params` (its free variables, in

@@ -857,11 +857,12 @@ pub(crate) fn native_sig(g: u32) -> Option<Sig> {
 pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig>> {
     use crate::ty::Ty;
     let n = m.fns.len();
-    // a value native code cannot represent at the boundary (a non-int
-    // array) rules the function out for good
+    // a value native code cannot represent (a non-int array at the
+    // boundary, a float or a constructor anywhere) rules the function out
     let forbid: Vec<bool> = (0..n)
         .map(|fi| {
             tys.params[fi].iter().chain(std::iter::once(&tys.ret[fi])).any(|t| matches!(t, Ty::Arr(false)))
+                || tys.locals[fi].iter().any(|t| matches!(t, Ty::Flo | Ty::Adt(_)))
         })
         .collect();
     let mut sigs: Vec<Option<Sig>> = m

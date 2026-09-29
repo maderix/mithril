@@ -6,11 +6,84 @@
   "kernel": "6.17.4-76061704-generic",
   "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
   "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0",
-  "git_head": "620e689455b1779c1abc631f1870857bc24eda24",
+  "git_head": "15f51dd97461f01564662d327165150b9a2b7bc6",
   "git_branch": "mithril-v1",
-  "date": "2026-09-27 20:18:36 IST"
+  "date": "2026-09-29 19:11:46 IST"
  },
  "timeout": 300.0,
  "n": 1,
- "rows": []
+ "rows": [
+  {
+   "name": "kdtree",
+   "expected": "1660315459",
+   "lanes": {
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-gh72dzo4/kdtree.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.340644083999905,
+     "runs": [
+      0.340644083999905
+     ],
+     "notes": [],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-gh72dzo4/kdtree.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 0.41560832199957076,
+     "runs": [
+      0.41560832199957076
+     ],
+     "notes": [],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-gh72dzo4/kdtree.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 0.10866058800002065,
+     "runs": [
+      0.10866058800002065
+     ],
+     "notes": [],
+     "error": null
+    },
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "run",
+      "/home/maderix/Mithril/bench/ports/kdtree.py",
+      "--threads",
+      "16",
+      "--gpu"
+     ],
+     "status": "ok",
+     "time": 1.6966828120002901,
+     "runs": [
+      1.6966828120002901
+     ],
+     "notes": [],
+     "error": null
+    }
+   },
+   "notes": [
+    "build 1.0s"
+   ],
+   "build_error": null,
+   "build_time": 0.9640159529999437
+  }
+ ]
 }

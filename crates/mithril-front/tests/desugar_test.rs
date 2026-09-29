@@ -420,3 +420,45 @@ fn closures_capture_by_scope_and_factories_work_in_the_oracle() {
     let cm = desugar(&m).unwrap();
     assert_eq!(eval_core(&cm, cm.main, &[]), Val::I(11 + 22 + 13));
 }
+
+// ---- review fixes (2026-09-29) ----
+
+#[test]
+fn range_start_is_evaluated_once() {
+    // `lo` is reassigned in the body; Python evaluates range(lo, 4) once
+    let src = "def main():\n    s = 0\n    lo = 1\n    for i in range(lo, 4):\n        s = s + i\n        lo = 10\n    return s\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(6));
+}
+
+#[test]
+fn a_bool_variable_stays_bool_across_a_loop_and_a_join() {
+    let src = "def main():\n    done = False\n    n = 0\n    while n < 3:\n        if done:\n            n = n + 10\n        done = n == 1\n        n = n + 1\n    if done:\n        return n\n    return n + 100\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(113));
+}
+
+#[test]
+fn a_bool_variable_assigned_an_int_in_a_loop_is_rejected_in_a_condition() {
+    let src = "def main():\n    done = False\n    n = 0\n    while n < 3:\n        if done:\n            n = n + 10\n        done = n\n        n = n + 1\n    return n\n";
+    assert!(desugar_err(src).msg.contains("condition must be bool"));
+}
+
+#[test]
+fn an_int_match_without_a_matching_case_falls_through() {
+    let src = "def main():\n    x = 5\n    match x:\n        case 1:\n            x = 2\n    return x\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(5));
+    // mid-function, the rest of the block runs
+    let src = "def f(x):\n    match x:\n        case 1:\n            return 2\n    y = 3\n    return y\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::I(1)]), Val::I(2));
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::I(7)]), Val::I(3));
+}
+
+#[test]
+fn nan_compares_false_except_not_equal() {
+    let src = "def f(a):\n    z = a / 0.0\n    if z < 1.0:\n        return 1\n    if z == z:\n        return 2\n    if z != z:\n        return 3\n    return 4\n";
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::F(0.0)]), Val::I(3));
+}

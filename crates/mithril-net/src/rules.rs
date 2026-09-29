@@ -5,7 +5,7 @@
 
 use crate::{instantiate, list_collect, ref_entry, ref_head, MatchMeta, Mode, NetProg, ARR_PAIR, PRIM_BASE};
 use mithril_core::net::Net;
-use mithril_front::core::{floor_div, py_mod, wrap56};
+use mithril_front::core::{cmp_bool, floor_div, py_mod, wrap56};
 use mithril_core::port::{Port, Tag};
 use mithril_core::rules::{MatMeta, Prog};
 
@@ -50,18 +50,8 @@ impl Prog<Net> for NetProg {
 }
 
 
-fn cmp_result(code: u16, ord: std::cmp::Ordering) -> Port {
-    use std::cmp::Ordering::*;
-    let r = match code {
-        16 => ord == Less,
-        17 => ord != Greater,
-        18 => ord == Greater,
-        19 => ord != Less,
-        20 => ord == Equal,
-        21 => ord != Equal,
-        _ => panic!("ICE: unknown cmp opcode {}", code),
-    };
-    Port::num(r as i64)
+fn cmp_result(code: u16, ord: Option<std::cmp::Ordering>) -> Port {
+    Port::num(cmp_bool(mithril_front::ast::CmpOp::ALL[(code - 16) as usize], ord) as i64)
 }
 
 /// Boxed f64 helpers: the bit pattern is split across two `Num`-tagged
@@ -92,7 +82,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
         (Tag::Num, Tag::Num) => {
             let (a, b) = (x.as_i64(), y.as_i64());
             if code >= 16 {
-                return Some(cmp_result(code, a.cmp(&b)));
+                return Some(cmp_result(code, Some(a.cmp(&b))));
             }
             if matches!(code, 3 | 4 | 5) && b == 0 {
                 return None;
@@ -120,8 +110,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
             net.free_cell(ax);
             net.free_cell(ay);
             if code >= 16 {
-                let ord = a.partial_cmp(&b).expect("ICE: incomparable floats (NaN)");
-                return Some(cmp_result(code, ord));
+                return Some(cmp_result(code, a.partial_cmp(&b)));
             }
             let r = match code {
                 0 => a + b,
@@ -132,7 +121,7 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
             };
             Some(mithril_core::agents::Cells::alloc_flo(net, r))
         }
-        (tx, ty) => panic!("ICE: Op fold on mixed operand tags {:?}/{:?}", tx, ty),
+        (tx, ty) => panic!("type error: arithmetic on mixed int/float operands ({:?}/{:?})", tx, ty),
     }
 }
 

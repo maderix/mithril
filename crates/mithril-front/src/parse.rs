@@ -148,7 +148,7 @@ impl<'a> Parser<'a> {
         self.expect(TokKind::Indent)?;
         let mut stmts = Vec::new();
         while !matches!(self.kind(), TokKind::Dedent) {
-            stmts.push(self.stmt()?);
+            stmts.extend(self.stmt()?);
         }
         self.expect(TokKind::Dedent)?;
         Ok(stmts)
@@ -156,11 +156,13 @@ impl<'a> Parser<'a> {
 
     // ---- statements ----
 
-    fn stmt(&mut self) -> Result<Stmt, Diag> {
-        match self.kind().clone() {
+    /// One statement; `for v in range(a, b)` is two (the start bound is
+    /// evaluated once, before the loop).
+    fn stmt(&mut self) -> Result<Vec<Stmt>, Diag> {
+        Ok(vec![match self.kind().clone() {
             TokKind::If => self.if_stmt(),
             TokKind::While => self.while_stmt(),
-            TokKind::For => self.for_stmt(),
+            TokKind::For => return self.for_stmt(),
             TokKind::Match => self.match_stmt(),
             TokKind::Return => {
                 self.bump();
@@ -172,7 +174,7 @@ impl<'a> Parser<'a> {
                 Err(Diag::new(self.line(), format!("unsupported statement: {}", n)))
             }
             _ => self.simple_stmt(),
-        }
+        }?])
     }
 
     fn simple_stmt(&mut self) -> Result<Stmt, Diag> {
@@ -227,7 +229,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While(cond, body))
     }
 
-    fn for_stmt(&mut self) -> Result<Stmt, Diag> {
+    fn for_stmt(&mut self) -> Result<Vec<Stmt>, Diag> {
         let line = self.line();
         self.bump(); // 'for'
         let var = self.expect_name()?;
@@ -241,8 +243,8 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokKind::LParen)?;
         let first = self.expr()?;
-        // `range(a, b)`: a loop over `range(b - a)` whose body first binds
-        // the variable to `counter + a` (empty when b <= a)
+        // `range(a, b)`: `a` bound once, then a loop over `range(b - a)`
+        // whose body first binds the variable to `counter + a`
         let start = if matches!(self.kind(), TokKind::Comma) {
             self.bump();
             let end = self.expr()?;
@@ -254,14 +256,12 @@ impl<'a> Parser<'a> {
         self.expect(TokKind::Colon)?;
         let mut body = self.suite()?;
         match start {
-            None => Ok(Stmt::For(var, first, body, None)),
+            None => Ok(vec![Stmt::For(var, first, body, None)]),
             Some((a, b)) => {
-                let ctr = format!("__range_{var}");
-                body.insert(
-                    0,
-                    Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), Box::new(a.clone()))),
-                );
-                Ok(Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), Box::new(a)), body, None))
+                let (ctr, lo) = (format!("__range_{var}"), format!("__lo_{var}"));
+                let lo_v = || Box::new(Expr::Var(lo.clone()));
+                body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), lo_v())));
+                Ok(vec![Stmt::Assign(lo.clone(), a), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])
             }
         }
     }

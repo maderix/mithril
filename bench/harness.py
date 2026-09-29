@@ -191,11 +191,10 @@ def run_lane(label, cmd, expected, n_fixed, timeout, env=None, arena_retry=False
     return rec
 
 
-def build_mithril_cli():
-    print("[harness] building mithril: cargo build --release -p mithril-cli "
-          "(CARGO_TARGET_DIR=%s)" % TARGET_DIR, flush=True)
-    proc = subprocess.run(["cargo", "build", "--release", "-p", "mithril-cli"],
-                          cwd=REPO_ROOT)
+def build_mithril_cli(gpu):
+    cmd = ["cargo", "build", "--release", "-p", "mithril-cli"] + (["--features", "gpu"] if gpu else [])
+    print("[harness] building mithril: %s (CARGO_TARGET_DIR=%s)" % (" ".join(cmd), TARGET_DIR), flush=True)
+    proc = subprocess.run(cmd, cwd=REPO_ROOT)
     if proc.returncode != 0:
         sys.exit("[harness] cargo build failed (exit %d)" % proc.returncode)
     if not os.path.isfile(MITHRIL_BIN):
@@ -407,7 +406,7 @@ def main():
         sys.exit("[harness] expected.txt is missing entries for: %s" % " ".join(missing))
 
     if not args.no_build:
-        build_mithril_cli()
+        build_mithril_cli(gpu_enabled)
     meta = machine_info()
     meta["date"] = time.strftime("%Y-%m-%d %H:%M:%S %Z")
 

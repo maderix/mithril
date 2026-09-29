@@ -761,3 +761,34 @@ fn shared_closure_runs_its_free_work_once_at_runtime() {
     assert_eq!(sout, oracle(&scm));
     assert!(rewrites(&serr) >= n, "strict twin did not call heavy per iteration: {}", rewrites(&serr));
 }
+
+// ---- review fixes (2026-09-29) ----
+
+#[test]
+fn a_native_tuple_projected_after_a_suspendable_call_compiles() {
+    trmc_golden("ntup_after_call.py");
+}
+
+#[test]
+fn unit_in_dive_tail_position_compiles() {
+    golden("unit_tail.py", 0, &["1", "4"]);
+}
+
+#[test]
+fn a_loop_form_frees_an_owned_parameter_it_never_reads() {
+    let (cm, rs) = pipeline(&fixture("loop_unread_param.py"), 0);
+    let want = oracle(&cm);
+    let bin = compile(&rs, "loop_unread_param");
+    let (got, err) = run_env(&bin, &["1"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(got, want);
+    let peak = peak_cells(&err);
+    assert!(peak < 1000, "loop_unread_param peak_cells = {peak}: the unread parameter leaks per iteration");
+}
+
+#[test]
+fn a_function_with_float_parameters_is_not_a_native_form() {
+    let (cm, rs) = pipeline(&fixture("float_params.py"), 0);
+    let fid = cm.fns.iter().position(|f| f.name == "dbl").unwrap();
+    assert!(!rs.contains(&format!("fn s_{fid}(")), "dbl became a native scalar form on float ports");
+    golden("float_params.py", 0, &["1", "4"]);
+}

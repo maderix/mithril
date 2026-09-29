@@ -269,11 +269,10 @@ impl<'a> Lexer<'a> {
             let text = std::str::from_utf8(&self.src[hstart..self.pos]).unwrap();
             let v = u64::from_str_radix(text, 16)
                 .map_err(|_| Diag::new(line, "invalid hex literal"))?;
-            let v = v as i64;
-            if !(I56_MIN..=I56_MAX).contains(&v) {
+            if v > I56_MAX as u64 {
                 return Err(Diag::new(line, "int literal out of range"));
             }
-            self.out.push(Token { kind: TokKind::Int(v), line });
+            self.out.push(Token { kind: TokKind::Int(v as i64), line });
             return Ok(());
         }
         while self.peek().is_ascii_digit() {

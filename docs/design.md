@@ -776,6 +776,46 @@ The ERA spill and the device work cap are device-only scheduling; the
 CPU tears down in place and burns work units (its suspension is the
 split), the same rules either way.
 
+### 3h. Harness standing at 15f51dd, and the source review
+
+The full harness (`bench/harness.py`, one run per lane, 300 s timeout,
+default arenas, this 4090 with the desktop holding ~1 GB of VRAM):
+
+* CPU, 17 ports: at or under reference seq on 12; ahead of reference par on 10 at
+  16 threads. Four ports do not scale at all (gameoflife, nbody, queens,
+  symreg run at one-thread speed): the sequential-prefix shapes.
+* GPU, the honest number: raytrace 0.78 s (reference 0.54), kdtree 1.7 s,
+  editdist 4.3 s, lexer 6.2 s, mandelbrot 15 s, merkle 18 s, nbody 70 s,
+  tree-radix 72 s, kmeans 142 s, gameoflife 262 s, queens past 300 s;
+  bfs, hashmap, symreg, terrain, tree-bitonic and tree-matmul exhaust a
+  per-rule ring, the array heap or the record arena at defaults. Every
+  finished run is checksum-equal. The device-only times quoted in 3f/3g
+  (bitonic ~0.1 s, raytrace 0.056 s) were hand-picked sizes with raised
+  arenas; the lane as a whole is not competitive yet. The two structural
+  items are one shared task ring and the work-phase cycling on
+  sequential prefixes.
+
+Three independent full-source reviews (one per crate group, 2026-09-29)
+found 16 defects, of which 10 were confirmed with probes and fixed in one
+commit, each with a fixture: `range(a, b)` re-evaluated `a` every
+iteration; a bool variable lost its boolness across a loop or a join and
+was rejected in a later condition (now kept when every assignment to it
+is boolean); an int `match` with no matching case fell into an
+unreachable constructor instead of continuing (Python falls through); a
+NaN comparison was an ICE (now IEEE: only `!=` holds, one definition
+shared by the oracle and the reducer); hex literals from 2^63 wrapped
+negative; a native tuple projected after a suspendable call did not
+compile; `return ()` in a dive tail did not compile; a loop-form dive
+leaked an owned parameter its body never read on every iteration; a
+function whose only floats were parameters was classified as a native
+scalar form and computed on the ports' bits. Unconfirmed (argued from the
+code, kept on the list): an array leaking through an if-arm tuple mask, a
+thread-local read before it is set on the device path, a borrow-inference
+round cap. The reviews also list about 1500 lines of folds at low risk
+and two Core-level rewrites in the code generator (tail inlining,
+if-conversion) that the core constraint forbids at that layer: those get
+their own commit and note.
+
 Every reference number in this document is reference (reference/reference, the reference
 runtime with the task cube, `bench/reference.csv` on this 4090), never reference
 1 or HVM.

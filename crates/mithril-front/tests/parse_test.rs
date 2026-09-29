@@ -392,3 +392,11 @@ fn unknown_construct_still_reports_a_line() {
     let d = err("def f():\n    with x:\n        return 1\n");
     assert!(d.line == 2);
 }
+
+#[test]
+fn hex_literal_past_the_i56_range_is_rejected_not_wrapped() {
+    assert!(err("def f():\n    return 0xFFFFFFFFFFFFFFFF\n").msg.contains("out of range"));
+    assert!(err("def f():\n    return 0x80000000000000\n").msg.contains("out of range"));
+    let m = ok("def f():\n    return 0x7FFFFFFFFFFFFF\n");
+    assert_eq!(m.fns[0].body[0], Stmt::Return(Expr::Int(0x7FFFFFFFFFFFFF)));
+}

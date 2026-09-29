@@ -1326,7 +1326,7 @@ impl<'m> Ex<'m> {
                     b.push(ret(v("tr")));
                 }
             }
-            Core::Tuple(items) if self.nret == items.len() => {
+            Core::Tuple(items) if self.nret > 0 && self.nret == items.len() => {
                 let es: Vec<E> = items.iter().map(|a| self.val(a, true, b)).collect();
                 self.flush_toks(b);
                 b.push(ret(ok(E::Arr(es))));
@@ -1391,7 +1391,9 @@ impl<'m> Ex<'m> {
         let Core::Call(g, args) = r else { return false };
         let Some(sig) = crate::scalar::native_sig(*g) else { return false };
         let crate::scalar::Kind::SK(k) = sig.ret else { return false };
-        if !only_projected(x, bo) {
+        // a projection after a suspendable call would put the tuple in a
+        // capture, and it has no boxed form: the boxed bridge instead
+        if !only_projected(x, bo) || (has_call(bo) && proj_prefix(x, k, bo).is_none()) {
             return false;
         }
         let call = self.native_call(*g, args, b);
@@ -1577,12 +1579,11 @@ pub(crate) fn dive_fn<'m>(
         }
     }
     let mut bb = Vec::new();
-    if !lp || trmc.is_some() {
-        // Owned parameters that the body never reads die immediately.
-        for i in 0..ar as u32 {
-            if !ex.bset.contains(&i) && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
-                bb.push(free(v(vn(i))));
-            }
+    // Owned parameters that the body never reads die immediately (in a
+    // loop form: on every iteration, after the budget check).
+    for i in 0..ar as u32 {
+        if !ex.bset.contains(&i) && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
+            bb.push(free(v(vn(i))));
         }
     }
     ex.dive_tail(body, &mut bb);

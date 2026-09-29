@@ -121,6 +121,28 @@ fn is_boolish(e: &Expr, bool_vars: &HashSet<String>) -> bool {
     }
 }
 
+/// Every assignment to `name` in `stmts` (at any depth) is boolean, so the
+/// name stays a bool variable across a loop or a join that assigns it.
+fn stays_bool(name: &str, stmts: &[Stmt], bool_vars: &HashSet<String>) -> bool {
+    stmts.iter().all(|s| match s {
+        Stmt::Assign(n, e) => n != name || is_boolish(e, bool_vars),
+        Stmt::If(_, a, b) => stays_bool(name, a, bool_vars) && stays_bool(name, b, bool_vars),
+        Stmt::While(_, b) | Stmt::For(_, _, b, _) => stays_bool(name, b, bool_vars),
+        Stmt::Match(_, cases) => cases.iter().all(|(_, b)| stays_bool(name, b, bool_vars)),
+        _ => true,
+    })
+}
+
+/// The bool variables among `names` after `bodies` ran (a join or a loop):
+/// bool before and never assigned a non-bool value.
+fn bools_after(names: &[String], bodies: &[&[Stmt]], scope: &Scope) -> HashSet<String> {
+    names
+        .iter()
+        .filter(|n| scope.bool_vars.contains(*n) && bodies.iter().all(|b| stays_bool(n, b, &scope.bool_vars)))
+        .cloned()
+        .collect()
+}
+
 fn check_cond(e: &Expr, scope: &Scope) -> Result<(), Diag> {
     if is_boolish(e, &scope.bool_vars) {
         Ok(())
@@ -136,6 +158,7 @@ fn always_returns(stmts: &[Stmt]) -> bool {
     match stmts.last() {
         Some(Stmt::Return(_)) => true,
         Some(Stmt::If(_, t, e)) => always_returns(t) && always_returns(e),
+        // (an int match ending a function: no matching case is a runtime error)
         Some(Stmt::Match(_, cases)) => !cases.is_empty() && cases.iter().all(|(_, b)| always_returns(b)),
         _ => false,
     }
@@ -381,17 +404,22 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
             let (cores, _binders, join) = compile_dispatch_arms(&arms, rest, scope, t, g, k)?;
             let producer = Core::If(Box::new(ccond), Box::new(cores[0].clone()), Box::new(cores[1].clone()));
             match join {
-                Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
+                Some(m) => {
+                    let bools = bools_after(&m, &[then, els], scope);
+                    bind_join_and_continue(producer, &m, bools, rest, scope, t, g, k)
+                }
                 None => Ok(producer),
             }
         }
         Stmt::While(cond, body) => {
             let (call, mutated) = compile_while(cond, body, scope, t, g)?;
-            bind_join_and_continue(call, &mutated, rest, scope, t, g, k)
+            let bools = bools_after(&mutated, &[body], scope);
+            bind_join_and_continue(call, &mutated, bools, rest, scope, t, g, k)
         }
         Stmt::For(var, bound, body, fold) => {
             let (call, mutated) = compile_for(var, bound, body, fold, scope, t, g)?;
-            bind_join_and_continue(call, &mutated, rest, scope, t, g, k)
+            let bools = bools_after(&mutated, &[body], scope);
+            bind_join_and_continue(call, &mutated, bools, rest, scope, t, g, k)
         }
         Stmt::Match(scrut, cases) => compile_match(scrut, cases, rest, scope, t, g, k),
     }
@@ -402,38 +430,24 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
 fn bind_join_and_continue(
     producer: Core,
     names: &[String],
+    bools: HashSet<String>,
     rest: &[Stmt],
     scope: &mut Scope,
     t: &Tables,
     g: &mut Gen,
     k: &Cont,
 ) -> Result<Core, Diag> {
+    let bind = |scope: &mut Scope, n: &String| {
+        if bools.contains(n) { scope.bool_vars.insert(n.clone()); } else { scope.bool_vars.remove(n); }
+        scope.fresh(n)
+    };
     if names.len() == 1 {
-        let idx = scope.fresh(&names[0]);
-        scope.bool_vars.remove(&names[0]);
+        let idx = bind(scope, &names[0]);
         let core = compile_block(rest, scope, t, g, k)?;
         return Ok(Core::Let(idx, Box::new(producer), Box::new(core)));
     }
-    bind_and_continue(producer, names, rest, scope, t, g, k)
-}
-
-/// Bind a `Tuple` producer's result into fresh indices for `names` (in
-/// order), then continue compiling `rest` with those bindings visible.
-fn bind_and_continue(
-    producer: Core,
-    names: &[String],
-    rest: &[Stmt],
-    scope: &mut Scope,
-    t: &Tables,
-    g: &mut Gen,
-    k: &Cont,
-) -> Result<Core, Diag> {
     let tup_idx = scope.fresh_anon();
-    let mut idxs = Vec::new();
-    for n in names {
-        idxs.push(scope.fresh(n));
-        scope.bool_vars.remove(n);
-    }
+    let idxs: Vec<u32> = names.iter().map(|n| bind(scope, n)).collect();
     let mut core = compile_block(rest, scope, t, g, k)?;
     for (i, idx) in idxs.iter().enumerate().rev() {
         core = Core::Let(*idx, Box::new(Core::Proj(Box::new(Core::Var(tup_idx)), i)), Box::new(core));
@@ -522,11 +536,15 @@ fn compile_match(
     if !is_int {
         check_exhaustive(cases, t)?;
     }
-    let arm_specs: Vec<(Vec<String>, &[Stmt])> = cases.iter().map(|(p, b)| (p.binds.clone(), b.as_slice())).collect();
+    let mut arm_specs: Vec<(Vec<String>, &[Stmt])> = cases.iter().map(|(p, b)| (p.binds.clone(), b.as_slice())).collect();
+    if is_int {
+        // no case matches: the statement does nothing (Python)
+        arm_specs.push((Vec::new(), &[]));
+    }
     let (cores, binder_idxs, join) = compile_dispatch_arms(&arm_specs, rest, scope, t, g, k)?;
     let producer = if is_int {
         let scrut_idx = scope.fresh_anon();
-        let mut chain = Core::Ctor(UNREACHABLE_CTOR, vec![]);
+        let mut chain = cores[cases.len()].clone();
         for ((p, _), core) in cases.iter().zip(cores.iter()).rev() {
             let v = p.as_int_lit().unwrap();
             chain = Core::If(
@@ -545,7 +563,11 @@ fn compile_match(
         Core::Match(Box::new(cscrut), arms)
     };
     match join {
-        Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
+        Some(m) => {
+            let bodies: Vec<&[Stmt]> = cases.iter().map(|(_, b)| b.as_slice()).collect();
+            let bools = bools_after(&m, &bodies, scope);
+            bind_join_and_continue(producer, &m, bools, rest, scope, t, g, k)
+        }
         None => Ok(producer),
     }
 }
@@ -594,6 +616,7 @@ fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut 
     for p in &params_all {
         hscope.fresh(p);
     }
+    hscope.bool_vars = bools_after(&params_all, &[body], scope);
     let hcond = compile_expr(cond, &hscope, t)?;
     let params_cl = params_all.clone();
     let then_core = {
@@ -653,6 +676,7 @@ fn compile_for(
     for p in &extra {
         hscope.fresh(p);
     }
+    hscope.bool_vars = bools_after(&extra, &[body], scope);
     let extra_cl = extra.clone();
     let then_core = {
         let mut s = hscope.clone();

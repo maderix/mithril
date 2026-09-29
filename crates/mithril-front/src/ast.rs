@@ -25,6 +25,11 @@ pub enum CmpOp {
     Ne,
 }
 
+impl CmpOp {
+    /// Declaration order is the opcode order (16 + index).
+    pub const ALL: [CmpOp; 6] = [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoolOp {
     And,
