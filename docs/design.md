@@ -278,21 +278,37 @@ Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
 binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
 definition shared by the oracle and the reducer.
 
+A variable stays boolean across loops and joins when every assignment to
+it is boolean.
+
 **f32 in the surface** (`infer.rs`, run by `parse`). A second monomorphic
 inference, over the surface AST: every variable, parameter, result,
 constructor field, tuple component and array element has one type, found
 by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
-assignments, operators, calls and returns. Where a value is f32, a
-literal becomes its bit pattern and `+ - * /` and comparisons become the
-`f32_*` builtins, so Core, the net and every backend see ints and the
-existing rules: `x + y` on f32 is `f32_add(x, y)`, nothing new in the
-rule table but `f32_le` (IEEE `<=`; `==` is `le(a, b) & le(b, a)`, a
-helper written in the language). Unary minus on f32 flips the sign bit.
-`int(x)` truncates toward zero. Mixing f32 with an int variable is an
-error that names the function; integer operators on f32 are errors. A
-program without f32 is unchanged, except that f64 negation becomes
-`-1.0 * x`. The inference is monomorphic: a function is used at one type. A variable stays boolean across loops and
-joins when every assignment to it is boolean.
+assignments, operators, calls and returns, and a float literal passed to
+`f32()` or `int()` is f32. Where a value is f32, a literal becomes its bit
+pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
+Core, the net and every backend see ints and the existing rules: `x + y`
+on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
+(IEEE `<=`; `==` is `le(a, b) & le(b, a)`, a helper written in the
+language). Unary minus on f32 flips the sign bit.
+
+* An int literal is an int. Only as the direct operand of an operator or
+  a conditional expression does it take the other side's type (`x * 2`
+  on f32 is `x * 2.0`). It never becomes f32 through a call, a return, a
+  constructor field or a tuple slot.
+* Every f32 conflict is an error that names the function: f32 meeting an
+  int, a tuple, an array, a constructor, or a value that already mixes
+  shapes. A function, field or slot has one type; a helper used at int
+  and at f32 is an error, not a retyping. Integer operators on f32 are
+  errors.
+* `f32(n)` rounds correctly for every i56 and `int(x)` truncates toward
+  zero, exactly below 2^55 (NaN and larger magnitudes give 0). Both are
+  helpers written in the language, so a constant argument folds by the
+  rules.
+* `a, b = e` checks that `e` is a tuple of two.
+* A program without f32 is unchanged, except negation: `-x` is `0 - x`
+  on ints and `-1.0 * x` on an f64; a value used as both is an error.
 
 ### 4.2 Representation
 
@@ -397,7 +413,17 @@ Each function is emitted in the forms its uses need.
 * **Native scalar form** (`s_<f>`, `scalar.rs`): a function whose
   parameters and results are ints, int tuples or int arrays becomes plain
   `i64` code, including tuple-valued join points. Array parameters are
-  borrowed or owned by fixpoint; tuple results carry an array mask.
+  borrowed or owned by fixpoint; tuple results carry an array mask. A
+  tuple is held as its leaves: a nested one (a record such as
+  `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`), and a
+  projection of a nested component is a view of its leaves. A tuple may
+  be used whole (returned, passed on, aliased, joined). Parameter and
+  result layouts come from type inference, so a parameter that is only
+  passed on still has its width. Bindings are scoped: a branch arm's or a
+  let's inner bindings end with it (generated code may reuse a variable
+  id in an inner scope). The dive bridge unpacks and packs nested tuple
+  cells. `MITHRIL_WHY_BOXED=1` prints why each function has no native
+  form.
 * **Bounded functions**: a function on no call cycle cannot run out of
   budget, so it is a plain call with no capture.
 
@@ -440,6 +466,7 @@ on the tree at the time it was adopted:
 | selects as mask arithmetic | bfs to 4.48 / 0.45 s |
 | pre-shifted int representation | editdist SEQ 4.05 s to 2.80 s |
 | length locals | editdist SEQ 2.80 s to 2.27 s |
+| tuples used whole, nested tuples | Cornell Whitted 512 x 512, CPU t16 0.33 s to 0.077 s, device 1.25 s to 0.145 s |
 
 ### 5.3 Fork sites and the frame split
 
@@ -680,7 +707,7 @@ at once.
   sound. Doubling stops where the device cannot back a deeper stack (the
   driver refuses the limit, or the arenas no longer fit); the run then
   reports the depth error of the last size that ran (64 KiB on the RTX
-  4090). The size that worked is kept beside the artefact
+  4090). Any other error of a retry is reported as it is. The size that worked is kept beside the artefact
   (`<artefact>.stack`, unless `MITHRIL_GPU_STACK` fixed it) and the next
   run starts there. The driver backs the stack with local memory for
   every resident thread, so a large fixed stack costs setup time on every
@@ -691,9 +718,11 @@ at once.
   with the refund it runs in 0.06 s.
 * Work units do not touch the depth budget. A loop in the parallel world
   runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
-  the frame's next budget check to suspend, so no fire runs unbounded; a
-  runaway loop cycles rounds to the round limit instead of freezing the
-  device, which the desktop shares.
+  a dive form's next budget check to suspend, so no dive runs unbounded;
+  a runaway loop cycles rounds to the round limit instead of freezing the
+  device, which the desktop shares. A native loop never suspends: once
+  per `WORK_CAP` iterations it checks whether the host asked the run to
+  stop (a no-op on the CPU).
 * The stack guard (`stack_deep` on the device) compares against the
   thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives
@@ -749,7 +778,8 @@ Setup cost is paid only for memory a run touches:
   before any thread starts. Runs are serialized (the kernel is
   cooperative over the whole device). A run frees its buffers and module
   and releases the context when it ends; a successful run of a process
-  that is exiting leaves that to the driver.
+  that is exiting leaves that to the driver, and a run past its deadline
+  leaves it to the context reset.
 
 Measured on a bare process: one connection 0.05 s; 16 GB eager arenas
 with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
@@ -758,14 +788,19 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
 
 * Round limit: `MITHRIL_GPU_ROUNDS`, default 2^24; a run that does not
   converge stops with an error.
-* Deadline: the host waits at most `MITHRIL_GPU_TIMEOUT` (300 s) and
-  tears the context down past it.
+* Deadline: at `MITHRIL_GPU_TIMEOUT` (300 s) the host writes a stop code
+  into the abort flag (managed memory, written while the kernel runs);
+  every lane stops at its next check and the run ends with a named error.
+  A kernel still running at twice the deadline is abandoned and the
+  context reset. (A context reset alone does not stop a running kernel;
+  measured.)
 * A failed run that left a sticky device error (700) in the context
   resets it; a clean abort leaves the context as it is.
 * Any arena exhaustion, out-of-bounds index, bad cell index or stack
   overflow sets the abort flag; every lane stops at its next check and
   the host reports the named cause. The first abort wins: a later one is
-  a consequence of it.
+  a consequence of it. Two independent faults in one run may be reported
+  in either order.
 
 Diagnostics: `MITHRIL_GPU_STATS` (setup and run time, rounds, grow sweeps
 and work phases with their cycles, widest frontier, cells and records
@@ -1003,25 +1038,29 @@ rows and columns. Nothing in them names a thread, a device or a task.
 stage times; the same file runs on the CPU and the device.
 
 * Whitted: 512 x 512, 2 x 2 samples, mirror and glass (Schlick's
-  Fresnel) to depth 5, direct light from four points of the emitter.
+  Fresnel) to four reflections or refractions, direct light from four
+  points of the emitter.
 * Path tracing: 256 x 256, 64 paths per pixel, next-event estimation
-  plus cosine-weighted bounces (Malley's method in the Duff et al.
-  basis), glass chosen by the Fresnel probability, six bounces, no
-  Russian roulette. The random numbers are a hash of (pixel, sample,
+  plus cosine-weighted bounces (Malley's method in Frisvad's
+  orthonormal basis), glass chosen by the Fresnel probability, up to six
+  surface hits per path, no Russian roulette. The random numbers are a hash of (pixel, sample,
   bounce), so the image is identical on every run, thread count and
   device.
 * Both approximate glass shadows the same way: a shadow ray passes
   through glass dimmed. The path tracer leaves caustics out (after a
   diffuse bounce light arrives by next-event estimation only).
 
-| demo | CPU 16 threads (run) | device (run, 16 rounds) |
+| demo | CPU 16 threads (run) | device (run) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.34 s | 2.73 s |
-| path, 256 x 256 x 64 paths | 1.37 s | 7.59 s |
+| Whitted, 512 x 512 x 4 samples | 0.077 s | 0.145 s |
+| path, 256 x 256 x 64 paths | 0.40 s | 1.06 s |
 
-The device image is byte-identical to the CPU image for both. The device
-is 5 to 8 times slower than 16 CPU threads here: the scheduling gap of
-section 12, not a property of the programs. A test renders the Whitted
+The device image is byte-identical to the CPU image for both. All ray
+code is native (vectors and hit records are nested tuples held in
+registers, section 5.2); before that the hot functions were boxed and
+the two demos took 0.34 s and 1.37 s on the CPU, 2.73 s and 7.59 s on the
+device. The device is still 2 to 3 times slower than 16 CPU threads here
+(section 12). A test renders the Whitted
 demo at 12 x 12 and checks it against the oracle at 1, 4 and 16 threads.
 
 ## 12. Open items

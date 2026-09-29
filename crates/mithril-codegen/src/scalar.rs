@@ -29,6 +29,7 @@
 use crate::lir::{do_, as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
 use mithril_front::core::{Core, CoreModule, Prim};
+use crate::ty::Shape;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -98,7 +99,9 @@ fn akind(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u3
 /// Array mask of a tuple-valued expression of `k` components.
 fn tmask(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core, k: usize) -> Vec<bool> {
     match e {
-        Core::Tuple(items) => items.iter().map(|it| akind(sigs, tarr, arrs, it)).collect(),
+        Core::Tuple(items) if items.len() == k => items.iter().map(|it| akind(sigs, tarr, arrs, it)).collect(),
+        // a nested tuple holds no arrays (the checker enforces it)
+        Core::Tuple(_) => vec![false; k],
         Core::If(_, x, _) => tmask(sigs, tarr, arrs, x, k),
         Core::Let(_, _, b) => tmask(sigs, tarr, arrs, b, k),
         Core::Call(g, _) => sigs[*g as usize].as_ref().map(|s| s.ra.clone()).unwrap_or_else(|| vec![false; k]),
@@ -106,11 +109,26 @@ fn tmask(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u3
     }
 }
 
+/// What a let binds (see `Chk::bind`).
+enum Bound {
+    Tup(Shape, Vec<bool>),
+    /// an alias of a borrowed array: the parameter it names
+    Lent(u32),
+    Owned,
+    Scalar,
+}
+
+/// `e` binds variables of its own.
+fn has_let(e: &Core) -> bool {
+    e.any(&mut |e| if matches!(e, Core::Let(..)) { Some(true) } else { None })
+}
+
 struct Chk<'m> {
     why: Option<String>,
     sigs: &'m [Option<Sig>],
-    /// component vars: SK-destructured lets AND T(k) params -> arity
-    tvars: HashMap<u32, usize>,
+    /// tuple vars (SK-destructured lets and T params) -> layout; held as
+    /// their leaves
+    tvars: HashMap<u32, Shape>,
     ok: bool,
     /// array vars -> borrowed (true) or owned
     arrs: HashMap<u32, bool>,
@@ -125,6 +143,22 @@ struct Chk<'m> {
 }
 
 impl<'m> Chk<'m> {
+    /// A tuple returned by `fid` has the layout its callers read: the
+    /// inferred result layout (flat when inference found none).
+    fn ret_shape(&mut self, e: &Core, fid: u32, sh: &Shape) {
+        if rshape(fid, sh.width()) != *sh {
+            self.fail(e);
+        }
+    }
+
+    /// A tuple variable used whole (returned, aliased, joined): its
+    /// components are copied, which ownership allows for ints only.
+    fn whole(&mut self, e: &Core, t: u32) {
+        if self.tarr.get(&t).is_some_and(|m| m.iter().any(|a| *a)) {
+            self.fail(e);
+        }
+    }
+
     fn fail(&mut self, e: &Core) {
         if self.why.is_none() {
             self.why = Some(format!("{:.160}", format!("{:?}", e)));
@@ -196,7 +230,7 @@ impl<'m> Chk<'m> {
                 }
             }
             Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() == Some(&true) => self.args(sig.params.clone(), args),
+                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() == Some(&true) => self.args(*g, args),
                 _ => self.fail(e),
             },
             Core::If(c, x, y) => {
@@ -218,10 +252,14 @@ impl<'m> Chk<'m> {
     /// end in the same set.
     fn arms<R>(&mut self, c: &Core, x: &Core, y: &Core, mut f: impl FnMut(&mut Self, &Core) -> R) -> (R, R, bool) {
         self.expr(c);
+        // each arm's bindings end with it
+        let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone());
         let before = self.live.clone();
         let a = f(self, x);
+        (self.tvars, self.tarr, self.arrs, self.root) = scope.clone();
         let after = std::mem::replace(&mut self.live, before);
         let b = f(self, y);
+        (self.tvars, self.tarr, self.arrs, self.root) = scope;
         let same = self.live == after;
         (a, b, same)
     }
@@ -274,17 +312,19 @@ impl<'m> Chk<'m> {
                 self.expr(b);
             }
             Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(sig.params.clone(), args),
+                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(*g, args),
                 _ => self.fail(e),
             },
             Core::Proj(..) if self.slot(e).is_some() => self.fail(e), // an array component
-            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).is_some_and(|k| i < k)) => {}
+            // a scalar component (a nested one is tuple-valued)
+            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).is_some_and(|s| s.0.get(*i) == Some(&None))) => {}
             _ => self.fail(e),
         }
     }
 
     /// Check call arguments against the callee's parameter types.
-    fn args(&mut self, ptys: Vec<PTy>, args: &[Core]) {
+    fn args(&mut self, g: u32, args: &[Core]) {
+        let ptys = self.sigs[g as usize].as_ref().map(|s| s.params.clone()).unwrap_or_default();
         let mut moved: Vec<(usize, u64)> = Vec::new();
         let mut lent: Vec<u64> = Vec::new();
         for (j, (pt, a)) in ptys.iter().zip(args).enumerate() {
@@ -300,15 +340,7 @@ impl<'m> Chk<'m> {
                 }
                 PTy::I if self.akind(a) => self.fail(a),
                 PTy::I => self.expr(a),
-                PTy::T(k) => match a {
-                    Core::Var(t) if self.tvars.get(t) == Some(k) => {}
-                    Core::Tuple(items) if items.len() == *k => {
-                        for it in items {
-                            self.expr(it);
-                        }
-                    }
-                    _ => self.fail(a),
-                },
+                PTy::T(k) => self.targ(a, &pshape(g, j, *k)),
             }
         }
         // an array lent to the callee must not also move into it: the
@@ -321,65 +353,110 @@ impl<'m> Chk<'m> {
         }
     }
 
+    /// A tuple argument of layout `sh` (no arrays: its leaves are ints).
+    fn targ(&mut self, a: &Core, sh: &Shape) {
+        match a {
+            Core::Var(t) if self.tvars.get(t) == Some(sh) => self.whole(a, *t),
+            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).and_then(|s| s.0.get(*i)) == Some(&Some(sh.clone()))) => {
+                if let Core::Var(t) = &**b {
+                    self.whole(a, *t);
+                }
+            }
+            Core::Tuple(items) if items.len() == sh.0.len() => {
+                for (it, c) in items.iter().zip(&sh.0) {
+                    match c {
+                        None => self.expr(it),
+                        Some(sub) => self.targ(it, sub),
+                    }
+                }
+            }
+            _ => self.fail(a),
+        }
+    }
+
     /// A let binding: a plain scalar RHS, the SK-destructure idiom, or a
     /// tuple-valued expression (a join point: `if`/`match` arms that each
     /// yield a tuple of the variables they assign) bound as components.
     fn bind(&mut self, x: u32, r: &Core) {
-        if let Some(k) = tuple_kind(self.sigs, r) {
-            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, k);
-            self.tuple_expr(r, k);
-            self.tvars.insert(x, k);
-            for (i, a) in mask.iter().enumerate() {
-                if *a {
-                    self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
+        // `r` is checked in the outer scope; its own bindings end with it,
+        // and `x` then shadows any outer binding of the same variable
+        let outer = has_let(r).then(|| (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone()));
+        let bound = if let Some(sh) = tuple_kind(self.sigs, &self.tvars, r) {
+            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, sh.width());
+            self.tuple_expr(r, &sh);
+            Bound::Tup(sh, mask)
+        } else if self.akind(r) {
+            match r {
+                Core::Var(v) if self.arrs.get(v) == Some(&true) => Bound::Lent(self.root.get(v).copied().unwrap_or(*v)),
+                _ => {
+                    let d = self.aexpr(r);
+                    self.settle(r, d);
+                    Bound::Owned
                 }
             }
-            self.tarr.insert(x, mask);
-            return;
+        } else {
+            self.expr(r);
+            Bound::Scalar
+        };
+        if let Some((tv, ta, ar, ro)) = outer {
+            (self.tvars, self.tarr, self.arrs, self.root) = (tv, ta, ar, ro);
         }
-        if self.akind(r) {
-            if let Core::Var(v) = r {
-                if self.arrs.get(v) == Some(&true) {
-                    self.arrs.insert(x, true); // alias of a borrowed array
-                    let r = self.root.get(v).copied().unwrap_or(*v);
-                    self.root.insert(x, r);
-                    return;
+        self.tvars.remove(&x);
+        self.tarr.remove(&x);
+        self.arrs.remove(&x);
+        match bound {
+            Bound::Tup(sh, mask) => {
+                for (i, a) in mask.iter().enumerate() {
+                    if *a {
+                        self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
+                    }
                 }
+                self.tvars.insert(x, sh);
+                self.tarr.insert(x, mask);
             }
-            let d = self.aexpr(r);
-            self.settle(r, d);
-            self.arrs.insert(x, false);
-            self.live.insert(x as u64);
-            return;
+            Bound::Lent(root) => {
+                self.arrs.insert(x, true); // alias of a borrowed array
+                self.root.insert(x, root);
+            }
+            Bound::Owned => {
+                self.arrs.insert(x, false);
+                self.live.insert(x as u64);
+            }
+            Bound::Scalar => {}
         }
-        self.expr(r);
     }
 
-    /// A tuple-valued expression of `k` components.
-    fn tuple_expr(&mut self, e: &Core, k: usize) {
+    /// A tuple-valued expression of layout `sh`.
+    fn tuple_expr(&mut self, e: &Core, sh: &Shape) {
         if !self.ok {
             return;
         }
+        let k = sh.width();
         match e {
-            Core::Tuple(items) if items.len() == k => {
+            Core::Var(t) if self.tvars.get(t) == Some(sh) => self.whole(e, *t),
+            Core::Proj(..) => self.targ(e, sh),
+            // flat: components may be arrays (moved in)
+            Core::Tuple(items) if sh.is_flat() && items.len() == k => {
                 let moved: Vec<(usize, u64)> =
                     items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
                 for (j, d) in moved {
                     self.consume(&items[j], d);
                 }
             }
+            // nested: ints only
+            Core::Tuple(_) => self.targ(e, sh),
             Core::If(c, x, y) => {
-                let same = self.arms(c, x, y, |s, e| s.tuple_expr(e, k)).2;
+                let same = self.arms(c, x, y, |s, e| s.tuple_expr(e, sh)).2;
                 if !same || tmask(self.sigs, &self.tarr, &self.arrs, x, k) != tmask(self.sigs, &self.tarr, &self.arrs, y, k) {
                     self.fail(e);
                 }
             }
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
-                self.tuple_expr(b, k);
+                self.tuple_expr(b, sh);
             }
             Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::SK(k) => self.args(sig.params.clone(), args),
+                Some(sig) if sig.ret == Kind::SK(k) && rshape(*g, k) == *sh => self.args(*g, args),
                 _ => self.fail(e),
             },
             _ => self.fail(e),
@@ -394,6 +471,19 @@ impl<'m> Chk<'m> {
             return (Kind::No, vec![]);
         }
         match e {
+            Core::Var(t) if self.tvars.contains_key(t) => {
+                let sh = self.tvars[t].clone();
+                self.whole(e, *t);
+                self.ret_shape(e, fid, &sh);
+                (Kind::SK(sh.width()), vec![false; sh.width()])
+            }
+            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if matches!(self.tvars.get(t).and_then(|s| s.0.get(*i)), Some(Some(_)))) => {
+                let Core::Var(t) = &**b else { unreachable!() };
+                let sh = self.tvars[t].0[*i].clone().unwrap_or_else(|| Shape::flat(0));
+                self.targ(e, &sh);
+                self.ret_shape(e, fid, &sh);
+                (Kind::SK(sh.width()), vec![false; sh.width()])
+            }
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
                 self.tail(b, fid)
@@ -410,6 +500,12 @@ impl<'m> Chk<'m> {
                 }
             }
             Core::Tuple(items) => {
+                let sh = tuple_kind(self.sigs, &self.tvars, e).unwrap_or_else(|| Shape::flat(items.len()));
+                self.ret_shape(e, fid, &sh);
+                if !sh.is_flat() {
+                    self.targ(e, &sh);
+                    return (Kind::SK(sh.width()), vec![false; sh.width()]);
+                }
                 let mask: Vec<bool> = items.iter().map(|it| self.akind(it)).collect();
                 let moved: Vec<(usize, u64)> =
                     items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
@@ -422,7 +518,10 @@ impl<'m> Chk<'m> {
                 match &self.sigs[*g as usize] {
                     Some(sig) => {
                         let sig = sig.clone();
-                        self.args(sig.params.clone(), args);
+                        if let Kind::SK(k) = sig.ret {
+                            self.ret_shape(e, fid, &rshape(*g, k));
+                        }
+                        self.args(*g, args);
                         if *g == fid {
                             (Kind::No, vec![]) // own kind, resolved by the caller of tail()
                         } else {
@@ -501,20 +600,34 @@ fn join_arm(e: &Core) -> bool {
 /// Component count of a tuple-valued expression (`None` for scalars or
 /// mixed shapes): a tuple literal, an `if` whose arms agree, a let chain
 /// ending in one, or a call returning SK(k).
-fn tuple_kind(sigs: &[Option<Sig>], e: &Core) -> Option<usize> {
+/// The layout of a tuple-valued expression (`tv`: the tuple variables in
+/// scope, each held as its leaves).
+fn tuple_kind(sigs: &[Option<Sig>], tv: &HashMap<u32, Shape>, e: &Core) -> Option<Shape> {
     match e {
-        Core::Tuple(items) => Some(items.len()),
+        Core::Tuple(items) => Some(Shape(items.iter().map(|it| tuple_kind(sigs, tv, it)).collect())),
+        Core::Var(t) => tv.get(t).cloned(),
+        Core::Proj(b, i) => match &**b {
+            Core::Var(t) => tv.get(t).and_then(|s| s.0.get(*i).cloned().flatten()),
+            _ => None,
+        },
         Core::If(_, x, y) => {
-            let (a, b) = (tuple_kind(sigs, x), tuple_kind(sigs, y));
+            let (a, b) = (tuple_kind(sigs, tv, x), tuple_kind(sigs, tv, y));
             if a == b {
                 a
             } else {
                 None
             }
         }
-        Core::Let(_, _, b) => tuple_kind(sigs, b),
+        Core::Let(x, r, b) => {
+            let mut inner = tv.clone();
+            match tuple_kind(sigs, tv, r) {
+                Some(sh) => inner.insert(*x, sh),
+                None => inner.remove(x),
+            };
+            tuple_kind(sigs, &inner, b)
+        }
         Core::Call(g, _) => match &sigs[*g as usize] {
-            Some(Sig { ret: Kind::SK(k), .. }) => Some(*k),
+            Some(Sig { ret: Kind::SK(k), .. }) => Some(rshape(*g, *k)),
             _ => None,
         },
         _ => None,
@@ -559,6 +672,8 @@ fn proj_shape(e: &Core, p: u32, bare: &mut bool, max: &mut i64) {
 }
 
 thread_local! {
+    /// The inferred layouts of tuple parameters and results (`ty::Types`).
+    static SHAPES: std::cell::RefCell<(Vec<Vec<Option<Shape>>>, Vec<Option<Shape>>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     /// Scalar signatures of the module being emitted, for direct calls
     /// from dive code (`native_sig`).
     pub(crate) static SIGS: std::cell::RefCell<Vec<Option<Sig>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -778,11 +893,28 @@ pub(crate) fn native_sig(g: u32) -> Option<Sig> {
         .filter(|s| s.params.iter().all(|p| *p == PTy::I) && s.ra.iter().all(|a| !a))
 }
 
+/// The layout of native tuple parameter `p` of `g` with `k` leaves: the
+/// inferred one, or flat when inference found no tuple of that width.
+fn pshape(g: u32, p: usize, k: usize) -> Shape {
+    SHAPES.with(|s| s.borrow().0.get(g as usize).and_then(|ps| ps.get(p).cloned().flatten())).filter(|s| s.width() == k).unwrap_or_else(|| Shape::flat(k))
+}
+
+/// `g` returns a flat tuple (what a dive-form caller destructures).
+pub(crate) fn flat_ret(g: u32, k: usize) -> bool {
+    rshape(g, k).is_flat()
+}
+
+/// The layout of `g`'s tuple result with `k` leaves (as `pshape`).
+fn rshape(g: u32, k: usize) -> Shape {
+    SHAPES.with(|s| s.borrow().1.get(g as usize).cloned().flatten()).filter(|s| s.width() == k).unwrap_or_else(|| Shape::flat(k))
+}
+
 /// A tuple param's component count cannot be read off the body alone (a
 /// caller may pass a wider tuple); seed with maxproj+1 and demote on caller
 /// mismatch. Bare use of a param whose callers pass tuples also demotes.
 pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig>> {
     use crate::ty::Ty;
+    SHAPES.with(|s| *s.borrow_mut() = (tys.pshape.clone(), tys.rshape.clone()));
     let n = m.fns.len();
     // a value native code cannot represent (a non-int array at the
     // boundary, a float or a constructor anywhere) rules the function out
@@ -802,8 +934,15 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             }
             let params = (0..f.arity as u32)
                 .map(|p| {
-                    if tys.params[fi].get(p as usize) == Some(&Ty::Arr(true)) {
-                        return PTy::B; // optimistic: demoted when consumed
+                    match tys.params[fi].get(p as usize) {
+                        Some(Ty::Arr(true)) => return PTy::B, // optimistic: demoted when consumed
+                        // the width type inference found: exact, and the
+                        // parameter may then be used whole
+                        Some(Ty::Tup(_)) => {
+                            let sh = tys.pshape[fi][p as usize].clone();
+                            return PTy::T(sh.map_or(0, |s| s.width()));
+                        }
+                        _ => {}
                     }
                     let (mut bare, mut mx) = (false, -1i64);
                     proj_shape(&f.body, p, &mut bare, &mut mx);
@@ -817,7 +956,10 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             // seed the return kind from type inference: mutually recursive
             // functions returning tuples cannot discover it from each other
             let (ret, ra) = match tys.ret.get(fi) {
-                Some(Ty::Tup(k)) => (Kind::SK(*k as usize), vec![false; *k as usize]),
+                Some(Ty::Tup(_)) => {
+                    let k = tys.rshape[fi].as_ref().map_or(0, Shape::width);
+                    (Kind::SK(k), vec![false; k])
+                }
                 Some(Ty::Arr(true)) => (Kind::S1, vec![true]),
                 _ => (Kind::S1, vec![false]),
             };
@@ -846,7 +988,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
         for (p, pt) in params.iter().enumerate() {
             match pt {
                 PTy::T(k) => {
-                    c.tvars.insert(p as u32, *k);
+                    c.tvars.insert(p as u32, pshape(fid as u32, p, *k));
                 }
                 PTy::A => {
                     c.arrs.insert(p as u32, false);
@@ -910,6 +1052,13 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             sigs[fid] = None;
         }
     }
+    // MITHRIL_WHY_BOXED: why each function has no native form (a diagnostic)
+    if std::env::var_os("MITHRIL_WHY_BOXED").is_some() {
+        for fid in (0..n).filter(|&f| sigs[f].is_none()) {
+            let why = if forbid[fid] { "a float, constructor or boxed array value".to_string() } else { whys[fid].clone().unwrap_or_else(|| "signature did not settle".into()) };
+            eprintln!("boxed {}: {why} (params {:?}, result {:?})", m.fns[fid].name, tys.params[fid], tys.ret[fid]);
+        }
+    }
     sigs
 }
 
@@ -925,7 +1074,7 @@ struct Sem<'m> {
     tmp: u32,
     /// component vars (SK-destructured lets and T(k) params): var -> arity;
     /// components live as q<var>_<i>
-    tvars: HashMap<u32, usize>,
+    tvars: HashMap<u32, Shape>,
     /// array vars -> borrowed; tuple vars -> array components; owned array
     /// slots alive on the current path (mirrors the classifier's `Chk`)
     arrs: HashMap<u32, bool>,
@@ -1079,17 +1228,21 @@ impl<'m> Sem<'m> {
         let ec = self.val(cd, b);
         let names = names(self);
         let (live0, lens0) = (self.live.clone(), self.lens.clone());
+        // each arm's bindings end with it
+        let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone());
         let mut bx = Vec::new();
         for (n, e) in names.iter().zip(arm(self, x, &mut bx)) {
             bx.push(set(n, e));
         }
         let after = std::mem::replace(&mut self.live, live0);
         self.lens = lens0.clone();
+        (self.tvars, self.tarr, self.arrs) = scope.clone();
         let mut by = Vec::new();
         for (n, e) in names.iter().zip(arm(self, y, &mut by)) {
             by.push(set(n, e));
         }
         (self.live, self.lens) = (after, lens0);
+        (self.tvars, self.tarr, self.arrs) = scope;
         b.extend(names.iter().map(|n| S::Decl(n.clone(), Ty::I64)));
         b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
         names
@@ -1172,20 +1325,11 @@ impl<'m> Sem<'m> {
                     let x = self.val(a, b);
                     es.push(conv(x, self.shifted, shifted(g)));
                 }
-                PTy::T(k) => match a {
-                    Core::Var(t) if self.tvars.contains_key(t) => {
-                        for i in 0..*k {
-                            es.push(conv(v(format!("q{t}_{i}")), self.shifted, shifted(g)));
-                        }
+                PTy::T(_) => {
+                    for x in self.tval(a, b) {
+                        es.push(conv(x, self.shifted, shifted(g)));
                     }
-                    Core::Tuple(items) => {
-                        for it in items {
-                            let x = self.val(it, b);
-                            es.push(conv(x, self.shifted, shifted(g)));
-                        }
-                    }
-                    _ => unreachable!("non-idiom tuple arg in scalar emission"),
-                },
+                }
             }
         }
         for k in moved {
@@ -1195,13 +1339,24 @@ impl<'m> Sem<'m> {
     }
 
     fn bind(&mut self, x: u32, r: &Core, b: &mut Vec<S>) {
-        if let Some(k) = tuple_kind(self.sigs, r) {
-            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, k);
+        // as `Chk::bind`: `r`'s own bindings end with it, then `x` shadows
+        let outer = has_let(r).then(|| (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.lens.clone()));
+        let unscope = |s: &mut Self| {
+            if let Some((tv, ta, ar, le)) = outer.clone() {
+                (s.tvars, s.tarr, s.arrs, s.lens) = (tv, ta, ar, le);
+            }
+            s.tvars.remove(&x);
+            s.tarr.remove(&x);
+            s.arrs.remove(&x);
+        };
+        if let Some(sh) = tuple_kind(self.sigs, &self.tvars, r) {
+            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, sh.width());
             let comps = self.tval(r, b);
+            unscope(self);
             for (i, e) in comps.into_iter().enumerate() {
                 b.push(let_(format!("q{x}_{i}"), Ty::I64, e));
             }
-            self.tvars.insert(x, k);
+            self.tvars.insert(x, sh);
             for (i, a) in mask.iter().enumerate() {
                 if *a {
                     self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
@@ -1213,9 +1368,11 @@ impl<'m> Sem<'m> {
         if self.akind(r) {
             if let Core::Var(y) = r {
                 if self.arrs.get(y) == Some(&true) {
+                    let l = self.lens.get(&vn(*y)).cloned();
+                    unscope(self);
                     self.arrs.insert(x, true);
                     b.push(let_(vn(x), Ty::I64, v(vn(*y))));
-                    if let Some(l) = self.lens.get(&vn(*y)).cloned() {
+                    if let Some(l) = l {
                         self.lens.insert(vn(x), l);
                     }
                     return;
@@ -1223,8 +1380,10 @@ impl<'m> Sem<'m> {
             }
             let er = self.aval_now(r, b);
             let en = name_of(&er);
+            let l = self.lens.get(&en).cloned();
+            unscope(self);
             b.push(let_(vn(x), Ty::I64, er));
-            if let Some(l) = self.lens.get(&en).cloned() {
+            if let Some(l) = l {
                 self.lens.insert(vn(x), l);
             }
             self.arrs.insert(x, false);
@@ -1234,29 +1393,33 @@ impl<'m> Sem<'m> {
         self.low = self.ranges.masked(x);
         self.low32 = self.ranges.masked32(x);
         let er = self.val(r, b);
+        unscope(self);
         b.push(let_(vn(x), Ty::I64, er));
     }
 
     /// A tuple-valued expression as its native components.
+    /// A tuple-valued expression as its leaves, in order.
     fn tval(&mut self, e: &Core, b: &mut Vec<S>) -> Vec<E> {
         match e {
             Core::Tuple(items) => {
                 let mut moved = Vec::new();
-                let es: Vec<E> = items
-                    .iter()
-                    .map(|it| {
+                let mut es: Vec<E> = Vec::new();
+                for it in items {
+                    if tuple_kind(self.sigs, &self.tvars, it).is_some() {
+                        es.extend(self.tval(it, b));
+                    } else {
                         let (x, d) = self.anyval(it, b);
                         moved.extend(d);
-                        x
-                    })
-                    .collect();
+                        es.push(x);
+                    }
+                }
                 for k in moved {
                     self.live.remove(&k);
                 }
                 es
             }
             Core::If(cd, x, y) => {
-                let k = tuple_kind(self.sigs, e).expect("tuple if");
+                let k = tuple_kind(self.sigs, &self.tvars, e).expect("tuple if").width();
                 let names = |s: &mut Self| {
                     let t = s.fresh();
                     (0..k).map(|i| format!("{t}_{i}")).collect()
@@ -1268,6 +1431,16 @@ impl<'m> Sem<'m> {
                 self.tval(bo, b)
             }
             Core::Call(g, args) => self.call_tuple(*g, args, b),
+            Core::Var(t) if self.tvars.contains_key(t) => (0..self.tvars[t].width()).map(|i| v(format!("q{t}_{i}"))).collect(),
+            // a nested component: its leaves
+            Core::Proj(base, i) => match &**base {
+                Core::Var(t) => {
+                    let sh = &self.tvars[t];
+                    let (off, w) = (sh.offset(*i), sh.0[*i].as_ref().map_or(1, Shape::width));
+                    (off..off + w).map(|j| v(format!("q{t}_{j}"))).collect()
+                }
+                _ => unreachable!("non-idiom Proj in scalar tuple emission"),
+            },
             _ => unreachable!("non-tuple Core in scalar tuple emission"),
         }
     }
@@ -1303,7 +1476,7 @@ impl<'m> Sem<'m> {
             }
             Core::Var(i) => v(vn(*i)),
             Core::Proj(base, i) => match &**base {
-                Core::Var(t) if self.tvars.contains_key(t) => v(format!("q{t}_{i}")),
+                Core::Var(t) if self.tvars.contains_key(t) => v(format!("q{t}_{}", self.tvars[t].offset(*i))),
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
             Core::Op2(op, x, y) => {
@@ -1418,15 +1591,15 @@ impl<'m> Sem<'m> {
                 self.bind(*x, r, b);
                 self.tail(bo, fid, lp, b);
             }
-            Core::If(..) if join_arm(e) && !self.akind(e) && tuple_kind(self.sigs, e).is_none_or(|k| {
-                tmask(self.sigs, &self.tarr, &self.arrs, e, k).iter().all(|a| !a)
+            Core::If(..) if join_arm(e) && !self.akind(e) && tuple_kind(self.sigs, &self.tvars, e).is_none_or(|sh| {
+                tmask(self.sigs, &self.tarr, &self.arrs, e, sh.width()).iter().all(|a| !a)
             }) =>
             {
                 // call-free, array-free arms: one value join and a single
                 // return (per-arm returns each settle fuel, which keeps the
                 // backend from turning a cheap unpredictable branch into a
                 // select)
-                let x = match tuple_kind(self.sigs, e) {
+                let x = match tuple_kind(self.sigs, &self.tvars, e) {
                     Some(_) => E::Tup(self.tval(e, b)),
                     None => self.val(e, b),
                 };
@@ -1436,13 +1609,13 @@ impl<'m> Sem<'m> {
             }
             Core::If(cd, x, y) => {
                 let ec = self.val(cd, b);
-                let (live, arrs, tarr, lens) = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone());
+                let (live, arrs, tarr, lens, tvars) = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone(), self.tvars.clone());
                 let mut bx = Vec::new();
                 self.tail(x, fid, lp, &mut bx);
-                (self.live, self.arrs, self.tarr, self.lens) = (live, arrs, tarr, lens.clone());
+                (self.live, self.arrs, self.tarr, self.lens, self.tvars) = (live, arrs.clone(), tarr.clone(), lens.clone(), tvars.clone());
                 let mut by = Vec::new();
                 self.tail(y, fid, lp, &mut by);
-                self.lens = lens;
+                (self.arrs, self.tarr, self.lens, self.tvars) = (arrs, tarr, lens, tvars);
                 b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
             }
             Core::Call(g, args) if *g == fid && lp => {
@@ -1482,7 +1655,7 @@ impl<'m> Sem<'m> {
                 self.settle_fuel(b);
                 b.push(ret(call));
             }
-            Core::Tuple(_) => {
+            Core::Tuple(_) | Core::Var(_) | Core::Proj(..) if tuple_kind(self.sigs, &self.tvars, e).is_some() => {
                 let x = E::Tup(self.tval(e, b));
                 self.drop_live(b);
                 self.settle_fuel(b);
@@ -1542,7 +1715,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     for (pp, pt) in sig.params.iter().enumerate() {
         match pt {
             PTy::T(k) => {
-                sem.tvars.insert(pp as u32, *k);
+                sem.tvars.insert(pp as u32, pshape(fid, pp, *k));
             }
             PTy::A => {
                 sem.arrs.insert(pp as u32, false);
@@ -1588,7 +1761,9 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     }
     body.push(let_("fl", Ty::I64, i64_(1)));
     if lp {
-        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1)))];
+        // a native loop never suspends: on the device it leaves the frame
+        // when the host asked the run to stop (checked once per work cap)
+        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1))), do_(p("loop_guard", vec![v("fl")]))];
         lb.extend(bb);
         body.push(S::Loop(lb));
     } else {
@@ -1626,11 +1801,23 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
                 bargs.push(cast(pv, Ty::I64));
             }
             PTy::T(k) => {
-                for i in 0..*k {
-                    let an = format!("a{pp}_{i}");
-                    unpack.push(let_(&an, Ty::I64, conv(c("field", vec![pv.clone(), usize_(i)]))));
-                    bargs.push(v(an));
+                // the port's leaves, nested tuples read through
+                fn leaves(src: E, sh: &Shape, name: &str, conv: &dyn Fn(E) -> E, out: &mut Vec<S>, args: &mut Vec<E>) {
+                    for (i, comp) in sh.0.iter().enumerate() {
+                        let (n, f) = (format!("{name}_{i}"), c("field", vec![src.clone(), usize_(i)]));
+                        match comp {
+                            None => {
+                                out.push(let_(&n, Ty::I64, conv(f)));
+                                args.push(v(n));
+                            }
+                            Some(sub) => {
+                                out.push(let_(&n, Ty::U64, f));
+                                leaves(v(&n), sub, &n, conv, out, args);
+                            }
+                        }
+                    }
                 }
+                leaves(pv.clone(), &pshape(fid, pp, *k), &format!("a{pp}"), &conv, &mut unpack, &mut bargs);
                 if !bor[fid as usize][pp] {
                     unpack.push(free(pv));
                 }
@@ -1653,8 +1840,28 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
             bridge_body.push(S::Let(Pat::Tup(comps.clone()), Ty::Infer, call));
             bridge_body.extend(after);
-            let packs: Vec<E> = (0..k).map(|i| pack(i, v(&comps[i]))).collect();
-            bridge_body.push(ret(ok(c("mk_con", vec![u16_(0xFFF), E::Slice(packs)]))));
+            // one tuple cell per level of the result's layout, inner ones
+            // first (each allocation takes the context)
+            fn cells(sh: &Shape, next: &mut usize, leaf: &dyn Fn(usize) -> E, out: &mut Vec<S>) -> E {
+                let mut fs = Vec::new();
+                for comp in &sh.0 {
+                    match comp {
+                        None => {
+                            *next += 1;
+                            fs.push(leaf(*next - 1));
+                        }
+                        Some(sub) => {
+                            let inner = cells(sub, next, leaf, out);
+                            let n = format!("rc{}", out.len());
+                            out.push(let_(&n, Ty::U64, inner));
+                            fs.push(v(n));
+                        }
+                    }
+                }
+                c("mk_con", vec![u16_(0xFFF), E::Slice(fs)])
+            }
+            let outer = cells(&rshape(fid, k), &mut 0, &|i| pack(i, v(&comps[i])), &mut bridge_body);
+            bridge_body.push(ret(ok(outer)));
         }
         Kind::No => unreachable!(),
     }

@@ -273,8 +273,37 @@ pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
 /// are left to the driver's exit path (~150 ms saved).
 pub static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// One run at a time: the kernel is cooperative over the whole device, and
+/// every run shares the device's primary context.
+static ONE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A retain of the device's primary context, released when dropped: while
+/// one is held, a run's release does not destroy the context, so memory a
+/// run fails to free stays visible (`free_vram`).
+pub struct ContextHold(i32);
+
+pub fn hold_context() -> Result<ContextHold, String> {
+    unsafe {
+        cu(cuInit(0), "cuInit")?;
+        let mut dev = 0i32;
+        cu(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
+        Ok(ContextHold(dev))
+    }
+}
+
+impl Drop for ContextHold {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cuDevicePrimaryCtxRelease_v2(self.0);
+        }
+    }
+}
+
 /// Free device memory in bytes, as the runner sees it between runs.
 pub fn free_vram() -> Result<usize, String> {
+    let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         cu(cuInit(0), "cuInit")?;
         let mut dev = 0i32;
@@ -306,9 +335,6 @@ impl GpuRunner {
     }
 
     unsafe fn run_inner(cubin: &[u8], boot: Redex, start: Option<usize>, used: &mut usize) -> Result<GpuResult, String> {
-        // one run at a time: the kernel is cooperative over the whole
-        // device, and every run shares the device's primary context
-        static ONE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
         cu(cuInit(0), "cuInit")?;
         let mut dev = 0i32;
@@ -340,9 +366,11 @@ impl GpuRunner {
             let exiting = r.is_ok() && EXITING.load(std::sync::atomic::Ordering::Relaxed);
             if !exiting {
                 // a device fault (700) leaves a sticky error in the context,
-                // which every later call reports: only then is it reset. A
-                // clean abort (the engine's own flags) leaves it usable.
-                if r.is_err() && cuCtxSynchronize() != 0 {
+                // which every later call reports: only then is it reset, and
+                // a timed-out kernel is killed by the reset (a synchronize
+                // would wait for it). A clean abort leaves it usable.
+                let timed_out = matches!(&r, Err(e) if e.starts_with(TIMEOUT));
+                if timed_out || (r.is_err() && cuCtxSynchronize() != 0) {
                     let _ = cuDevicePrimaryCtxReset_v2(dev);
                 }
                 let td = std::time::Instant::now();
@@ -356,7 +384,7 @@ impl GpuRunner {
                     if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: stack guard hit; re-running with {stack} bytes of stack per thread"); }
                 }
                 // the deeper stack could not be backed: the depth error stands
-                Err(_) if deep.is_some() => {
+                Err(e) if deep.is_some() && cannot_back(&e) => {
                     *used = stack / 2;
                     return Err(deep.unwrap_or_default());
                 }
@@ -372,11 +400,15 @@ impl GpuRunner {
 struct Mem {
     bufs: Vec<CUdeviceptr>,
     module: *mut c_void,
+    /// a successful run of an exiting process: the driver reclaims it
+    keep: bool,
+    /// the kernel still runs (a timeout): the context reset reclaims it
+    abandon: bool,
 }
 
 impl Drop for Mem {
     fn drop(&mut self) {
-        if EXITING.load(std::sync::atomic::Ordering::Relaxed) && !std::thread::panicking() {
+        if self.keep || self.abandon {
             return;
         }
         unsafe {
@@ -399,6 +431,9 @@ enum Commit {
     /// on first touch: an arena that fills from its start as the run
     /// allocates, so a run pays for what it uses, not for the arena's size
     OnTouch,
+    /// managed with no preferred location: the host writes it while the
+    /// kernel runs (the stop request at the deadline)
+    Shared,
 }
 
 /// Allocate a device buffer. `OnTouch` is managed memory preferring the
@@ -415,6 +450,9 @@ unsafe fn alloc(mem: &mut Mem, dev: i32, n: usize, commit: Commit, what: &str) -
     }
     cu(cuMemAllocManaged(&mut p, n.max(1), CU_MEM_ATTACH_GLOBAL), what)?;
     mem.bufs.push(p);
+    if commit == Commit::Shared {
+        return Ok(p);
+    }
     let at = CUmemLocation { kind: CU_MEM_LOCATION_TYPE_DEVICE, id: dev };
     cu(cuMemAdvise_v2(p, n.max(1), CU_MEM_ADVISE_SET_PREFERRED_LOCATION, at), what)?;
     Ok(p)
@@ -431,12 +469,21 @@ unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Res
 
 /// The abort message of a run the stack guard stopped (see `GpuRunner::run`).
 const DEEP: &str = "mithril-gpu: recursion too deep";
+/// The error of a run stopped at its deadline.
+const TIMEOUT: &str = "mithril-gpu: the device run exceeded";
+/// The abort code the host writes at the deadline (engine.cu `AB_TIMEOUT`).
+const AB_TIMEOUT: u32 = 12;
+
+/// The device could not back a run: its stack limit or its buffers.
+fn cannot_back(e: &str) -> bool {
+    e.contains("cuCtxSetLimit") || e.contains("call alloc ") || e.contains("arena exhausted")
+}
 
 unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Result<GpuResult, String> {
     let t0 = std::time::Instant::now();
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
-    let mut mem = Mem { bufs: Vec::new(), module: std::ptr::null_mut() };
+    let mut mem = Mem { bufs: Vec::new(), module: std::ptr::null_mut(), keep: false, abandon: false };
     cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
     let module = mem.module;
     let t_load = t0.elapsed();
@@ -530,7 +577,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         blen: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc blen")?,
         bdone: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc bdone")?,
         result: alloc(&mut mem, dev, 16, Commit::Now, "alloc result")?,
-        abortf: alloc(&mut mem, dev, 4, Commit::Now, "alloc abortf")?,
+        abortf: alloc(&mut mem, dev, 4, Commit::Shared, "alloc abortf")?,
         heap: alloc(&mut mem, dev, 8 * hcap as usize, Commit::OnTouch, "alloc heap")?,
         hbump: alloc(&mut mem, dev, 8, Commit::Now, "alloc hbump")?,
         hcap,
@@ -669,9 +716,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         "launch k_run (cooperative)",
     )?;
     // wait with a deadline: a run past MITHRIL_GPU_TIMEOUT seconds is an
-    // error, and the caller's context teardown kills the kernel (the
-    // device is shared with the desktop; a stuck kernel freezes it)
+    // error, and the caller's context reset kills the kernel (the device is
+    // shared with the desktop; a stuck kernel freezes it)
     let deadline = std::time::Duration::from_secs(env_cap("MITHRIL_GPU_TIMEOUT", 300));
+    let mut stop_sent = false;
     loop {
         let r = cuStreamQuery(std::ptr::null_mut());
         if r == 0 {
@@ -680,12 +728,24 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         if r != 600 {
             return Err(format!("mithril-gpu: the device run failed with code {r}"));
         }
-        if t_run.elapsed() > deadline {
-            return Err(format!("mithril-gpu: the device run exceeded {} s (MITHRIL_GPU_TIMEOUT); killed", deadline.as_secs()));
+        if t_run.elapsed() > deadline && !stop_sent {
+            // ask the lanes to stop: the abort flag, which every lane reads
+            // at its next check (a fire yields at least every 2^20 units)
+            std::ptr::write_volatile(d.abortf as *mut u32, AB_TIMEOUT);
+            stop_sent = true;
+        }
+        if t_run.elapsed() > 2 * deadline {
+            // the lanes did not stop: the kernel still runs, freeing would
+            // wait for it; the caller resets the context
+            mem.abandon = true;
+            return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT) and did not stop", deadline.as_secs()));
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
+    if ab == AB_TIMEOUT {
+        return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT); stopped", deadline.as_secs()));
+    }
     let mut ptr: CUdeviceptr = 0;
     let mut sz = 0usize;
     cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_rounds".as_ptr()), "cuModuleGetGlobal(g_rounds)")?;
@@ -732,7 +792,12 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let mut ub_sz = 0usize;
     cu(cuModuleGetGlobal_v2(&mut ub_ptr, &mut ub_sz, module, c"UNBOX_CID".as_ptr()), "cuModuleGetGlobal(UNBOX_CID)")?;
     let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
-    let text = show(&d, &unbox, res[1])?;
+    // the cells in use, copied once: the result is read on the host (one
+    // copy per cell cost ~1.7 s for a 512 x 512 image)
+    let used = (dtoh::<u32>(d.nbump, 1, "read nbump")?[0] as u64).min(ncap as u64) as usize;
+    let cells = dtoh::<u64>(d.nodes, 2 * used, "read cells")?;
+    let text = show(&d, &cells, &unbox, res[1])?;
+    mem.keep = EXITING.load(std::sync::atomic::Ordering::Relaxed);
     Ok(GpuResult { port: res[1], text, rounds: r[0] })
 }
 
@@ -746,19 +811,19 @@ const T_ARR: u64 = 14;
 const TU: u64 = 16;
 const M56: u64 = (1u64 << 56) - 1;
 
-unsafe fn cell(d: &Dev, i: u32) -> Result<[u64; 2], String> {
-    let v = dtoh::<u64>(d.nodes + 16 * i as u64, 2, "read cell")?;
-    Ok([v[0], v[1]])
+fn cell(cells: &[u64], i: u32) -> Result<[u64; 2], String> {
+    let k = 2 * i as usize;
+    cells.get(k..k + 2).map(|c| [c[0], c[1]]).ok_or_else(|| format!("mithril-gpu: result cell {i} is outside the cells in use"))
 }
 
-unsafe fn show(d: &Dev, unbox: &[u32], p: u64) -> Result<String, String> {
+unsafe fn show(d: &Dev, cells: &[u64], unbox: &[u32], p: u64) -> Result<String, String> {
     let as_i = |p: u64| ((p << 8) as i64) >> 8;
     let t = p >> 56;
     Ok(match t {
         t if t >= TU => format!("C{}({})", unbox.get((t - TU) as usize).copied().unwrap_or(0), as_i(p)),
         T_LAM => "<closure>".to_string(),
         T_NUM => as_i(p).to_string(),
-        T_FLO => format!("{:?}", f64::from_bits(cell(d, (p & M56) as u32)?[0])),
+        T_FLO => format!("{:?}", f64::from_bits(cell(cells, (p & M56) as u32)?[0])),
         T_CON => {
             let k = ((p >> 4) & 0xFFF) as u16;
             let mut q = p;
@@ -766,13 +831,13 @@ unsafe fn show(d: &Dev, unbox: &[u32], p: u64) -> Result<String, String> {
             if p & 0xF != 0 {
                 loop {
                     let ar = (q & 0xF) as usize;
-                    let c = cell(d, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
+                    let c = cell(cells, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
                     if ar > 2 {
-                        fs.push(show(d, unbox, c[0])?);
+                        fs.push(show(d, cells, unbox, c[0])?);
                         q = c[1];
                     } else {
                         for s in c.iter().take(ar) {
-                            fs.push(show(d, unbox, *s)?);
+                            fs.push(show(d, cells, unbox, *s)?);
                         }
                         break;
                     }
@@ -789,7 +854,7 @@ unsafe fn show(d: &Dev, unbox: &[u32], p: u64) -> Result<String, String> {
             let mut fs = Vec::new();
             for e in elems {
                 let e = if raw { (e >> 8) | (T_NUM << 56) } else { e };
-                fs.push(show(d, unbox, e)?);
+                fs.push(show(d, cells, unbox, e)?);
             }
             format!("[{}]", fs.join(", "))
         }

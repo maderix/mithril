@@ -25,6 +25,27 @@ pub(crate) enum Ty {
     Arr(bool),
 }
 
+/// A tuple's layout: each component a scalar (`None`) or a nested tuple.
+/// Native code holds a tuple as its leaves in order (`width` of them).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Shape(pub Vec<Option<Shape>>);
+
+impl Shape {
+    pub fn flat(k: usize) -> Shape {
+        Shape(vec![None; k])
+    }
+    pub fn width(&self) -> usize {
+        self.0.iter().map(|c| c.as_ref().map_or(1, Shape::width)).sum()
+    }
+    /// The first leaf of component `i`.
+    pub fn offset(&self, i: usize) -> usize {
+        self.0[..i].iter().map(|c| c.as_ref().map_or(1, Shape::width)).sum()
+    }
+    pub fn is_flat(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+}
+
 pub(crate) struct Types {
     /// ctor -> canonical ADT class (ctors co-matched share a class)
     pub class_of: Vec<u32>,
@@ -36,6 +57,9 @@ pub(crate) struct Types {
     pub field: Vec<Vec<Ty>>,
     /// fn -> local var -> type (indexed by var id; Dyn when out of range)
     pub locals: Vec<Vec<Ty>>,
+    /// fn -> the layout of each tuple parameter, and of a tuple result
+    pub pshape: Vec<Vec<Option<Shape>>>,
+    pub rshape: Vec<Option<Shape>>,
 }
 
 impl Types {
@@ -231,6 +255,19 @@ impl Inf {
         let res = self.uf.fresh();
         self.pending.push((tb, i, res));
         res
+    }
+
+    /// The layout of a tuple-typed tyvar (nesting bounded: a type that
+    /// reaches itself is no tuple layout).
+    fn shape(&mut self, v: u32, depth: u32) -> Option<Shape> {
+        let r = self.uf.find(v);
+        match self.uf.n[r as usize] {
+            Node::Tup(_, c) if depth < 8 => {
+                let comps = self.tups[c as usize].clone();
+                Some(Shape(comps.into_iter().map(|t| self.shape(t, depth + 1)).collect()))
+            }
+            _ => None,
+        }
     }
 
     /// Resolve projections recorded before their base was known.
@@ -483,5 +520,7 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
     let ret = rd(&inf.fret);
     let field = inf.cfield.iter().map(|fs| rd(fs)).collect();
     let locals = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
-    Types { class_of, params, ret, field, locals }
+    let pshape = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| inf.shape(t, 0)).collect()).collect();
+    let rshape = inf.fret.clone().iter().map(|&t| inf.shape(t, 0)).collect();
+    Types { class_of, params, ret, field, locals, pshape, rshape }
 }

@@ -1138,7 +1138,7 @@ impl<'m> Ex<'m> {
             }
             Core::Call(g, args)
                 if self.nret > 0
-                    && crate::scalar::native_sig(*g).is_some_and(|sig| sig.ret == crate::scalar::Kind::SK(self.nret)) =>
+                    && crate::scalar::native_sig(*g).is_some_and(|sig| sig.ret == crate::scalar::Kind::SK(self.nret) && crate::scalar::flat_ret(*g, self.nret)) =>
             {
                 // the callee is native with this shape: its components come
                 // back in registers, no bridge tuple
@@ -1233,6 +1233,9 @@ impl<'m> Ex<'m> {
         let Core::Call(g, args) = r else { return false };
         let Some(sig) = crate::scalar::native_sig(*g) else { return false };
         let crate::scalar::Kind::SK(k) = sig.ret else { return false };
+        if !crate::scalar::flat_ret(*g, k) {
+            return false;
+        }
         // a projection after a suspendable call would put the tuple in a
         // capture, and it has no boxed form: the boxed bridge instead
         if !only_projected(x, bo) || (has_call(bo) && proj_prefix(x, k, bo).is_none()) {

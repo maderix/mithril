@@ -44,28 +44,29 @@ fn body(m: &mithril_front::Module, f: &str) -> Vec<Stmt> {
 
 #[test]
 fn operators_become_builtins_and_literals_become_bits() {
-    let m = parse("def main():\n    x = f32(3)\n    return x * 2.0 + 1\n").unwrap();
+    let m = parse("def main():\n    x = sqrt(9.0)\n    return x * 2.0 + 1\n").unwrap();
     let Stmt::Return(e) = &body(&m, "main")[1] else { panic!() };
     let two = 2.0f32.to_bits() as i64;
     let one = 1.0f32.to_bits() as i64;
     let x = Expr::Var("x".into());
     let want = Expr::Call("f32_add".into(), vec![Expr::Call("f32_mul".into(), vec![x, Expr::Int(two)]), Expr::Int(one)]);
     assert_eq!(e, &want);
-    assert_eq!(body(&m, "main")[0], Stmt::Assign("x".into(), Expr::Int(3.0f32.to_bits() as i64)));
+    let nine = Expr::Int(9.0f32.to_bits() as i64);
+    assert_eq!(body(&m, "main")[0], Stmt::Assign("x".into(), Expr::Call("f32_sqrt".into(), vec![nine])));
 }
 
 #[test]
 fn negation_flips_the_sign_bit() {
-    let m = parse("def main():\n    x = f32(3)\n    return -x\n").unwrap();
+    let m = parse("def main():\n    x = sqrt(9.0)\n    return -x\n").unwrap();
     let Stmt::Return(e) = &body(&m, "main")[1] else { panic!() };
     assert_eq!(e, &Expr::Bin(BinOp::BitXor, Box::new(Expr::Var("x".into())), Box::new(Expr::Int(1 << 31))));
 }
 
 #[test]
 fn helpers_are_added_only_when_used() {
-    let m = parse("def main():\n    x = f32(3)\n    return x < 1.0\n").unwrap();
+    let m = parse("def main():\n    x = sqrt(9.0)\n    return x < 1.0\n").unwrap();
     assert!(m.fns.iter().all(|f| !f.name.starts_with("__")), "no helper needed for <");
-    let m = parse("def main():\n    x = f32(3)\n    return x == 1.0\n").unwrap();
+    let m = parse("def main():\n    x = sqrt(9.0)\n    return x == 1.0\n").unwrap();
     let names: Vec<_> = m.fns.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["main", "__f32_eq"]);
 }
@@ -179,9 +180,12 @@ def main():
 }
 
 #[test]
-fn an_accumulator_seeded_with_a_literal_becomes_f32() {
-    let src = "def main():\n    s = 0\n    for i in range(5):\n        s = s + f32(i) * 0.5\n    return int(s * 10.0)\n";
+fn an_accumulator_seeded_with_a_float_literal_becomes_f32() {
+    let src = "def main():\n    s = 0.0\n    for i in range(5):\n        s = s + f32(i) * 0.5\n    return int(s * 10.0)\n";
     assert_eq!(int(src), 50);
+    // an int literal is an int: seeding with 0 is a mix
+    let e = err("def main():\n    s = 0\n    for i in range(5):\n        s = s + f32(i) * 0.5\n    return int(s)\n");
+    assert!(e.contains("used both as f32 and as an int"), "{e}");
 }
 
 #[test]
@@ -227,9 +231,72 @@ fn f32_as_a_tuple_or_constructor_is_an_error() {
 }
 
 #[test]
-fn converting_an_f64_value_is_an_error() {
-    let e = err("def main():\n    a = 0.5\n    b = a * 2.0\n    return int(b)\n");
-    assert!(e.contains("int() of an f64"), "{e}");
+fn converting_a_float_variable_makes_it_f32() {
+    assert_eq!(int("def main():\n    a = 0.5\n    b = a * 7.0\n    return int(b)\n"), 3);
+    let e = err("def main():\n    a = 0.5\n    a = 1\n    return int(a)\n");
+    assert!(e.contains("used both as an int and as a float"), "{e}");
+}
+
+// ---- one type per function, field and slot (review of 4b01016) ----
+
+#[test]
+fn a_helper_used_at_int_and_f32_is_an_error_not_a_retyping() {
+    for src in [
+        "def sq(x):\n    return x * x\n\ndef main():\n    a = sq(3)\n    b = sq(sqrt(2.0))\n    return a + 1\n",
+        "@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\ndef main():\n    x = Cons(16777217, Nil())\n    y = Cons(sqrt(2.0), Nil())\n    return 0\n",
+        "def f(p):\n    return p[0]\n\ndef main():\n    return f((5, 1)) + int(f((sqrt(2.0), 1)))\n",
+    ] {
+        let e = err(src);
+        assert!(e.contains("used both as f32 and as an int"), "{src}: {e}");
+    }
+}
+
+#[test]
+fn f32_meeting_a_mixed_value_is_an_error() {
+    let src = "def id(v):\n    return v\n\ndef main():\n    x = id((1, 2))\n    w = id(3 < 4)\n    y = id(sqrt(f32(4)))\n    return 0\n";
+    let e = err(src);
+    assert!(e.contains("f32 and as"), "{e}");
+}
+
+#[test]
+fn and_or_results_are_ints() {
+    let e = err("def main():\n    x = sqrt(2.0)\n    c = 1 < 2\n    return (c and x) + x\n");
+    assert!(e.contains("used both as f32 and as an int"), "{e}");
+}
+
+#[test]
+fn conversions_cover_the_whole_int_range() {
+    // f32(n) rounds correctly for every i56; int(x) is exact below 2^55
+    for n in [5_000_000_000i64, -5_000_000_000, (1 << 55) - 1, -(1 << 55) + 1, 16_777_217, (1 << 40) + (1 << 16) + 1] {
+        assert_eq!(f32_bits(&format!("f32({n})")), (n as f32).to_bits(), "f32({n})");
+        let src = format!("def main():\n    n = {n}\n    return f32(n)\n");
+        assert_eq!(int(&src) as u32, (n as f32).to_bits(), "f32 of a variable {n}");
+    }
+    for x in ["5000000000.0", "-5000000000.0", "3.0e16", "2.5e16 * f32(1)"] {
+        let v: f32 = x.split(' ').next().unwrap().parse::<f32>().unwrap();
+        assert_eq!(int(&format!("def main():\n    return int({x})\n")), v as i64, "int({x})");
+    }
+    assert_eq!(int("def main():\n    return int(1e20 * f32(1))\n"), 0, "past 2^55");
+    // the smallest i56 (no literal spells it)
+    let min = "def main():\n    n = 0 - 36028797018963967 - 1\n    return f32(n)\n";
+    assert_eq!(int(min) as u32, (-(1i64 << 55) as f32).to_bits());
+}
+
+#[test]
+fn negation_follows_the_value() {
+    assert_eq!(run("def main():\n    a = 1.5\n    return -a\n"), Val::F(-1.5));
+    assert_eq!(int("def main():\n    a = 7\n    return -a\n"), -7);
+    let e = err("def neg(x):\n    return -x\n\ndef main():\n    a = neg(3)\n    b = neg(1.5)\n    return a\n");
+    assert!(e.contains("negation of a value used both as an int and as an f64"), "{e}");
+}
+
+#[test]
+fn unpacking_checks_the_count() {
+    for src in ["def main():\n    a, b, c = (1, 2)\n    return a\n", "def main():\n    x, y = (5, 6, 7)\n    return x\n", "def main():\n    x, y = 5\n    return x\n"] {
+        let e = err(src);
+        assert!(e.contains("cannot unpack a value into"), "{src}: {e}");
+    }
+    assert_eq!(int("def two():\n    return 3, 4\n\ndef main():\n    x, y = two()\n    return x * 10 + y\n"), 34);
 }
 
 // ---- parser forms ----

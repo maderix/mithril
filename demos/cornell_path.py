@@ -2,7 +2,7 @@
 #
 # The scene of cornell_whitted.py (the same room, emitter, mirror sphere,
 # glass sphere and block), rendered by Monte Carlo path tracing: every
-# pixel averages spp() paths. A path bounces up to five times. At a
+# pixel averages spp() paths. A path meets up to six surfaces. At a
 # diffuse surface it takes direct light from a random point on the
 # emitter (next-event estimation) and continues in a cosine-weighted
 # random direction; mirror and glass continue specularly (glass picks
@@ -224,8 +224,9 @@ def next_event(p, n, h):
 
 
 # a cosine-weighted direction around n: a uniform point of the unit disk
-# lifted to the hemisphere (Malley), in a frame built from n (Duff et al.,
-# "Building an Orthonormal Basis, Revisited", 2017)
+# lifted to the hemisphere (Malley), in a frame built from n (Frisvad,
+# "Building an Orthonormal Basis from a 3D Unit Vector Without
+# Normalization", 2012)
 def disk(h):
     x = unit_float(hash(h)) * 2.0 - 1.0
     y = unit_float(hash(h + 1)) * 2.0 - 1.0

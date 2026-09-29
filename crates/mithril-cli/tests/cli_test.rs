@@ -296,3 +296,18 @@ fn image_and_stats_need_a_path() {
         assert!(stderr(&out).contains(&format!("{flag} needs a path")), "{}", stderr(&out));
     }
 }
+
+#[test]
+fn stats_program_path_is_valid_json() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("stats-json").join("a \"quoted\\ dir");
+    fs::create_dir_all(&d).unwrap();
+    let prog = write_prog(&d, "def main():\n    return 1\n");
+    let st = d.join("s.json");
+    let out = mithril(&["run", prog.to_str().unwrap(), "--stats", st.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let j = fs::read_to_string(&st).unwrap();
+    assert!(j.contains("a \\\"quoted\\\\ dir"), "{j}");
+}

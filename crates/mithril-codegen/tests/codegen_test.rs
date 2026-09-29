@@ -716,7 +716,7 @@ fn f32_surface_matches_oracle_and_numpy() {
     // the expected value is computed independently (numpy float32) for the
     // ray batch and by hand for the rest
     let (cm, _) = pipeline(&fixture("f32_surface.py"), 1 << 20);
-    let want = "(66621, 14, (8, 7, 0, 16777216), 45)";
+    let want = "(66621, 14, (8, 7, 0, 16777216), 45, 7)";
     assert_eq!(oracle(&cm), want);
     let mut m = mithril_front::parse(&fixture("f32_surface.py")).unwrap();
     let _ = mithril_reassoc::analyze(&mut m);
@@ -727,6 +727,38 @@ fn f32_surface_matches_oracle_and_numpy() {
         for t in ["1", "4", "16"] {
             assert_eq!(run(&bin, &[t]), want, "f32_surface {tag} --threads {t}");
         }
+    }
+}
+
+#[test]
+fn tuples_used_whole_stay_native() {
+    let src = fixture("tuple_whole.py");
+    let (cm, rs) = pipeline(&src, 1 << 20);
+    let want = oracle(&cm);
+    for f in ["pick", "swap", "step"] {
+        let id = cm.fns.iter().position(|x| x.name == f).unwrap();
+        assert!(rs.contains(&format!("fn s_{id}(")), "{f} has no native form");
+    }
+    let bin = compile(&rs, "tuple_whole");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "tuple_whole --threads {t}");
+    }
+}
+
+#[test]
+fn nested_tuples_stay_native_and_cross_the_bridge() {
+    let (cm, rs) = pipeline(&fixture("tuple_nested.py"), 1 << 20);
+    let want = oracle(&cm);
+    // native forms for the functions left after inlining (use and shift
+    // are inlined); the forking tree enters pick through its bridge, which
+    // unpacks the nested tuples, and packs make's nested result
+    for f in ["make", "pick"] {
+        let id = cm.fns.iter().position(|x| x.name == f).unwrap();
+        assert!(rs.contains(&format!("fn s_{id}(")), "{f} has no native form");
+    }
+    let bin = compile(&rs, "tuple_nested");
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "tuple_nested --threads {t}");
     }
 }
 
@@ -743,6 +775,11 @@ fn cornell_demo_matches_oracle_at_every_thread_count() {
     let (cm, rs) = pipeline(&cornell_small(12), 1 << 20);
     let want = oracle(&cm);
     assert!(want.starts_with("(12, 12, "), "{want}");
+    // the ray code is native: vectors and hit records stay in registers
+    for f in ["scene", "trace", "glass", "light_from", "sphere", "block"] {
+        let id = cm.fns.iter().position(|x| x.name == f).unwrap();
+        assert!(rs.contains(&format!("fn s_{id}(")), "{f} has no native form");
+    }
     let bin = compile(&rs, "cornell_small");
     for t in ["1", "4", "16"] {
         assert_eq!(run(&bin, &[t]), want, "cornell --threads {t}");

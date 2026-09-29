@@ -41,6 +41,7 @@ typedef unsigned long long usize;
 #define AB_HEAP 8u
 #define AB_ROUNDS 10u // the round limit (MITHRIL_GPU_ROUNDS): a run that does not converge
 #define AB_DEEP 11u   // a native frame past the thread's stack (recursion too deep for the device)
+#define AB_TIMEOUT 12u // written by the host at MITHRIL_GPU_TIMEOUT: stop
 // a walk over cells that never ends is a corrupted arena, not a hang
 #define GUARD(n) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return; } } while (0)
 #define GUARDV(n, v) do { if (++(n) > (1u << 22)) { g_abort(AB_LOOP); return v; } } while (0)
@@ -207,6 +208,11 @@ __device__ inline void work_fuel(i64 *fuel, i64 n) {
     *fuel = -1;
   }
   s_work[threadIdx.x] = w;
+}
+// a native loop's stop check, once per WORK_CAP iterations: the host asked
+// the run to stop at its deadline (the lanes then leave at their next check)
+__device__ inline bool stop_asked(i64 n) {
+  return (n & (WORK_CAP - 1)) == 0 && *(volatile u32 *)G.abortf == AB_TIMEOUT;
 }
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
@@ -803,7 +809,7 @@ __device__ inline void arr_oob(i64 i, usize n) { (void)i; (void)n; g_abort(AB_OO
 __device__ inline u64 arr_new_raw(i64 n, i64 x) {
   if (n < 0) { g_abort(AB_OOB); n = 0; }
   u64 p = arr_alloc_fill((usize)n, (u64)x);
-  arr_block(p)[1] |= ARR_RAW;
+  if ((p & M56) != 0) arr_block(p)[1] |= ARR_RAW; // not the empty sentinel
   return p;
 }
 __device__ __noinline__ void arr_unraw(u64 a) {
@@ -841,10 +847,10 @@ __device__ __noinline__ u64 arr_copy(u64 a) {
   usize n = arr_len_of(b);
   if (arr_boxed(a)) {
     for (usize k = 0; k < n; k++) arr_elems(b)[k] = dup_val(arr_elems(a)[k]);
-    arr_block(b)[1] |= ARR_BOXED;
+    if ((b & M56) != 0) arr_block(b)[1] |= ARR_BOXED; // not the empty sentinel
   } else {
     for (usize k = 0; k < n; k++) arr_elems(b)[k] = arr_elems(a)[k];
-    if (arr_raw(a)) arr_block(b)[1] |= ARR_RAW;
+    if (arr_raw(a) && (b & M56) != 0) arr_block(b)[1] |= ARR_RAW;
   }
   free_val(a);
   return b;

@@ -39,19 +39,38 @@ def __f32_eq(a, b):
 
 def __f32_of_int(n):
     if n < 0:
-        return f32_from_u32(0 - n) ^ 2147483648
-    return f32_from_u32(n)
+        if 0 - n < 0:
+            return 3674210304
+        return __f32_of_int(0 - n) ^ 2147483648
+    if n < 4294967296:
+        return f32_from_u32(n)
+    k = 0
+    sticky = 0
+    while n >= 4294967296:
+        sticky = sticky | (n & 1)
+        n = n >> 1
+        k = k + 1
+    return f32_mul(f32_from_u32(n | sticky), (127 + k) << 23)
 
 def __int_of_f32(x):
     if f32_lt(x, 0) == 1:
-        return 0 - f32_to_u32(x ^ 2147483648)
-    return f32_to_u32(x)
+        return 0 - __int_of_f32(x ^ 2147483648)
+    e = ((x >> 23) & 255) - 127
+    if e < 32:
+        return f32_to_u32(x)
+    if e >= 55:
+        return 0
+    return f32_to_u32(x - ((e - 31) << 23)) << (e - 31)
 ";
 
 const SIGN: i64 = 1 << 31;
 
 fn bits(v: f64) -> i64 {
     (v as f32).to_bits() as i64
+}
+
+fn int_bits(n: i64) -> i64 {
+    (n as f32).to_bits() as i64
 }
 
 struct Infer<'m> {
@@ -66,6 +85,10 @@ struct Infer<'m> {
     fields: HashMap<&'m str, Vec<usize>>,
     /// tuple projections whose tuple's width is not known yet
     projs: Vec<(usize, usize, usize)>,
+    /// arguments of `f32()` and `int()`: a float literal there is f32
+    conv: Vec<usize>,
+    /// destructuring assignments: the tuple and the number of names
+    unpacks: Vec<(usize, usize)>,
     cur: &'m str,
     err: Option<Diag>,
     used: BTreeSet<&'static str>,
@@ -105,11 +128,12 @@ impl<'m> Infer<'m> {
             (Ty::Var, _) | (_, Ty::Var) | (Ty::F32, Ty::F32) | (Ty::Int, Ty::Int) | (Ty::Opaque, Ty::Opaque) => {}
             (Ty::Tup(xs), Ty::Tup(ys)) if xs.len() == ys.len() => xs.into_iter().zip(ys).for_each(|(x, y)| self.unify(x, y)),
             (Ty::Arr(x), Ty::Arr(y)) => self.unify(x, y),
-            (Ty::F32, t) | (t, Ty::F32) if t != Ty::Poison => {
+            (Ty::F32, t) | (t, Ty::F32) => {
                 let what = match t {
                     Ty::Int => "an int",
                     Ty::Tup(_) => "a tuple",
                     Ty::Arr(_) => "an array",
+                    Ty::Poison => "a value of mixed shape",
                     _ => "a constructor or closure",
                 };
                 self.err.get_or_insert(Diag::new(0, format!("in '{}': a value is used both as f32 and as {what} (convert with f32(n) or int(x))", self.cur)));
@@ -126,7 +150,9 @@ impl<'m> Infer<'m> {
 
     fn expr(&mut self, e: &'m Expr, env: &mut HashMap<String, usize>) -> usize {
         let n = match e {
-            Expr::Int(_) => self.node(Ty::Var),
+            // an int literal is an int; only as the direct operand of an
+            // operator does it take its sibling's type (`x * 2` on f32)
+            Expr::Int(_) => self.node(Ty::Int),
             Expr::Float(_) => {
                 let n = self.node(Ty::Var);
                 self.flo[n] = true;
@@ -138,7 +164,7 @@ impl<'m> Infer<'m> {
                         self.expr(a, env);
                     }
                     Expr::Cmp(_, a, b) => {
-                        let (x, y) = (self.expr(a, env), self.expr(b, env));
+                        let (x, y) = (self.operand(a, env), self.operand(b, env));
                         self.unify(x, y);
                     }
                     _ => {}
@@ -155,14 +181,14 @@ impl<'m> Infer<'m> {
                 if let Expr::IfExp(c, ..) = e {
                     self.expr(c, env);
                 }
-                let (x, y) = (self.expr(a, env), self.expr(b, env));
+                let (x, y) = (self.operand(a, env), self.operand(b, env));
                 self.unify(x, y);
                 x
             }
             Expr::Bool2(_, a, b) => {
                 self.expr(a, env);
                 self.expr(b, env);
-                self.node(Ty::Var)
+                self.node(Ty::Int)
             }
             Expr::Tuple(items) => {
                 let xs = items.iter().map(|i| self.expr(i, env)).collect();
@@ -194,6 +220,16 @@ impl<'m> Infer<'m> {
         n
     }
 
+    /// An operand: an int literal here takes the other operand's type.
+    fn operand(&mut self, e: &'m Expr, env: &mut HashMap<String, usize>) -> usize {
+        if let Expr::Int(_) = e {
+            let n = self.node(Ty::Var);
+            self.at.insert(e as *const Expr, n);
+            return n;
+        }
+        self.expr(e, env)
+    }
+
     fn call(&mut self, f: &str, xs: &[usize], env: &HashMap<String, usize>) -> usize {
         if env.contains_key(f) {
             return self.node(Ty::Var);
@@ -214,8 +250,15 @@ impl<'m> Infer<'m> {
                 self.fresh_is(xs[0], Ty::F32);
                 xs[0]
             }
-            ("f32", 1) => self.node(Ty::F32),
-            ("int", 1) | ("array_len", 1) => self.node(Ty::Int),
+            ("f32", 1) => {
+                self.conv.push(xs[0]);
+                self.node(Ty::F32)
+            }
+            ("int", 1) => {
+                self.conv.push(xs[0]);
+                self.node(Ty::Int)
+            }
+            ("array_len", 1) => self.node(Ty::Int),
             ("array_new", 2) => {
                 int(self, xs.first());
                 self.node(Ty::Arr(xs[1]))
@@ -252,6 +295,13 @@ impl<'m> Infer<'m> {
                     let t = self.expr(e, env);
                     let x = self.var(v, env);
                     self.unify(x, t);
+                    // `a, b = e` (parse.rs): the hidden name ends in the count
+                    if let Some(n) = v.strip_prefix("__tuple").and_then(|r| r.rsplit('_').next()).and_then(|n| n.parse().ok()) {
+                        let xs = (0..n).map(|_| self.node(Ty::Var)).collect();
+                        let tup = self.node(Ty::Tup(xs));
+                        self.unify(x, tup);
+                        self.unpacks.push((x, n));
+                    }
                 }
                 Stmt::Return(e) => {
                     let t = self.expr(e, env);
@@ -338,17 +388,18 @@ impl<'m> Infer<'m> {
         let b = |x: Expr| Box::new(x);
         let is32 = self.f32(e);
         Ok(match e {
-            Expr::Int(v) if is32 => Expr::Int(bits(*v as f64)),
+            Expr::Int(v) if is32 => Expr::Int(int_bits(*v)),
             Expr::Float(v) if is32 => Expr::Int(bits(*v)),
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => e.clone(),
             Expr::Neg(a) => {
                 let x = self.ex(a, env)?;
-                if is32 {
-                    Expr::Bin(BinOp::BitXor, b(x), b(Expr::Int(SIGN)))
-                } else if self.flo_of(e) {
-                    Expr::Bin(BinOp::Mul, b(Expr::Float(-1.0)), b(x))
-                } else {
-                    Expr::Neg(b(x))
+                let r = self.find(self.at[&(e as *const Expr)]);
+                match (&self.ty[r], self.flo[r]) {
+                    (Ty::F32, _) => Expr::Bin(BinOp::BitXor, b(x), b(Expr::Int(SIGN))),
+                    // an f64 (a class of float literals only)
+                    (Ty::Var, true) => Expr::Bin(BinOp::Mul, b(Expr::Float(-1.0)), b(x)),
+                    (_, true) => return Err(Diag::new(0, format!("in '{}': negation of a value used both as an int and as an f64", self.cur))),
+                    _ => Expr::Neg(b(x)),
                 }
             }
             Expr::Bin(op, x, y) => {
@@ -389,20 +440,10 @@ impl<'m> Infer<'m> {
                 match f.as_str() {
                     "sqrt" => Expr::Call("f32_sqrt".into(), vec![x]),
                     "int" if on32 => self.helper("__int_of_f32", vec![x]),
-                    "int" => match a {
-                        Expr::Float(v) => Expr::Int(v.trunc() as i64),
-                        _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': int() of an f64 value", self.cur))),
-                        _ => x,
-                    },
                     _ if on32 => x,
-                    _ => match a {
-                        Expr::Int(v) => Expr::Int(bits(*v as f64)),
-                        Expr::Float(v) => Expr::Int(bits(*v)),
-                        _ if self.flo_of(a) => {
-                            return Err(Diag::new(0, format!("in '{}': f32() of an f64 value; write the literal in an f32 context", self.cur)))
-                        }
-                        _ => self.helper("__f32_of_int", vec![x]),
-                    },
+                    _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': {f}() of a value used both as an int and as a float", self.cur))),
+                    "int" => x,
+                    _ => self.helper("__f32_of_int", vec![x]),
                 }
             }
             Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| self.ex(a, env)).collect::<Result<_, _>>()?),
@@ -475,6 +516,8 @@ pub fn elaborate(m: &mut Module) -> Result<(), Diag> {
         ret: Vec::new(),
         fields: HashMap::new(),
         projs: Vec::new(),
+        conv: Vec::new(),
+        unpacks: Vec::new(),
         cur: "",
         err: None,
         used: BTreeSet::new(),
@@ -498,6 +541,19 @@ pub fn elaborate(m: &mut Module) -> Result<(), Diag> {
         s.stmts(&f.body, &mut env);
     }
     s.settle();
+    for x in std::mem::take(&mut s.conv) {
+        let r = s.find(x);
+        if s.flo[r] && s.ty[r] == Ty::Var {
+            s.fresh_is(x, Ty::F32);
+        }
+    }
+    s.settle();
+    for (x, n) in std::mem::take(&mut s.unpacks) {
+        let r = s.find(x);
+        if !matches!(&s.ty[r], Ty::Tup(xs) if xs.len() == n) {
+            s.err.get_or_insert(Diag::new(0, format!("cannot unpack a value into {n} names: it is not a tuple of {n}")));
+        }
+    }
     if let Some(d) = s.err.take() {
         return Err(d);
     }

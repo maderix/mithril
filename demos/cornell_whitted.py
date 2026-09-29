@@ -6,8 +6,8 @@
 # sphere (refraction with Schlick's Fresnel term) and a tall diffuse
 # block. Diffuse surfaces take direct light from four points on the
 # emitter (soft shadow edges; glass dims the light but does not block
-# it) plus a small ambient term; mirror and glass recurse up to five
-# bounces. Every pixel averages 2x2 samples.
+# it) plus a small ambient term; mirror and glass recurse up to four
+# reflections or refractions. Every pixel averages 2x2 samples.
 #
 # The image forks as a tree of rows and then columns, so the work is
 # parallel with no annotation. main() returns (width, height, pixels):

@@ -1,7 +1,7 @@
 # The f32 surface: float literals, + - * /, unary minus, comparisons (NaN
 # and signed zero), sqrt, f32() and int() conversions, with the type found
 # through calls, returns, tuples, destructuring, constructors and arrays.
-# A batch of 2^6 ray-sphere tests forks as a tree.
+# A batch of 2^6 ray-sphere tests forks as a tree; a closure compares f32.
 @data
 class Hit:
     Miss: ()
@@ -99,6 +99,16 @@ def arrays(n):
     return int(s * 4.0)
 
 
+# f32 inside a closure: its body runs on the net's rules at runtime
+def thresholds(n):
+    k = sqrt(2.0)
+    g = lambda v: 1 if k <= f32(v) * 0.5 else 0
+    s = 0
+    for i in range(n):
+        s = s + g(i)
+    return s
+
+
 def main():
     lo, hi = (0, 64)
-    return (batch(lo, hi), ieee(), convert(), arrays(10))
+    return (batch(lo, hi), ieee(), convert(), arrays(10), thresholds(array_len(array_new(10, 0))))

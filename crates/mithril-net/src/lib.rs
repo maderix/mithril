@@ -86,6 +86,10 @@ const PRIMS: [(Prim, bool); 13] = [
     (Prim::F32Le, false),
 ];
 
+// the pairing pseudo-op sits right after the builtins; the runtime
+// dispatchers (rt template.rs, engine.cu) number the codes the same way
+const _: () = assert!(ARR_PAIR == PRIM_BASE + PRIMS.len() as u16);
+
 pub(crate) fn prim_code(p: Prim) -> u16 {
     PRIM_BASE + PRIMS.iter().position(|(q, _)| *q == p).unwrap() as u16
 }

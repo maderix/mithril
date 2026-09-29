@@ -87,6 +87,8 @@ const FIXTURES: &[&str] = &[
     "hetero_array.py",
     "f32_ops.py",
     "f32_surface.py",
+    "tuple_whole.py",
+    "tuple_nested.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",
@@ -328,6 +330,13 @@ fn gpu_failed_runs_leave_no_memory_behind() {
     if !gpu_on() {
         return;
     }
+    // a retain held across the runs: a run's release then does not destroy
+    // the context, so memory a run fails to free shows
+    let _hold = mithril_gpu::hold_context().unwrap();
+    // one run first: the context then holds what every run shares (the
+    // module's local-memory reserve for the stack)
+    let (want, got) = run_fixture("fib_naive.py");
+    assert_eq!(got.map(|r| r.text), Ok(want));
     let before = mithril_gpu::free_vram().unwrap();
     std::env::set_var("MITHRIL_GPU_NODES", "1024");
     for _ in 0..3 {
@@ -385,4 +394,23 @@ fn gpu_arena_exhaustion_is_a_clean_error() {
     let low = err.to_lowercase();
     assert!(!low.contains("illegal"), "leaked CUDA error text: {err}");
     assert!(!err.contains("CUDA_ERROR"), "leaked CUDA error text: {err}");
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_TIMEOUT; run --test-threads=1)"]
+fn gpu_timeout_kills_the_run_and_the_next_run_works() {
+    if !gpu_on() {
+        return;
+    }
+    // a loop far longer than the deadline
+    let src = "def spin(n):\n    s = 0\n    for i in range(n):\n        s = (s * 31 + i) & 4294967295\n    return s\n\ndef main():\n    return spin(array_len(array_new(1, 0)) << 40)\n";
+    let (_, cu) = pipeline_src(src);
+    std::env::set_var("MITHRIL_GPU_TIMEOUT", "2");
+    let t = std::time::Instant::now();
+    let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("the run cannot finish in 2 s");
+    std::env::remove_var("MITHRIL_GPU_TIMEOUT");
+    assert!(err.contains("exceeded 2 s") && err.contains("stopped"), "wrong error: {err}");
+    assert!(t.elapsed().as_secs() < 30, "the timeout waited for the kernel ({:?})", t.elapsed());
+    let (want, got) = run_fixture("fib_naive.py");
+    assert_eq!(got.map(|r| r.text), Ok(want), "the run after a timeout");
 }

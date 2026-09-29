@@ -187,7 +187,8 @@ impl<'a> Parser<'a> {
             return match e {
                 Expr::Tuple(targets) if !targets.is_empty() => {
                     self.hidden += 1;
-                    let tmp = format!("__tuple{}", self.hidden);
+                    // the name carries the count, which `infer` checks
+                    let tmp = format!("__tuple{}_{}", self.hidden, targets.len());
                     let mut out = vec![Stmt::Assign(tmp.clone(), rhs)];
                     for (i, t) in targets.iter().enumerate() {
                         let proj = Expr::Index(Box::new(Expr::Var(tmp.clone())), Box::new(Expr::Int(i as i64)));

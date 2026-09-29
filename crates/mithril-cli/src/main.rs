@@ -322,6 +322,12 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
         if let Some(t) = o.threads {
             c.args(["--threads", &t.to_string()]);
         }
+        if o.image.is_none() && o.stats.is_none() {
+            // nothing to post-process: the program prints as it runs
+            let status = c.status().map_err(|e| format!("cannot run compiled program: {}", e))?;
+            let _ = fs::remove_dir_all(&tmp);
+            return Ok(status.code().unwrap_or(1));
+        }
         let tr = std::time::Instant::now();
         let out = c.stderr(std::process::Stdio::inherit()).output().map_err(|e| format!("cannot run compiled program: {}", e))?;
         let run = tr.elapsed().as_secs_f64();
@@ -400,12 +406,27 @@ fn write_image(path: &Path, text: &str) -> Result<(usize, usize), CliErr> {
     Ok((w, h))
 }
 
+/// A JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 /// `--stats`: what ran where, and what each stage cost.
 fn write_stats(path: &Path, o: &Opts, r: &Ran, dims: Option<(usize, usize)>) -> Result<(), CliErr> {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "null".into());
     let json = format!(
-        "{{\n  \"program\": {:?},\n  \"backend\": \"{}\",\n  \"threads\": {},\n  \"front_s\": {:.4},\n  \"compile_s\": {:.4},\n  \"run_s\": {:.4},\n  \"device_rounds\": {},\n  \"image\": {}\n}}\n",
-        o.file.display().to_string(),
+        "{{\n  \"program\": {},\n  \"backend\": \"{}\",\n  \"threads\": {},\n  \"front_s\": {:.4},\n  \"compile_s\": {:.4},\n  \"run_s\": {:.4},\n  \"device_rounds\": {},\n  \"image\": {}\n}}\n",
+        json_str(&o.file.display().to_string()),
         if o.gpu { "gpu" } else { "cpu" },
         opt(o.threads.filter(|_| !o.gpu).map(|t| t.to_string())),
         r.front,
