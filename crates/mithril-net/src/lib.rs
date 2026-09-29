@@ -39,8 +39,7 @@
 //!   two dups that meet face to face annihilate exactly when they are the
 //!   two halves of one copy and commute otherwise.
 //! - `Era`, `Lam(a)`, `App(a)` — standard; `Lam`/`App` cells are
-//!   `[param, body]` / `[arg, ret]`. LAM/APP are unreachable from Core v1
-//!   (desugar rejects lambdas) but APP-LAM beta is implemented.
+//!   `[param, body]` / `[arg, ret]` (closures: `Core::Lam`/`Core::App`).
 //! - `Ext`      — internal chain pointers (`Ext(addr)`) and the `EMPTY`
 //!   sentinel (all-ones payload); never a redex side.
 //!
@@ -63,7 +62,7 @@ pub mod rules;
 
 use mithril_core::net::Net;
 use mithril_front::ast::{BinOp, CmpOp};
-use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
+use mithril_front::core::{Core, CoreModule, Prim, UNREACHABLE_CTOR};
 use mithril_front::Diag;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,69 +78,29 @@ pub use rules::link;
 /// A unary builtin rides a binary Op with a `Num(0)` second operand; the
 /// ternary `array_set(a, i, v)` is `ARRSET(a, ARR_PAIR(i, v))`.
 
-pub(crate) fn prim_code(p: mithril_front::core::Prim) -> u16 {
-    use mithril_front::core::Prim::*;
-    match p {
-        F32Add => 32,
-        F32Sub => 33,
-        F32Mul => 34,
-        F32Div => 35,
-        F32Sqrt => 36,
-        F32Lt => 37,
-        F32FromU32 => 38,
-        F32ToU32 => 39,
-        ArrNew => 40,
-        ArrGet => 41,
-        ArrLen => 42,
-        ArrSet => 43,
-    }
+/// Builtins by opcode (index + PRIM_BASE) and whether each is unary.
+const PRIMS: [(Prim, bool); 12] = [
+    (Prim::F32Add, false), (Prim::F32Sub, false), (Prim::F32Mul, false), (Prim::F32Div, false),
+    (Prim::F32Sqrt, true), (Prim::F32Lt, false), (Prim::F32FromU32, true), (Prim::F32ToU32, true),
+    (Prim::ArrNew, false), (Prim::ArrGet, false), (Prim::ArrLen, true), (Prim::ArrSet, false),
+];
+
+pub(crate) fn prim_code(p: Prim) -> u16 {
+    PRIM_BASE + PRIMS.iter().position(|(q, _)| *q == p).unwrap() as u16
 }
 
 /// The builtin of an opcode and whether it is unary.
-pub(crate) fn prim_of_code(code: u16) -> (mithril_front::core::Prim, bool) {
-    use mithril_front::core::Prim::*;
-    match code {
-        32 => (F32Add, false),
-        33 => (F32Sub, false),
-        34 => (F32Mul, false),
-        35 => (F32Div, false),
-        36 => (F32Sqrt, true),
-        37 => (F32Lt, false),
-        38 => (F32FromU32, true),
-        39 => (F32ToU32, true),
-        40 => (ArrNew, false),
-        41 => (ArrGet, false),
-        42 => (ArrLen, true),
-        43 => (ArrSet, false),
-        c => panic!("ICE: opcode {} is not a builtin", c),
-    }
+pub(crate) fn prim_of_code(code: u16) -> (Prim, bool) {
+    *code.checked_sub(PRIM_BASE).and_then(|i| PRIMS.get(i as usize)).unwrap_or_else(|| panic!("ICE: opcode {} is not a builtin", code))
 }
 
+/// BinOp opcodes are the declaration order (`BinOp::ALL`), CmpOp's 16 up.
 pub fn opcode_bin(op: BinOp) -> u16 {
-    match op {
-        BinOp::Add => 0,
-        BinOp::Sub => 1,
-        BinOp::Mul => 2,
-        BinOp::Div => 3,
-        BinOp::FloorDiv => 4,
-        BinOp::Mod => 5,
-        BinOp::Shl => 6,
-        BinOp::Shr => 7,
-        BinOp::BitAnd => 8,
-        BinOp::BitOr => 9,
-        BinOp::BitXor => 10,
-    }
+    op as u16
 }
 
 pub(crate) fn opcode_cmp(op: CmpOp) -> u16 {
-    match op {
-        CmpOp::Lt => 16,
-        CmpOp::Le => 17,
-        CmpOp::Gt => 18,
-        CmpOp::Ge => 19,
-        CmpOp::Eq => 20,
-        CmpOp::Ne => 21,
-    }
+    16 + op as u16
 }
 
 pub use mithril_core::agents::*;
@@ -231,20 +190,25 @@ fn lift(prog: &mut NetProg, params: Vec<u32>, body: &Core) -> u16 {
 }
 
 fn close(prog: &mut NetProg, body: &Core, binders: &[u32]) -> ClosureSpec {
-    let caps: Vec<u32> = free_vars(body).into_iter().filter(|v| !binders.contains(v)).collect();
+    let caps: Vec<u32> = body.free_vars().into_iter().filter(|v| !binders.contains(v)).collect();
     let mut params = binders.to_vec();
     params.extend(caps.iter().copied());
     let entry = lift(prog, params, body);
     ClosureSpec { entry, caps }
 }
 
-fn ctag_of(cid: u32) -> u16 {
+pub(crate) fn ctag_of(cid: u32) -> u16 {
     if cid == UNREACHABLE_CTOR {
         CTAG_UNREACHABLE
     } else {
         assert!(cid < CTAG_UNREACHABLE as u32, "ICE: ctor id {} exceeds the 12-bit cell tag space", cid);
         cid as u16
     }
+}
+
+/// The inverse of `ctag_of`.
+pub(crate) fn cid_of(t: u16) -> u32 {
+    if t == CTAG_UNREACHABLE { UNREACHABLE_CTOR } else { t as u32 }
 }
 
 fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
@@ -290,10 +254,6 @@ fn lower(c: &Core, prog: &mut NetProg) -> NExpr {
     }
 }
 
-fn free_vars(c: &Core) -> BTreeSet<u32> {
-    c.free_vars()
-}
-
 // ---- clone discipline ----
 
 /// Every variable use is bound (a param, `Let`, match binder or lambda
@@ -321,7 +281,7 @@ fn check_self_app(c: &Core, alias: &mut BTreeMap<u32, u32>, fname: &str) -> Resu
             check_self_app(a, alias, fname)?;
             if let Core::Var(v) = &**a {
                 let v = canon(*v, alias);
-                let fvs: BTreeSet<u32> = free_vars(f).into_iter().map(|u| canon(u, alias)).collect();
+                let fvs: BTreeSet<u32> = f.free_vars().into_iter().map(|u| canon(u, alias)).collect();
                 if fvs.contains(&v) {
                     return Err(Diag::new(0, format!("clone discipline: closure v{} is applied to itself in function '{}'", v, fname)));
                 }
@@ -336,62 +296,17 @@ fn check_self_app(c: &Core, alias: &mut BTreeMap<u32, u32>, fname: &str) -> Resu
             }
             check_self_app(b, alias, fname)
         }
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => Ok(()),
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            check_self_app(a, alias, fname)?;
-            check_self_app(b, alias, fname)
-        }
-        Core::If(a, b, c2) => {
-            check_self_app(a, alias, fname)?;
-            check_self_app(b, alias, fname)?;
-            check_self_app(c2, alias, fname)
-        }
-        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-            for x in xs {
-                check_self_app(x, alias, fname)?;
-            }
-            Ok(())
-        }
-        Core::Match(s, arms) => {
-            check_self_app(s, alias, fname)?;
-            for (_, _, b) in arms {
-                check_self_app(b, alias, fname)?;
-            }
-            Ok(())
-        }
-        Core::Proj(e, _) | Core::Lam(_, e) => check_self_app(e, alias, fname),
+        _ => c.kids().into_iter().try_for_each(|k| check_self_app(k, alias, fname)),
     }
 }
 
 fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), Diag> {
     match c {
-        Core::Num(_) | Core::Flo(_) => Ok(()),
-        Core::Var(v) => {
-            if bound.contains(v) {
-                Ok(())
-            } else {
-                Err(Diag::new(0, format!("clone discipline: unbound variable v{} in function '{}'", v, fname)))
-            }
-        }
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            check_bound(a, bound, fname)?;
-            check_bound(b, bound, fname)
-        }
-        Core::If(c1, t, e) => {
-            check_bound(c1, bound, fname)?;
-            check_bound(t, bound, fname)?;
-            check_bound(e, bound, fname)
-        }
+        Core::Var(v) if !bound.contains(v) => Err(Diag::new(0, format!("clone discipline: unbound variable v{} in function '{}'", v, fname))),
         Core::Let(v, r, b) => {
             check_bound(r, bound, fname)?;
             bound.insert(*v);
             check_bound(b, bound, fname)
-        }
-        Core::Call(_, args) | Core::Ctor(_, args) | Core::Tuple(args) | Core::Reuse(_, _, args) | Core::Prim(_, args) => {
-            for a in args {
-                check_bound(a, bound, fname)?;
-            }
-            Ok(())
         }
         Core::Match(s, arms) => {
             check_bound(s, bound, fname)?;
@@ -403,7 +318,6 @@ fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), D
             }
             Ok(())
         }
-        Core::Proj(e, _) => check_bound(e, bound, fname),
         Core::Lam(x, b) => {
             let fresh = bound.insert(*x);
             check_bound(b, bound, fname)?;
@@ -412,9 +326,6 @@ fn check_bound(c: &Core, bound: &mut BTreeSet<u32>, fname: &str) -> Result<(), D
             }
             Ok(())
         }
-        Core::App(f, a) => {
-            check_bound(f, bound, fname)?;
-            check_bound(a, bound, fname)
-        }
+        _ => c.kids().into_iter().try_for_each(|k| check_bound(k, bound, fname)),
     }
 }

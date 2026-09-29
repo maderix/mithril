@@ -1,8 +1,6 @@
 //! Net construction. `build` creates the initial net: the root wire (cell
 //! 0) and one redex pairing `main` as a `Ref` against the output var.
-//! `instantiate` splices an entry's body into a live net during `Ref`
-//! unfolding — this is also where DUP chains are inserted for every
-//! variable used more than once.
+//! Entry bodies are spliced by `mithril_core::lower::instantiate`.
 
 use crate::{instantiate, list_alloc, ref_port, wire, NetProg, EMPTY};
 use mithril_core::net::Net;

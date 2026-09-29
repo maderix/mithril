@@ -10,7 +10,8 @@
 
 use crate::poly::{padd, pconst, pmul, pneg, psubst, pvar, Poly, MASK32, MASK56};
 use mithril_front::ast::{BinOp, Expr, FnDef, Stmt};
-use std::collections::HashMap;
+use mithril_front::desugar::free_reads_expr;
+use std::collections::{BTreeSet, HashMap};
 
 /// The exact u32-emulation mask literal (`4294967295 = 2^32 - 1`).
 pub const M32_LIT: i64 = 0xFFFF_FFFF;
@@ -122,18 +123,11 @@ fn add_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// `e` reads `name` (not as a lambda's own parameter).
 pub fn uses_var(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::Var(n) => n == name,
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => false,
-        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => {
-            uses_var(a, name) || uses_var(b, name)
-        }
-        Expr::Not(a) => uses_var(a, name),
-        Expr::IfExp(c, t, e2) => uses_var(c, name) || uses_var(t, name) || uses_var(e2, name),
-        Expr::Call(_, args) | Expr::Tuple(args) => args.iter().any(|a| uses_var(a, name)),
-        Expr::Lambda(params, b) => !params.iter().any(|p| p == name) && uses_var(b, name),
-    }
+    let mut reads = BTreeSet::new();
+    free_reads_expr(e, &mut reads);
+    reads.contains(name)
 }
 
 /// Symbolically evaluate an expression to a `Poly` over Z_2^k (`mask` =
@@ -154,20 +148,11 @@ pub fn sym_eval(e: &Expr, env: &HashMap<String, Poly>, mask: u64) -> Result<Poly
             }
             Err("tuple indexing outside the combiner parameters".into())
         }
-        Expr::Bin(BinOp::BitAnd, a, b) => {
-            let is_m32 = |x: &Expr| matches!(x, Expr::Int(v) if *v == M32_LIT);
-            if mask == MASK32 && is_m32(b.as_ref()) {
-                return sym_eval(a, env, mask);
-            }
-            if mask == MASK32 && is_m32(a.as_ref()) {
-                return sym_eval(b, env, mask);
-            }
-            if is_m32(a.as_ref()) || is_m32(b.as_ref()) {
-                Err("subexpression is masked with & 4294967295 but the combiner's top-level result is not masked".into())
-            } else {
-                Err("bitand with a mask other than 4294967295 is opaque".into())
-            }
-        }
+        Expr::Bin(BinOp::BitAnd, ..) => match strip_top_mask(e) {
+            Some(inner) if mask == MASK32 => sym_eval(inner, env, mask),
+            Some(_) => Err("subexpression is masked with & 4294967295 but the combiner's top-level result is not masked".into()),
+            None => Err("bitand with a mask other than 4294967295 is opaque".into()),
+        },
         Expr::Bin(op, a, b) => match op {
             BinOp::Add => Ok(padd(&sym_eval(a, env, mask)?, &sym_eval(b, env, mask)?, mask)),
             BinOp::Sub => {

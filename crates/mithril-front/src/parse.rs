@@ -37,18 +37,29 @@ impl<'a> Parser<'a> {
             Err(Diag::new(self.line(), format!("expected {:?}, found {:?}", k, self.kind())))
         }
     }
-    fn names_to_rparen(&mut self) -> Result<Vec<String>, Diag> {
-        let mut binds = Vec::new();
+    /// `item (',' item)* ')'`, possibly empty, trailing comma allowed; '(' already consumed.
+    fn list<T>(&mut self, mut item: impl FnMut(&mut Self) -> Result<T, Diag>) -> Result<Vec<T>, Diag> {
+        let mut xs = Vec::new();
         while !matches!(self.kind(), TokKind::RParen) {
-            binds.push(self.expect_name()?);
-            if matches!(self.kind(), TokKind::Comma) {
-                self.bump();
-            } else {
+            xs.push(item(self)?);
+            if !matches!(self.kind(), TokKind::Comma) {
                 break;
             }
+            self.bump();
         }
         self.expect(TokKind::RParen)?;
-        Ok(binds)
+        Ok(xs)
+    }
+    /// An indented block: Newline Indent item* Dedent.
+    fn block<T>(&mut self, mut item: impl FnMut(&mut Self) -> Result<T, Diag>) -> Result<Vec<T>, Diag> {
+        self.expect_newline()?;
+        self.expect(TokKind::Indent)?;
+        let mut xs = Vec::new();
+        while !matches!(self.kind(), TokKind::Dedent) {
+            xs.push(item(self)?);
+        }
+        self.expect(TokKind::Dedent)?;
+        Ok(xs)
     }
 
     fn expect_name(&mut self) -> Result<String, Diag> {
@@ -109,18 +120,14 @@ impl<'a> Parser<'a> {
         self.expect(TokKind::Class)?;
         let name = self.expect_name()?;
         self.expect(TokKind::Colon)?;
-        self.expect_newline()?;
-        self.expect(TokKind::Indent)?;
-        let mut ctors = Vec::new();
-        while !matches!(self.kind(), TokKind::Dedent) {
-            let cname = self.expect_name()?;
-            self.expect(TokKind::Colon)?;
-            self.expect(TokKind::LParen)?;
-            let binds = self.names_to_rparen()?;
-            self.expect_newline()?;
-            ctors.push((cname, binds));
-        }
-        self.expect(TokKind::Dedent)?;
+        let ctors = self.block(|p| {
+            let cname = p.expect_name()?;
+            p.expect(TokKind::Colon)?;
+            p.expect(TokKind::LParen)?;
+            let binds = p.list(Self::expect_name)?;
+            p.expect_newline()?;
+            Ok((cname, binds))
+        })?;
         Ok(DataDef { name, ctors })
     }
 
@@ -128,30 +135,14 @@ impl<'a> Parser<'a> {
         self.bump(); // 'def'
         let name = self.expect_name()?;
         self.expect(TokKind::LParen)?;
-        let mut params = Vec::new();
-        while !matches!(self.kind(), TokKind::RParen) {
-            params.push(self.expect_name()?);
-            if matches!(self.kind(), TokKind::Comma) {
-                self.bump();
-            } else {
-                break;
-            }
-        }
-        self.expect(TokKind::RParen)?;
+        let params = self.list(Self::expect_name)?;
         self.expect(TokKind::Colon)?;
         let body = self.suite()?;
         Ok(FnDef { name, params, body })
     }
 
     fn suite(&mut self) -> Result<Vec<Stmt>, Diag> {
-        self.expect_newline()?;
-        self.expect(TokKind::Indent)?;
-        let mut stmts = Vec::new();
-        while !matches!(self.kind(), TokKind::Dedent) {
-            stmts.extend(self.stmt()?);
-        }
-        self.expect(TokKind::Dedent)?;
-        Ok(stmts)
+        Ok(self.block(Self::stmt)?.concat())
     }
 
     // ---- statements ----
@@ -194,7 +185,7 @@ impl<'a> Parser<'a> {
     }
 
     fn if_stmt(&mut self) -> Result<Stmt, Diag> {
-        self.bump(); // 'if'
+        self.bump(); // 'if' or 'elif'
         let cond = self.expr()?;
         self.expect(TokKind::Colon)?;
         let then = self.suite()?;
@@ -204,14 +195,7 @@ impl<'a> Parser<'a> {
 
     fn elif_or_else(&mut self) -> Result<Vec<Stmt>, Diag> {
         match self.kind() {
-            TokKind::Elif => {
-                self.bump();
-                let cond = self.expr()?;
-                self.expect(TokKind::Colon)?;
-                let then = self.suite()?;
-                let els = self.elif_or_else()?;
-                Ok(vec![Stmt::If(cond, then, els)])
-            }
+            TokKind::Elif => Ok(vec![self.if_stmt()?]),
             TokKind::Else => {
                 self.bump();
                 self.expect(TokKind::Colon)?;
@@ -245,23 +229,22 @@ impl<'a> Parser<'a> {
         let first = self.expr()?;
         // `range(a, b)`: `a` bound once, then a loop over `range(b - a)`
         // whose body first binds the variable to `counter + a`
-        let start = if matches!(self.kind(), TokKind::Comma) {
+        let end = if matches!(self.kind(), TokKind::Comma) {
             self.bump();
-            let end = self.expr()?;
-            Some((first.clone(), end))
+            Some(self.expr()?)
         } else {
             None
         };
         self.expect(TokKind::RParen)?;
         self.expect(TokKind::Colon)?;
         let mut body = self.suite()?;
-        match start {
+        match end {
             None => Ok(vec![Stmt::For(var, first, body, None)]),
-            Some((a, b)) => {
+            Some(b) => {
                 let (ctr, lo) = (format!("__range_{var}"), format!("__lo_{var}"));
                 let lo_v = || Box::new(Expr::Var(lo.clone()));
                 body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), lo_v())));
-                Ok(vec![Stmt::Assign(lo.clone(), a), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])
+                Ok(vec![Stmt::Assign(lo.clone(), first), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])
             }
         }
     }
@@ -270,17 +253,12 @@ impl<'a> Parser<'a> {
         self.bump(); // 'match'
         let scrut = self.expr()?;
         self.expect(TokKind::Colon)?;
-        self.expect_newline()?;
-        self.expect(TokKind::Indent)?;
-        let mut cases = Vec::new();
-        while !matches!(self.kind(), TokKind::Dedent) {
-            self.expect(TokKind::Case)?;
-            let pat = self.pattern()?;
-            self.expect(TokKind::Colon)?;
-            let body = self.suite()?;
-            cases.push((pat, body));
-        }
-        self.expect(TokKind::Dedent)?;
+        let cases = self.block(|p| {
+            p.expect(TokKind::Case)?;
+            let pat = p.pattern()?;
+            p.expect(TokKind::Colon)?;
+            Ok((pat, p.suite()?))
+        })?;
         Ok(Stmt::Match(scrut, cases))
     }
 
@@ -295,8 +273,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if matches!(self.kind(), TokKind::LParen) {
                     self.bump();
-                    let binds = self.names_to_rparen()?;
-                    Ok(Pat { ctor: n, binds })
+                    Ok(Pat { ctor: n, binds: self.list(Self::expect_name)? })
                 } else {
                     Ok(Pat { ctor: n, binds: Vec::new() })
                 }
@@ -311,13 +288,8 @@ impl<'a> Parser<'a> {
     // or_expr -> and_expr ('or' and_expr)*
     // and_expr -> not_expr ('and' not_expr)*
     // not_expr -> 'not' not_expr | cmp_expr
-    // cmp_expr -> bitor_expr (cmpop bitor_expr)?      (non-chaining)
-    // bitor_expr -> bitxor_expr ('|' bitxor_expr)*
-    // bitxor_expr -> bitand_expr ('^' bitand_expr)*
-    // bitand_expr -> shift_expr ('&' shift_expr)*
-    // shift_expr -> addsub_expr (('<<'|'>>') addsub_expr)*
-    // addsub_expr -> muldiv_expr (('+'|'-') muldiv_expr)*
-    // muldiv_expr -> unary (('*'|'/'|'//'|'%') unary)*
+    // cmp_expr -> bin_level(0) (cmpop bin_level(0))?      (non-chaining)
+    // bin_level(n) -> bin_level(n+1) (op_n bin_level(n+1))*, op_0..5: | ^ & <<>> +- *///%
     // unary -> postfix          (no unary +/- in this grammar)
     // postfix -> atom ('[' expr ']')*
     // atom -> literal | name | call | tuple/paren | lambda
@@ -387,7 +359,7 @@ impl<'a> Parser<'a> {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, Diag> {
-        let e = self.bitor_expr()?;
+        let e = self.bin_level(0)?;
         let op = match self.kind() {
             TokKind::Lt => Some(CmpOp::Lt),
             TokKind::Le => Some(CmpOp::Le),
@@ -400,152 +372,81 @@ impl<'a> Parser<'a> {
         match op {
             Some(op) => {
                 self.bump();
-                let rhs = self.bitor_expr()?;
+                let rhs = self.bin_level(0)?;
                 Ok(Expr::Cmp(op, Box::new(e), Box::new(rhs)))
             }
             None => Ok(e),
         }
     }
 
-    fn bitor_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.bitxor_expr()?;
-        while matches!(self.kind(), TokKind::Pipe) {
-            self.bump();
-            let rhs = self.bitxor_expr()?;
-            e = Expr::Bin(BinOp::BitOr, Box::new(e), Box::new(rhs));
+    /// Left-associative binary levels, loosest (0: `|`) to tightest (5: `* / // %`).
+    fn bin_level(&mut self, lvl: u8) -> Result<Expr, Diag> {
+        if lvl == 6 {
+            return self.unary();
         }
-        Ok(e)
-    }
-
-    fn bitxor_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.bitand_expr()?;
-        while matches!(self.kind(), TokKind::Caret) {
-            self.bump();
-            let rhs = self.bitand_expr()?;
-            e = Expr::Bin(BinOp::BitXor, Box::new(e), Box::new(rhs));
-        }
-        Ok(e)
-    }
-
-    fn bitand_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.shift_expr()?;
-        while matches!(self.kind(), TokKind::Amp) {
-            self.bump();
-            let rhs = self.shift_expr()?;
-            e = Expr::Bin(BinOp::BitAnd, Box::new(e), Box::new(rhs));
-        }
-        Ok(e)
-    }
-
-    fn shift_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.addsub_expr()?;
+        let mut e = self.bin_level(lvl + 1)?;
         loop {
-            let op = match self.kind() {
-                TokKind::Shl => BinOp::Shl,
-                TokKind::Shr => BinOp::Shr,
-                _ => break,
+            let op = match (lvl, self.kind()) {
+                (0, TokKind::Pipe) => BinOp::BitOr,
+                (1, TokKind::Caret) => BinOp::BitXor,
+                (2, TokKind::Amp) => BinOp::BitAnd,
+                (3, TokKind::Shl) => BinOp::Shl,
+                (3, TokKind::Shr) => BinOp::Shr,
+                (4, TokKind::Plus) => BinOp::Add,
+                (4, TokKind::Minus) => BinOp::Sub,
+                (5, TokKind::Star) => BinOp::Mul,
+                (5, TokKind::Slash) => BinOp::Div,
+                (5, TokKind::SlashSlash) => BinOp::FloorDiv,
+                (5, TokKind::Percent) => BinOp::Mod,
+                _ => return Ok(e),
             };
             self.bump();
-            let rhs = self.addsub_expr()?;
+            let rhs = self.bin_level(lvl + 1)?;
             e = Expr::Bin(op, Box::new(e), Box::new(rhs));
         }
-        Ok(e)
-    }
-
-    fn addsub_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.muldiv_expr()?;
-        loop {
-            let op = match self.kind() {
-                TokKind::Plus => BinOp::Add,
-                TokKind::Minus => BinOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.muldiv_expr()?;
-            e = Expr::Bin(op, Box::new(e), Box::new(rhs));
-        }
-        Ok(e)
-    }
-
-    fn muldiv_expr(&mut self) -> Result<Expr, Diag> {
-        let mut e = self.unary()?;
-        loop {
-            let op = match self.kind() {
-                TokKind::Star => BinOp::Mul,
-                TokKind::Slash => BinOp::Div,
-                TokKind::SlashSlash => BinOp::FloorDiv,
-                TokKind::Percent => BinOp::Mod,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.unary()?;
-            e = Expr::Bin(op, Box::new(e), Box::new(rhs));
-        }
-        Ok(e)
     }
 
     fn unary(&mut self) -> Result<Expr, Diag> {
         // Unary +/- is not part of this grammar (see brief: decline
         // anything not listed); only binary +/- and unary `not` exist.
-        if matches!(self.kind(), TokKind::Minus) {
-            return Err(Diag::new(self.line(), "unary minus is not supported"));
-        }
-        if matches!(self.kind(), TokKind::Plus) {
-            return Err(Diag::new(self.line(), "unary plus is not supported"));
+        if let TokKind::Minus | TokKind::Plus = self.kind() {
+            let sign = if matches!(self.kind(), TokKind::Minus) { "minus" } else { "plus" };
+            return Err(Diag::new(self.line(), format!("unary {} is not supported", sign)));
         }
         self.postfix()
     }
 
     fn postfix(&mut self) -> Result<Expr, Diag> {
         let mut e = self.atom()?;
-        loop {
-            if matches!(self.kind(), TokKind::LBracket) {
-                self.bump();
-                let idx = self.expr()?;
-                self.expect(TokKind::RBracket)?;
-                e = Expr::Index(Box::new(e), Box::new(idx));
-            } else {
-                break;
-            }
+        while matches!(self.kind(), TokKind::LBracket) {
+            self.bump();
+            let idx = self.expr()?;
+            self.expect(TokKind::RBracket)?;
+            e = Expr::Index(Box::new(e), Box::new(idx));
         }
         Ok(e)
     }
 
     fn atom(&mut self) -> Result<Expr, Diag> {
         let line = self.line();
+        let lit = match self.kind() {
+            TokKind::Int(v) => Some(Expr::Int(*v)),
+            TokKind::Float(v) => Some(Expr::Float(*v)),
+            TokKind::True => Some(Expr::Bool(true)),
+            TokKind::False => Some(Expr::Bool(false)),
+            _ => None,
+        };
+        if let Some(e) = lit {
+            self.bump();
+            return Ok(e);
+        }
         match self.kind().clone() {
-            TokKind::Int(v) => {
-                self.bump();
-                Ok(Expr::Int(v))
-            }
-            TokKind::Float(v) => {
-                self.bump();
-                Ok(Expr::Float(v))
-            }
-            TokKind::True => {
-                self.bump();
-                Ok(Expr::Bool(true))
-            }
-            TokKind::False => {
-                self.bump();
-                Ok(Expr::Bool(false))
-            }
             TokKind::Lambda => self.lambda(),
             TokKind::Name(n) => {
                 self.bump();
                 if matches!(self.kind(), TokKind::LParen) {
                     self.bump();
-                    let mut args = Vec::new();
-                    while !matches!(self.kind(), TokKind::RParen) {
-                        args.push(self.expr()?);
-                        if matches!(self.kind(), TokKind::Comma) {
-                            self.bump();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(TokKind::RParen)?;
-                    Ok(Expr::Call(n, args))
+                    Ok(Expr::Call(n, self.list(Self::expr)?))
                 } else {
                     Ok(Expr::Var(n))
                 }

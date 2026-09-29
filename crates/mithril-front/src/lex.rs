@@ -111,8 +111,7 @@ struct Lexer<'a> {
     out: Vec<Token>,
     /// true at the start of a logical line, before any non-whitespace.
     at_line_start: bool,
-    /// true once a NEWLINE has been emitted and we're waiting for a
-    /// statement (used to avoid emitting blank leading indents).
+    /// Open brackets: inside them newlines and indentation are not tokens.
     paren_depth: i32,
 }
 
@@ -208,7 +207,6 @@ impl<'a> Lexer<'a> {
     /// or comment-only (caller should keep scanning at line start).
     fn handle_indent(&mut self) -> Result<bool, Diag> {
         let line = self.line;
-        let start = self.pos;
         let mut col: u32 = 0;
         loop {
             match self.peek() {
@@ -222,7 +220,6 @@ impl<'a> Lexer<'a> {
                 _ => break,
             }
         }
-        let _ = start;
         // Blank line or comment-only line: no indent change, no NEWLINE.
         if self.peek() == b'\n' {
             self.bump();
@@ -311,86 +308,44 @@ impl<'a> Lexer<'a> {
         self.out.push(Token { kind, line });
     }
 
+    fn eat(&mut self, c: u8) -> bool {
+        let y = self.peek() == c;
+        if y {
+            self.pos += 1;
+        }
+        y
+    }
+
     fn lex_op(&mut self) -> Result<(), Diag> {
+        use TokKind::*;
         let line = self.line;
         let c = self.bump();
         let kind = match c {
-            b'(' => {
+            b'(' | b'[' => {
                 self.paren_depth += 1;
-                TokKind::LParen
+                if c == b'(' { LParen } else { LBracket }
             }
-            b')' => {
+            b')' | b']' => {
                 self.paren_depth -= 1;
-                TokKind::RParen
+                if c == b')' { RParen } else { RBracket }
             }
-            b'[' => {
-                self.paren_depth += 1;
-                TokKind::LBracket
-            }
-            b']' => {
-                self.paren_depth -= 1;
-                TokKind::RBracket
-            }
-            b':' => TokKind::Colon,
-            b',' => TokKind::Comma,
-            b'.' => TokKind::Dot,
-            b'@' => TokKind::At,
-            b'+' => TokKind::Plus,
-            b'-' => TokKind::Minus,
-            b'*' => TokKind::Star,
-            b'%' => TokKind::Percent,
-            b'&' => TokKind::Amp,
-            b'|' => TokKind::Pipe,
-            b'^' => TokKind::Caret,
-            b'/' => {
-                if self.peek() == b'/' {
-                    self.pos += 1;
-                    TokKind::SlashSlash
-                } else {
-                    TokKind::Slash
-                }
-            }
-            b'<' => {
-                if self.peek() == b'<' {
-                    self.pos += 1;
-                    TokKind::Shl
-                } else if self.peek() == b'=' {
-                    self.pos += 1;
-                    TokKind::Le
-                } else {
-                    TokKind::Lt
-                }
-            }
-            b'>' => {
-                if self.peek() == b'>' {
-                    self.pos += 1;
-                    TokKind::Shr
-                } else if self.peek() == b'=' {
-                    self.pos += 1;
-                    TokKind::Ge
-                } else {
-                    TokKind::Gt
-                }
-            }
-            b'=' => {
-                if self.peek() == b'=' {
-                    self.pos += 1;
-                    TokKind::EqEq
-                } else {
-                    TokKind::Assign
-                }
-            }
-            b'!' => {
-                if self.peek() == b'=' {
-                    self.pos += 1;
-                    TokKind::NotEq
-                } else {
-                    return Err(Diag::new(line, "unexpected character '!'"));
-                }
-            }
-            other => {
-                return Err(Diag::new(line, format!("unexpected character '{}'", other as char)));
-            }
+            b':' => Colon,
+            b',' => Comma,
+            b'.' => Dot,
+            b'@' => At,
+            b'+' => Plus,
+            b'-' => Minus,
+            b'*' => Star,
+            b'%' => Percent,
+            b'&' => Amp,
+            b'|' => Pipe,
+            b'^' => Caret,
+            b'/' => if self.eat(b'/') { SlashSlash } else { Slash },
+            b'<' => if self.eat(b'<') { Shl } else if self.eat(b'=') { Le } else { Lt },
+            b'>' => if self.eat(b'>') { Shr } else if self.eat(b'=') { Ge } else { Gt },
+            b'=' => if self.eat(b'=') { EqEq } else { Assign },
+            b'!' if self.eat(b'=') => NotEq,
+            other => return Err(Diag::new(line, format!("unexpected character '{}'", other as char))),
         };
         self.out.push(Token { kind, line });
         Ok(())

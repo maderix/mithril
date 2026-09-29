@@ -15,6 +15,14 @@ pub enum BinOp {
     BitXor,
 }
 
+impl BinOp {
+    /// Declaration order is the opcode order (the index).
+    pub const ALL: [BinOp; 11] = [
+        BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::FloorDiv, BinOp::Mod,
+        BinOp::Shl, BinOp::Shr, BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor,
+    ];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
     Lt,
@@ -53,10 +61,8 @@ pub enum Expr {
     Lambda(Vec<String>, Box<Expr>),
 }
 
-/// Binding decision (controller): carried by `Stmt::For`, always `None` out
-/// of the parser. Task 4 fills it in; Task 3's desugar copies it onto the
-/// generated fold-function's `CoreFn.fold` (converting `Fn(String)` to
-/// `Fn(FnId)` via name resolution).
+/// A proven fold: carried by `Stmt::For` (`None` out of the parser; reassoc
+/// sets it) and copied by desugar onto the loop helper's `CoreFn.fold`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct FoldInfo {
     pub combiner: Combiner,
@@ -71,9 +77,8 @@ pub enum Combiner {
     /// 2^32; the join must re-mask its result to the low 32 bits.
     WrapAdd32,
     TupleWrapAdd32(usize),
-    /// Surface level: the combiner function's *name*. `core.rs`/desugar
-    /// resolve this to a `FnId` when lowering.
-    Fn(String),
+    /// Never constructed; kept until codegen's `fold.rs` drops its arm.
+    Fn(u32),
 }
 
 #[derive(Clone, PartialEq, Debug)]

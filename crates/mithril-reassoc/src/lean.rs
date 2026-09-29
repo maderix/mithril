@@ -36,14 +36,8 @@ pub fn lean_obligations(reports: &[FoldReport]) -> String {
             bits
         );
         let nm = format!("{}_{}", r.func, r.acc);
-        if k == 1 {
-            lines.push(format!("def comb_{nm} (a b : BitVec {bits}) : BitVec {bits} := a + b"));
-            lines.push(format!(
-                "theorem assoc_{nm} : ∀ a b c, comb_{nm} (comb_{nm} a b) c = comb_{nm} a (comb_{nm} b c) := by"
-            ));
-            lines.push(format!("  intro a b c; simp [comb_{nm}, BitVec.add_assoc]"));
-            lines.push(format!("theorem ident_{nm} : ∀ b, comb_{nm} 0 b = b := by"));
-            lines.push(format!("  intro b; simp [comb_{nm}]"));
+        let (ty, sum, fx, zero) = if k == 1 {
+            (format!("BitVec {bits}"), "a + b", "", "0")
         } else {
             // Vk is the historical (spike) name for the 56-bit vector;
             // masked folds get a distinct Vkx32 so mixed modules compile.
@@ -52,14 +46,15 @@ pub fn lean_obligations(reports: &[FoldReport]) -> String {
                 abbrevs.push((k, bits));
                 lines.push(format!("abbrev {vn} := Fin {k} → BitVec {bits}"));
             }
-            lines.push(format!("def comb_{nm} (a b : {vn}) : {vn} := fun i => a i + b i"));
-            lines.push(format!(
-                "theorem assoc_{nm} : ∀ a b c, comb_{nm} (comb_{nm} a b) c = comb_{nm} a (comb_{nm} b c) := by"
-            ));
-            lines.push(format!("  intro a b c; funext i; simp [comb_{nm}, BitVec.add_assoc]"));
-            lines.push(format!("theorem ident_{nm} : ∀ b, comb_{nm} (fun _ => 0) b = b := by"));
-            lines.push(format!("  intro b; funext i; simp [comb_{nm}]"));
-        }
+            (vn, "fun i => a i + b i", " funext i;", "(fun _ => 0)")
+        };
+        lines.push(format!("def comb_{nm} (a b : {ty}) : {ty} := {sum}"));
+        lines.push(format!(
+            "theorem assoc_{nm} : ∀ a b c, comb_{nm} (comb_{nm} a b) c = comb_{nm} a (comb_{nm} b c) := by"
+        ));
+        lines.push(format!("  intro a b c;{fx} simp [comb_{nm}, BitVec.add_assoc]"));
+        lines.push(format!("theorem ident_{nm} : ∀ b, comb_{nm} {zero} b = b := by"));
+        lines.push(format!("  intro b;{fx} simp [comb_{nm}]"));
         lines.push(String::new());
     }
     lines.push("-- Generic justification, proved once for the compiler: folding chunk".into());

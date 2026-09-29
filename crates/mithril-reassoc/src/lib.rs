@@ -72,27 +72,8 @@ fn classify_init(e: &Expr) -> Init {
 /// Forget everything about names assigned anywhere in `stmts` (a `for`
 /// loop's induction variable counts as assigned by the loop).
 fn kill_assigned(inits: &mut HashMap<String, Init>, stmts: &[Stmt]) {
-    for s in stmts {
-        match s {
-            Stmt::Assign(n, _) => {
-                inits.insert(n.clone(), Init::Other);
-            }
-            Stmt::If(_, t, e) => {
-                kill_assigned(inits, t);
-                kill_assigned(inits, e);
-            }
-            Stmt::While(_, b) => kill_assigned(inits, b),
-            Stmt::For(v, _, b, _) => {
-                inits.insert(v.clone(), Init::Other);
-                kill_assigned(inits, b);
-            }
-            Stmt::Match(_, cases) => {
-                for (_, b) in cases {
-                    kill_assigned(inits, b);
-                }
-            }
-            Stmt::Return(_) | Stmt::ExprStmt(_) => {}
-        }
+    for n in mithril_front::desugar::assigned_names(stmts) {
+        inits.insert(n, Init::Other);
     }
 }
 
@@ -153,17 +134,6 @@ fn walk_block(
     }
 }
 
-fn decline(out: &mut Vec<FoldReport>, func: &str, acc: &str, reason: String) {
-    out.push(FoldReport {
-        func: func.to_string(),
-        acc: acc.to_string(),
-        proven: false,
-        reason,
-        arity: 0,
-        bits: 0,
-    });
-}
-
 /// Detect + prove one `for var in range(_): body` loop; set `fold` iff
 /// proven, and always push a report.
 fn analyze_for(
@@ -175,64 +145,54 @@ fn analyze_for(
     inits: &HashMap<String, Init>,
     out: &mut Vec<FoldReport>,
 ) {
-    let (cand, top_masked) = match detect(var, body) {
-        None => {
-            return decline(
-                out,
-                func,
-                "",
-                format!("loop over '{var}' is not a single-assignment accumulation, kept sequential"),
-            )
+    let report = |acc: &str, proven, reason, arity, bits| FoldReport { func: func.to_string(), acc: acc.to_string(), proven, reason, arity, bits };
+    out.push(match prove_for(var, body, fns, inits) {
+        Ok((acc, combiner, arity, bits, desc)) => {
+            *fold = Some(FoldInfo { combiner, proven: true });
+            report(acc, true, format!("PROVEN assoc+identity (combiner: {desc}, arity {arity})"), arity, bits)
         }
-        Some(c) => c,
+        Err((acc, reason)) => report(acc, false, reason, 0, 0),
+    });
+}
+
+/// A proven loop: (accumulator, combiner, arity, bits, description); or
+/// why it is declined, with the accumulator ("" when not a fold shape).
+#[allow(clippy::type_complexity)]
+fn prove_for<'a>(
+    var: &str,
+    body: &'a [Stmt],
+    fns: &HashMap<String, FnDef>,
+    inits: &HashMap<String, Init>,
+) -> Result<(&'a str, Combiner, usize, u32, String), (&'a str, String)> {
+    let Some((cand, top_masked)) = detect(var, body) else {
+        return Err(("", format!("loop over '{var}' is not a single-assignment accumulation, kept sequential")));
     };
     let acc = cand.acc();
+    let decline = |reason: String| (acc, reason);
+    let opaque = |e: String| decline(format!("combiner opaque ({e}), DECLINED"));
     let step: Step = match &cand {
         Cand::Call { fname, elem, .. } => {
             if uses_var(elem, acc) {
                 // The "element" is not per-iteration data: reassociating
                 // would change semantics even for an associative combiner.
-                return decline(
-                    out,
-                    func,
-                    acc,
-                    format!("element expression reads the accumulator '{acc}', DECLINED"),
-                );
+                return Err(decline(format!("element expression reads the accumulator '{acc}', DECLINED")));
             }
-            match fns.get(*fname).map(|fd| step_from_fn(fd, top_masked)) {
-                None => {
-                    return decline(
-                        out,
-                        func,
-                        acc,
-                        format!("combiner opaque (unknown function '{fname}'), DECLINED"),
-                    )
-                }
-                Some(Err(e)) => {
-                    return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED"))
-                }
-                Some(Ok(s)) => s,
-            }
+            let fd = fns.get(*fname).ok_or_else(|| decline(format!("combiner opaque (unknown function '{fname}'), DECLINED")))?;
+            step_from_fn(fd, top_masked).map_err(opaque)?
         }
-        Cand::Expr { op, left, .. } => match step_from_expr(acc, *op, left, top_masked) {
-            Err(e) => return decline(out, func, acc, format!("combiner opaque ({e}), DECLINED")),
-            Ok(s) => s,
-        },
+        Cand::Expr { op, left, .. } => step_from_expr(acc, *op, left, top_masked).map_err(opaque)?,
     };
     let (assoc, ident) = prove(&step);
     if !assoc {
-        return decline(out, func, acc, "combiner is not associative over Z_2^56, DECLINED".into());
+        return Err(decline("combiner is not associative over Z_2^56, DECLINED".into()));
     }
     if !ident {
-        return decline(out, func, acc, "zero is not a left identity of the combiner, DECLINED".into());
+        return Err(decline("zero is not a left identity of the combiner, DECLINED".into()));
     }
     if !is_componentwise_add(&step) {
-        return decline(
-            out,
-            func,
-            acc,
+        return Err(decline(
             "combiner is associative with identity but not (componentwise) wrapping add — unsupported form, DECLINED".into(),
-        );
+        ));
     }
     let init_ok = match (inits.get(acc), step.arity) {
         (Some(Init::Zero), 1) => true,
@@ -242,15 +202,9 @@ fn analyze_for(
     if !init_ok {
         let want =
             if step.arity == 1 { "0".to_string() } else { format!("the all-zero {}-tuple", step.arity) };
-        return decline(
-            out,
-            func,
-            acc,
-            format!("loop entry value of '{acc}' is not the combiner identity (expected {want}), DECLINED"),
-        );
+        return Err(decline(format!("loop entry value of '{acc}' is not the combiner identity (expected {want}), DECLINED")));
     }
     let mode32 = step.mask == poly::MASK32;
-    let bits: u32 = if mode32 { 32 } else { 56 };
     let (combiner, desc) = match (step.arity, mode32) {
         (1, false) => (Combiner::WrapAdd, "wrapping add".to_string()),
         (1, true) => (Combiner::WrapAdd32, "wrapping add mod 2^32".to_string()),
@@ -262,13 +216,5 @@ fn analyze_for(
             format!("componentwise wrapping add mod 2^32 on {k}-tuple"),
         ),
     };
-    *fold = Some(FoldInfo { combiner, proven: true });
-    out.push(FoldReport {
-        func: func.to_string(),
-        acc: acc.to_string(),
-        proven: true,
-        reason: format!("PROVEN assoc+identity (combiner: {desc}, arity {})", step.arity),
-        arity: step.arity,
-        bits,
-    });
+    Ok((acc, combiner, step.arity, if mode32 { 32 } else { 56 }, desc))
 }

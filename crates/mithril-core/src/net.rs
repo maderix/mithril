@@ -18,19 +18,13 @@ pub struct Net {
 
 impl Default for Net {
     fn default() -> Net {
-        Net::new()
+        Net { cells: Vec::new(), free: Vec::new(), redexes: Vec::new(), residual: Vec::new(), labels: 1 }
     }
 }
 
 impl Net {
     pub fn new() -> Net {
-        Net {
-            cells: Vec::new(),
-            free: Vec::new(),
-            redexes: Vec::new(),
-            residual: Vec::new(),
-            labels: 1,
-        }
+        Net::default()
     }
 
     /// Allocate a cell holding ports `a` and `b`, reusing a freed slot if
@@ -62,36 +56,23 @@ impl Net {
     /// (indexes decimal, in arena order), followed by one `redex: ...`
     /// line per pending redex, in redex-vector order.
     pub fn dump(&self) -> String {
+        let pf = |p: u64| format!("{:?}({})", Port(p).tag(), Port(p).payload());
+        let mut out = String::new();
+        for (i, c) in self.live() {
+            out.push_str(&format!("cell {}: {} {}\n", i, pf(c[0]), pf(c[1])));
+        }
+        for (a, b) in &self.redexes {
+            out.push_str(&format!("redex: {} {}\n", pf(a.0), pf(b.0)));
+        }
+        out
+    }
+
+    /// The non-freed cells, in arena order.
+    pub fn live(&self) -> impl Iterator<Item = (usize, [u64; 2])> + '_ {
         let mut freed = vec![false; self.cells.len()];
         for &i in &self.free {
             freed[i as usize] = true;
         }
-
-        let mut out = String::new();
-        for (i, c) in self.cells.iter().enumerate() {
-            if freed[i] {
-                continue;
-            }
-            let a = Port(c[0]);
-            let b = Port(c[1]);
-            out.push_str(&format!(
-                "cell {}: {:?}({}) {:?}({})\n",
-                i,
-                a.tag(),
-                a.payload(),
-                b.tag(),
-                b.payload()
-            ));
-        }
-        for (a, b) in &self.redexes {
-            out.push_str(&format!(
-                "redex: {:?}({}) {:?}({})\n",
-                a.tag(),
-                a.payload(),
-                b.tag(),
-                b.payload()
-            ));
-        }
-        out
+        self.cells.iter().copied().enumerate().filter(move |(i, _)| !freed[*i])
     }
 }

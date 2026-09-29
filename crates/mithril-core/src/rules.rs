@@ -110,6 +110,14 @@ pub fn resolve<C: Cells>(c: &mut C, mut p: Port) -> Port {
     p
 }
 
+/// A fresh `label` dup fed by `p`: its two output wires.
+fn fan<C: Cells>(c: &mut C, label: u32, p: Port) -> (Port, Port) {
+    let (w1, w2) = (wire(c), wire(c));
+    let d = c.alloc(w1, w2);
+    link(c, dup_port(d, label), p);
+    (w1, w2)
+}
+
 fn is_value<C: Cells, P: Prog<C> + ?Sized>(prog: &P, p: Port) -> bool {
     matches!(p.tag(), Tag::Num | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
 }
@@ -133,13 +141,10 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
         }
         if other.tag() == Tag::Dup && prog.is_closure(r) {
             // DUP–closure: two closures over dup'd captures
-            let d = dup_addr(other);
-            let label = dup_label(other);
-            let dc = c.cell(d);
-            c.free_cell(d);
-            let (ra, rb) = copy_closure(c, r, label);
-            link(c, ra, Port(dc[0]));
-            link(c, rb, Port(dc[1]));
+            let (o1, o2) = take(c, dup_addr(other));
+            let (ra, rb) = copy_closure(c, r, dup_label(other));
+            link(c, ra, o1);
+            link(c, rb, o2);
             return 1;
         }
         return prog.unfold(c, r, other);
@@ -194,45 +199,23 @@ fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
                 link(c, era(), f);
             }
         }
-        Tag::Dup => {
-            let d = dup_addr(p);
-            let cell = c.cell(d);
-            c.free_cell(d);
-            link(c, era(), Port(cell[0]));
-            link(c, era(), Port(cell[1]));
-        }
-        Tag::Lam | Tag::App => {
-            let a = p.payload() as u32;
-            let cell = c.cell(a);
-            c.free_cell(a);
-            link(c, era(), Port(cell[0]));
-            link(c, era(), Port(cell[1]));
-        }
-        Tag::Op => {
-            let a = op_addr(p);
-            let cell = c.cell(a);
-            c.free_cell(a);
-            link(c, era(), Port(cell[0]));
-            link(c, era(), Port(cell[1]));
-        }
-        Tag::Swi => {
-            let s = p.payload() as u32;
-            let cell = c.cell(s);
-            c.free_cell(s);
-            link(c, era(), Port(cell[0])); // ret
-            let s2 = Port(cell[1]).payload() as u32;
-            let c2 = c.cell(s2);
-            c.free_cell(s2);
-            link(c, era(), Port(c2[0]));
-            link(c, era(), Port(c2[1]));
-        }
-        Tag::Mat => {
-            let m = mat_addr(p);
-            let cell = c.cell(m);
-            c.free_cell(m);
-            link(c, era(), Port(cell[0])); // ret
-            for r in list_collect(c, Port(cell[1])) {
-                link(c, era(), r);
+        Tag::Dup | Tag::Lam | Tag::App | Tag::Op | Tag::Swi | Tag::Mat => {
+            // slot 0 (a ret for Swi/Mat); slot 1 the Swi's arms cell, the
+            // Mat's arm list
+            let (x, y) = take(c, addr_of(p));
+            link(c, era(), x);
+            match p.tag() {
+                Tag::Swi => {
+                    let (t, e) = take(c, y.payload() as u32);
+                    link(c, era(), t);
+                    link(c, era(), e);
+                }
+                Tag::Mat => {
+                    for r in list_collect(c, y) {
+                        link(c, era(), r);
+                    }
+                }
+                _ => link(c, era(), y),
             }
         }
         _ if prog.is_ext_value(p) => prog.erase_ext(c, p),
@@ -242,15 +225,11 @@ fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
 
 /// APP–LAM beta: arg meets param, body meets ret.
 fn beta<C: Cells>(c: &mut C, app: Port, lam: Port) {
-    let ia = app.payload() as u32;
-    let il = lam.payload() as u32;
-    debug_assert!(ia != il, "ICE: beta on one cell");
-    let ca = c.cell(ia);
-    let cl = c.cell(il);
-    c.free_cell(ia);
-    c.free_cell(il);
-    link(c, Port(ca[0]), Port(cl[0])); // arg -> param
-    link(c, Port(ca[1]), Port(cl[1])); // ret <- body
+    debug_assert!(app.payload() != lam.payload(), "ICE: beta on one cell");
+    let (arg, ret) = take(c, app.payload() as u32);
+    let (param, body) = take(c, lam.payload() as u32);
+    link(c, arg, param);
+    link(c, ret, body);
 }
 
 /// OP–value: compute if the other operand has been produced, otherwise
@@ -269,19 +248,13 @@ fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Po
         // OP–SUP: the other operand is a superposition (a copied closure's
         // parameter): the op splits into one per side, the produced
         // operand copied to both, the result superposed on the ret
-        let d = dup_addr(other);
         let label = dup_label(other);
-        let dc = c.cell(d);
-        c.free_cell(d);
+        let (s1, s2) = take(c, dup_addr(other));
         c.free_cell(addr);
-        let (v1, v2) = (wire(c), wire(c));
-        let dv = c.alloc(v1, v2);
-        link(c, dup_port(dv, label), val);
-        let (r1, r2) = (wire(c), wire(c));
-        let dr = c.alloc(r1, r2);
-        link(c, dup_port(dr, label), Port(cell[1]));
-        let a1 = c.alloc(Port(dc[0]), r1);
-        let a2 = c.alloc(Port(dc[1]), r2);
+        let (v1, v2) = fan(c, label, val);
+        let (r1, r2) = fan(c, label, Port(cell[1]));
+        let a1 = c.alloc(s1, r1);
+        let a2 = c.alloc(s2, r2);
         link(c, op_port(a1, code), v1);
         link(c, op_port(a2, code), v2);
         return;
@@ -307,14 +280,9 @@ fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Po
 /// other. Branch closures are unfired `Ref`s, so the untaken branch's code
 /// was never built — this is where laziness (and loop termination) lives.
 fn swi_rule<C: Cells>(c: &mut C, swi: Port, num: Port) {
-    let s = swi.payload() as u32;
-    let cell = c.cell(s);
-    c.free_cell(s);
-    let ret = Port(cell[0]);
-    let s2 = Port(cell[1]).payload() as u32;
-    let c2 = c.cell(s2);
-    c.free_cell(s2);
-    let (taken, dead) = if num.as_i64() != 0 { (Port(c2[0]), Port(c2[1])) } else { (Port(c2[1]), Port(c2[0])) };
+    let (ret, arms) = take(c, swi.payload() as u32);
+    let (t, e) = take(c, arms.payload() as u32);
+    let (taken, dead) = if num.as_i64() != 0 { (t, e) } else { (e, t) };
     link(c, era(), dead);
     c.push_redex(taken, ret);
 }
@@ -323,11 +291,8 @@ fn swi_rule<C: Cells>(c: &mut C, swi: Port, num: Port) {
 /// prepend the constructor's fields to the arm closure's captured args and
 /// fire it; erase the other arms. A projection is the 1-way special case.
 fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: Port) {
-    let m = mat_addr(mat);
     let mid = mat_id(mat);
-    let cell = c.cell(m);
-    c.free_cell(m);
-    let ret = Port(cell[0]);
+    let (ret, arms) = take(c, mat_addr(mat));
     let (ct, fields) = if val.tag() == Tag::Con { (val.con_tag(), con_collect(c, val)) } else { prog.ext_ctor(c, val) };
     match prog.mat_meta(mid) {
         MatMeta::Proj(i) => {
@@ -342,7 +307,7 @@ fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: 
             }
         }
         MatMeta::Arms(tags) => {
-            let refs = list_collect(c, Port(cell[1]));
+            let refs = list_collect(c, arms);
             debug_assert_eq!(refs.len(), tags.len());
             let j = tags
                 .iter()
@@ -368,11 +333,8 @@ fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: 
 /// HVM-style (two lams, body dup, params joined by a same-label dup acting
 /// as the superposition). Copies carry the copier's label.
 fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: Port) {
-    let d = dup_addr(dup);
     let label = dup_label(dup);
-    let cell = c.cell(d);
-    c.free_cell(d);
-    let (o1, o2) = (Port(cell[0]), Port(cell[1]));
+    let (o1, o2) = take(c, dup_addr(dup));
     match val.tag() {
         Tag::Num => {
             link(c, val, o1);
@@ -390,10 +352,7 @@ fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: 
             let mut fa = Vec::with_capacity(fields.len());
             let mut fb = Vec::with_capacity(fields.len());
             for f in fields {
-                let w1 = wire(c);
-                let w2 = wire(c);
-                let df = c.alloc(w1, w2);
-                link(c, dup_port(df, label), f);
+                let (w1, w2) = fan(c, label, f);
                 fa.push(w1);
                 fb.push(w2);
             }
@@ -422,9 +381,7 @@ pub fn copy_closure<C: Cells>(c: &mut C, r: Port, label: u32) -> (Port, Port) {
     let caps = list_collect(c, ref_head(r));
     let (mut ca, mut cb) = (Vec::new(), Vec::new());
     for p in caps {
-        let (w1, w2) = (wire(c), wire(c));
-        let nd = c.alloc(w1, w2);
-        link(c, dup_port(nd, label), p);
+        let (w1, w2) = fan(c, label, p);
         ca.push(w1);
         cb.push(w2);
     }
@@ -458,11 +415,8 @@ pub fn copy_lam<C: Cells>(c: &mut C, l: u32, label: u32) -> (Port, Port) {
 /// through the dup. What each copy then computes is its own; what they
 /// share (an operand already produced, a call's result) is shared.
 fn dup_commute<C: Cells>(c: &mut C, dup: Port, agent: Port) {
-    let d = dup_addr(dup);
     let label = dup_label(dup);
-    let dc = c.cell(d);
-    c.free_cell(d);
-    let (o1, o2) = (Port(dc[0]), Port(dc[1]));
+    let (o1, o2) = take(c, dup_addr(dup));
     // a same-label dup whose outputs are fresh wires; its input is `p`.
     // An arm closure (a Ref, a value) is copied right away: arm slots
     // always hold closures, never wires a copy will arrive on later
@@ -470,45 +424,34 @@ fn dup_commute<C: Cells>(c: &mut C, dup: Port, agent: Port) {
         if p.tag() == Tag::Ref {
             return copy_closure(c, p, label);
         }
-        let (w1, w2) = (wire(c), wire(c));
-        let nd = c.alloc(w1, w2);
-        link(c, dup_port(nd, label), p);
-        (w1, w2)
+        fan(c, label, p)
     };
     match agent.tag() {
         Tag::Op => {
-            let a = op_addr(agent);
             let code = op_code(agent);
-            let cell = c.cell(a);
-            c.free_cell(a);
-            let (x1, x2) = split(c, Port(cell[0]));
-            let (r1, r2) = split(c, Port(cell[1]));
+            let (x, r) = take(c, op_addr(agent));
+            let (x1, x2) = split(c, x);
+            let (r1, r2) = split(c, r);
             let a1 = c.alloc(x1, r1);
             let a2 = c.alloc(x2, r2);
             link(c, op_port(a1, code), o1);
             link(c, op_port(a2, code), o2);
         }
         Tag::App => {
-            let a = agent.payload() as u32;
-            let cell = c.cell(a);
-            c.free_cell(a);
-            let (x1, x2) = split(c, Port(cell[0]));
-            let (r1, r2) = split(c, Port(cell[1]));
+            let (x, r) = take(c, agent.payload() as u32);
+            let (x1, x2) = split(c, x);
+            let (r1, r2) = split(c, r);
             let a1 = c.alloc(x1, r1);
             let a2 = c.alloc(x2, r2);
             link(c, Port::new(Tag::App, a1 as u64), o1);
             link(c, Port::new(Tag::App, a2 as u64), o2);
         }
         Tag::Swi => {
-            let s = agent.payload() as u32;
-            let cell = c.cell(s);
-            c.free_cell(s);
-            let s2 = Port(cell[1]).payload() as u32;
-            let c2 = c.cell(s2);
-            c.free_cell(s2);
-            let (r1, r2) = split(c, Port(cell[0]));
-            let (t1, t2) = split(c, Port(c2[0]));
-            let (e1, e2) = split(c, Port(c2[1]));
+            let (r, arms) = take(c, agent.payload() as u32);
+            let (t, e) = take(c, arms.payload() as u32);
+            let (r1, r2) = split(c, r);
+            let (t1, t2) = split(c, t);
+            let (e1, e2) = split(c, e);
             let arms1 = c.alloc(t1, e1);
             let arms2 = c.alloc(t2, e2);
             let n1 = c.alloc(r1, Port::new(Tag::Ext, arms1 as u64));
@@ -517,12 +460,10 @@ fn dup_commute<C: Cells>(c: &mut C, dup: Port, agent: Port) {
             link(c, Port::new(Tag::Swi, n2 as u64), o2);
         }
         Tag::Mat => {
-            let m = mat_addr(agent);
             let id = mat_id(agent);
-            let cell = c.cell(m);
-            c.free_cell(m);
-            let (r1, r2) = split(c, Port(cell[0]));
-            let arms = list_collect(c, Port(cell[1]));
+            let (r, list) = take(c, mat_addr(agent));
+            let (r1, r2) = split(c, r);
+            let arms = list_collect(c, list);
             let (mut l1, mut l2) = (Vec::new(), Vec::new());
             for r in arms {
                 let (a1, a2) = split(c, r);
@@ -545,25 +486,22 @@ fn dup_commute<C: Cells>(c: &mut C, dup: Port, agent: Port) {
 /// passing through the other (four dups, the copies of `a` carry b's
 /// label and vice versa).
 fn dup_dup<C: Cells>(c: &mut C, a: Port, b: Port) {
-    let (ia, ib) = (dup_addr(a), dup_addr(b));
     let (la, lb) = (dup_label(a), dup_label(b));
-    let ca = c.cell(ia);
-    let cb = c.cell(ib);
-    c.free_cell(ia);
-    c.free_cell(ib);
+    let (a0, a1) = take(c, dup_addr(a));
+    let (b0, b1) = take(c, dup_addr(b));
     if la == lb {
-        link(c, Port(ca[0]), Port(cb[0]));
-        link(c, Port(ca[1]), Port(cb[1]));
+        link(c, a0, b0);
+        link(c, a1, b1);
         return;
     }
     let w: Vec<Port> = (0..4).map(|_| wire(c)).collect();
     // a's outputs each receive a b-labelled dup; b's outputs an a-labelled one
-    let b1 = c.alloc(w[0], w[1]);
-    let b2 = c.alloc(w[2], w[3]);
-    let a1 = c.alloc(w[0], w[2]);
-    let a2 = c.alloc(w[1], w[3]);
-    link(c, dup_port(b1, lb), Port(ca[0]));
-    link(c, dup_port(b2, lb), Port(ca[1]));
-    link(c, dup_port(a1, la), Port(cb[0]));
-    link(c, dup_port(a2, la), Port(cb[1]));
+    let n1 = c.alloc(w[0], w[1]);
+    let n2 = c.alloc(w[2], w[3]);
+    let m1 = c.alloc(w[0], w[2]);
+    let m2 = c.alloc(w[1], w[3]);
+    link(c, dup_port(n1, lb), a0);
+    link(c, dup_port(n2, lb), a1);
+    link(c, dup_port(m1, la), b0);
+    link(c, dup_port(m2, la), b1);
 }
