@@ -15,7 +15,7 @@
 //! dive are *deferred* into `fr` and applied only when the dive completes or
 //! commits, so a fuel-out unwind never invalidates the original arguments.
 
-use crate::lir::{self, as_i, bin, burn_fuel, c, cast, do_, err, free, i64_, idx, let_, num, ok, p, rec_addr, ret, set, truthy, u16_, u32_, u64_, u8_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
+use crate::lir::{work_fuel, self, as_i, bin, burn_fuel, c, cast, do_, err, free, i64_, idx, let_, num, ok, p, rec_addr, ret, set, truthy, u16_, u32_, u64_, u8_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::rules::{emit_rec, SegQ};
 use crate::ty::{Ty as CTy, Types};
 
@@ -662,7 +662,7 @@ impl<'m> Ex<'m> {
     fn native_call(&mut self, g: u32, args: &[Core], b: &mut Vec<S>) -> E {
         let es: Vec<E> = args.iter().map(|a| self.val(a, false, b)).collect();
         if self.dive && crate::scalar::is_leaf(g) {
-            b.push(burn_fuel());
+            b.push(work_fuel(i64_(1)));
         }
         let conv = if crate::scalar::shifted(g) { "sh" } else { "as_i" };
         let mut a = vec![fuel_arg(self.dive)];
@@ -798,6 +798,7 @@ impl<'m> Ex<'m> {
                 self.pin_leave(&[th, el], outer, b);
                 v(t)
             }
+            // a binding is owned unless it aliases a lent value: copy a lent read into it
             Core::Let(x, r, bo) => {
                 if self.native_let(*x, r, bo, b) {
                     return self.val(bo, esc, b);
@@ -816,7 +817,7 @@ impl<'m> Ex<'m> {
                     if has_call(r) {
                         self.kframes.push((*x, (**bo).clone()));
                         self.cur_let = Some(*x);
-                        let er = self.val(r, false, b);
+                        let er = self.val(r, !self.bset.contains(x), b);
                         self.cur_let = None;
                         self.kframes.pop();
                         self.emit_bind(*x, er, b);
@@ -824,7 +825,7 @@ impl<'m> Ex<'m> {
                     }
                 }
                 self.cur_let = Some(*x);
-                let er = self.val(r, false, b);
+                let er = self.val(r, !self.bset.contains(x), b);
                 self.cur_let = None;
                 self.emit_bind(*x, er, b);
                 self.val(bo, esc, b)
@@ -1195,14 +1196,14 @@ impl<'m> Ex<'m> {
                 if has_call(r) {
                     self.kframes.push((*x, (**bo).clone()));
                     self.cur_let = Some(*x);
-                    let er = self.val(r, false, b);
+                    let er = self.val(r, !self.bset.contains(x), b);
                     self.cur_let = None;
                     self.kframes.pop();
                     self.emit_bind(*x, er, b);
                     return self.dive_tail(bo, b);
                 }
                 self.cur_let = Some(*x);
-                let er = self.val(r, false, b);
+                let er = self.val(r, !self.bset.contains(x), b);
                 self.cur_let = None;
                 self.emit_bind(*x, er, b);
                 self.dive_tail(bo, b);
@@ -1626,6 +1627,9 @@ pub(crate) fn dive_fn<'m>(
     }
     if lp {
         let mut lb = if leafy { Vec::new() } else { fuel_check.clone() };
+        if !leafy {
+            lb[1] = work_fuel(i64_(1));
+        }
         if is_fold {
             s.push(let_("fold_start", Ty::U64, v("v0")));
             lb.extend(FOLD_SPLIT.with(|f| f.borrow().get(fid as usize).cloned().flatten()).unwrap_or_default());
@@ -1795,7 +1799,7 @@ pub(crate) fn dps_fn<'m>(
     let mut ex = Ex::new(true, fid, true, rem, HashSet::new(), bor, ints, Some(sq), unbox, iret, tys, shared);
     ex.trmc = Some((cid, 0));
     ex.dps_param = Some(pp);
-    let mut bb = vec![do_(p("stack_guard", vec![])), burn_fuel()];
+    let mut bb = vec![do_(p("stack_guard", vec![])), work_fuel(i64_(1))];
     for i in 0..ar as u32 {
         if i as usize != pp && ex.rem.get(&i).copied().unwrap_or(0) == 0 {
             bb.push(free(v(vn(i))));
@@ -1851,11 +1855,8 @@ pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
     Some((p_body, live[0], j_body))
 }
 
-/// Split the dependent rest `j` of a frame (see `split_frame`) around
-/// the independent part's live-out `live`: `Some((D, m, J2))` where D is
-/// the chain of J's bindings that need x but not `live`, ending in its one
-/// live-out `m`, and J2 the rest (which reads `m` and `live`, not x). `None`
-/// when D does no call, has zero or several live-outs, or J2 reads x.
+/// Split a frame's dependent rest `j` around P's live-out `live`: D (needs
+/// x, not `live`; one live-out `m`, a call) and J2 (reads `m`, `live`, not x).
 pub(crate) fn split_dep(x: u32, live: u32, j: &Core) -> Option<(Core, u32, Core)> {
     let mut binds: Vec<(u32, &Core)> = Vec::new();
     let mut cur = j;

@@ -138,7 +138,7 @@ fn engine_source_is_program_independent() {
     assert!(!ENGINE_CU.contains("prog_fire(u32 rule, u64 e0, u64 e1, u64 e2) {"));
     assert!(!ENGINE_CU.contains("bool lin(u16 k) {"));
     // the IR's context vocabulary, on the device without a context object
-    for h in ["alloc2(", "alloc_rec(", "deliver(", "dive_to(", "dive_res(", "dive_res_fork(", "tail_to(", "fork_fuel(", "stack_deep(", "pop_chain(", "rec_parent(", "spawn_call(", "mk_con2(", "consume2k(", "dup_val(", "free_val(", "take_field(", "arr_set_n(", "hole_link(", "tup_add("] {
+    for h in ["alloc2(", "alloc_rec(", "deliver(", "dive_to(", "dive_res(", "dive_res_fork(", "tail_to(", "fork_fuel(", "stack_deep(", "work_fuel(", "pop_chain(", "rec_parent(", "spawn_call(", "mk_con2(", "consume2k(", "dup_val(", "free_val(", "take_field(", "arr_set_n(", "hole_link(", "tup_add("] {
         assert!(ENGINE_CU.contains(h), "engine lacks {h}");
     }
 }

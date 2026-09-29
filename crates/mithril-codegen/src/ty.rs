@@ -5,8 +5,8 @@
 //! that appear together in matches). Unification over a union-find; no
 //! polymorphism, no generalization — every benchmark-relevant module is
 //! monomorphic, and anything that fails to resolve simply stays `Dyn`
-//! (emission falls back to the tagged helpers, so inference is
-//! soundness-free: it only unlocks faster emission).
+//! (emission falls back to the tagged helpers). `Int` is load-bearing:
+//! the borrow analysis takes an integer binder as an immediate that never escapes.
 //!
 //! Global variables: one per function parameter, one per function return,
 //! one per (ctor, field). Per-function locals get vars during the walk.

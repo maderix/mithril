@@ -272,12 +272,9 @@ pub(crate) fn emit_rec(ex: &mut Ex, env: &[u32], rule: u16, pend: u32, par: &E, 
     rn
 }
 
-/// The records a suspended frame's dependent rest waits in, after
-/// `split_frame` gave P (independent, live-out `live`) and J: the pend-2
-/// join `rn` (slots: J's other input, `live`; parent `par`) and the record
-/// the pending value x must be delivered to. When a call in J needs only x
-/// (`split_dep`), that is a pend-1 record D chained under the join, so it
-/// runs as soon as x arrives; otherwise the join itself takes x.
+/// The records a split frame's dependent rest waits in: the pend-2 join
+/// `rn` and the record x is delivered to (a pend-1 D under the join when a
+/// call needs only x, else the join itself).
 pub(crate) fn join_records(ex: &mut Ex, sq: &mut SegQ, x: u32, live: u32, j_body: &Core, par: &E, b: &mut Vec<S>) -> (String, String) {
     if let Some((d_body, m, j2)) = crate::seq::split_dep(x, live, j_body) {
         let mut env: BTreeSet<u32> = free_vars(&j2);

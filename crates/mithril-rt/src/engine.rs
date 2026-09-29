@@ -34,13 +34,30 @@ pub struct Engine {
     stats: Stats,
 }
 
+/// `MemAvailable` from /proc/meminfo, in bytes (Linux; None elsewhere).
+fn mem_available() -> Option<usize> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    line.split_whitespace().nth(1)?.parse::<usize>().ok().map(|kb| kb * 1024)
+}
+
 impl Engine {
     /// Engine with capacities from `MITHRIL_NODES` (default 2^26 cells) /
     /// `MITHRIL_RECS` (default 2^27 records). Both are reservations that
     /// commit memory only as chunks are used; max 2^32 each (u32 indices).
     pub fn new(threads: usize, fuel: i64) -> Engine {
-        let cells = cap_from_env("MITHRIL_NODES", 1 << 26);
-        let recs = cap_from_env("MITHRIL_RECS", 1 << 27);
+        let mut cells = cap_from_env("MITHRIL_NODES", 1 << 26);
+        let mut recs = cap_from_env("MITHRIL_RECS", 1 << 27);
+        // never more than half of the memory available now: a runaway
+        // program then ends in "arena exhausted", not in swap
+        if let Some(avail) = mem_available() {
+            let (cb, rb) = (cells * 20, recs * 48);
+            if cb + rb > avail / 2 {
+                let scale = (avail / 2) as f64 / (cb + rb) as f64;
+                cells = ((cells as f64 * scale) as usize).max(1 << 16);
+                recs = ((recs as f64 * scale) as usize).max(1 << 12);
+            }
+        }
         Engine::with_capacity(threads, fuel, cells, recs)
     }
 

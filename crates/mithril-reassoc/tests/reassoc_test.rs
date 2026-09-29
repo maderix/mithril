@@ -116,7 +116,7 @@ fn fold_tuple_hist_proven() {
     assert!(fi.proven);
     assert_eq!(fi.combiner, CoreCombiner::TupleWrapAdd(8));
     let v = eval_core(&cm, fn_id(&cm, "hist"), &[Val::I(3)]);
-    let want = Val::T(vec![
+    let want = Val::T(std::sync::Arc::new(vec![
         Val::I(3), // 0+1+2
         Val::I(5), // 0+1+4
         Val::I(3), // 1+1+1
@@ -125,7 +125,7 @@ fn fold_tuple_hist_proven() {
         Val::I(0),
         Val::I(0),
         Val::I(0),
-    ]);
+    ]));
     assert_eq!(v, want);
 }
 
@@ -181,7 +181,7 @@ def hist32(n):
     );
     let cm = desugar(&m).expect("desugar failed");
     let v = eval_core(&cm, fn_id(&cm, "hist32"), &[Val::I(3)]);
-    assert_eq!(v, Val::T(vec![Val::I(3), Val::I(5)]));
+    assert_eq!(v, Val::T(std::sync::Arc::new(vec![Val::I(3), Val::I(5)])));
 }
 
 #[test]

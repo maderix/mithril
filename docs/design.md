@@ -689,6 +689,97 @@ took thousands at depth 8 and 7,764 at depth 16) and
 shared by the three records), `chain_boxed.py`, `deep_leaves.py` (deep
 recursion inside a WORK lane).
 
+### 3g. A use case outside the corpus: the k-d tree (generality probe)
+
+`bench/ports/kdtree.py` (C twin `kdtree.c`): a 2-d tree over 2^18 hashed
+points, built by midpoint splits over a list (subtrees as unequal as the
+data makes them, a bucket for coincident points), then 2^18 nearest
+neighbour queries with pruning, forked as a batch that only reads the
+shared tree. Nothing in the corpus shares a large read-only structure
+across every fork, or partitions lists, or chases pointers data-
+dependently. C, CPython (the port shim) and Mithril agree at every size.
+It found six general defects; none of the fixes looks at the program.
+
+The access model, stated once (it was already the rule; two places broke
+it):
+
+* Shared data is lent. A lent value costs no atomic: `field` reads and
+  pattern matches on a borrowed parameter touch no count. Counts move
+  only when ownership moves (a stored, returned or owned-passed value: an
+  O(1) increment; a drop: a decrement, the last one tears down). The
+  escape analysis counted an integer field returned from a lent tree as
+  an escape, so `nearest` owned the tree and every node visit paid three
+  atomics on cells every lane shares; an integer is an immediate and
+  never escapes. `nearest` and the batch now borrow the tree end to end.
+  Borrowing more widely exposed a hole in the emitter: a `let` whose
+  right-hand side is a branch (`p = lft(a)` after the net inlines `lft`)
+  bound the arm's raw read of the lent tree without copying it, and the
+  owned binding was then consumed or freed: kmeans freed a subtree of the
+  shared stats tree and overflowed its stack on the corrupted cycle. A
+  binding is owned unless it aliases a lent value, so a lent read bound by
+  a branch is copied (an O(1) count increment). Fixture `lent_pick.py`
+  fails on the old emitter (wrong sum) and is oracle-equal on this one,
+  at every thread count and suspension budget.
+* Counts are 32-bit plain atomics on both runtimes. The CPU's were 8-bit,
+  saturating at 255 by a fetch_add then a store: under concurrent
+  increments the count passed through 0 for a moment, a reader saw the
+  root as unique and freed the shared tree (a panic at 16 threads, never
+  at one). Fixture `shared_tree.py`, oracle-equal at 16 threads.
+* Allocation is a per-lane arena: a global bump hands out chunks, freed
+  cells and records go on the lane's intrusive free list (the link in
+  the freed cell's first word, the record's `d`): unbounded, lock-free,
+  no atomic on the alloc or free path. The device's lists were bounded
+  (64, then a 1M ring, then dropped): the sequential build leaked its
+  way to the arena cap on every program.
+* Erasure is work. The net's ERA rewrites are independent; the runtime's
+  teardown was one lane walking a value. The engine owns one rule past
+  the program's table, ERA: a teardown past 256 nodes spills its
+  subtrees as ERA tasks, dealt like any other. The k-d tree's end-of-run
+  teardown (2^19 cells, 3.1G cycles on one lane, the whole work phase)
+  became parallel.
+* The device budget bounds recursion depth only: work units (loop
+  iterations, native leaf calls) burn nothing there, a loop in the
+  parallel world runs to its end (reference's), and a dive refunds its budget
+  on return. The CPU keeps the work budget (its suspension is the split).
+  tree-bitonic depth 23: 876 ms -> ~100 ms.
+* Bounds on both sides. A device fire is bounded: every 2^20 work units
+  force the frame's next budget check to suspend, so a runaway loop
+  cycles rounds to the round limit instead of freezing the device (which
+  is shared with the desktop); the host waits with a deadline
+  (`MITHRIL_GPU_TIMEOUT`, 300 s) and tears the context down past it. The
+  CPU arenas are capped at half of the memory available at start, so a
+  runaway program ends in "arena exhausted", not in swap. A teardown also
+  spills past 32 nested frames (its frames stack on the caller's): that
+  was the 256-lane fault.
+* The oracle interpreter deep-copied a value on every variable read
+  (`Val::C(id, Vec<Val>)`): the shared-tree fixture cost it 21 GB and
+  hung the machine twice under the test suite. Payloads are now shared
+  (`Arc`), a clone copies nothing; the same fixture takes 69 MB. Test
+  suites run under a memory watcher that kills them past a cap.
+* Small runtime helpers are inlined on the device: a `__noinline__` call
+  out of a 200-register function spills through local memory (1.7M
+  cycles per tree-node visit, profiled with clock64; Nsight needs the
+  admin counter permission on this box and could not attach to the
+  cooperative launch).
+
+Standing (this box; the device numbers were taken while a game held 6 GB
+of VRAM, so they are upper bounds): CPU 0.42 s at one thread, 0.115 s at
+16, C twin 0.35 s; device 0.54 s, of which ~0.45 s is the build's
+sequential prefix (partitioning a 2^18 list on one lane, a property of
+the model that reference shares). Open: tree-bitonic depth 23 can overflow
+a rule ring (2M entries) now that work phases run whole subtrees: a
+level of its merge is 2^22 tasks of one rule; the fix is one shared task
+ring (reference's cube is 16M tasks), not per-rule rings: a regression at
+that one size against b738538 (the loop budget kept the frontier small
+by suspending work phases), traded for the 10x on every other size.
+The ERA spill and the device work cap are device-only scheduling; the
+CPU tears down in place and burns work units (its suspension is the
+split), the same rules either way.
+
+Every reference number in this document is reference (reference/reference, the reference
+runtime with the task cube, `bench/reference.csv` on this 4090), never reference
+1 or HVM.
+
 ## 4. Runtime: waves, dives, records
 
 The runtime is one model on CPU and GPU:

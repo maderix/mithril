@@ -231,6 +231,12 @@ pub fn rec_addr(rn: &str) -> E {
 pub fn burn_fuel() -> S {
     S::Store("fuel".into(), bin(Bop::Sub, E::Deref("fuel".into()), i64_(1)))
 }
+/// `n` units of work charged to the budget (loop iterations, native leaf
+/// calls): the CPU burns them (its suspension splits work); the device
+/// does not (its budget bounds stack depth only; a loop runs to its end).
+pub fn work_fuel(n: E) -> S {
+    do_(p("work_fuel", vec![v("fuel"), n]))
+}
 
 // ---- analyses ----
 

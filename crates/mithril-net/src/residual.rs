@@ -607,14 +607,10 @@ impl<'a> Reader<'a> {
         vs
     }
 
-    /// The one placement rule for every let-bound value (a compound value,
-    /// a shared value, a pending call): no lower than the innermost frame
-    /// binding something it reads (a binder, a bound value); above that, a
-    /// closure frame is kept exactly when the value reads what the closure
-    /// binds (else it is shared by every application: the net computed it
-    /// once), and a non-closure frame takes it unless it is above `floor`
-    /// (a value created in an outer frame is being read: the net made it
-    /// there, unconditionally).
+    /// The one placement rule for every let-bound value: no lower than the
+    /// innermost frame binding something it reads; above that, a closure
+    /// frame only when the value reads what it binds (else every
+    /// application shares it), a non-closure frame unless above `floor`.
     fn place(&self, e: &Core) -> usize {
         let need = self.stack.iter().rposition(|fr| mentions(e, &self.bound_in(*fr))).unwrap_or(0);
         for (i, &fr) in self.stack.iter().enumerate().rev() {

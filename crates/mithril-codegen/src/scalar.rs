@@ -472,8 +472,7 @@ pub(crate) fn calls_fn(e: &Core, g: u32) -> bool {
     e.any(&mut |e| if matches!(e, Core::Call(h, _) if *h == g) { Some(true) } else { None })
 }
 
-/// `fid` is reached again through another function's body (a cycle that
-/// grows the native stack even when its own self call is a loop).
+/// `fid` is reached again through another function's body (a cycle).
 pub(crate) fn recursive_via_others(m: &CoreModule, fid: u32) -> bool {
     let callees = |g: u32| {
         let mut v = Vec::new();
@@ -1030,7 +1029,7 @@ fn as_u(e: E) -> E {
 impl<'m> Sem<'m> {
     fn settle_fuel(&self, b: &mut Vec<S>) {
         if self.fuel {
-            b.push(S::Store("fuel".into(), bin(Bop::Sub, E::Deref("fuel".into()), v("fl"))));
+            b.push(crate::lir::work_fuel(v("fl")));
         }
     }
 
@@ -1073,6 +1072,14 @@ impl<'m> Sem<'m> {
         b.push(let_(&l, Ty::Usize, p("arr_len_of", vec![as_u(v(a))])));
         self.lens.insert(a.to_string(), l.clone());
         l
+    }
+
+    /// an element read, through the held length when there is one
+    fn arr_get(&self, a: &str, i: E) -> E {
+        match self.acc(a) {
+            Some(l) => p("arr_get_n", vec![as_u(v(a)), v(l), i]),
+            None => p("arr_get_r", vec![as_u(v(a)), i]),
+        }
     }
 
     /// The length local of array value `a` when known.
@@ -1372,10 +1379,7 @@ impl<'m> Sem<'m> {
                     let a = self.rd(&xs[0]);
                     let i = self.val(&xs[1], b);
                     let t = self.fresh();
-                    let get = match self.acc(&a) {
-                        Some(l) => p("arr_get_n", vec![as_u(v(&a)), v(l), i]),
-                        None => p("arr_get_r", vec![as_u(v(&a)), i]),
-                    };
+                    let get = self.arr_get(&a, i);
                     b.push(let_(&t, Ty::I64, bin(Bop::Shr, cast(get, Ty::I64), i64_(8))));
                     return v(t);
                 }
@@ -1404,10 +1408,7 @@ impl<'m> Sem<'m> {
                 let a = self.rd(&xs[0]);
                 let i = self.unshifted(&xs[1], b);
                 let t = self.fresh();
-                let get = match self.acc(&a) {
-                    Some(l) => p("arr_get_n", vec![as_u(v(&a)), v(l), i]),
-                    None => p("arr_get_r", vec![as_u(v(&a)), i]),
-                };
+                let get = self.arr_get(&a, i);
                 b.push(let_(&t, Ty::I64, cast(get, Ty::I64)));
                 v(t)
             }

@@ -85,9 +85,9 @@ fn read_con(net: &Net, mut p: Port) -> Option<Val> {
         }
     }
     if ctag == CTAG_TUPLE {
-        Some(Val::T(fields))
+        Some(Val::T(std::sync::Arc::new(fields)))
     } else {
-        Some(Val::C(ctag as u32, fields))
+        Some(Val::C(ctag as u32, std::sync::Arc::new(fields)))
     }
 }
 

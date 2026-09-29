@@ -96,7 +96,21 @@ extern "C" {
 // the runtime descriptor is written once by the host: constant memory, so
 // a field read is a cached broadcast, not a dependent global load
 __constant__ Dev G;
-__device__ u32 g_nrules = PROG_NRULES;
+__device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, widest frontier, grow cycles, work cycles
+// The rule table plus one rule the engine owns: ERA, the erasure of a
+// value (the net's ERA-CON rewrites). A large teardown spills its subtrees
+// as ERA tasks, so every lane erases a share instead of one lane walking
+// the whole value.
+#define ERA_RULE PROG_NRULES
+#define NRULES_ALL (PROG_NRULES + 1)
+#define ERA_CHUNK 256
+#define ERA_DEPTH 32
+// per thread: nodes erased by the current top-level teardown, its depth,
+// and the work charged since the last forced suspension
+__shared__ u32 s_era[256];
+__shared__ u32 s_era_depth[256];
+__shared__ u32 s_work[256];
+__device__ u32 g_nrules = NRULES_ALL;
 }
 
 
@@ -126,6 +140,7 @@ __device__ void prog_fire(u32 rule, u64 e0, u64 e1, u64 e2);
 __device__ bool prog_rec_rule(u32 rule);
 // rule -> its tasks can fork (the driver grows the frontier through these)
 __device__ bool prog_forks(u32 rule);
+__device__ inline bool rule_forks(u32 r) { return r == ERA_RULE || prog_forks(r); }
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
 __device__ u32 unbox_cid(u64 slot);
@@ -182,7 +197,24 @@ __device__ __forceinline__ unsigned long long sp_now() {
   asm volatile("stacksave.u64 %0;" : "=l"(v));
   return v;
 }
-__device__ inline void stack_mark() { s_sp0[threadIdx.x] = sp_now(); }
+__device__ inline void stack_mark() {
+  s_sp0[threadIdx.x] = sp_now();
+  s_era[threadIdx.x] = s_era_depth[threadIdx.x] = 0;
+  s_work[threadIdx.x] = 0;
+}
+// Work charged on the device: it deepens no stack, so it does not touch
+// the depth budget, but every WORK_CAP units it forces the frame's next
+// budget check to suspend, so no fire runs unbounded (a runaway loop then
+// cycles rounds to the round limit instead of freezing the device).
+#define WORK_CAP (1u << 20)
+__device__ inline void work_fuel(i64 *fuel, i64 n) {
+  u32 w = s_work[threadIdx.x] + (u32)n;
+  if (w >= WORK_CAP) {
+    w = 0;
+    *fuel = -1;
+  }
+  s_work[threadIdx.x] = w;
+}
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
   g_abort(AB_DEEP);
@@ -246,25 +278,18 @@ __device__ inline void cell_set(u32 i, usize slot, u64 v) { G.nodes[2 * (u64)ncl
 
 // ---- node arena: lane free list -> global overflow ring -> checked bump ----
 
-__device__ __noinline__ u32 alloc_node(u64 a, u64 b) {
+// Cells: a per-lane intrusive free list (the link in the cell's first
+// word, the head in `nfreen`, index+1, 0 = empty: unbounded, no atomics)
+// and a bump of `chunksz` cells per lane from the global counter.
+__device__ __forceinline__ u32 alloc_node(u64 a, u64 b) {
   u32 L = lane();
-  if (G.nfreen[L]) {
-    u32 i = G.nfree[L * FREECAP + --G.nfreen[L]];
+  u32 h = G.nfreen[L];
+  if (h) {
+    u32 i = h - 1;
+    G.nfreen[L] = (u32)G.nodes[2 * (u64)i];
     setcell(i, a, b);
     return i;
   }
-  // Try the global overflow ring. Slot values are exchanged atomically, so a
-  // node is never handed out twice; a lost race falls through to the bump
-  // (worst case a node stays stranded in its slot until a later pop).
-  int t = atomicSub(G.ovftop, 1) - 1;
-  if (t >= 0 && (u32)t < G.ovfcap) {
-    u32 v = atomicExch(&G.ovf[t], 0u);
-    if (v) {
-      setcell(v - 1, a, b);
-      return v - 1;
-    }
-  }
-  atomicAdd(G.ovftop, 1); // took no value: restore the counter
   u32 *ck = &G.nchunk[2 * L];
   if (ck[0] >= ck[1]) {
     u32 base = atomicAdd(G.nbump, G.chunksz);
@@ -280,19 +305,12 @@ __device__ __noinline__ u32 alloc_node(u64 a, u64 b) {
   setcell(i, a, b);
   return i;
 }
-
-__device__ __noinline__ void free_node(u32 i) {
+__device__ __forceinline__ void free_node(u32 i) {
   if (i == 0 || i >= G.ncap)
     return;
   u32 L = lane();
-  if (G.nfreen[L] < FREECAP) {
-    G.nfree[L * FREECAP + G.nfreen[L]++] = i;
-    return;
-  }
-  // lane list full: spill to the global overflow ring (fixes the spike leak)
-  int t = atomicAdd(G.ovftop, 1);
-  if (t < 0 || (u32)t >= G.ovfcap || atomicCAS(&G.ovf[t], 0u, i + 1) != 0)
-    atomicSub(G.ovftop, 1); // ring full, or the slot still holds an unread value: drop (bounded leak, never unsafe)
+  G.nodes[2 * (u64)i] = G.nfreen[L];
+  G.nfreen[L] = i + 1;
 }
 
 __device__ inline u32 alloc2(u64 a, u64 b) { u32 i = alloc_node(a, b); G.rc[nclamp(i)] = 1; return i; }
@@ -306,36 +324,26 @@ __device__ inline bool rc_unique(u32 i) { return *(volatile u32 *)&G.rc[nclamp(i
 
 // ---- records / buckets / delivery ----
 
-// records fired by a record-activated rule are dead: recycled per lane
-// (the lane list full: the global ring, as cells; a full ring drops)
+// Records: the same per-lane intrusive free list (the link in `d`, the
+// head in `rfreen`) and a global bump.
 __device__ inline void rec_free(u32 i) {
   if (i == 0 || i >= G.rcap) return;
   u32 L = lane();
-  if (G.rfreen[L] < RFREECAP) {
-    G.rfree[L * RFREECAP + G.rfreen[L]++] = i;
-    return;
-  }
-  int t = atomicAdd(G.rovftop, 1);
-  if (t < 0 || (u32)t >= G.ovfcap || atomicCAS(&G.rovf[t], 0u, i) != 0)
-    atomicSub(G.rovftop, 1); // full, or an unread value in the slot: drop
+  G.recs[i].d = G.rfreen[L];
+  G.rfreen[L] = i + 1;
 }
-__device__ __noinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
+__device__ __forceinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 parent) {
   u32 L = lane();
-  u32 i = 0;
-  if (G.rfreen[L]) {
-    i = G.rfree[L * RFREECAP + --G.rfreen[L]];
+  u32 i;
+  u32 h = G.rfreen[L];
+  if (h) {
+    i = h - 1;
+    G.rfreen[L] = G.recs[i].d;
   } else {
-    if (*(volatile int *)G.rovftop > 0) {
-      int t = atomicSub(G.rovftop, 1) - 1;
-      if (t >= 0 && (u32)t < G.ovfcap) i = atomicExch(&G.rovf[t], 0u);
-      if (!i) atomicAdd(G.rovftop, 1);
-    }
-    if (!i) {
-      i = atomicAdd(G.rbump, 1);
-      if (i >= G.rcap) {
-        g_abort(AB_RECS);
-        return G.rcap - 1;
-      }
+    i = atomicAdd(G.rbump, 1);
+    if (i >= G.rcap) {
+      g_abort(AB_RECS);
+      return G.rcap - 1;
     }
   }
   Rec &r = G.recs[i];
@@ -861,7 +869,7 @@ __device__ void apply_spawn(u64 f, u64 a, u64 parent);
 __device__ u64 build_closure(u16 id, const u64 *caps, int n);
 
 // share a value: O(1) refcount bump on the root cell
-__device__ __noinline__ u64 dup_val(u64 p) {
+__device__ __forceinline__ u64 dup_val(u64 p) {
   u64 t = tag(p);
   if (t >= TU) return p;
   if (t == T_LAM) return dup_closure(p);
@@ -879,8 +887,10 @@ __device__ inline void free_val(u64 p) {
   if (t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM) return;
   free_val_slow(p);
 }
-__device__ __noinline__ void free_val_slow(u64 p) {
+__device__ __forceinline__ void free_val_slow(u64 p) {
   u32 g = 0;
+  if (s_era_depth[threadIdx.x]++ == 0) s_era[threadIdx.x] = 0;
+  struct Leave { __device__ ~Leave() { s_era_depth[threadIdx.x]--; } } leave;
   u64 t = tag(p);
   if (t == T_ARR) { arr_drop(p); return; }
   if (t == T_LAM) { drop_closure(p); return; }
@@ -900,12 +910,15 @@ __device__ __noinline__ void free_val_slow(u64 p) {
     u32 ca = con_addr(q);
     u64 c0 = cell0(ca), c1 = cell1(ca);
     free_node(ca);
+    // past the node budget, or ERA_DEPTH frames down (the frames stack on
+    // the caller's), the rest is ERA tasks for every lane
+    bool spill = ++s_era[threadIdx.x] > ERA_CHUNK || s_era_depth[threadIdx.x] > ERA_DEPTH;
     if (ar > 2) {
-      free_val_slow(c0);
+      if (spill && tag(c0) == T_CON && con_ar(c0) > 0) spawn_global(ERA_RULE, c0, 0, 0); else free_val_slow(c0);
       q = c1;
     } else {
-      if (ar >= 1) free_val(c0);
-      if (ar >= 2) free_val(c1);
+      if (ar >= 1) { if (spill && tag(c0) == T_CON && con_ar(c0) > 0) spawn_global(ERA_RULE, c0, 0, 0); else free_val(c0); }
+      if (ar >= 2) { if (spill && tag(c1) == T_CON && con_ar(c1) > 0) spawn_global(ERA_RULE, c1, 0, 0); else free_val(c1); }
       return;
     }
   }
@@ -1746,6 +1759,17 @@ __device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
 
 // ---- the kernels: boot, and the driver ----
 
+// Fire one task: the engine's ERA rule erases a value; a program rule
+// fires through the table, and a fired record is dead.
+__device__ inline void fire(u32 rule, u64 e0, u64 e1, u64 e2) {
+  if (rule == ERA_RULE) {
+    free_val(e0);
+    return;
+  }
+  prog_fire(rule, e0, e1, e2);
+  if (prog_rec_rule(rule)) rec_free((u32)e2);
+}
+
 // Run the joins this lane completed (parallel world: outside k_work the
 // local stack only ever holds completed cross-lane joins).
 __device__ void drain_local() {
@@ -1758,8 +1782,7 @@ __device__ void drain_local() {
     u32 rule = (u32)t[0] & ~PAR_TASK;
     u64 e0 = t[1], e1 = t[2], e2 = t[3];
     G.lsn[L] = n - 1;
-    prog_fire(rule, e0, e1, e2);
-    if (prog_rec_rule(rule)) rec_free((u32)e2);
+    fire(rule, e0, e1, e2);
   }
 }
 
@@ -1775,30 +1798,28 @@ extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
 // the joins and ready records its firing completed run at once on this lane.
 __device__ inline void fire_task(u32 rule, u32 idx) {
   const u64 *e = &G.ebuf[((u64)rule * G.bcap + (idx & (G.bcap - 1))) * 3];
-  u64 e0 = e[0], e1 = e[1], e2 = e[2];
-  prog_fire(rule, e0, e1, e2);
-  if (prog_rec_rule(rule)) rec_free((u32)e2);
+  fire(rule, e[0], e[1], e[2]);
   drain_local();
 }
 
 // WORK phase: every lane drains its own tasks depth-first (the tasks it
 // spawns and the joins it completes stay on it), dealt every nl-th pending
 // task of the snapshot. After `max_steps` fires a lane spills its stack to
-// the global rings and stops, so no phase runs unbounded.
+// the global rings and stops; a fire itself is bounded by WORK_CAP.
 #define LOGCAP (1u << 16)
-__device__ u32 g_off[PROG_NRULES + 1]; // forkable-task prefix of the snapshot
-__device__ u32 g_woff[PROG_NRULES + 1]; // pending-task prefix of the snapshot (WORK deals these)
-__device__ u32 g_snap[PROG_NRULES];    // blen at the snapshot
-__device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, widest frontier, grow cycles, work cycles
+__device__ u32 g_off[NRULES_ALL + 1]; // forkable-task prefix of the snapshot
+__device__ u32 g_woff[NRULES_ALL + 1]; // pending-task prefix of the snapshot (WORK deals these)
+__device__ u32 g_snap[NRULES_ALL];    // blen at the snapshot
 __device__ u32 g_wmax, g_wsum;         // a work phase: the most steps one lane took, all lanes' steps
 __device__ u32 g_wcyc, g_wbusy, g_wsteps_of_max; // a work phase: the slowest lane's K cycles, lanes that fired, its steps
+__device__ u32 g_whist[40];            // lanes per log2(K cycles) bucket, the last work phase (trace)
 __device__ u32 g_wlog[LOGCAP * 6];     // per round: work steps (max lane, sum), K cycles, slowest lane K cycles, its steps, busy lanes; trace
 __device__ int g_phase;                // 0 exit, 1 grow, 2 work
 __device__ int g_grew = 1;
 __device__ u64 g_prev = 0;             // total pushes at the previous snapshot
 __device__ u32 g_log[LOGCAP * 3];      // per round: phase, pending, forkable (trace)
 #define RLOG 64
-__device__ u32 g_rlog[RLOG * PROG_NRULES]; // the first rounds' pending tasks per rule (trace)
+__device__ u32 g_rlog[RLOG * NRULES_ALL]; // the first rounds' pending tasks per rule (trace)
 
 // The sequential world runs a lane's subtrees with the dive budget: a
 // fuel-out suspension costs ~100 rewrites' worth of allocation (bitonic
@@ -1849,8 +1870,7 @@ __device__ void work_phase(u32 max_steps) {
       e2 = e[2];
       next += nl;
     }
-    prog_fire(rule, e0, e1, e2);
-    if (prog_rec_rule(rule)) rec_free((u32)e2);
+    fire(rule, e0, e1, e2);
     s_mode[threadIdx.x] = 1;
   }
   // step cap: hand the unfinished local tasks, and the dealt tasks this
@@ -1875,6 +1895,7 @@ __device__ void work_phase(u32 max_steps) {
     atomicAdd(&g_wbusy, 1);
     u32 kc = (u32)((clock64() - w0) >> 10);
     if (atomicMax(&g_wcyc, kc) < kc) g_wsteps_of_max = s;
+    atomicAdd(&g_whist[kc ? 32 - __clz(kc) : 0], 1u);
   }
 }
 
@@ -1902,8 +1923,8 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         g_snap[r] = len;
         g_off[r] = off;
         g_woff[r] = total;
-        if (g_rounds[0] < RLOG) g_rlog[g_rounds[0] * PROG_NRULES + r] = pend;
-        if (prog_forks(r)) {
+        if (g_rounds[0] < RLOG) g_rlog[g_rounds[0] * NRULES_ALL + r] = pend;
+        if (rule_forks(r)) {
           off += pend;
           forkable += pend;
         }
@@ -1928,6 +1949,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       else
         g_phase = 2;
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
+      if (g_phase == 2) for (int k = 0; k < 40; k++) g_whist[k] = 0;
       if (g_rounds[0] < LOGCAP) {
         g_log[g_rounds[0] * 3] = g_phase;
         g_log[g_rounds[0] * 3 + 1] = total;
@@ -1953,7 +1975,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       grid.sync();
       if (gid == 0) {
         for (u32 r = 0; r < G.nrules; r++)
-          if (prog_forks(r)) G.bdone[r] = g_snap[r];
+          if (rule_forks(r)) G.bdone[r] = g_snap[r];
         g_rounds[1]++;
         g_rounds[4] += clock64() - c0;
       }

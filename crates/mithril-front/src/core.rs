@@ -280,11 +280,11 @@ pub struct CoreModule {
 pub enum Val {
     I(i64),
     F(f64),
-    C(CtorId, Vec<Val>),
-    T(Vec<Val>),
-    A(Vec<Val>),
+    C(CtorId, std::sync::Arc<Vec<Val>>), // shared: a clone copies no value
+    T(std::sync::Arc<Vec<Val>>),
+    A(std::sync::Arc<Vec<Val>>),
     /// A closure value (oracle only): parameter, body, captured environment.
-    L(u32, Box<Core>, Vec<(u32, Val)>),
+    L(u32, std::sync::Arc<Core>, std::sync::Arc<Vec<(u32, Val)>>),
 }
 
 /// Wrap a 64-bit result down to the signed 56-bit `int` range, matching
@@ -395,7 +395,7 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
                 panic!("eval_core: non-exhaustive match reached at runtime");
             }
             let vals: Vec<Val> = args.iter().map(|a| eval(m, env, a)).collect();
-            Val::C(*cid, vals)
+            Val::C(*cid, std::sync::Arc::new(vals))
         }
         Core::Match(scrut, arms) => {
             let v = eval(m, env, scrut);
@@ -417,21 +417,21 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
         Core::Lam(x, body) => {
             let mut captured: Vec<(u32, Val)> = env.iter().map(|(k, v)| (*k, v.clone())).collect();
             captured.sort_by_key(|(k, _)| *k);
-            Val::L(*x, body.clone(), captured)
+            Val::L(*x, std::sync::Arc::new((**body).clone()), std::sync::Arc::new(captured))
         }
         Core::App(f, a) => {
             let fv = eval(m, env, f);
             let av = eval(m, env, a);
             match fv {
                 Val::L(x, body, captured) => {
-                    let mut env2: HashMap<u32, Val> = captured.into_iter().collect();
+                    let mut env2: HashMap<u32, Val> = captured.iter().cloned().collect();
                     env2.insert(x, av);
                     eval(m, &env2, &body)
                 }
                 other => panic!("eval_core: application of a non-closure value {:?}", other),
             }
         }
-        Core::Tuple(items) => Val::T(items.iter().map(|it| eval(m, env, it)).collect()),
+        Core::Tuple(items) => Val::T(std::sync::Arc::new(items.iter().map(|it| eval(m, env, it)).collect())),
         Core::Proj(e, i) => match eval(m, env, e) {
             Val::T(items) => items[*i].clone(),
             other => panic!("eval_core: Proj on non-tuple value {:?}", other),
@@ -447,14 +447,14 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
                 (Prim::ArrNew, [n, v]) => {
                     let n = as_i(n);
                     assert!(n >= 0, "eval_core: negative array size {}", n);
-                    Val::A(vec![v.clone(); n as usize])
+                    Val::A(std::sync::Arc::new(vec![v.clone(); n as usize]))
                 }
                 (Prim::ArrGet, [Val::A(xs), i]) => xs[idx(i, xs.len())].clone(),
                 (Prim::ArrSet, [Val::A(xs), i, v]) => {
-                    let mut ys = xs.clone();
+                    let mut ys = (**xs).clone();
                     let k = idx(i, ys.len());
                     ys[k] = v.clone();
-                    Val::A(ys)
+                    Val::A(std::sync::Arc::new(ys))
                 }
                 (Prim::ArrLen, [Val::A(xs)]) => Val::I(xs.len() as i64),
                 (p, vs) if p.is_f32() => Val::I(f32_prim(*p, &vs.iter().map(as_i).collect::<Vec<_>>())),

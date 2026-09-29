@@ -22,7 +22,7 @@ extern "C" {
     fn cuCtxCreate_v2(ctx: *mut *mut c_void, flags: u32, dev: i32) -> CUresult;
     fn cuCtxDestroy_v2(ctx: *mut c_void) -> CUresult;
     fn cuCtxSetLimit(limit: i32, value: usize) -> CUresult;
-    fn cuCtxSynchronize() -> CUresult;
+    fn cuStreamQuery(stream: *mut c_void) -> CUresult;
     fn cuModuleLoadData(module: *mut *mut c_void, image: *const c_void) -> CUresult;
     fn cuModuleGetFunction(f: *mut *mut c_void, module: *mut c_void, name: *const std::ffi::c_char) -> CUresult;
     fn cuModuleGetGlobal_v2(
@@ -291,9 +291,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
     let bcap = if std::env::var("MITHRIL_GPU_BUCKET").is_ok() {
         env_cap("MITHRIL_GPU_BUCKET", 1 << 20) as u32
     } else {
-        ((1u64 << 24) / nrules as u64).clamp(1 << 14, 1 << 20) as u32
+        // a GROW sweep pushes a whole level at once: the rings hold it
+        ((1u64 << 27) / nrules as u64).clamp(1 << 14, 1 << 21) as u32
     };
-    let bcap = 1u32 << (31 - bcap.leading_zeros()); // rings: a power of two
+    let bcap = bcap.next_power_of_two(); // rings: a power of two
     let ovfcap: u32 = 1 << 20;
     let hcap = env_cap("MITHRIL_GPU_HEAP", 1 << 26);
     let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
@@ -488,7 +489,23 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         cuLaunchCooperativeKernel(k_run, blocks, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr()),
         "launch k_run (cooperative)",
     )?;
-    cu(cuCtxSynchronize(), "cuCtxSynchronize")?;
+    // wait with a deadline: a run past MITHRIL_GPU_TIMEOUT seconds is an
+    // error, and the caller's context teardown kills the kernel (the
+    // device is shared with the desktop; a stuck kernel freezes it)
+    let deadline = std::time::Duration::from_secs(env_cap("MITHRIL_GPU_TIMEOUT", 300));
+    loop {
+        let r = cuStreamQuery(std::ptr::null_mut());
+        if r == 0 {
+            break;
+        }
+        if r != 600 {
+            return Err(format!("mithril-gpu: the device run failed with code {r}"));
+        }
+        if t_run.elapsed() > deadline {
+            return Err(format!("mithril-gpu: the device run exceeded {} s (MITHRIL_GPU_TIMEOUT); killed", deadline.as_secs()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
     let mut ptr: CUdeviceptr = 0;
     let mut sz = 0usize;
@@ -499,6 +516,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32) -> Result<GpuResult, S
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
         eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[3]);
         if std::env::var_os("MITHRIL_GPU_TRACE").is_some() {
+            cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_whist".as_ptr()), "cuModuleGetGlobal(g_whist)")?;
+            let h = dtoh::<u32>(ptr, 40, "read g_whist")?;
+            let hs: Vec<String> = (0..40).filter(|k| h[*k] > 0).map(|k| format!("2^{k}K:{}", h[k])).collect();
+            eprintln!("mithril-gpu: last work phase, lanes by cycles: {}", hs.join(" "));
             let n = (r[0] as usize).min(1 << 20);
             cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_log".as_ptr()), "cuModuleGetGlobal(g_log)")?;
             let log = dtoh::<u32>(ptr, n * 3, "read g_log")?;

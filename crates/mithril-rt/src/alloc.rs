@@ -32,8 +32,8 @@ pub(crate) struct Rec {
 unsafe trait ZeroValid {}
 // SAFETY: AtomicU64 has the same in-memory representation as u64.
 unsafe impl ZeroValid for AtomicU64 {}
-// SAFETY: all-zero bytes are a valid AtomicU8 (value 0).
-unsafe impl ZeroValid for std::sync::atomic::AtomicU8 {}
+// SAFETY: all-zero bytes are a valid AtomicU32 (value 0).
+unsafe impl ZeroValid for std::sync::atomic::AtomicU32 {}
 // SAFETY: Rec consists solely of AtomicU32/AtomicU64 fields.
 unsafe impl ZeroValid for Rec {}
 
@@ -109,9 +109,8 @@ pub(crate) struct Arena {
     /// Cell i occupies words 2i and 2i+1.
     cells: Box<[AtomicU64]>,
     /// Reference count of cell i (valid while allocated; alloc sets 1).
-    /// u8 with saturation: 255 pins the cell immortal (never freed) — the
-    /// escape hatch keeps counts dense (64 cells per cache line).
-    rc: Box<[std::sync::atomic::AtomicU8]>,
+    /// per-cell reference counts of shared (non-linear) constructors
+    rc: Box<[std::sync::atomic::AtomicU32]>,
     pub recs: Box<[Rec]>,
     cbump: AtomicU64,
     rbump: AtomicU64,
@@ -182,19 +181,18 @@ impl Arena {
     }
 
     #[inline(always)]
-    fn rcs(&self, i: u32) -> &std::sync::atomic::AtomicU8 {
+    fn rcs(&self, i: u32) -> &std::sync::atomic::AtomicU32 {
         debug_assert!((i as usize) < self.rc.len());
         // SAFETY: same allocator-issued index invariant as `cell`.
         unsafe { self.rc.get_unchecked(i as usize) }
     }
 
+    /// 32-bit counts (as the device's): an 8-bit count saturating at 255
+    /// wrapped through 0 for a moment under concurrent increments, and a
+    /// reader then saw the cell as unique and freed a shared tree.
     #[inline(always)]
     pub fn rc_inc(&self, i: u32) {
-        // saturate at 255: a pinned cell is never freed (leak over UB)
-        let r = self.rcs(i);
-        if r.fetch_add(1, Ordering::Relaxed) >= 254 {
-            r.store(255, Ordering::Relaxed);
-        }
+        self.rcs(i).fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement; returns true when this was the last reference (the caller
@@ -202,11 +200,7 @@ impl Arena {
     /// writes with the freeing reader, HVM2-style.
     #[inline(always)]
     pub fn rc_dec(&self, i: u32) -> bool {
-        let r = self.rcs(i);
-        if r.load(Ordering::Relaxed) == 255 {
-            return false; // pinned
-        }
-        r.fetch_sub(1, Ordering::Release) == 1
+        self.rcs(i).fetch_sub(1, Ordering::Release) == 1
     }
 
     #[inline(always)]

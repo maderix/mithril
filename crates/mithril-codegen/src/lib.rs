@@ -61,8 +61,8 @@ fn core_value(e: &Core) -> Option<mithril_front::Val> {
     Some(match e {
         Core::Num(n) => Val::I(*n),
         Core::Flo(f) => Val::F(*f),
-        Core::Ctor(c, xs) => Val::C(*c, xs.iter().map(core_value).collect::<Option<Vec<_>>>()?),
-        Core::Tuple(xs) => Val::T(xs.iter().map(core_value).collect::<Option<Vec<_>>>()?),
+        Core::Ctor(c, xs) => Val::C(*c, std::sync::Arc::new(xs.iter().map(core_value).collect::<Option<Vec<_>>>()?)),
+        Core::Tuple(xs) => Val::T(std::sync::Arc::new(xs.iter().map(core_value).collect::<Option<Vec<_>>>()?)),
         _ => return None,
     })
 }
@@ -1283,7 +1283,7 @@ pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
 
 /// ADT classes some value of which is used more than once (on one path)
 /// somewhere in the program: those carry refcounts regardless.
-fn shared_classes(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> std::collections::HashSet<u32> {
+fn shared_classes(bodies: &[Core], tys: &ty::Types) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::new();
     for (fid, b) in bodies.iter().enumerate() {
         let mut uses = Cnt::new();
@@ -1296,7 +1296,6 @@ fn shared_classes(m: &CoreModule, bodies: &[Core], tys: &ty::Types) -> std::coll
             }
         }
     }
-    let _ = m;
     out
 }
 
@@ -1333,7 +1332,7 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
     // so a suspended borrower could not take a reference to it. For shared
     // types an escaping read of a borrowed value is an O(1) increment, so a
     // suspension that stores one just takes a reference.
-    let shared = shared_classes(m, bodies, tys);
+    let shared = shared_classes(bodies, tys);
     let nf = m.fns.len();
     let mut bor: Vec<Vec<bool>> = m
         .fns
@@ -1353,7 +1352,7 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
     for _ in 0..32 {
         let mut changed = false;
         for f in 0..nf {
-            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor);
+            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor, &|v| tys.var(f, v) == ty::Ty::Int);
             for (i, b) in bor[f].iter_mut().enumerate() {
                 if *b && esc & (1u64 << i) != 0 {
                     *b = false;
@@ -1368,7 +1367,9 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
     let bsets = (0..nf).map(|f| derive_set(&bodies[f], &bor[f])).collect();
     (bor, bsets)
 }
-fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -> u64 {
+/// The lent parameters whose value escapes (stored, returned, passed to an
+/// owning parameter); an integer field is an immediate and never does.
+fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) -> u64 {
     use std::collections::HashMap;
     if arity > 60 {
         return u64::MAX;
@@ -1386,15 +1387,15 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
             _ => 0,
         }
     }
-    fn walk(e: &Core, mask: &mut HashMap<u32, u64>, esc: &mut u64, bor: &[Vec<bool>]) {
+    fn walk(e: &Core, mask: &mut HashMap<u32, u64>, esc: &mut u64, bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) {
         match e {
             Core::Let(x, r, b) => {
                 if let Core::Var(y) = r.as_ref() {
                     let v = mask.get(y).copied().unwrap_or(0);
                     mask.insert(*x, v);
                 }
-                walk(r, mask, esc, bor);
-                walk(b, mask, esc, bor);
+                walk(r, mask, esc, bor, is_int);
+                walk(b, mask, esc, bor, is_int);
             }
             // an array read only looks at its array: not an escape
             Core::Prim(mithril_front::core::Prim::ArrGet | mithril_front::core::Prim::ArrLen, xs) => {
@@ -1402,13 +1403,13 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                     if j > 0 {
                         *esc |= var_mask(x, mask);
                     }
-                    walk(x, mask, esc, bor);
+                    walk(x, mask, esc, bor, is_int);
                 }
             }
             Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
                 for x in xs {
                     *esc |= var_mask(x, mask);
-                    walk(x, mask, esc, bor);
+                    walk(x, mask, esc, bor, is_int);
                 }
             }
             Core::Call(g, xs) => {
@@ -1418,23 +1419,23 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>]) -
                     if owned_param {
                         *esc |= var_mask(x, mask);
                     }
-                    walk(x, mask, esc, bor);
+                    walk(x, mask, esc, bor, is_int);
                 }
             }
             Core::Match(s, arms) => {
                 let sm = var_mask(s, mask);
-                walk(s, mask, esc, bor);
+                walk(s, mask, esc, bor, is_int);
                 for (_, binders, b) in arms {
                     for bv in binders {
-                        mask.insert(*bv, sm);
+                        mask.insert(*bv, if is_int(*bv) { 0 } else { sm });
                     }
-                    walk(b, mask, esc, bor);
+                    walk(b, mask, esc, bor, is_int);
                 }
             }
-            _ => e.kids().into_iter().for_each(|k| walk(k, mask, esc, bor)),
+            _ => e.kids().into_iter().for_each(|k| walk(k, mask, esc, bor, is_int)),
         }
     }
-    walk(body, &mut mask, &mut esc, bor);
+    walk(body, &mut mask, &mut esc, bor, is_int);
     esc
 }
 

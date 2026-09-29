@@ -350,6 +350,11 @@ fn dependent_calls_wait_only_for_their_own_input() {
 }
 
 #[test]
+fn a_tree_shared_by_many_parallel_forks_survives() {
+    golden("shared_tree.py", 0, &["1", "16", "16", "16"]);
+}
+
+#[test]
 fn split_shapes_and_chains_match_oracle() {
     // every split shape (a boxed value shared by D, P and J2; the three
     // two-way fallbacks) and a boxed chain, on every thread count and fuel
@@ -399,6 +404,19 @@ fn trmc_tree_builders_match_oracle_under_suspension() {
 }
 
 // ---- borrowed parameters ----
+
+#[test]
+fn a_lent_child_bound_by_a_branch_is_copied_into_its_binding() {
+    // `p = lft(a)` binds a branch result that reads a lent tree; the
+    // binding is owned (consumed by `leaf`, freed unused on one branch), so
+    // the read is copied. Missing the copy freed the lender's subtree
+    // (kmeans: a stack overflow on the corrupted stats tree).
+    let (cm, rs) = pipeline(&fixture("lent_pick.py"), 100_000);
+    let fid = cm.fns.iter().position(|f| f.name == "pick").unwrap();
+    assert!(rs.contains(&format!("{fid} => {{\nlet r = d_{fid}(ctx, fuel, args[1]")), "pick: tree parameter is not borrowed");
+    golden("lent_pick.py", 100_000, &["1", "4", "16"]);
+    trmc_golden("lent_pick.py");
+}
 
 #[test]
 fn borrowed_shared_tree_matches_oracle_under_suspension() {
