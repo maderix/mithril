@@ -812,6 +812,7 @@ scalar form and computed on the ports' bits. Unconfirmed (argued from the
 code, kept on the list): an array leaking through an if-arm tuple mask, a
 thread-local read before it is set on the device path, a borrow-inference
 round cap. The reviews also list about 1500 lines of folds at low risk
+(two batches applied: 15000 to 13843 lines, generated Rust byte-identical)
 and two Core-level rewrites in the code generator (tail inlining,
 if-conversion) that the core constraint forbids at that layer: those get
 their own commit and note.
