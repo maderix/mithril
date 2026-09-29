@@ -21,7 +21,7 @@
 
 use crate::lir::{c, do_, free, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
 use crate::seq::{vn, vparams, Ex};
-use crate::{cnt_expr, free_vars, has_call, merge_max, Cnt};
+use crate::{cnt_rule, free_vars, has_call, Cnt};
 use mithril_front::core::{Core, CoreModule};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -87,53 +87,12 @@ fn wrap(lets: Vec<(u32, Core)>, tail: Core) -> Core {
     lets.into_iter().rev().fold(tail, |acc, (x, r)| Core::Let(x, Box::new(r), Box::new(acc)))
 }
 
-/// Normalize a function body (tail position).
+/// Normalize a function body (tail position): its prerequisite bindings
+/// wrap the let-RHS shape of the body.
 pub(crate) fn normalize(e: &Core, c: &mut u32) -> Core {
-    norm_tail(e, c)
-}
-
-fn norm_tail(e: &Core, c: &mut u32) -> Core {
-    if !has_call(e) {
-        return e.clone();
-    }
-    match e {
-        Core::Call(f, args) => {
-            let mut lets = Vec::new();
-            let args2: Vec<Core> = args.iter().map(|a| norm_pure(a, c, &mut lets)).collect();
-            wrap(lets, Core::Call(*f, args2))
-        }
-        Core::If(cd, t, f) => {
-            let mut lets = Vec::new();
-            let c2 = norm_pure(cd, c, &mut lets);
-            wrap(
-                lets,
-                Core::If(Box::new(c2), Box::new(norm_tail(t, c)), Box::new(norm_tail(f, c))),
-            )
-        }
-        Core::Match(s, arms) => {
-            let mut lets = Vec::new();
-            let s2 = norm_pure(s, c, &mut lets);
-            let arms2 =
-                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), norm_tail(b, c))).collect();
-            wrap(lets, Core::Match(Box::new(s2), arms2))
-        }
-        Core::Let(x, r, bo) => {
-            let mut lets = Vec::new();
-            let r2 = norm_bind(r, c, &mut lets);
-            wrap(lets, Core::Let(*x, Box::new(r2), Box::new(norm_tail(bo, c))))
-        }
-        Core::App(f, a) => {
-            let mut lets = Vec::new();
-            let f2 = norm_pure(f, c, &mut lets);
-            let a2 = norm_pure(a, c, &mut lets);
-            wrap(lets, Core::App(Box::new(f2), Box::new(a2)))
-        }
-        _ => {
-            let mut lets = Vec::new();
-            let p = norm_pure(e, c, &mut lets);
-            wrap(lets, p)
-        }
-    }
+    let mut lets = Vec::new();
+    let t = norm_bind(e, c, &mut lets);
+    wrap(lets, t)
 }
 
 /// Normalize into a let-RHS shape: pure | Call | If | Match; prerequisite
@@ -149,13 +108,13 @@ fn norm_bind(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         Core::App(f, a) => Core::App(Box::new(norm_pure(f, c, lets)), Box::new(norm_pure(a, c, lets))),
         Core::If(cd, t, f) => {
             let c2 = norm_pure(cd, c, lets);
-            Core::If(Box::new(c2), Box::new(norm_tail(t, c)), Box::new(norm_tail(f, c)))
+            Core::If(Box::new(c2), Box::new(normalize(t, c)), Box::new(normalize(f, c)))
         }
         Core::Match(s, arms) => {
             let s2 = norm_pure(s, c, lets);
             Core::Match(
                 Box::new(s2),
-                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), norm_tail(b, c))).collect(),
+                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), normalize(b, c))).collect(),
             )
         }
         Core::Let(x, r, bo) => {
@@ -209,49 +168,6 @@ fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
         // a closure's body is not compiled here: it is built as a net
         Core::Lam(x, b) => Core::Lam(*x, b.clone()),
         Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
-    }
-}
-
-// ---- fork detection (shared by counting and emission) ----
-
-/// `Let(x, Call g, Let(y, Call h, bo2))` with `h`'s args independent of `x`.
-// ---- use counting for the rule form (mirrors rtail's structure) ----
-
-pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) {
-    match e {
-        Core::Let(_, r, bo) => {
-            // A call dives inline (continuation runs here) or suspends
-            // (continuation moves into a record taking exactly its uses):
-            // both paths consume the same counts.
-            if has_call(r) {
-                cnt_rule(r, m);
-            } else {
-                cnt_expr(r, m);
-            }
-            cnt_rule(bo, m);
-        }
-        Core::If(c, t, f) => {
-            cnt_expr(c, m);
-            let mut mt = Cnt::new();
-            cnt_rule(t, &mut mt);
-            let mut mf = Cnt::new();
-            cnt_rule(f, &mut mf);
-            merge_max(m, vec![mt, mf]);
-        }
-        Core::Match(s, arms) => {
-            cnt_expr(s, m);
-            let bs: Vec<Cnt> = arms
-                .iter()
-                .map(|(_, _, b)| {
-                    let mut mm = Cnt::new();
-                    cnt_rule(b, &mut mm);
-                    mm
-                })
-                .collect();
-            merge_max(m, bs);
-        }
-        Core::Call(_, xs) => xs.iter().for_each(|x| cnt_expr(x, m)),
-        other => cnt_expr(other, m),
     }
 }
 

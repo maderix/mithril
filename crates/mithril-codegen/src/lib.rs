@@ -1238,37 +1238,24 @@ pub(crate) fn merge_max(into: &mut Cnt, branches: Vec<Cnt>) {
     }
 }
 
-/// Use counts of a dive-form body: tail If/Match branches merge by max.
-pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) {
+/// Use counts of a tail-form body: tail If/Match branches merge by max. In
+/// the rule form (`rule`) a let RHS carrying calls is itself a tail form: a
+/// call dives inline (continuation runs here) or suspends (continuation
+/// moves into a record taking exactly its uses), both consuming the same.
+fn cnt_tail(e: &Core, m: &mut Cnt, rule: bool) {
+    let arm = |a: &Core| { let mut mm = Cnt::new(); cnt_tail(a, &mut mm, rule); mm };
     match e {
         Core::Let(_, r, b) => {
-            cnt_expr(r, m);
-            cnt_dive(b, m);
+            if rule && has_call(r) { cnt_tail(r, m, rule) } else { cnt_expr(r, m) }
+            cnt_tail(b, m, rule);
         }
-        Core::If(c, t, f) => {
-            cnt_expr(c, m);
-            let mut mt = Cnt::new();
-            cnt_dive(t, &mut mt);
-            let mut mf = Cnt::new();
-            cnt_dive(f, &mut mf);
-            merge_max(m, vec![mt, mf]);
-        }
-        Core::Match(s, arms) => {
-            cnt_expr(s, m);
-            let bs: Vec<Cnt> = arms
-                .iter()
-                .map(|(_, _, b)| {
-                    let mut mm = Cnt::new();
-                    cnt_dive(b, &mut mm);
-                    mm
-                })
-                .collect();
-            merge_max(m, bs);
-        }
-        Core::Call(_, xs) => xs.iter().for_each(|x| cnt_expr(x, m)),
+        Core::If(c, t, f) => { cnt_expr(c, m); merge_max(m, vec![arm(t), arm(f)]); }
+        Core::Match(s, arms) => { cnt_expr(s, m); merge_max(m, arms.iter().map(|(_, _, b)| arm(b)).collect()); }
         other => cnt_expr(other, m),
     }
 }
+pub(crate) fn cnt_dive(e: &Core, m: &mut Cnt) { cnt_tail(e, m, false) }
+pub(crate) fn cnt_rule(e: &Core, m: &mut Cnt) { cnt_tail(e, m, true) }
 
 // ---- borrow inference (read-only parameters) ----
 //

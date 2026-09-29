@@ -1815,86 +1815,39 @@ pub(crate) fn dps_fn<'m>(
     FnDef { name: format!("dp_{fid}"), ctx: true, params, ret: Ty::Unit, body, inline: Inline::Default, cold: false }
 }
 
-/// Split a suspended frame's continuation `bo` (a let chain) around the
-/// pending value `x`: `Some((P, l, J))` where P is the chain of bindings
-/// independent of x ending in its one live-out `l` (the single binder J
-/// reads), and J is the dependent rest. `None` when P does no call or
-/// has zero or several live-outs (those frames wait as plain records).
-pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> {
+/// Split a let chain `e` around `seed`: `Some((I, l, D))` where I is the
+/// bindings independent of `seed` ending in their one live-out `l` (the
+/// single binder D reads), and D the dependent rest. `None` when I does no
+/// call or has zero or several live-outs.
+fn split_chain(seed: u32, e: &Core) -> Option<(Core, u32, Core)> {
     let mut binds: Vec<(u32, &Core)> = Vec::new();
-    let mut cur = bo;
+    let mut cur = e;
     while let Core::Let(v, r, b) = cur {
         binds.push((*v, r));
         cur = b;
     }
-    let mut dep: HashSet<u32> = HashSet::from([x]);
-    let (mut p, mut j): (Vec<(u32, &Core)>, Vec<(u32, &Core)>) = (Vec::new(), Vec::new());
+    let mut dep: HashSet<u32> = HashSet::from([seed]);
+    let (mut ind, mut de): (Vec<(u32, &Core)>, Vec<(u32, &Core)>) = (Vec::new(), Vec::new());
     for (v, r) in binds {
-        if free_vars(r).iter().any(|f| dep.contains(f)) {
-            dep.insert(v);
-            j.push((v, r));
-        } else {
-            p.push((v, r));
-        }
+        if free_vars(r).iter().any(|f| dep.contains(f)) { dep.insert(v); de.push((v, r)); } else { ind.push((v, r)); }
     }
-    if !p.iter().any(|(_, r)| has_call(r)) {
-        return None;
-    }
-    let mut j_body = cur.clone();
-    for (v, r) in j.iter().rev() {
-        j_body = Core::Let(*v, Box::new((*r).clone()), Box::new(j_body));
-    }
-    let jf = free_vars(&j_body);
-    let live: Vec<u32> = p.iter().map(|(v, _)| *v).filter(|v| jf.contains(v)).collect();
-    if live.len() != 1 {
-        return None;
-    }
-    let mut p_body = Core::Var(live[0]);
-    for (v, r) in p.iter().rev() {
-        p_body = Core::Let(*v, Box::new((*r).clone()), Box::new(p_body));
-    }
-    Some((p_body, live[0], j_body))
+    if !ind.iter().any(|(_, r)| has_call(r)) { return None; }
+    let wrap = |bs: &[(u32, &Core)], t: Core| bs.iter().rev().fold(t, |acc, (v, r)| Core::Let(*v, Box::new((*r).clone()), Box::new(acc)));
+    let d_body = wrap(&de, cur.clone());
+    let jf = free_vars(&d_body);
+    let live: Vec<u32> = ind.iter().map(|(v, _)| *v).filter(|v| jf.contains(v)).collect();
+    if live.len() != 1 { return None; }
+    Some((wrap(&ind, Core::Var(live[0])), live[0], d_body))
 }
 
-/// Split a frame's dependent rest `j` around P's live-out `live`: D (needs
-/// x, not `live`; one live-out `m`, a call) and J2 (reads `m`, `live`, not x).
+/// A suspended frame's continuation `bo` around the pending `x`: (P, P's
+/// live-out, J); frames that do not split wait as plain records.
+pub(crate) fn split_frame(x: u32, bo: &Core) -> Option<(Core, u32, Core)> { split_chain(x, bo) }
+
+/// A frame's dependent rest `j` around P's live-out `live`: D (needs x, not
+/// `live`; one live-out `m`, a call) and J2 (reads `m`, `live`, not x).
 pub(crate) fn split_dep(x: u32, live: u32, j: &Core) -> Option<(Core, u32, Core)> {
-    let mut binds: Vec<(u32, &Core)> = Vec::new();
-    let mut cur = j;
-    while let Core::Let(v, r, b) = cur {
-        binds.push((*v, r));
-        cur = b;
-    }
-    let mut dl: HashSet<u32> = HashSet::from([live]);
-    let (mut d, mut j2): (Vec<(u32, &Core)>, Vec<(u32, &Core)>) = (Vec::new(), Vec::new());
-    for (v, r) in binds {
-        if free_vars(r).iter().any(|f| dl.contains(f)) {
-            dl.insert(v);
-            j2.push((v, r));
-        } else {
-            d.push((v, r));
-        }
-    }
-    if !d.iter().any(|(_, r)| has_call(r)) {
-        return None;
-    }
-    let mut j2_body = cur.clone();
-    for (v, r) in j2.iter().rev() {
-        j2_body = Core::Let(*v, Box::new((*r).clone()), Box::new(j2_body));
-    }
-    let jf = free_vars(&j2_body);
-    if jf.contains(&x) {
-        return None;
-    }
-    let m: Vec<u32> = d.iter().map(|(v, _)| *v).filter(|v| jf.contains(v)).collect();
-    if m.len() != 1 {
-        return None;
-    }
-    let mut d_body = Core::Var(m[0]);
-    for (v, r) in d.iter().rev() {
-        d_body = Core::Let(*v, Box::new((*r).clone()), Box::new(d_body));
-    }
-    Some((d_body, m[0], j2_body))
+    split_chain(live, j).filter(|(_, _, j2)| !free_vars(j2).contains(&x))
 }
 
 /// Every occurrence of `x` in `e` is directly under a `Proj`.
