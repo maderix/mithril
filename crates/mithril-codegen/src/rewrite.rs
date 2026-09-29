@@ -17,11 +17,6 @@ use crate::has_call;
 use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
 use std::collections::HashMap;
 
-/// Node count of an expression (size heuristic for inlining).
-pub(crate) fn size(e: &Core) -> usize {
-    e.size()
-}
-
 /// Tail inlining: a small, non-self-recursive `g` tail-called from `f`
 /// whose own calls are tail calls back to `f` (or calls to call-free
 /// functions) is inlined at that site. Mutual tail recursion then becomes
@@ -35,7 +30,7 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
             return false;
         }
         let gb = &m.fns[g as usize].body;
-        if size(gb) > MAX_SIZE {
+        if gb.size() > MAX_SIZE {
             return false;
         }
         let cs = crate::call_sites(gb);
@@ -43,14 +38,16 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
             && cs.iter().all(|h| *h == f || (*h != g && leaf[*h as usize]))
             && mithril_front::desugar::compute_self_tail_rec(f, gb)
     };
-    fn rewrite_tail(e: &Core, f: u32, m: &CoreModule, fits: &dyn Fn(u32, u32) -> bool, next: &mut u32) -> Core {
-        match e {
-            Core::Call(g, args) if fits(f, *g) => {
+    let mut out = m.clone();
+    for (fid, f) in out.fns.iter_mut().enumerate() {
+        let mut next = f.body.max_var().max(f.arity as u32) + 1;
+        let nb = map_tails(&f.body, &mut |e| match e {
+            Core::Call(g, args) if fits(fid as u32, *g) => {
                 let callee = &m.fns[*g as usize];
-                let base = *next;
-                *next += callee.arity as u32;
-                let shift = *next;
-                *next += callee.body.max_var().max(callee.arity as u32) + 1;
+                let base = next;
+                next += callee.arity as u32;
+                let shift = next;
+                next += callee.body.max_var().max(callee.arity as u32) + 1;
                 let mut map = HashMap::new();
                 for p in 0..callee.arity as u32 {
                     match &args[p as usize] {
@@ -64,27 +61,30 @@ pub(crate) fn tail_inline(m: &CoreModule) -> CoreModule {
                         out = Core::Let(base + p as u32, Box::new(a.clone()), Box::new(out));
                     }
                 }
-                out
+                Some(out)
             }
-            Core::Let(x, r, b) => Core::Let(*x, r.clone(), Box::new(rewrite_tail(b, f, m, fits, next))),
-            Core::If(c, t, el) => Core::If(c.clone(), Box::new(rewrite_tail(t, f, m, fits, next)), Box::new(rewrite_tail(el, f, m, fits, next))),
-            Core::Match(sc, arms) => Core::Match(
-                sc.clone(),
-                arms.iter().map(|(c, bs, b)| (*c, bs.clone(), rewrite_tail(b, f, m, fits, next))).collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-    let mut out = m.clone();
-    for (fid, f) in out.fns.iter_mut().enumerate() {
-        let mut next = f.body.max_var().max(f.arity as u32) + 1;
-        let nb = rewrite_tail(&f.body, fid as u32, m, &fits, &mut next);
+            _ => None,
+        });
         if nb != f.body {
             f.body = nb;
             f.self_tail_rec = mithril_front::desugar::compute_self_tail_rec(fid as u32, &f.body);
         }
     }
     out
+}
+
+/// `e` with `f` applied at its tail positions (`None`: descend through
+/// Let/If/Match; any other tail stays).
+fn map_tails(e: &Core, f: &mut dyn FnMut(&Core) -> Option<Core>) -> Core {
+    if let Some(r) = f(e) {
+        return r;
+    }
+    match e {
+        Core::Let(x, r, b) => Core::Let(*x, r.clone(), Box::new(map_tails(b, f))),
+        Core::If(c, t, el) => Core::If(c.clone(), Box::new(map_tails(t, f)), Box::new(map_tails(el, f))),
+        Core::Match(s, arms) => Core::Match(s.clone(), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), map_tails(b, f))).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Rename every binder of a closed body: params via `map`, locals to
@@ -201,21 +201,16 @@ fn tail(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
         Core::Match(s, arms) => {
             let s2 = val(s, cx, avail);
             // a consumed boxed scrutinee cell becomes a token for each arm
-            let consumed = match &**s {
-                Core::Var(v) => cx.uses.get(v).copied().unwrap_or(0) == 1,
-                _ => true,
+            let tok = match &**s {
+                Core::Var(v) if cx.uses.get(v) == Some(&1) => Some(*v),
+                _ => None,
             };
             let arms2 = arms
                 .iter()
                 .map(|(c, bs, b)| {
                     let mut a = avail.clone();
-                    if consumed && *c != UNREACHABLE_CTOR && !cx.unbox.contains_key(c) {
-                        if let Core::Var(v) = &**s {
-                            let ar = cx.m.ctors[*c as usize].1;
-                            if ar == 2 {
-                                a.push((*v, ar));
-                            }
-                        }
+                    if let Some(v) = tok.filter(|_| *c != UNREACHABLE_CTOR && !cx.unbox.contains_key(c) && cx.m.ctors[*c as usize].1 == 2) {
+                        a.push((v, 2));
                     }
                     (*c, bs.clone(), tail(b, cx, &mut a))
                 })
@@ -226,9 +221,6 @@ fn tail(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
         other => val(other, cx, avail),
     }
 }
-
-// ------------------------------------------------- record-to-tuple rewrite
-
 
 // ---- if-conversion of same-call branches ----
 //
@@ -392,43 +384,31 @@ pub(crate) fn if_convert(m: &CoreModule) -> CoreModule {
             _ => false,
         }
     }
-    fn tail(e: &Core, next: &mut u32, fid: u32, tys: &crate::ty::Types) -> Core {
-        let tail = |e: &Core, next: &mut u32| tail(e, next, fid, tys);
-        match e {
-            Core::Let(x, r, b) => Core::Let(*x, r.clone(), Box::new(tail(b, next))),
-            Core::If(c, t, f) => {
-                let mut budget = IFCONV_LETS;
-                let mut n2 = *next;
-                let mut conds = HashMap::new();
-                let cheap = tree_ops(e) <= IFCONV_WORK;
-                let conv = if cheap { ifconv(e, &mut n2, &mut budget, &mut Vec::new(), &mut conds) } else { None };
-                let ints_only = |leaves: &Vec<Leaf>| {
-                    (0..leaves[0].1.len()).all(|j| {
-                        leaves.iter().all(|(_, a)| a[j] == leaves[0].1[j])
-                            || leaves.iter().all(|(_, a)| int_expr(&a[j], fid, tys))
-                    })
-                };
-                if let Some((lets, g, leaves)) = conv.filter(|(_, g, l)| *g == fid && ints_only(l)) {
-                    *next = n2;
-                    let args: Vec<Core> = (0..leaves[0].1.len()).map(|j| select_arg(&leaves, j, &conds)).collect();
-                    let mut out = Core::Call(g, args);
-                    for (v, r) in lets.into_iter().rev() {
-                        out = Core::Let(v, Box::new(r), Box::new(out));
-                    }
-                    return out;
-                }
-                Core::If(c.clone(), Box::new(tail(t, next)), Box::new(tail(f, next)))
-            }
-            Core::Match(s, arms) => {
-                Core::Match(s.clone(), arms.iter().map(|(c, bs, b)| (*c, bs.clone(), tail(b, next))).collect())
-            }
-            other => other.clone(),
-        }
-    }
     let mut out = m.clone();
     for (fid, f) in out.fns.iter_mut().enumerate() {
+        let fid = fid as u32;
         let mut next = f.body.max_var().max(f.arity as u32) + 1;
-        f.body = tail(&f.body, &mut next, fid as u32, &tys);
+        f.body = map_tails(&f.body, &mut |e| {
+            let Core::If(..) = e else { return None };
+            let mut budget = IFCONV_LETS;
+            let mut n2 = next;
+            let mut conds = HashMap::new();
+            let cheap = tree_ops(e) <= IFCONV_WORK;
+            let conv = if cheap { ifconv(e, &mut n2, &mut budget, &mut Vec::new(), &mut conds) } else { None };
+            let ints_only = |leaves: &Vec<Leaf>| {
+                (0..leaves[0].1.len()).all(|j| {
+                    leaves.iter().all(|(_, a)| a[j] == leaves[0].1[j]) || leaves.iter().all(|(_, a)| int_expr(&a[j], fid, &tys))
+                })
+            };
+            let (lets, g, leaves) = conv.filter(|(_, g, l)| *g == fid && ints_only(l))?;
+            next = n2;
+            let args: Vec<Core> = (0..leaves[0].1.len()).map(|j| select_arg(&leaves, j, &conds)).collect();
+            let mut out = Core::Call(g, args);
+            for (v, r) in lets.into_iter().rev() {
+                out = Core::Let(v, Box::new(r), Box::new(out));
+            }
+            Some(out)
+        });
     }
     out
 }

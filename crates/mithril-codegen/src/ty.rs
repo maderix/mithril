@@ -66,15 +66,9 @@ impl Types {
                 },
                 _ => Ty::Int, // binary32 primitives
             },
-            Core::Proj(b, i) => match self.expr(fid, b) {
-                Ty::Tup(_) => Ty::Dyn, // refined during inference via tvars
-                _ => {
-                    let _ = i;
-                    Ty::Dyn
-                }
-            },
-            Core::Match(..) => Ty::Dyn, // not needed by emitters (arms carry it)
-            Core::Lam(..) | Core::App(..) => Ty::Dyn,
+            // not needed by emitters (a projection's type is refined during
+            // inference; match arms carry theirs)
+            Core::Proj(..) | Core::Match(..) | Core::Lam(..) | Core::App(..) => Ty::Dyn,
         }
     }
 }
@@ -117,10 +111,7 @@ impl Uf {
         match (self.n[r as usize], k) {
             (Node::Free, _) => self.n[r as usize] = k,
             (a, b) if a == b => {}
-            // conflict: collapse to a poisoned Adt-with-id-MAX? use Free->stay;
-            // mark Dyn by a sentinel: keep first, differences resolve to Dyn
-            // at readout via a poison set
-            _ => self.n[r as usize] = Node::Adt(u32::MAX), // poison
+            _ => self.n[r as usize] = Node::Adt(u32::MAX), // conflict: poison (reads as Dyn)
         }
     }
     fn union(&mut self, a: u32, b: u32) {
@@ -255,17 +246,20 @@ impl Inf {
         }
     }
 
-    /// A fresh array node with element tyvar `e`.
-    fn arr_of(&mut self, e: u32) -> u32 {
+    /// A fresh tyvar of shape `k`.
+    fn node(&mut self, k: Node) -> u32 {
         let t = self.uf.fresh();
-        self.uf.n[t as usize] = Node::Arr(e);
+        self.uf.n[t as usize] = k;
         t
     }
 
+    /// A fresh array node with element tyvar `e`.
+    fn arr_of(&mut self, e: u32) -> u32 {
+        self.node(Node::Arr(e))
+    }
+
     fn int(&mut self) -> u32 {
-        let t = self.uf.fresh();
-        self.uf.set(t, Node::Int);
-        t
+        self.node(Node::Int)
     }
 
     fn set_adt(&mut self, t: u32, k: Node) {
@@ -283,16 +277,8 @@ impl Inf {
     /// Type of expression `e`; unifies as it walks. `env[v]` = tyvar.
     fn walk(&mut self, fid: u32, e: &Core, env: &mut Vec<u32>) -> u32 {
         match e {
-            Core::Num(_) => {
-                let t = self.uf.fresh();
-                self.uf.set(t, Node::Int);
-                t
-            }
-            Core::Flo(_) => {
-                let t = self.uf.fresh();
-                self.uf.set(t, Node::Flo);
-                t
-            }
+            Core::Num(_) => self.int(),
+            Core::Flo(_) => self.node(Node::Flo),
             Core::Var(i) => env[*i as usize],
             Core::Op2(_, a, b) => {
                 let ta = self.walk(fid, a, env);
@@ -304,9 +290,7 @@ impl Inf {
                 let ta = self.walk(fid, a, env);
                 let tb = self.walk(fid, b, env);
                 self.unify(ta, tb);
-                let t = self.uf.fresh();
-                self.uf.set(t, Node::Int);
-                t
+                self.int()
             }
             Core::If(c, x, y) => {
                 let tc = self.walk(fid, c, env);
@@ -318,10 +302,7 @@ impl Inf {
             }
             Core::Let(x, r, b) => {
                 let tr = self.walk(fid, r, env);
-                if env.len() <= *x as usize {
-                    env.resize(*x as usize + 1, u32::MAX);
-                }
-                env[*x as usize] = tr;
+                bind(env, *x, tr);
                 self.walk(fid, b, env)
             }
             Core::Call(g, args) => {
@@ -347,14 +328,9 @@ impl Inf {
                 t
             }
             Core::Tuple(xs) => {
-                // element types tracked through cfield of the pseudo-ctor?
-                // tuples are structural; track only arity here, element types
-                // flow through Proj on the same var below when resolvable.
                 let comps: Vec<u32> = xs.iter().map(|a| self.walk(fid, a, env)).collect();
                 self.tups.push(comps);
-                let t = self.uf.fresh();
-                self.uf.n[t as usize] = Node::Tup(xs.len() as u32, (self.tups.len() - 1) as u32);
-                t
+                self.node(Node::Tup(xs.len() as u32, (self.tups.len() - 1) as u32))
             }
             Core::Proj(b, i) => {
                 let tb = self.walk(fid, b, env);
@@ -364,19 +340,13 @@ impl Inf {
             // first-order parts get their types
             Core::Lam(x, b) => {
                 let tx = self.uf.fresh();
-                if env.len() <= *x as usize {
-                    env.resize(*x as usize + 1, u32::MAX);
-                }
-                env[*x as usize] = tx;
+                bind(env, *x, tx);
                 let _ = self.walk(fid, b, env);
-                let t = self.uf.fresh();
-                self.uf.set(t, Node::Fun);
-                t
+                self.node(Node::Fun)
             }
             Core::App(f, a) => {
                 let tf = self.walk(fid, f, env);
-                let fun = self.uf.fresh();
-                self.uf.set(fun, Node::Fun);
+                let fun = self.node(Node::Fun);
                 self.unify(tf, fun);
                 let _ = self.walk(fid, a, env);
                 self.uf.fresh()
@@ -423,13 +393,11 @@ impl Inf {
             }
             Core::Match(s, arms) => {
                 let ts = self.walk(fid, s, env);
+                let arms: Vec<_> = arms.iter().filter(|(c, ..)| *c != UNREACHABLE_CTOR).collect();
                 // unify scrutinee with each arm ctor's class; co-matched
                 // ctors join one class
                 let mut first: Option<u32> = None;
-                for (c, _, _) in arms.iter() {
-                    if *c == UNREACHABLE_CTOR {
-                        continue;
-                    }
+                for (c, _, _) in &arms {
                     if let Some(f) = first {
                         self.cunion(f, *c);
                     } else {
@@ -441,15 +409,9 @@ impl Inf {
                     self.set_adt(ts, k);
                 }
                 let mut tout: Option<u32> = None;
-                for (c, binders, body) in arms.iter() {
-                    if *c == UNREACHABLE_CTOR {
-                        continue;
-                    }
+                for (c, binders, body) in &arms {
                     for (j, bv) in binders.iter().enumerate() {
-                        if env.len() <= *bv as usize {
-                            env.resize(*bv as usize + 1, u32::MAX);
-                        }
-                        env[*bv as usize] = self.cfield[*c as usize][j];
+                        bind(env, *bv, self.cfield[*c as usize][j]);
                     }
                     let tb = self.walk(fid, body, env);
                     if let Some(o) = tout {
@@ -462,6 +424,14 @@ impl Inf {
             }
         }
     }
+}
+
+/// `env[x] = t`, growing `env` (unbound slots are `u32::MAX`).
+fn bind(env: &mut Vec<u32>, x: u32, t: u32) {
+    if env.len() <= x as usize {
+        env.resize(x as usize + 1, u32::MAX);
+    }
+    env[x as usize] = t;
 }
 
 /// Infer module types. Two passes over every body (the second lets sigs
@@ -506,22 +476,12 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
             .collect();
         locals.push(tys);
     }
-    let fparam = inf.fparam.clone();
-    let fret = inf.fret.clone();
-    let cfield = inf.cfield.clone();
-    let params: Vec<Vec<Ty>> =
-        fparam.iter().map(|ps| ps.iter().map(|&v| inf.uf.read(v)).collect()).collect();
-    let ret: Vec<Ty> = fret.iter().map(|&v| inf.uf.read(v)).collect();
-    let field: Vec<Vec<Ty>> =
-        cfield.iter().map(|fs| fs.iter().map(|&v| inf.uf.read(v)).collect()).collect();
     let class_of: Vec<u32> = (0..m.ctors.len() as u32).map(|c| inf.cfind(c)).collect();
-    let canon = |t: Ty| match t {
-        Ty::Adt(c) => Ty::Adt(class_of[c as usize]),
-        o => o,
-    };
-    let params = params.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
-    let ret = ret.into_iter().map(canon).collect();
-    let field = field.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
+    let canon = |t: Ty| if let Ty::Adt(c) = t { Ty::Adt(class_of[c as usize]) } else { t };
+    let mut rd = |vs: &[u32]| -> Vec<Ty> { vs.iter().map(|&v| canon(inf.uf.read(v))).collect() };
+    let params = inf.fparam.iter().map(|ps| rd(ps)).collect();
+    let ret = rd(&inf.fret);
+    let field = inf.cfield.iter().map(|fs| rd(fs)).collect();
     let locals = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
     Types { class_of, params, ret, field, locals }
 }

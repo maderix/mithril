@@ -19,13 +19,11 @@ type Iv = (i128, i128);
 const MIN: i128 = -(1 << 55);
 const MAX: i128 = (1 << 55) - 1;
 const FULL: Iv = (MIN, MAX);
+/// Past i56 on both sides (forces the wrap).
+const OVER: Iv = (MIN * 2, MAX * 2);
 
 fn fits(v: Iv) -> bool {
     v.0 >= MIN && v.1 <= MAX
-}
-
-fn low_mask(e: &Core) -> bool {
-    matches!(e, Core::Num(c) if (0..=MAX as i64).contains(c))
 }
 
 pub(crate) struct Ranges {
@@ -106,7 +104,7 @@ impl Ranges {
 
 /// `low` flag for the left operand of `Op2(op, _, b)`.
 pub(crate) fn feeds_mask(op: &BinOp, b: &Core) -> bool {
-    *op == BinOp::BitAnd && low_mask(b)
+    *op == BinOp::BitAnd && matches!(b, Core::Num(c) if (0..=MAX as i64).contains(c))
 }
 
 /// The left operand of `Op2(op, _, b)` is only observed in its low 32 bits.
@@ -155,23 +153,19 @@ fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
         }
         BinOp::Shl => match k {
             Some(s) if (0..=62).contains(&s) => (x.0 << s, x.1 << s),
-            _ => (MIN * 2, MAX * 2),
+            _ => OVER,
         },
         BinOp::Shr => match k {
             Some(s) if (0..=62).contains(&s) => (x.0 >> s, x.1 >> s),
             _ => FULL,
         },
-        BinOp::FloorDiv => match k {
-            Some(d) if d > 0 => (x.0.div_euclid(d), x.1.div_euclid(d)),
-            _ => (MIN * 2, MAX * 2),
-        },
-        BinOp::Div => match k {
-            Some(d) if d > 0 => (x.0 / d, x.1 / d),
-            _ => (MIN * 2, MAX * 2),
-        },
-        BinOp::Mod => match k {
-            Some(d) if d > 0 => (0, d - 1),
-            _ => (MIN * 2, MAX * 2),
+        BinOp::Div | BinOp::FloorDiv | BinOp::Mod => match k {
+            Some(d) if d > 0 => match op {
+                BinOp::Mod => (0, d - 1),
+                BinOp::Div => (x.0 / d, x.1 / d),
+                _ => (x.0.div_euclid(d), x.1.div_euclid(d)),
+            },
+            _ => OVER,
         },
     }
 }
