@@ -26,6 +26,23 @@ pub(crate) struct Shared {
     pub tuples: bool,
     pub poison: bool,
 }
+
+impl Shared {
+    /// A value of type `t` is shared; returns whether the set grew (a
+    /// poisoning never counts: it ends the analysis).
+    pub fn note(&mut self, t: &CTy) -> bool {
+        match *t {
+            CTy::Adt(c) => self.classes.insert(c),
+            CTy::Tup(_) => !std::mem::replace(&mut self.tuples, true),
+            CTy::Dyn => {
+                self.poison = true;
+                false
+            }
+            // ints; floats and arrays always carry a refcount
+            _ => false,
+        }
+    }
+}
 use crate::{cnt_dive, free_vars, has_call, Cnt};
 use mithril_front::ast::{BinOp, CmpOp};
 use mithril_front::core::{Core, CoreModule, UNREACHABLE_CTOR};
@@ -258,21 +275,16 @@ impl<'m> Ex<'m> {
 
     /// Record that variable `i`'s value is shared by emitted code.
     fn note_share(&self, i: u32) {
-        let t = if self.self_fid == u32::MAX {
-            CTy::Dyn
-        } else {
-            self.tys.var(self.self_fid as usize, i)
-        };
-        let mut sh = self.shared.borrow_mut();
-        match t {
-            CTy::Int => {}
-            CTy::Flo => {} // boxed floats always carry an rc
-            CTy::Adt(c) => {
-                sh.classes.insert(c);
-            }
-            CTy::Tup(_) => sh.tuples = true,
-            CTy::Arr(_) => {} // arrays always carry a refcount
-            CTy::Dyn => sh.poison = true,
+        let t = if self.self_fid == u32::MAX { CTy::Dyn } else { self.tys.var(self.self_fid as usize, i) };
+        self.shared.borrow_mut().note(&t);
+    }
+
+    /// The value being bound stays reachable elsewhere too (a field or
+    /// element read): its let binder's type is shared.
+    fn share_let(&self) {
+        match self.cur_let {
+            Some(x) => self.note_share(x),
+            None => self.shared.borrow_mut().poison = true,
         }
     }
 
@@ -563,53 +575,48 @@ impl<'m> Ex<'m> {
     }
 
     /// Bind a match arm's fields under the scrutinee's hold mode; Consume
-    /// also frees the constructor spine.
-    pub(crate) fn bind_fields(&mut self, sv: &E, hold: Hold, cid: u32, binders: &[u32], tok: Option<u32>, b: &mut Vec<S>) {
+    /// also frees the constructor spine (in the dive form into a reuse
+    /// token when the arm `body` rebuilds the scrutinee's cell). An unboxed
+    /// ctor's one field is the port itself.
+    pub(crate) fn bind_fields(&mut self, sv: &E, hold: Hold, cid: u32, binders: &[u32], body: &Core, b: &mut Vec<S>) {
+        if self.unbox.contains_key(&cid) {
+            if let Some(bv) = binders.first() {
+                if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
+                    b.push(let_(vn(*bv), Ty::U64, num(as_i(sv.clone()))));
+                }
+            }
+            return;
+        }
         let names: Vec<String> = binders.iter().map(|bv| vn(*bv)).collect();
-        let free_unused = |me: &Self, b: &mut Vec<S>| {
+        let k = u16_(cid as u64);
+        if hold == Hold::Consume {
+            match (reuse_var(body, sv).filter(|_| self.dive && binders.len() == 2), binders.len()) {
+                (Some(x), _) => {
+                    let tk = format!("tok_v{x}");
+                    b.push(S::Let(Pat::Tup(vec![names[0].clone(), names[1].clone(), tk.clone()]), Ty::Infer, c("consume2r", vec![sv.clone(), k])));
+                    self.toks.push(tk);
+                }
+                (None, 1) => {
+                    b.push(S::Let(Pat::Tup(vec![names[0].clone(), "m_unused".into()]), Ty::Infer, c("consume2k", vec![sv.clone(), k])));
+                    b.push(free(v("m_unused")));
+                }
+                (None, 2) => b.push(S::Let(Pat::Tup(names), Ty::Infer, c("consume2k", vec![sv.clone(), k]))),
+                // chained arity: move every field out, dropping the unused ones
+                (None, n) => b.push(S::Let(Pat::Arr(names), Ty::Infer, c(&format!("consume_chain::<{n}>"), vec![sv.clone(), k]))),
+            }
             for bv in binders {
-                if me.rem.get(bv).copied().unwrap_or(0) == 0 {
+                if self.rem.get(bv).copied().unwrap_or(0) == 0 {
                     b.push(free(v(vn(*bv))));
                 }
             }
-        };
-        // Consume with a reuse token (the rewrite placed a `Reuse` of this
-        // scrutinee var on some path of the arm)
-        if self.dive && hold == Hold::Consume && binders.len() == 2 && tok.is_some() {
-            let tk = format!("tok_v{}", tok.unwrap());
-            b.push(S::Let(Pat::Tup(vec![names[0].clone(), names[1].clone(), tk.clone()]), Ty::Infer, c("consume2r", vec![sv.clone(), u16_(cid as u64)])));
-            self.toks.push(tk);
-            free_unused(self, b);
-            return;
-        }
-        if hold == Hold::Consume && !binders.is_empty() && binders.len() <= 2 {
-            match binders.len() {
-                1 => {
-                    b.push(S::Let(Pat::Tup(vec![names[0].clone(), "m_unused".into()]), Ty::Infer, c("consume2k", vec![sv.clone(), u16_(cid as u64)])));
-                    b.push(free(v("m_unused")));
-                }
-                _ => b.push(S::Let(Pat::Tup(names.clone()), Ty::Infer, c("consume2k", vec![sv.clone(), u16_(cid as u64)]))),
-            }
-            free_unused(self, b);
-            return;
-        }
-        if hold == Hold::Consume {
-            // chained arity: move every field out, dropping the unused ones
-            b.push(S::Let(Pat::Arr(names.clone()), Ty::Infer, c(&format!("consume_chain::<{}>", binders.len()), vec![sv.clone(), u16_(cid as u64)])));
-            free_unused(self, b);
             return;
         }
         for (i, bv) in binders.iter().enumerate() {
-            let cnt = self.rem.get(bv).copied().unwrap_or(0);
             let fld = c("field", vec![sv.clone(), usize_(i)]);
             match hold {
                 Hold::BorrowRaw => b.push(let_(vn(*bv), Ty::U64, fld)),
-                Hold::Consume => unreachable!(),
-                Hold::BorrowDup => {
-                    if cnt > 0 {
-                        b.push(let_(vn(*bv), Ty::U64, c("dup_val", vec![fld])));
-                    }
-                }
+                _ if self.rem.get(bv).copied().unwrap_or(0) > 0 => b.push(let_(vn(*bv), Ty::U64, c("dup_val", vec![fld]))),
+                _ => {}
             }
         }
     }
@@ -703,63 +710,41 @@ impl<'m> Ex<'m> {
             Core::Prim(pr, args) => {
                 use mithril_front::core::Prim;
                 let t = self.fresh();
-                let post_free = |b: &mut Vec<S>, post: Option<E>| {
-                    if let Some(q) = post {
-                        b.push(free(q));
-                    }
-                };
                 match pr {
-                    Prim::ArrNew if self.is_int(&args[1]) => {
+                    Prim::ArrNew => {
                         let n = self.val(&args[0], false, b);
+                        // n copies of a boxed element: its type is shared
+                        let int = self.is_int(&args[1]);
+                        if !int {
+                            match &args[1] {
+                                Core::Var(x) => self.note_share(*x),
+                                _ => self.shared.borrow_mut().poison = true,
+                            }
+                        }
                         let x = self.val(&args[1], true, b);
-                        b.push(let_(&t, Ty::U64, p("arr_new_i", vec![as_i(n), x])));
+                        b.push(let_(&t, Ty::U64, if int { p("arr_new_i", vec![as_i(n), x]) } else { c("arr_new", vec![as_i(n), x]) }));
                     }
-                    Prim::ArrGet if self.int_arr(&args[0]) => {
+                    Prim::ArrGet => {
+                        let int = self.int_arr(&args[0]);
                         let (a, post) = self.borrow_read(&args[0], b);
                         let i = self.val(&args[1], false, b);
-                        b.push(let_(&t, Ty::U64, p("arr_get_i", vec![a, as_i(i)])));
-                        post_free(b, post);
+                        // a boxed element stays in the array too: shared
+                        let e = if int { p("arr_get_i", vec![a, as_i(i)]) } else { self.share_let(); c("arr_get", vec![a, as_i(i)]) };
+                        b.push(let_(&t, Ty::U64, e));
+                        b.extend(post.map(free));
                     }
-                    Prim::ArrSet if self.int_arr(&args[0]) => {
+                    Prim::ArrSet => {
                         // index and value first (they may read the array), then
                         // take the array: its last use moves instead of dup+free
                         let i = self.val(&args[1], false, b);
                         let x = self.val(&args[2], true, b);
                         let a = self.val(&args[0], true, b);
-                        b.push(let_(&t, Ty::U64, c("arr_set_i", vec![a, as_i(i), x])));
-                    }
-                    Prim::ArrNew => {
-                        let n = self.val(&args[0], false, b);
-                        // n copies of the element: its type is shared
-                        if let Core::Var(x) = &args[1] {
-                            self.note_share(*x);
-                        } else if !self.is_int(&args[1]) {
-                            self.shared.borrow_mut().poison = true;
-                        }
-                        let x = self.val(&args[1], true, b);
-                        b.push(let_(&t, Ty::U64, c("arr_new", vec![as_i(n), x])));
-                    }
-                    Prim::ArrGet => {
-                        let (a, post) = self.borrow_read(&args[0], b);
-                        let i = self.val(&args[1], false, b);
-                        // the element stays in the array too: shared
-                        match self.cur_let {
-                            Some(x) => self.note_share(x),
-                            None => self.shared.borrow_mut().poison = true,
-                        }
-                        b.push(let_(&t, Ty::U64, c("arr_get", vec![a, as_i(i)])));
-                        post_free(b, post);
-                    }
-                    Prim::ArrSet => {
-                        let i = self.val(&args[1], false, b);
-                        let x = self.val(&args[2], true, b);
-                        let a = self.val(&args[0], true, b);
-                        b.push(let_(&t, Ty::U64, c("arr_set", vec![a, as_i(i), x])));
+                        b.push(let_(&t, Ty::U64, c(if self.int_arr(&args[0]) { "arr_set_i" } else { "arr_set" }, vec![a, as_i(i), x])));
                     }
                     Prim::ArrLen => {
                         let (a, post) = self.borrow_read(&args[0], b);
                         b.push(let_(&t, Ty::U64, num(cast(p("arr_len_of", vec![a]), Ty::I64))));
-                        post_free(b, post);
+                        b.extend(post.map(free));
                     }
                     _ => {
                         let es: Vec<E> = args.iter().map(|a| as_i(self.val(a, false, b))).collect();
@@ -811,7 +796,7 @@ impl<'m> Ex<'m> {
                 let (call, post) = self.dive_call(*g, args, b);
                 v(self.try_call(call, post, crate::is_bounded(*g), None, b))
             }
-            Core::Ctor(cid, args) => {
+            Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => {
                 if *cid == UNREACHABLE_CTOR {
                     let t = self.fresh();
                     b.push(let_(&t, Ty::U64, p("mith_unreachable", vec![])));
@@ -824,24 +809,12 @@ impl<'m> Ex<'m> {
                     b.push(let_(&t, Ty::U64, p("ic", vec![u64_(*slot as u64), as_i(e0)])));
                     return v(t);
                 }
+                // a Reuse (decided by the reuse rewrite) builds in x's consumed cell
                 let es: Vec<E> = args.iter().map(|a| self.val(a, true, b)).collect();
+                let reuse = if let Core::Reuse(x, ..) = e { Some(*x) } else { None };
                 let t = self.fresh();
-                b.push(let_(&t, Ty::U64, mk_con(*cid, es)));
-                v(t)
-            }
-            Core::Reuse(x, cid, args) => {
-                // decided by the reuse rewrite: build in v's consumed cell
-                let es: Vec<E> = args.iter().map(|a| self.val(a, true, b)).collect();
-                let t = self.fresh();
-                let tk = format!("tok_v{x}");
-                if self.dive && self.toks.iter().any(|y| *y == tk) {
-                    self.toks.retain(|y| *y != tk);
-                    let mut a = vec![v(tk), u16_(*cid as u64)];
-                    a.extend(es);
-                    b.push(let_(&t, Ty::U64, c("mk_con2r", a)));
-                } else {
-                    b.push(let_(&t, Ty::U64, mk_con(*cid, es)));
-                }
+                let con = self.build_con(*cid, reuse, es);
+                b.push(let_(&t, Ty::U64, con));
                 v(t)
             }
             Core::Tuple(items) => {
@@ -869,10 +842,7 @@ impl<'m> Ex<'m> {
                 } else {
                     // the container stays: the field is now shared, so its
                     // type must carry a refcount
-                    match self.cur_let {
-                        Some(y) => self.note_share(y),
-                        None => self.shared.borrow_mut().poison = true,
-                    }
+                    self.share_let();
                     b.push(let_(&t, Ty::U64, c("dup_val", vec![c("field", vec![sv, usize_(*i)])])));
                 }
                 v(t)
@@ -888,16 +858,7 @@ impl<'m> Ex<'m> {
                 let sw = plan_arms(&sv, arms, unbox, |i| {
                     let (cid, binders, body) = &arms[i];
                     let mut ab = self.arm_own(body);
-                    if unbox.contains_key(cid) {
-                        if let Some(bv) = binders.first() {
-                            if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
-                                ab.push(let_(vn(*bv), Ty::U64, num(as_i(sv.clone()))));
-                            }
-                        }
-                    } else {
-                        let tok = reuse_var(body, &sv);
-                        self.bind_fields(&sv, hold, *cid, binders, tok, &mut ab);
-                    }
+                    self.bind_fields(&sv, hold, *cid, binders, body, &mut ab);
                     self.block_into(body, esc, &t, &mut ab);
                     ab
                 });
@@ -1084,16 +1045,7 @@ impl<'m> Ex<'m> {
             let mut local = Cnt::new();
             cnt(body, &mut local);
             self.enter_branch(&live, &local, &mut ab);
-            if unbox.contains_key(cid) {
-                if let Some(bv) = binders.first() {
-                    if self.rem.get(bv).copied().unwrap_or(0) > 0 || self.pinned > 0 {
-                        ab.push(let_(vn(*bv), Ty::U64, num(as_i(sv.clone()))));
-                    }
-                }
-            } else {
-                let tok = reuse_var(body, &sv);
-                self.bind_fields(&sv, hold, *cid, binders, tok, &mut ab);
-            }
+            self.bind_fields(&sv, hold, *cid, binders, body, &mut ab);
             emit(self, body, &mut ab);
             ab
         });
@@ -1341,18 +1293,32 @@ impl<'m> Ex<'m> {
         b.push(S::Continue);
     }
 
+    /// Take the pending reuse token of `x`'s consumed cell, if this span
+    /// holds it (tokens are unique; the rule form never holds any).
+    fn take_tok(&mut self, x: u32) -> Option<String> {
+        let tk = format!("tok_v{x}");
+        let i = self.toks.iter().position(|y| *y == tk)?;
+        Some(self.toks.remove(i))
+    }
+
+    /// Build ctor `cid` from `es`, in `reuse`'s consumed cell when its token is held.
+    fn build_con(&mut self, cid: u32, reuse: Option<u32>, es: Vec<E>) -> E {
+        match reuse.and_then(|x| self.take_tok(x)) {
+            Some(tk) => {
+                let mut a = vec![v(tk), u16_(cid as u64)];
+                a.extend(es);
+                c("mk_con2r", a)
+            }
+            None => mk_con(cid, es),
+        }
+    }
+
     /// Tail case (a): `C(f0, x)` with `x` the pending self call.
     fn trmc_cons(&mut self, cid: u32, reuse: Option<u32>, f0: &Core, b: &mut Vec<S>) {
         let e0 = self.val(f0, true, b);
         let pn = self.fresh();
-        let tk = reuse.map(|x| format!("tok_v{x}"));
-        match tk {
-            Some(tk) if self.toks.iter().any(|t| *t == tk) => {
-                self.toks.retain(|t| *t != tk);
-                b.push(let_(&pn, Ty::U64, c("mk_con2r", vec![v(tk), u16_(cid as u64), e0, u64_(0)])));
-            }
-            _ => b.push(let_(&pn, Ty::U64, c("mk_con2", vec![u16_(cid as u64), e0, u64_(0)]))),
-        }
+        let con = self.build_con(cid, reuse, vec![e0, u64_(0)]);
+        b.push(let_(&pn, Ty::U64, con));
         b.push(do_(c("hole_link", vec![E::Ref("th_head".into()), E::Ref("th_hole".into()), v(pn)])));
         self.trmc_continue(b);
     }
@@ -1383,8 +1349,7 @@ fn is_var_local(x: &str) -> bool {
 pub(crate) fn reuse_var(body: &Core, sv: &E) -> Option<u32> {
     let E::V(name) = sv else { return None };
     let x: u32 = name.strip_prefix('v')?.parse().ok()?;
-    let has = |e: &Core| e.any(&mut |e| if matches!(e, Core::Reuse(w, _, _) if *w == x) { Some(true) } else { None });
-    if has(body) { Some(x) } else { None }
+    body.any(&mut |e| matches!(e, Core::Reuse(w, _, _) if *w == x).then_some(true)).then_some(x)
 }
 
 /// Switch lowering for a constructor match on `sv`: dispatch on the port's

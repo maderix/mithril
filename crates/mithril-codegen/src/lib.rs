@@ -380,15 +380,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
                 if i == pf.acc {
                     continue;
                 }
-                let mut sh = shared.borrow_mut();
-                match tys.params[fid][i] {
-                    ty::Ty::Adt(c) => {
-                        sh.classes.insert(c);
-                    }
-                    ty::Ty::Tup(_) => sh.tuples = true,
-                    ty::Ty::Dyn => sh.poison = true,
-                    _ => {}
-                }
+                shared.borrow_mut().note(&tys.params[fid][i]);
             }
         }
     }
@@ -534,17 +526,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
                     continue;
                 }
                 for ft in &tys.field[c] {
-                    match *ft {
-                        ty::Ty::Adt(d) => changed |= sh.classes.insert(d),
-                        ty::Ty::Tup(_) => {
-                            if !sh.tuples {
-                                sh.tuples = true;
-                                changed = true;
-                            }
-                        }
-                        ty::Ty::Dyn => sh.poison = true,
-                        _ => {}
-                    }
+                    changed |= sh.note(ft);
                 }
             }
         }
