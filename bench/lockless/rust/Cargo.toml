@@ -1,0 +1,13 @@
+# Rust twins of the bench/lockless programs: one binary per program,
+# rayon for parallelism, Mutex or atomics where the problem needs them.
+# Not a member of the root workspace (the empty [workspace] table below).
+[package]
+name = "lockless"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rayon = "1.11"
+
+[workspace]
