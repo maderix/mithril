@@ -1,0 +1,6 @@
+name = "confluence"
+version = "0.1.0"
+defaultTargets = ["Confluence"]
+
+[[lean_lib]]
+name = "Confluence"

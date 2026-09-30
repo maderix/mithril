@@ -1076,7 +1076,8 @@ what is checked and what is only claimed:
 | ports compute the right answer | checked | every run's checksum against `bench/expected.txt`, which the C twin and the CPython shim agree with |
 | every redex order reaches the same value | checked on samples | `mithril-net/tests/schedule_test.rs`: 10,000 random programs (arithmetic, branches, a shared closure applied twice, a shared list consumed twice, tuples), each reduced by `mithril_core::rules` under 5 sampled redex orders, equal to `eval_core` |
 | every redex order takes the same number of rewrites | **false** for the extended table | most generated programs take order-dependent counts, a spread of about 1% per program: OP's half step fires only when its first operand arrives before the second; values never differ. The test is kept, ignored with this reason |
-| the rule table is confluent | **claimed**, tested as above | a Lean proof is not started |
+| the rule table is confluent (pure core) | **proved** | `proofs/confluence` (Lean 4, no Mathlib, no `sorry`; `lake build`): for nets with agents named by the redex that created them, any oriented rule table with local right-hand sides has the diamond property (`diamond`), hence one normal form, reached in the same number of steps by every order (`net_same_length`), and any partial reduction keeps it (`net_partial_reduction_sound`, the justification for stopping compile-time reduction at a budget). Instantiated for Mithril's kinds (`mithril_confluent`, `mithril_same_length`): ERA, DUP-DUP by label, DUP copying, beta, SWI and MAT selection, REF unfold and OP compute left abstract |
+| the rule table is confluent (Mithril's extensions) | **claimed**, tested as above | not in the proof: OP reading its operand through a wire and OP-SUP (three agents), closure copy on DUP, labels from a global counter, MAT's arm calling convention, `Kont` delivery and the static gate (`proofs/confluence/README.md`). The rewrite-count test above shows the extended table is not diamond in step counts |
 | lockless protocols (CPU runtime): a join record fires once and sees every argument; a wave entry is claimed once; a refcounted cell or array is torn down once, after every other owner's reads | **model-checked** | loom over the functions the runtime calls (`mithril-rt/src/sync.rs`), every interleaving and C11 ordering: `cargo test -p mithril-rt --features loom --release --test loom_test`. It found two orderings that let a cell's last owner free or reuse it before another owner's read was ordered before it (a stale or reused value, not undefined behaviour, since cells are atomics): the release was `Release` only, and the unique-owner check a `Relaxed` load. The release is `AcqRel` and the check `Acquire` |
 | the device rule table equals `mithril_core::rules` | **claimed**, checked by tests only | two implementations held together by the oracle |
 | lowering preserves meaning | **claimed**, checked by tests only | oracle equality of generated code |
@@ -1410,7 +1411,7 @@ Constraint and proofs:
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
-16. Lean proof of confluence of the core rule table: not started.
+16. Lean proof of confluence: the pure core is proved (section 8); the extensions (section 8, `proofs/confluence/README.md`) and the conformance link from `mithril_core::rules` to the Lean model are not.
 17. One rule-table source for the CPU and the device: not started.
 
 Measurement:
