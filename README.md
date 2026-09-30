@@ -1,15 +1,47 @@
 # Mithril
 
-Mithril is a small language whose meaning is defined by interaction-net
-rules. Programs are written in a subset of Python. The same rule table runs
-at compile time (on the parts of a program that do not depend on input) and
-at run time, and the compiler lowers the rest to native code that runs in
-parallel on the CPU, or on an NVIDIA GPU, with no annotations: independent
-work in the program's structure (both halves of a tree recursion, the
-branches of a divide and conquer) runs in parallel because the rules are
-confluent, and the result never depends on the schedule or the thread count.
+**Write plain scalar code. Mithril runs it in parallel on every CPU core and on
+the GPU, and the result is the same no matter what order the work runs in.**
 
-`docs/design.md` describes the design and records the measurements behind it.
+No threads, no locks, no annotations. Independent work in your program runs at
+the same time on its own, and the answer is identical at 1 thread, 16 threads
+or on the GPU.
+
+![Cornell box, path traced by Mithril](docs/img/cornell_path.png)
+
+This is `demos/cornell_path.py`, an ordinary recursive path tracer:
+
+```python
+def path(o, d, depth, h, seen):
+    x = scene(o, d)
+    if x[0] >= far() or depth == 0:
+        return (0.0, 0.0, 0.0)
+    ...
+    direct = next_event(p, n, h)
+    more = path(add(p, scale(n, eps())), bounce(n, hash(h + 4)), depth - 1, hash(h + 5), 0)
+    return mul(albedo(m), add((direct, direct, direct), more))
+
+# split the image into halves, then halves again: each half is independent work
+def rows(y0, n):
+    if n == 1:
+        return cols(y0, 0, size())
+    h = n // 2
+    return (rows(y0, h), rows(y0 + h, n - h))
+```
+
+```
+mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 1.62 s
+mithril run --image cornell.ppm demos/cornell_path.py                # 0.17 s, 16 threads
+mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.20 s, RTX 4090
+```
+
+All three write the same image, bit for bit (times are run time, excluding
+compilation).
+
+How it works: a Mithril program means a set of interaction-net rewrite rules,
+and those rules give the same result in any order, so the runtime is free to
+run them in parallel. The same rules run at compile time on everything that
+does not depend on input. `docs/design.md` has the details.
 
 ## Build
 
@@ -34,40 +66,6 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 
 `MITHRIL_NVCC_IMAGE` selects another image. Kernels are currently compiled
 for `sm_89` (RTX 40 series) and cached under `target/mithril-cache/gpu`.
-
-## A first program
-
-```python
-@data
-class Tree:
-    Leaf: (v,)
-    Node: (l, r)
-
-def mk(d, v):
-    if d == 0:
-        return Leaf(v)
-    return Node(mk(d - 1, v * 2), mk(d - 1, v * 2 + 1))
-
-def sumtree(t):
-    match t:
-        case Leaf(v):
-            return v
-        case Node(l, r):
-            return sumtree(l) + sumtree(r)
-
-def main():
-    return sumtree(mk(12, 1))
-```
-
-```
-mithril run tree.py                 # all cores
-mithril run tree.py --threads 1
-mithril run tree.py --gpu
-mithril build tree.py -o tree       # a standalone binary: ./tree --threads 8
-mithril build tree.py --gpu -o t.gpu && mithril exec t.gpu
-```
-
-`main()` takes no arguments and its value is printed.
 
 ## The language
 
@@ -156,6 +154,15 @@ teardown (about 0.1 s). Every run prints the same checksum.
 
 `bench/results.md` has the CPU table with C ratios, and `docs/design.md`
 section 10 the comparison with reference.
+
+## Limitations
+
+- Programs are a subset of Python with no mutation of shared state; I/O is the
+  value `main()` returns.
+- The GPU backend is young: on programs with little parallel work or long
+  serial phases it is slower than the CPU (see the table above).
+- Kernels are compiled for `sm_89` (RTX 40 series) only.
+- Known bugs and planned work are tracked in the issues.
 
 ## Repository layout
 
