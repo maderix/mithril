@@ -935,9 +935,12 @@ remaining suffix. Its second payload is the next element index plus one
 (zero denotes ordinary value erasure). Resuming does not decrement the
 reference count again, and the array block is freed only after its last
 element. This bounds queued work by exposed subtrees, rather than array
-length: hashmap's eager teardown exposed 7,569,521 ERA tasks and overflowed
-a 2^21 ring; the continuation probe kept the widest frontier at 4,096,
-with the same 33,423,361 cells and checksum 1307803744. No ring enlargement
+length: an eager teardown exposes every remaining element as a task
+(hashmap: 7,569,521 ERA tasks, over a 2^21 ring); with the continuation
+hashmap's widest frontier is 4,096, with the same 33,423,361 cells and
+checksum 1307803744. The continuation is one chain: a single huge boxed
+array tears down over as many rounds as it has budget-sized chunks
+(section 12). No ring enlargement
 or program-specific decision is needed. CPU array erasure already walks
 elements in place; ownership and ERA semantics are identical.
 
@@ -1032,12 +1035,10 @@ for a scalar result. The cost is zero cell bytes for a cell-free result,
 otherwise the allocation high-water range, independent of program names.
 The full suite transfers zero cell bytes for all 17 scalar ports; the
 two aggregate demo results retain their bulk snapshots.
-Measured scalar results: tree-matmul copied 1.64 GB in 556 ms and tree-radix
-2.11 GB in 708 ms. A hand-edited merkle kernel suppressing that dead range
-kept its checksum and 32 rounds while wall time fell from 243 to 140 ms.
-The generated path measures tree-matmul at 0.565 s (from 1.243),
-tree-radix at 0.650 s (from 1.515), and merkle at 0.142 s (from 0.249),
-all checksum-equal.
+Justification: copying the high-water range for a scalar result cost
+tree-matmul 1.64 GB and 556 ms, and tree-radix 2.11 GB and 708 ms; with
+the result-directed walk their device wall clocks are 0.565 and 0.650 s,
+merkle's 0.142 s, all checksum-equal.
 The CPU already walks only the root value; neither lowering nor the rule
 table changes.
 
@@ -1167,7 +1168,6 @@ Conditions:
 * Mithril t16 and device: 2026-09-30 measured built artefacts, load below
   2, min of three warm runs; every checksum equals the CPU and
   `bench/expected.txt`. Device `run` is sampled separately (section 9).
-  Raw results: `/home/maderix/Mithril-codex-logs/ab_after.json`.
 * **r**: default arenas exhausted; run with `MITHRIL_NODES=2^32
   MITHRIL_RECS=2^28`.
 * reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
@@ -1347,6 +1347,13 @@ Device:
 4. The grow/work policy (section 7.2) is reference's design. Its replacement
    must follow Mithril's own measured cost model (section 14). No reference
    implementation source is needed to derive it.
+
+5. Array teardown on the device is one continuation chain per array: a
+   single boxed array of 2^20 elements is erased over about 4,096 rounds in
+   sequence. Splitting the unvisited suffix in two at each resume keeps the
+   frontier bounded with logarithmic depth. The device erasure tests check
+   results, not free-list balance; a double free or a leaked block would
+   pass them.
 
 CPU:
 

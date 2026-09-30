@@ -797,10 +797,14 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_rounds".as_ptr()), "cuModuleGetGlobal(g_rounds)")?;
     let r = dtoh::<u64>(ptr, 8, "read g_rounds")?;
     if stats {
+        // diagnostics never fail a run: an unreadable event is reported
         let (mut boot_ms, mut run_ms) = (0f32, 0f32);
-        cu(cuEventElapsedTime(&mut boot_ms, mem.events[0], mem.events[1]), "time boot")?;
-        cu(cuEventElapsedTime(&mut run_ms, mem.events[2], mem.events[3]), "time run")?;
-        eprintln!("mithril-gpu: device events: boot {boot_ms:.3} ms, run {run_ms:.3} ms");
+        let boot = cu(cuEventElapsedTime(&mut boot_ms, mem.events[0], mem.events[1]), "time boot");
+        let run = cu(cuEventElapsedTime(&mut run_ms, mem.events[2], mem.events[3]), "time run");
+        match (boot, run) {
+            (Ok(()), Ok(())) => eprintln!("mithril-gpu: device events: boot {boot_ms:.3} ms, run {run_ms:.3} ms"),
+            (b, r) => eprintln!("mithril-gpu: device events unavailable ({})", b.err().or(r.err()).unwrap_or_default()),
+        }
         let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
         eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[3]);
