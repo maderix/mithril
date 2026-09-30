@@ -1402,7 +1402,9 @@ pub(crate) fn dive_fn<'m>(
     let nret = ntup_of(fid);
     let trmc = if nret > 0 || bor[fid as usize].iter().any(|b| *b) || std::env::var_os("MITHRIL_NO_TRMC").is_some() { None } else { trmc_ctor(fid, body, m, unbox) };
     let hole_rule = trmc.map(|c| sq.add_hole(c));
-    let lp = f.self_tail_rec || trmc.is_some();
+    // a loop where the body calls itself (`self_tail_rec` holds vacuously
+    // for a function with no self call), or a TRMC loop
+    let lp = (f.self_tail_rec && crate::scalar::calls_fn(body, fid)) || trmc.is_some();
     let argl: Vec<E> = (0..ar).map(|i| v(vn(i as u32))).collect();
     let is_fold = FOLDS.with(|f| f.borrow().get(fid as usize).copied().unwrap_or(false));
     // Fuel-out at entry / loop top: the pending call IS the continuation;

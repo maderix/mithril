@@ -416,20 +416,55 @@ fn gpu_arena_exhaustion_is_a_clean_error() {
 }
 
 #[test]
-#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_TIMEOUT; run --test-threads=1)"]
-fn gpu_timeout_kills_the_run_and_the_next_run_works() {
+#[ignore = "requires MITHRIL_GPU=1 (runs a child process with MITHRIL_GPU_TIMEOUT)"]
+fn gpu_timeout_abandons_a_runaway_loop_and_other_processes_run() {
     if !gpu_on() {
         return;
     }
-    // a loop far longer than the deadline
+    // A native loop far longer than the deadline checks nothing per
+    // iteration, so it is abandoned at twice the deadline until its process
+    // exits: run it in a child process (this test binary, the child test
+    // below), then run on the device here.
+    let t = std::time::Instant::now();
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--ignored", "--exact", "gpu_timeout_child", "--nocapture", "--test-threads=1"]);
+    // a clean device environment: only the switch and this test's deadline
+    for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("MITHRIL_GPU_") && k != "MITHRIL_GPU") {
+        cmd.env_remove(k);
+    }
+    let mut child = cmd
+        .env("MITHRIL_GPU_TIMEOUT_CHILD", "1")
+        .env("MITHRIL_GPU_TIMEOUT", "2")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the child is bounded too: abandoned at 4 s, it must exit well within 60
+    while child.try_wait().unwrap().is_none() {
+        if t.elapsed().as_secs() > 60 {
+            let _ = child.kill();
+            panic!("the child did not exit within 60 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "child failed:\n{log}");
+    assert!(log.contains("exceeded 2 s") && log.contains("abandoned until the process exits"), "wrong error:\n{log}");
+    assert!(t.elapsed().as_secs() < 30, "the child waited for the kernel ({:?})", t.elapsed());
+    let (want, got) = run_fixture("fib_naive.py");
+    assert_eq!(got.map(|r| r.text), Ok(want), "a run after the child's timeout");
+}
+
+/// The child of the test above (does nothing unless asked by it).
+#[test]
+#[ignore = "run by gpu_timeout_abandons_a_runaway_loop_and_other_processes_run"]
+fn gpu_timeout_child() {
+    if std::env::var_os("MITHRIL_GPU_TIMEOUT_CHILD").is_none() || !gpu_on() {
+        return;
+    }
     let src = "def spin(n):\n    s = 0\n    for i in range(n):\n        s = (s * 31 + i) & 4294967295\n    return s\n\ndef main():\n    return spin(array_len(array_new(1, 0)) << 40)\n";
     let (_, cu) = pipeline_src(src);
-    std::env::set_var("MITHRIL_GPU_TIMEOUT", "2");
-    let t = std::time::Instant::now();
     let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("the run cannot finish in 2 s");
-    std::env::remove_var("MITHRIL_GPU_TIMEOUT");
-    assert!(err.contains("exceeded 2 s") && err.contains("stopped"), "wrong error: {err}");
-    assert!(t.elapsed().as_secs() < 30, "the timeout waited for the kernel ({:?})", t.elapsed());
-    let (want, got) = run_fixture("fib_naive.py");
-    assert_eq!(got.map(|r| r.text), Ok(want), "the run after a timeout");
+    println!("child error: {err}");
 }

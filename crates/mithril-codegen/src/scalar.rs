@@ -1694,7 +1694,9 @@ fn flat_names(sig: &Sig) -> Vec<String> {
 pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[Vec<bool>], bridge: bool) -> Vec<FnDef> {
     let f = &m.fns[fid as usize];
     let ar = f.arity;
-    let lp = f.self_tail_rec;
+    // a loop only where the body calls itself (`self_tail_rec` also holds,
+    // vacuously, for a function with no self call)
+    let lp = f.self_tail_rec && calls_fn(&f.body, fid);
     let sig = sigs[fid as usize].as_ref().unwrap().clone();
     let mut params: Vec<(String, Ty)> = vec![("fuel".into(), Ty::RefI64)];
     params.extend(flat_names(&sig).into_iter().map(|n| (n, Ty::I64)));
@@ -1767,16 +1769,11 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     }
     body.push(let_("fl", Ty::I64, i64_(1)));
     if lp {
-        // a native loop never suspends: on the device it leaves the frame
-        // when the run is aborting, checked once per work cap of its own
-        // iterations (`it`: fuel `fl` also counts leaf calls, by varying
-        // steps; dead code on the CPU)
-        body.push(let_("it", Ty::I64, i64_(0)));
-        let mut lb = vec![
-            set("fl", bin(Bop::Add, v("fl"), i64_(1))),
-            set("it", bin(Bop::Add, v("it"), i64_(1))),
-            do_(p("loop_guard", vec![v("it")])),
-        ];
+        // a native loop never suspends and checks nothing per iteration: a
+        // check in a hot loop blocks the backend's unrolling of short
+        // counted loops (raytrace's device kernel 68 -> 385 ms). A runaway
+        // native loop is stopped with its process (design section 7.6).
+        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1)))];
         lb.extend(bb);
         body.push(S::Loop(lb));
     } else {

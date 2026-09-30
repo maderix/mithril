@@ -708,10 +708,17 @@ error ("recursion too deep for the device"). Guarding every non-leaf
 native function cost raytrace 3x (`isect` is called 10^8 times), hence
 the recursion test.
 
-Every native loop counts its own iterations in a register and calls
-`loop_guard(it)` per iteration: a no-op on the CPU; on the device a read
-of the abort flag once per `WORK_CAP` iterations, leaving the frame when
-the run is aborting (section 7.3).
+A native loop checks nothing per iteration. A stop check in a hot loop,
+even one that reads the abort flag once per 2^20 iterations, cost
+raytrace's device kernel 5.7x (385 ms against 68 ms; the likely cause is
+that it blocks the backend's unrolling of the short counted sphere
+loops). The loop scaffold (the back edge and its one fuel unit per
+iteration) is emitted only for a function that calls itself, in the
+native and the dive form (`self_tail_rec` holds vacuously for a
+function with no self call). A runaway native loop is stopped with its
+process (section 7.6): it holds the device until the run is abandoned
+at twice `MITHRIL_GPU_TIMEOUT` (600 s by default), and the CLI then
+exits.
 
 ### 5.6 Fold splitting
 
@@ -901,15 +908,10 @@ at once.
   runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
   a dive form's next budget check to suspend, so no dive runs unbounded;
   a runaway loop cycles rounds to the round limit instead of freezing the
-  device, which the desktop shares. A native loop never suspends: once
-  per `WORK_CAP` of its own iterations (a register count per frame) it
-  checks the abort flag, and leaves when the run is aborting (an abort,
-  or the host's stop at the deadline; a no-op on the CPU). Not covered: a
-  native loop whose body calls a function with an inner loop, each under
-  `WORK_CAP` iterations per frame, and long non-forking native recursion;
-  neither is checked. A counter shared across frames and checked at every
-  recursive entry covered them but cost the Whitted demo's kernel 19 to
-  32 ms; the per-frame check costs 2 ms.
+  device, which the desktop shares. A native loop never suspends and
+  checks nothing (section 5.5): a runaway native loop, like long
+  non-forking native recursion, runs until the host abandons the run
+  at twice its deadline (section 7.6).
 * The stack guard (`stack_deep` on the device) compares against the
   thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives
@@ -981,15 +983,16 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
   devices with concurrent managed access, and only when no abort is set;
   the host's read and write are not one atomic step, so a device abort
   landing between them is reported as the timeout). Lanes stop at their
-  next check and the run ends with a named error.
-  Measured: a runaway native loop stops within the deadline plus about
-  3 s. A runaway forking recursion does not stop (a dive form that leaves
-  early reads as suspended, and its work keeps expanding as tasks): at
-  twice the deadline the run returns an error and the kernel is
-  abandoned until the process exits, and every later run in the process
-  fails at once (it would queue behind that kernel; a process-wide
-  `STUCK` flag). A context reset does not stop a running kernel
-  (measured), so none is attempted.
+  next scheduler check and the run ends with a named error. A lane inside
+  a native loop or a runaway forking recursion (a dive form that leaves
+  early reads as suspended, and its work keeps expanding as tasks) does
+  not stop: at twice the deadline the run returns an error and the
+  kernel is abandoned until the process exits, and every later run in
+  the process fails at once (it would queue behind that kernel; a
+  process-wide `STUCK` flag). The CLI runs one program per process, so
+  its exit ends the kernel. A context reset does not stop a running
+  kernel (measured), so none is attempted. Native loops carry no stop
+  check: it cost raytrace's kernel 5.7x (section 5.5).
 * A failed run that left a sticky device error (700) in the context
   resets it; a clean abort leaves the context as it is.
 * Any arena exhaustion (cells, records, a rule ring, the array heap),

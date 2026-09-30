@@ -198,8 +198,8 @@ __device__ inline void stack_mark() {
 }
 // Work charged on the device: it deepens no stack, so it does not touch
 // the depth budget, but every WORK_CAP units it forces the frame's next
-// budget check to suspend, so no fire runs unbounded (a runaway loop then
-// cycles rounds to the round limit instead of freezing the device).
+// budget check to suspend, so a dive form yields (a native loop checks
+// nothing and runs to its end: design.md section 5.5).
 #define WORK_CAP (1u << 20)
 __device__ inline void work_fuel(i64 *fuel, i64 n) {
   u32 w = s_work[threadIdx.x] + (u32)n;
@@ -208,15 +208,6 @@ __device__ inline void work_fuel(i64 *fuel, i64 n) {
     *fuel = -1;
   }
   s_work[threadIdx.x] = w;
-}
-// A native loop's stop check, once per WORK_CAP iterations (`n` counts the
-// frame's iterations in a register): the run is aborting (an abort, or the
-// host's stop at the deadline), so the frame leaves; the lanes then stop at
-// their next check. Native recursion needs none: without a fork it is
-// bounded by the stack guard, and forking recursion runs in dive forms,
-// which suspend every WORK_CAP units.
-__device__ inline bool stop_asked(i64 n) {
-  return (n & (WORK_CAP - 1)) == 0 && *(volatile u32 *)G.abortf != 0;
 }
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
@@ -1965,7 +1956,8 @@ __device__ inline void fire_task(u32 rule, u32 idx) {
 // WORK phase: every lane drains its own tasks depth-first (the tasks it
 // spawns and the joins it completes stay on it), dealt every nl-th pending
 // task of the snapshot. After `max_steps` fires a lane spills its stack to
-// the global rings and stops; a fire itself is bounded by WORK_CAP.
+// the global rings and stops; a fire's dive forms yield every WORK_CAP
+// units (its native loops run to their ends).
 #define LOGCAP (1u << 16)
 __device__ u32 g_off[NRULES_ALL + 1]; // forkable-task prefix of the snapshot
 __device__ u32 g_woff[NRULES_ALL + 1]; // pending-task prefix of the snapshot (WORK deals these)

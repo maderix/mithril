@@ -417,7 +417,7 @@ struct Mem {
     module: *mut c_void,
     /// a successful run of an exiting process: the driver reclaims it
     keep: bool,
-    /// the kernel still runs (a timeout): the context reset reclaims it
+    /// the kernel still runs (a timeout): the process's exit reclaims it
     abandon: bool,
 }
 
@@ -733,8 +733,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         "launch k_run (cooperative)",
     )?;
     // wait with a deadline: a run past MITHRIL_GPU_TIMEOUT seconds is an
-    // error, and the caller's context reset kills the kernel (the device is
-    // shared with the desktop; a stuck kernel freezes it)
+    // error; lanes that do not stop (a native loop, a runaway forking
+    // recursion) leave the kernel running until the process exits
     let deadline = std::time::Duration::from_secs(env_cap("MITHRIL_GPU_TIMEOUT", 300));
     let mut stop_sent = false;
     let mut concurrent = 0i32;
@@ -750,7 +750,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         }
         if t_run.elapsed() > deadline && !stop_sent {
             // ask the lanes to stop: the abort flag, which every lane reads
-            // at its next check (a fire yields at least every 2^20 units)
+            // at its next scheduler check (a native loop never checks)
             // (only where the host may write managed memory while a kernel
             // runs, and only when no abort is set: the first abort wins)
             if concurrent && std::ptr::read_volatile(d.abortf as *const u32) == 0 {
