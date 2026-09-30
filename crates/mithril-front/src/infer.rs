@@ -388,9 +388,6 @@ impl<'m> Infer<'m> {
         let is32 = self.f32(e);
         Ok(match e {
             Expr::Int(v) if is32 => Expr::Int(int_bits(*v)),
-            // an int literal beside an f64 (a class of float literals) is
-            // that float
-            Expr::Int(v) if self.flo_of(e) && self.is(self.at[&(e as *const Expr)], &Ty::Var) => Expr::Float(*v as f64),
             Expr::Float(v) if is32 => Expr::Int(bits(*v)),
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => e.clone(),
             Expr::Neg(a) => {

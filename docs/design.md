@@ -275,7 +275,8 @@ used (an int stored in a tree that also holds tuples) stays at that use
 and does not flow back into the arithmetic that made it; a result whose
 operand is poisoned later takes the operand's type again (a fixpoint
 after each pass). A closure's result has no known type and conflicts
-with any type it meets, so a parameter that receives it is not native. One
+with any type it meets, as do the components and elements read out of
+it, so a parameter that receives any of them is not native. One
 heterogeneous array (ints and lists in one array) still poisons the ints
 unified with its elements to `Dyn`: correct tagged code, slower. No port
 does this; `hetero_array.py` covers the runtime conversion.
@@ -293,9 +294,10 @@ constructor field, tuple component and array element has one type, found
 by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
 assignments, operators, calls and returns, and a float literal written as
 the argument of `f32()` or `int()` is f32 (any other f64 expression passed
-to either is an error, not a retyping). An int literal written as an
-operand beside an f64 is that float (`g + 1`). f64 stays dynamically
-typed (a helper may take ints and f64s; the rules dispatch on the value). Where a value is f32, a literal becomes its bit
+to either is an error, not a retyping). f64 stays dynamically typed: a
+helper may take ints and f64s, and the rules dispatch on the value.
+Mixed int/f64 arithmetic (`2.5 * 3`) is a type error of the rules; native
+code does not check it and computes a meaningless value (a known gap). Where a value is f32, a literal becomes its bit
 pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
 Core, the net and every backend see ints and the existing rules: `x + y`
 on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
@@ -1117,44 +1119,50 @@ Device:
 
 CPU:
 
-7. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
+7. A closure that returns a tuple, applied by a self-recursive function
+   whose result is returned (`def ap(f, s, n): return f(s) if n == 0
+   else ap(f, s, n - 1)` with `f = lambda y: (y, y)` and runtime `n`),
+   delivers a raw int instead of the tuple port on the CPU ("unprintable
+   result port"). The same program without the recursion, or with
+   constant arguments, is correct. Open.
+8. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
    0.771. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
-8. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
+9. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
    (0.827 s against 0.616, and default arenas exhausted); tree-matmul at
    16 threads (0.66 s against 0.61).
-9. `interp_closure`: a closure body with no parameter-free work should be
+10. `interp_closure`: a closure body with no parameter-free work should be
    applied by compiled code directly, the rule table deciding when.
-10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+11. Inference: one heterogeneous array poisons connected ints to `Dyn`.
 
 Semantic core:
 
-11. Readback: a closure created in an arm, capturing a pattern binder and
+12. Readback: a closure created in an arm, capturing a pattern binder and
     applied twice, is an ICE in the reader (the ignored test in
     `specialize_test.rs`). Two specializer crashes on nested closures with
     conditionals (in `mithril-core` `net.rs` and `rules.rs`).
-12. The Dup cache is keyed by the whole selection, so a captured shared
+13. The Dup cache is keyed by the whole selection, so a captured shared
     value read under three selections is bound three times (duplicated
     work, not a wrong answer). Keying by the selections a read consults
     fixes it.
 
 Constraint and proofs:
 
-13. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
+14. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
     with unmarked thresholds (64, 32, 128), and the inline decision uses a
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
-14. Lean proof of confluence of the core rule table: not started.
-15. One rule-table source for the CPU and the device: not started.
+15. Lean proof of confluence of the core rule table: not started.
+16. One rule-table source for the CPU and the device: not started.
 
 Measurement:
 
-16. reference re-measured on a quiet machine: not done.
-17. The efficiency study: work per port against the C twin and a hand
+17. reference re-measured on a quiet machine: not done.
+18. The efficiency study: work per port against the C twin and a hand
     CUDA kernel; speedup per core; lanes busy per phase. Not started.
-18. The nbody C twin does not compile with gcc 11 (`musttail` placement).
-19. A reference lane for the generality corpus is not set up.
+19. The nbody C twin does not compile with gcc 11 (`musttail` placement).
+20. A reference lane for the generality corpus is not set up.
 
 Unconfirmed findings from source review (argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a

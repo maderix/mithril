@@ -227,6 +227,15 @@ impl Inf {
 
     fn unify(&mut self, a: u32, b: u32) {
         self.merge_adts(a, b);
+        // a tuple or an array meeting an unknown value (poison): what is
+        // read out of it is unknown too
+        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
+        let poison = Node::Adt(u32::MAX);
+        for (x, y) in [(ra, rb), (rb, ra)] {
+            if self.uf.n[y as usize] == poison && x != y {
+                self.poison_inside(x, 0);
+            }
+        }
         // arrays unify their element types, tuples their components
         let (ra, rb) = (self.uf.find(a), self.uf.find(b));
         if ra != rb {
@@ -250,9 +259,30 @@ impl Inf {
         self.uf.union(a, b);
     }
 
+    /// Poison the components or elements of a tuple or array tyvar.
+    fn poison_inside(&mut self, v: u32, depth: u32) {
+        let r = self.uf.find(v);
+        let inner: Vec<u32> = match self.uf.n[r as usize] {
+            Node::Tup(_, c) => self.tups[c as usize].clone(),
+            Node::Arr(e) => vec![e],
+            _ => return,
+        };
+        if depth > 8 {
+            return;
+        }
+        for t in inner {
+            let p = self.node(Node::Adt(u32::MAX));
+            self.unify(t, p);
+            self.poison_inside(t, depth + 1);
+        }
+    }
+
     /// The tyvar of component `i` of a value typed `tb`.
     fn proj(&mut self, tb: u32, i: usize) -> u32 {
         let r = self.uf.find(tb);
+        if self.uf.n[r as usize] == Node::Adt(u32::MAX) {
+            return self.node(Node::Adt(u32::MAX));
+        }
         if let Node::Tup(k, c) = self.uf.n[r as usize] {
             if i < k as usize {
                 return self.tups[c as usize][i];
@@ -312,6 +342,11 @@ impl Inf {
     fn settle(&mut self) {
         for (b, i, res) in std::mem::take(&mut self.pending) {
             let r = self.uf.find(b);
+            if self.uf.n[r as usize] == Node::Adt(u32::MAX) {
+                let p = self.node(Node::Adt(u32::MAX));
+                self.unify(res, p);
+                continue;
+            }
             if let Node::Tup(k, c) = self.uf.n[r as usize] {
                 if i < k as usize {
                     let t = self.tups[c as usize][i];
@@ -525,7 +560,7 @@ fn bind(env: &mut Vec<u32>, x: u32, t: u32) {
 /// Infer module types. Two passes over every body (the second lets sigs
 /// settled late propagate), then a readout.
 pub(crate) fn infer(m: &CoreModule) -> Types {
-    let nf = m.fns.len();
+    let _nf = m.fns.len();
     let mut inf = Inf {
         uf: Uf { n: Vec::new() },
         fparam: Vec::new(),
@@ -573,7 +608,6 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
         .iter()
         .map(|env| env.iter().map(|&v| if v == u32::MAX { Ty::Dyn } else { inf.uf.read(v) }).collect())
         .collect();
-    let _ = nf;
     let class_of: Vec<u32> = (0..m.ctors.len() as u32).map(|c| inf.cfind(c)).collect();
     let canon = |t: Ty| if let Ty::Adt(c) = t { Ty::Adt(class_of[c as usize]) } else { t };
     let mut rd = |vs: &[u32]| -> Vec<Ty> { vs.iter().map(|&v| canon(inf.uf.read(v))).collect() };

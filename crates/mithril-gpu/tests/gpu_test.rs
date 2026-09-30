@@ -93,6 +93,7 @@ const FIXTURES: &[&str] = &[
     "mixed_params.py",
     "stale_ret.py",
     "closure_result.py",
+    "closure_parts.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",
