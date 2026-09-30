@@ -95,6 +95,8 @@ const FIXTURES: &[&str] = &[
     "closure_result.py",
     "closure_parts.py",
     "self_types.py",
+    "net_values.py",
+    "net_lists.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",

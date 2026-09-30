@@ -282,6 +282,52 @@ opaque `Lam` ports until applied. On the device, entries are printed as
 straight-line net builders (`inst_<e>`) from the same `NExpr` bodies
 the CPU interprets.
 
+A value the net builds can still hold fields on unfilled wires when it
+reaches compiled code (a tuple a closure returns, whose parts wait on a
+compiled call delivered later). Compiled code reads fields as values, so
+every entry from the net into compiled code settles the value first:
+`apply`, the delivery of a `Kont`, and a net call fired into a rule form.
+`settle` (`mithril-core` `rules.rs`) follows each field's wire, writes
+the value back into its slot, and returns the fields still pending. When
+none is pending the value is delivered at once. Otherwise three records
+finish it. Like FILL, they are bridge records of the runtime, not
+interaction rules: they move values between the net and compiled code
+and never rewrite the net.
+
+* FIELD: one record per pending field, fed through a `Kont` by that
+  field's wire. A `Kont` delivery settles first, so the value it receives
+  is whole; it writes the value into the field's slot and counts down its
+  parent.
+* WHOLE: the parent, holding the value; it delivers the value when its
+  count reaches zero.
+* RELINK: a net call whose top-level arguments exist but whose fields
+  are pending waits for them as a whole value, then is pushed as a redex
+  (not linked: a link would park the call in the wire as if it were the
+  value).
+
+A record created in a dive (WHOLE from `apply`, like the forwarding
+record) gets its parent after the dive returns (`set_parent`). That is
+safe because a record's inputs are produced by work this dive spawned,
+and that work runs after the dive returns: on the lane's own stack, or
+after the next wave or barrier. The CPU and the device implement the
+same three records (one runtime model). The CPU counts the pending
+fields first and allocates the parent with that count. The device
+allocates the parent at the first pending field with one guard count,
+adds one per field and drops the guard at the end; if every field
+already arrived, the value is whole and the record is freed unfired.
+Both walk the value head before tail, holding only constructors not
+yet visited, so the worklist grows with left nesting, not with a list's
+length.
+
+Cost: settling walks the whole value at every crossing. A closure
+returning an n-element list pays n steps per application, and a loop
+that grows an accumulator through a closure pays O(n^2) over the loop.
+`settle` does not walk array elements (section 12).
+
+Oracle tests: the `net_values`, `net_lists` (a 200-element list, a
+40-field tuple) and `closure_parts` fixtures, at 1, 4 and 16 threads,
+with a starved budget, and on the device.
+
 The sharing constant, measured on the W2 shape (`g = λx. x + heavy(k)`
 built once, copied through a chain of DUPs, applied N times):
 
@@ -943,7 +989,11 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
   unreachable match arm, unsupported device feature, cell walk past
   2^22 steps (a corrupted arena) or the round limit sets the abort flag;
   every lane stops at its next check and the host reports the named
-  cause. The first abort wins: a later one is
+  cause. Settling a net value (section 3.4) walks it with a 64-entry
+  worklist that holds only constructors not yet visited, head before
+  tail, so a list of any length settles; a value nested more than 64
+  deep on the left aborts as unsupported (the CPU's worklist is
+  unbounded). The first abort wins: a later one is
   a consequence of it. Two independent faults in one run may be reported
   in either order.
 
@@ -1246,34 +1296,24 @@ Device:
 
 CPU:
 
-6. Values built by the net that reach compiled code keep their fields
-   as unresolved wires: `apply` (rt template.rs) resolves only the
-   top-level port it returns, and so do the continuation delivery and the
-   arguments of a net call fired into a rule form. Compiled code then
-   reads a wire as a field. A closure applied at runtime that returns a
-   tuple fails ("unprintable result port") or gives a silently wrong
-   value (`t = ap(lambda y: (y, y), n, n); t[0] + t[1]` prints a float
-   for 6). Programs whose applications the net removes at compile time
-   are correct. Fix: one boundary that settles a net value before
-   compiled code reads it, wherever a net value enters compiled code
-   (`apply`, continuation delivery, net calls into rule forms): follow
-   every field's wire and write the value back into its slot. A field can
-   still be pending (its value waits on a compiled result delivered
-   later, or on net work the budget spawned elsewhere), so the boundary
-   also needs a continuation that waits for a whole value: a record fed
-   by each pending field that writes the field in place and delivers the
-   value when none is left. Both runtimes need it (one runtime model).
-   Open.
-7. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
+6. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
    0.677. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
-8. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
+7. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
    (0.850 s against 0.468, and default arenas exhausted); tree-matmul at
    16 threads (0.575 s against 0.460). Section 10 lists every port over
    reference.
-9. `interp_closure`: a closure body with no parameter-free work should be
+8. `interp_closure`: a closure body with no parameter-free work should be
    applied by compiled code directly, the rule table deciding when.
-10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+9. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+10. An array of tuples built by the net (in a closure applied at runtime)
+    and read by compiled code gives a wrong value: `array_new(2, (y * 3,
+    1))` returned from a closure reads its first field as a float bit
+    pattern (`net_array_tuples.py`, an ignored test). Arrays of ints and
+    bare tuples are correct. `settle` does not walk array elements.
+
+Semantic core:
+
 11. Readback: a closure created in an arm, capturing a pattern binder and
     applied twice, is an ICE in the reader (the ignored test
     `a_closure_capturing_an_arm_binder_applied_twice` in

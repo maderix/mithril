@@ -517,6 +517,7 @@ pub fn print(prog: &LirProgram) -> String {
     let _ = writeln!(out, "#define NET_RULE {}", prog.net_rule);
     let _ = writeln!(out, "#define FILL_RULE {}", prog.fill_rule);
     let _ = writeln!(out, "#define FWD_RULE {}", prog.fwd);
+    let _ = writeln!(out, "#define FIELD_RULE {}\n#define WHOLE_RULE {}\n#define RELINK_RULE {}", prog.settle_rules[0], prog.settle_rules[1], prog.settle_rules[2]);
     let _ = writeln!(out, "#include \"engine.cu\"\n");
     // tables
     let lin: Vec<&str> = prog.lin.iter().map(|b| if *b { "true" } else { "false" }).collect();
@@ -525,7 +526,7 @@ pub fn print(prog: &LirProgram) -> String {
     let cids: Vec<String> = prog.unbox_cid.iter().map(|c| c.to_string()).collect();
     let _ = writeln!(out, "__device__ const u32 UNBOX_CID[{}] = {{{}}};", prog.unbox_cid.len().max(1), if cids.is_empty() { "0".to_string() } else { cids.join(", ") });
     let _ = writeln!(out, "__device__ u32 unbox_cid(u64 slot) {{ return UNBOX_CID[slot]; }}");
-    let rr: Vec<&str> = prog.rules.iter().map(|r| if matches!(r, Rule::Seg(_) | Rule::Join(_) | Rule::Hole(_) | Rule::Fill) { "true" } else { "false" }).collect();
+    let rr: Vec<&str> = prog.rules.iter().map(|r| if matches!(r, Rule::Seg(_) | Rule::Join(_) | Rule::Hole(_) | Rule::Fill | Rule::Field | Rule::Whole | Rule::Relink) { "true" } else { "false" }).collect();
     let _ = writeln!(out, "__device__ const bool REC_RULE[PROG_NRULES] = {{{}}};\n__device__ bool prog_rec_rule(u32 rule) {{ return REC_RULE[rule]; }}", rr.join(", "));
     // rules that can fork (a call rule, a segment with a call, the net
     // region's rules): a GROW sweep fires only these
@@ -581,6 +582,9 @@ pub fn print(prog: &LirProgram) -> String {
             Rule::Hole(k) => format!("hl_{k}(e0, e1, e2)"),
             Rule::Net => "net_fire(e0, e1)".to_string(),
             Rule::Fill => "fill_fire(e0, e2)".to_string(),
+            Rule::Field => "field_fire(e0, e2)".to_string(),
+            Rule::Whole => "whole_fire(e2)".to_string(),
+            Rule::Relink => "relink_fire(e2)".to_string(),
         };
         let _ = writeln!(out, "  case {id}u: {call}; return;");
     }

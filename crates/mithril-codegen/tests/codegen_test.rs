@@ -789,13 +789,50 @@ fn mixed_type_params_are_not_read_as_ints() {
 
 #[test]
 fn stale_result_types_and_closure_results_match_oracle() {
-    for (name, want) in [("stale_ret.py", "(0, 4, 100.0)"), ("closure_result.py", "(6.25, 3)"), ("closure_parts.py", "(5.0, 6)"), ("self_types.py", "(1, 1)")] {
+    for (name, want) in [("stale_ret.py", "(0, 4, 100.0)"), ("closure_result.py", "(6.25, 3)"), ("closure_parts.py", "(5.0, 5.0, 6)"), ("self_types.py", "(1, 1)")] {
         let (cm, rs) = pipeline(&fixture(name), 1 << 20);
         assert_eq!(oracle(&cm), want, "{name} oracle");
         let bin = compile(&rs, name.trim_end_matches(".py"));
         for t in ["1", "4"] {
             assert_eq!(run(&bin, &[t]), want, "{name} --threads {t}");
         }
+    }
+}
+
+#[test]
+fn net_values_are_settled_before_compiled_code_reads_them() {
+    let (cm, rs) = pipeline(&fixture("net_values.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert_eq!(want, "((3, 3), 6, (3, 3), 7.0, 0, 5.0)");
+    let bin = compile(&rs, "net_values");
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "net_values --threads {t}");
+        // a starved budget: suspensions inside and around every application
+        assert_eq!(run(&bin, &[t, "2"]), want, "net_values --threads {t} --fuel 2");
+    }
+}
+
+#[test]
+fn net_values_of_any_length_or_width_are_settled() {
+    let (cm, rs) = pipeline(&fixture("net_lists.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert_eq!(want, "(2646700, 1773)");
+    let bin = compile(&rs, "net_lists");
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "net_lists --threads {t}");
+        assert_eq!(run(&bin, &[t, "2"]), want, "net_lists --threads {t} --fuel 2");
+    }
+}
+
+#[test]
+#[ignore = "open bug, design.md section 12: net-built arrays of tuples read with the wrong representation"]
+fn net_built_arrays_of_tuples_read_right() {
+    let (cm, rs) = pipeline(&fixture("net_array_tuples.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert_eq!(want, "10");
+    let bin = compile(&rs, "net_array_tuples");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "net_array_tuples --threads {t}");
     }
 }
 

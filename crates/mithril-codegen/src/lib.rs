@@ -219,6 +219,12 @@ pub enum Rule {
     /// the net region's generic redexes / its fill records
     Net,
     Fill,
+    /// a net value's pending field arrived: written in place (`settle`)
+    Field,
+    /// a net value is settled: delivered whole to its destination
+    Whole,
+    /// a call's arguments are settled: the call is linked again
+    Relink,
 }
 
 /// A lowered program: every function as `lir`, the rule and dive tables,
@@ -243,6 +249,9 @@ pub struct LirProgram {
     /// the net region's rules (the same rule table, run by the runtime)
     pub net_rule: u16,
     pub fill_rule: u16,
+    /// the settle rules: a pending field arrived, a value is whole, a
+    /// call's arguments are whole ([FIELD, WHOLE, RELINK])
+    pub settle_rules: [u16; 3],
     /// `Some(value)`: the whole program reduced to a literal at compile time
     pub constant: Option<Val>,
     /// The net region: the derived program (entries with `NExpr` bodies)
@@ -265,7 +274,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     let m_s = rewrite::tail_inline(m);
     let m_u = rewrite::if_convert(&uniquify(&m_s));
     let m = &m_u;
-    let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
+    let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
     // Const path: the whole program reduced to its value at compile time.
     if let Some(v) = core_value(&m.fns[m.main as usize].body) {
         return (empty(Some(v)), m_u.clone());
@@ -435,7 +444,8 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     // result back into a wire
     let net_rule = sq.next;
     let fill_rule = sq.next + 1;
-    let mut rules = vec![Rule::Net; sq.next as usize + 2];
+    let settle_rules = [sq.next + 2, sq.next + 3, sq.next + 4];
+    let mut rules = vec![Rule::Net; sq.next as usize + 5];
     rules[0] = Rule::Boot(m.main);
     for fid in 0..nf {
         rules[1 + fid] = Rule::Call(fid as u32);
@@ -457,8 +467,12 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     }
     rules[net_rule as usize] = Rule::Net;
     rules[fill_rule as usize] = Rule::Fill;
+    for (id, r) in settle_rules.iter().zip([Rule::Field, Rule::Whole, Rule::Relink]) {
+        rules[*id as usize] = r;
+    }
     diving.push(net_rule);
     diving.push(fill_rule);
+    diving.extend(settle_rules);
     let mut unbox_cid = vec![0u32; unbox.len()];
     for (cid, slot) in &unbox {
         unbox_cid[*slot as usize] = *cid;
@@ -495,6 +509,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         unbox_cid,
         net_rule,
         fill_rule,
+        settle_rules,
         constant: None,
         net,
         net_live,
@@ -582,6 +597,9 @@ fn emit_rust_inner(m: &CoreModule) -> String {
             Rule::Hole(k) => format!("hl_{k}(ctx, e.a, e.b, e.aux)"),
             Rule::Net => "net_fire(ctx, e)".to_string(),
             Rule::Fill => "fill_fire(ctx, e)".to_string(),
+            Rule::Field => "field_fire(ctx, e)".to_string(),
+            Rule::Whole => "whole_fire(ctx, e)".to_string(),
+            Rule::Relink => "relink_fire(ctx, e)".to_string(),
         };
         fire_arms.push_str(&format!("            {id} => {arm},\n"));
     }
@@ -678,7 +696,15 @@ fn net_region(prog: &LirProgram) -> String {
         }
     }
     s.push_str("    ]\n}\n\n");
-    let vars = [("nfns", nfns.to_string()), ("net_rule", prog.net_rule.to_string()), ("fill_rule", prog.fill_rule.to_string()), ("fwd", prog.fwd.to_string())];
+    let vars = [
+        ("nfns", nfns.to_string()),
+        ("net_rule", prog.net_rule.to_string()),
+        ("fill_rule", prog.fill_rule.to_string()),
+        ("field_rule", prog.settle_rules[0].to_string()),
+        ("whole_rule", prog.settle_rules[1].to_string()),
+        ("relink_rule", prog.settle_rules[2].to_string()),
+        ("fwd", prog.fwd.to_string()),
+    ];
     s.push_str(&fill(mithril_rt::template::NET_REGION, &vars));
     s
 }

@@ -110,6 +110,40 @@ pub fn resolve<C: Cells>(c: &mut C, mut p: Port) -> Port {
     p
 }
 
+/// A net value as compiled code reads it: every constructor field,
+/// transitively, resolved in place (filled wires followed and freed, the
+/// value written into the field's slot). Returns the fields still waiting
+/// on an unfilled wire as (cell, slot, wire end); empty when the value is
+/// settled. Compiled code must not read a value until it is.
+pub fn settle<C: Cells>(c: &mut C, v: Port) -> Vec<(u32, usize, Port)> {
+    let with_fields = |p: Port| p.tag() == Tag::Con && p.con_arity() > 0;
+    let mut pending = Vec::new();
+    let mut work: Vec<Port> = [v].into_iter().filter(|p| with_fields(*p)).collect();
+    while let Some(p) = work.pop() {
+        let cell = p.con_addr() as u32;
+        // arity 2: two fields; 1: one; wider: a field and the rest of the
+        // chain. Pushed last-first, so the head is visited before the tail
+        // and the worklist grows with left nesting only.
+        if p.con_arity() > 2 {
+            work.extend([Port(c.cell(cell)[1])].into_iter().filter(|r| with_fields(*r)));
+        }
+        let slots: &[usize] = if p.con_arity() == 2 { &[1, 0] } else { &[0] };
+        for &s in slots {
+            let mut f = Port(c.cell(cell)[s]);
+            if f.tag() == Tag::Var {
+                f = resolve(c, f);
+                c.set(cell, s, f);
+            }
+            if f.tag() == Tag::Var {
+                pending.push((cell, s, f));
+            } else if with_fields(f) {
+                work.push(f);
+            }
+        }
+    }
+    pending
+}
+
 /// A fresh `label` dup fed by `p`: its two output wires.
 fn fan<C: Cells>(c: &mut C, label: u32, p: Port) -> (Port, Port) {
     let (w1, w2) = (wire(c), wire(c));

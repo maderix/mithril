@@ -914,6 +914,12 @@ __device__ __noinline__ void arr_drop(u64 p) {
 __device__ u64 dup_closure(u64 p);
 __device__ void drop_closure(u64 p);
 __device__ R apply(u64 f, u64 a);
+// settling a net value compiled code will read (defined with the bridge)
+// no record yet (record 0 is the root sink, never allocated)
+#define NOREC 0u
+__device__ int settle_await(u64 v, u16 rule, u32 d, u32 s, u64 parent, u32 *j);
+__device__ bool settle_release(u32 j);
+__device__ bool settled(u64 v, u16 rule, u32 d, u32 s, u64 parent, u32 *j);
 __device__ void apply_spawn(u64 f, u64 a, u64 parent);
 __device__ u64 build_closure(u16 id, const u64 *caps, int n);
 
@@ -1238,6 +1244,24 @@ __device__ inline bool is_closure(u64 r) { return ref_entry(r) >= NFNS; }
 // CALL rule and comes back through a FILL record; anything else (a lifted
 // branch/arm, a call met before its arguments) is instantiated as a net.
 __device__ __noinline__ void unfold(u64 r, u64 other) {
+  if (ref_entry(r) < NFNS) {
+    // compiled code reads its arguments whole: a call whose arguments still
+    // have pending fields waits for them, then meets its output again
+    bool produced = true;
+    u32 g = 0;
+    for (u64 h = ref_head(r); h != EMPTY && produced; h = cell1((u32)payload(h))) {
+      GUARD(g);
+      produced = tag(cell0((u32)payload(h))) != T_VAR;
+    }
+    u32 j = NOREC;
+    g = 0;
+    for (u64 h = ref_head(r); h != EMPTY && produced; h = cell1((u32)payload(h))) {
+      GUARD(g);
+      u64 a = cell0((u32)payload(h));
+      if (settle_await(a, RELINK_RULE, (u32)r, (u32)(r >> 32), other, &j) < 0) return;
+    }
+    if (j != NOREC && !settle_release(j)) return;
+  }
   u64 args[LISTCAP];
   int n = list_collect(ref_head(r), args);
   u16 entry = ref_entry(r);
@@ -1716,7 +1740,9 @@ __device__ __noinline__ int process(u64 a, u64 b) {
   if (ta == T_KONT || tb == T_KONT) {
     u64 k = ta == T_KONT ? a : b, v = ta == T_KONT ? b : a;
     if (!is_value(v)) { g_abort(AB_UNREACHABLE); return 1; }
-    deliver(payload(k), v);
+    // compiled code reads the value whole: delivered once settled
+    u32 j;
+    if (settled(v, WHOLE_RULE, (u32)v, (u32)(v >> 32), payload(k), &j)) deliver(payload(k), v);
     return 1;
   }
   if (ta == T_ERA || tb == T_ERA) {
@@ -1767,6 +1793,85 @@ __device__ __noinline__ void fill_fire(u64 a, u64 aux) {
   reduce_net();
 }
 
+// ---- settling a net value compiled code will read (rules::settle) ----
+
+// a constructor with fields joins the settle worklist; false (run aborted)
+// when the worklist is full
+__device__ inline bool settle_push(u64 *work, int *nw, u64 f) {
+  if (tag(f) != T_CON || con_ar(f) == 0) return true;
+  if (*nw == LISTCAP) { g_abort(AB_UNSUPPORTED); return false; }
+  work[(*nw)++] = f;
+  return true;
+}
+// Resolve every constructor field of `v` in place, transitively. Each field
+// still waiting on an unfilled wire gets a FIELD record fed by that wire and
+// reporting to *j; *j (rule, d, s, parent) is allocated on the first one,
+// with one guard count so no arrival can complete it during the scan (see
+// settle_release). The head is visited before the tail, so the worklist
+// grows with left nesting only, not with a list's length. The number of
+// fields awaited, or -1 (run aborted) past LISTCAP of left nesting.
+__device__ __noinline__ int settle_await(u64 v, u16 rule, u32 d, u32 s, u64 parent, u32 *j) {
+  u64 work[LISTCAP];
+  int nw = 0, np = 0;
+  if (!settle_push(work, &nw, v)) return -1;
+  while (nw) {
+    u64 p = work[--nw];
+    u32 c = con_addr(p);
+    int ar = con_ar(p);
+    u64 *slot = &G.nodes[2 * (u64)nclamp(c)];
+    // pushed first, visited last: the chain rest (arity > 2), then slot 1
+    if (ar > 2 && !settle_push(work, &nw, slot[1])) return -1;
+    for (int k = (ar == 2 ? 1 : 0); k >= 0; k--) {
+      u64 f = slot[k];
+      if (tag(f) == T_VAR) slot[k] = f = resolve(f);
+      if (tag(f) == T_VAR) {
+        if (*j == NOREC) *j = alloc_rec(rule, 1, d, s, parent);
+        atomicAdd(&G.recs[rclamp(*j)].pend, 1);
+        u32 fr = alloc_rec(FIELD_RULE, 1, c, (u32)k, rec_addr(*j));
+        link(kont_port(rec_addr(fr)), f);
+        np++;
+      } else if (!settle_push(work, &nw, f)) {
+        return -1;
+      }
+    }
+  }
+  return np;
+}
+// Drop the scan's guard on record j: true when every awaited field already
+// arrived (the value is whole; j is freed unfired), false when the last
+// arrival will fire j.
+__device__ bool settle_release(u32 j) {
+  if (atomicSub(&G.recs[rclamp(j)].pend, 1) != 1) return false;
+  rec_free(j);
+  return true;
+}
+// `v` settled: true. Otherwise a `rule` record (d, s, parent) waits for its
+// pending fields and false is returned, the record in *j.
+__device__ bool settled(u64 v, u16 rule, u32 d, u32 s, u64 parent, u32 *j) {
+  *j = NOREC;
+  if (settle_await(v, rule, d, s, parent, j) < 0) return true;
+  return *j == NOREC || settle_release(*j);
+}
+// FIELD_RULE: a pending field's value arrived (whole: it came through a
+// Kont, which settles first): written into its slot
+__device__ __noinline__ void field_fire(u64 a, u64 aux) {
+  u32 ri = (u32)aux;
+  G.nodes[2 * (u64)nclamp(rec_d(ri)) + rec_s(ri)] = a;
+  deliver(rec_parent(ri), 0);
+}
+// WHOLE_RULE: every field arrived: the value goes to its destination
+__device__ __noinline__ void whole_fire(u64 aux) {
+  u32 ri = (u32)aux;
+  deliver(rec_parent(ri), (u64)rec_d(ri) | ((u64)rec_s(ri) << 32));
+}
+// RELINK_RULE: a call's arguments are whole: the call meets its output again
+__device__ __noinline__ void relink_fire(u64 aux) {
+  u32 ri = (u32)aux;
+  // a redex, not a link: a call against a wire must unfold, not park
+  push_redex((u64)rec_d(ri) | ((u64)rec_s(ri) << 32), rec_parent(ri));
+  reduce_net();
+}
+
 // ---- the bridge compiled code uses ----
 
 __device__ __noinline__ u64 dup_closure(u64 p) {
@@ -1795,7 +1900,12 @@ __device__ __noinline__ R apply(u64 f, u64 a) {
   link(mkport(T_APP, c), f);
   reduce_net();
   u64 v = resolve(w);
-  if (tag(v) != T_VAR) return R{v, true};
+  if (tag(v) != T_VAR) {
+    // compiled code reads the result whole
+    u32 j;
+    if (settled(v, WHOLE_RULE, (u32)v, (u32)(v >> 32), NONE, &j)) return R{v, true};
+    return R{(u64)j, false};
+  }
   u32 r = alloc_rec(FWD_RULE, 1, 0, 0, NONE);
   link(kont_port(rec_addr(r)), v);
   return R{(u64)r, false};
