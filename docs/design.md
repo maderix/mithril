@@ -57,7 +57,11 @@ suite.
 
 ```
 Python-subset source
-  -> parse, desugar (loops become tail-recursive functions; an if/match
+  -> parse, including the f32 elaboration (mithril-front::infer,
+     section 4.1)
+  -> fold detection and proof on the surface AST
+     (mithril-reassoc::analyze, section 5.6)
+  -> desugar (loops become tail-recursive functions; an if/match
      statement becomes one join continuation, not a copy of the rest
      per arm)
   -> Core IR (mithril-front::core; eval_core is the reference oracle)
@@ -65,9 +69,10 @@ Python-subset source
      each function body is a net over unknown parameters, reduced to
      quiescence and read back as Core
   -> Core rewrites codegen owns (mithril-codegen::rewrite): tail
-     inlining, if-conversion of loop back-edges, reuse marking
-  -> type inference (monomorphic), unboxing, linearity, borrowing
-  -> ANF normalization
+     inlining, if-conversion of loop back-edges
+  -> ANF normalization, then over the normalized bodies: type inference
+     (monomorphic), unboxing, native-scalar classification, linearity,
+     borrowing, reuse marking
   -> lowering to LIR (mithril-codegen::lower -> LirProgram): dive forms,
      rule forms, native scalar forms, the rule table, the net region
   -> printers: lir::rust (rustc -O against mithril-rt, CPU) and
@@ -76,7 +81,28 @@ Python-subset source
 
 Nothing is decided twice. The CPU and the device run the same
 `LirProgram`; the printers differ only in syntax and in the runtime they
-call.
+call. When specialization reduces `main` to a value, lowering emits no
+functions: the program is that constant.
+
+The CLI (`mithril-cli`):
+
+* `run f.py [--threads N] [--gpu]` compiles and runs. On the CPU the
+  generated Rust is compiled by `rustc -O` against a cached
+  `mithril-rt`; with `--gpu` the CUDA program is compiled by nvcc (or
+  loaded from the cache) and run by the device runner.
+* `run ... --image out.ppm` reads the printed result as
+  `(width, height, pixels)`, the pixels any nesting of tuples or
+  constructors read depth first, each `0xRRGGBB` or an `(r, g, b)` of
+  0 to 255, and writes a binary PPM. `--stats out.json` writes the
+  backend, thread count, front-end, compile and run seconds, device
+  rounds and image size.
+* `build f.py -o out [--gpu]` writes the CPU binary, or the device cubin
+  (a program that reduced to a constant writes `MITHRIL-CONST <value>`).
+  `exec out` runs a device artefact with no front end.
+* `net f.py` prints what specialization did per function (section 3.2);
+  `prove f.py` writes and checks the Lean obligations of the proven
+  folds (section 8).
+* `MITHRIL_TIMING` prints the stage times.
 
 ## 3. Semantic core
 
@@ -117,8 +143,9 @@ Constant folding, inlining, branch selection, static evaluation and
 unrolling are not passes. They are the rules firing early, on redexes
 that do not depend on runtime input. `mithril net f.py` prints what
 reduction did per function (rewrites, calls kept, ops kept, calls
-evaluated, size before and after). `MITHRIL_NET_CORE=1` dumps the bodies;
-`MITHRIL_NET_TRACE=1` narrates.
+evaluated, size before and after). `MITHRIL_NET_CORE=1` dumps the bodies.
+The reduction of each function runs under 2^20 rewrites (`REDUCE_FUEL`
+in the CLI); running out is an internal error.
 
 A function is specialized as follows.
 
@@ -140,13 +167,14 @@ Speculative unfolding instantiates the call in a clone of the whole state
 and specializes it to its fixpoint, unfolding its own calls in turn. A
 loop with a static bound unrolls as a chain; a branch inside it keeps
 both arms. The attempt is accepted only when its control was static: no
-call of its own remains, no match on a runtime value, no constructor over
-unknown fields, and growth within 2,000 agents (ops, branches, data;
-wires are free). A data builder is not code to unroll: symreg's
+call of its own remains, no match on a runtime value, no new constructor
+other than a tuple (a tuple is loop state), and growth within 2,000
+agents (ops, branches, data; wires are free). A data builder is not code to unroll: symreg's
 `gen(5, ..)` doubled the program for no instruction gain, hence the
 constructor condition. Budgets: 50,000 rewrites per top-level attempt,
-shared by everything nested in it; 400,000 per function; nesting depth
-256. A failed attempt is memoized by (callee, which arguments are known).
+shared by everything nested in it; 400,000 speculative rewrites per
+function (each top-level attempt is also charged the cells it cloned);
+nesting depth 256. A failed attempt is memoized by (callee, which arguments are known).
 The growth ceiling is inherited by nested attempts, so a 300-iteration
 chain stops at the ceiling. Inside a speculation only the branches the
 speculated body parked are instantiated, and the first new residual call
@@ -223,17 +251,23 @@ dup-fanned by the same binding as every other shared value.
 
 In the net a `Lam` cell `[param, body]` is built eagerly: work in the
 body that does not depend on the parameter fires when the closure is
-built, once. The clone discipline (`check_clone_discipline`) rejects a
-closure applied to itself (`App(f, Var v)` with `v` free in `f`, through
-`Let` aliases). `f(f(x))`, factories, closures capturing closures and
-`map` with a lambda are accepted.
+built, once. The clone discipline (`check_clone_discipline` in
+`mithril-net`) detects a closure applied to itself (`App(f, Var v)` with
+`v` free in `f`, through `Let` aliases) and accepts `f(f(x))`,
+factories, closures capturing closures and `map` with a lambda. Only
+`reduce_test` runs it; the compiler does not, so a self-application
+compiles (section 12).
 
 The runtime runs the same table. A compiled program has a net region:
 
 * an entry table (`net_entries`): the closures compiled code builds and,
-  transitively, the branches and arms their bodies mention. A real
-  function is never instantiated as a net; a `Ref` to it spawns its CALL
-  rule, and a FILL record links the result back into the waiting wire;
+  transitively, the branches and arms their bodies mention. A `Ref` to a
+  compiled function whose arguments are all produced spawns its CALL
+  rule, and a FILL record links the result back into the waiting wire. A
+  call met before its arguments exist (inside a closure body being
+  built) runs the callee's body as a net, so the functions that
+  net-region bodies call are shipped in the region too
+  (`net_live_entries`);
 * two engine rules: NET (generic redexes spilled on fuel-out, or a value
   delivered into the net) and FILL;
 * the bridge: `build_closure`, `apply` (dive form: the App cell reduced
@@ -245,8 +279,8 @@ The runtime runs the same table. A compiled program has a net region:
 
 Value forms cross the boundary unchanged. Closures in compiled code are
 opaque `Lam` ports until applied. On the device, entries are printed as
-straight-line net builders (`inst_<e>`) from the same `NExpr` bodies the
-CPU interprets.
+straight-line net builders (`inst_<e>`) from the same `NExpr` bodies
+the CPU interprets.
 
 The sharing constant, measured on the W2 shape (`g = λx. x + heavy(k)`
 built once, copied through a chain of DUPs, applied N times):
@@ -281,6 +315,33 @@ heterogeneous array (ints and lists in one array) still poisons the ints
 unified with its elements to `Dyn`: correct tagged code, slower. No port
 does this; `hetero_array.py` covers the runtime conversion.
 
+The mechanism (`ty::infer`): union-find over type nodes, two walks over
+every normalized body, then a readout walk. After each walk `settle`
+resolves projections recorded before their base was known, and `relink`
+runs to a fixpoint: an int or float op records (operand, fresh result,
+kind), and a result whose operand no longer has that kind (a later walk
+poisoned it) is unified with the operand again; a conflict made by the
+result's own consumer does not flow back. A comparison's result is
+always a fresh int. A conflict, found by `unify` or by a direct `set`,
+poisons both classes and everything read out of them (tuple components,
+array elements) through a worklist that marks a class before visiting
+its parts, so it ends on self-referential types (a list of pairs, an
+array of arrays; fixture `self_types.py`). `App` yields a poisoned node
+and `Lam` a function node; a lambda's body is still walked, so its
+first-order parts get types (fixtures `closure_result.py`,
+`closure_parts.py`). A poisoned class reads as `Dyn`.
+
+From the result, codegen reads two more facts per function:
+
+* `pshape` and `rshape` (`ty::Shape`): the layout of each tuple
+  parameter and tuple result, a tree whose leaves are all ints, at most 8
+  deep. A tuple with a non-int leaf, deeper nesting, or a type that
+  reaches itself has no layout. `width()` is the leaf count and
+  `offset(i)` the first leaf of component i.
+* `pmixed`: a parameter whose class was poisoned by conflicting uses (an
+  int in one place, a tuple, float or constructor in another). Its
+  function gets no native form (section 5.2).
+
 Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
 binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
 definition shared by the oracle and the reducer.
@@ -302,7 +363,12 @@ pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
 Core, the net and every backend see ints and the existing rules: `x + y`
 on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
 (IEEE `<=`; `==` is `le(a, b) & le(b, a)`, a helper written in the
-language). Unary minus on f32 flips the sign bit.
+language). Unary minus on f32 flips the sign bit. The helpers (`__f32_eq`,
+`__f32_of_int`, `__int_of_f32`) are language source; only the ones a
+program uses are appended to it. A name that a local, function or
+constructor shadows is not the builtin. A lambda has an opaque type
+(f32 meeting it is an error); its parameters are fresh, and applying a
+local closure gives a fresh type.
 
 * An int literal is an int. Only as the direct operand of an operator or
   a conditional expression does it take the other side's type (`x * 2`
@@ -317,7 +383,8 @@ language). Unary minus on f32 flips the sign bit.
   zero, exactly below 2^55 (NaN and larger magnitudes give 0). Both are
   helpers written in the language, so a constant argument folds by the
   rules.
-* `a, b = e` checks that `e` is a tuple of two.
+* A destructuring `a, b, ... = e` checks that `e` is a tuple of that
+  many components.
 * A program without f32 is unchanged, except negation: `-x` is `0 - x`
   on ints and `-1.0 * x` on an f64; a value used as both is an error.
 
@@ -414,16 +481,31 @@ Each function is emitted in the forms its uses need.
   returns `Result<u64, u64>` in registers: a value, or the record of its
   suspended residue. Suspension code lives in out-of-line cold functions,
   so it never bloats the hot frame.
-* **Multi-value dive form** (`n_<f>`): a function returning a k-tuple
-  returns `[u64; k]`; `x = g(..)` followed by projections takes the
-  components with no heap tuple. A suspension delivers the boxed tuple.
+* **Multi-value dive form** (`n_<f>`): a function returning a k-tuple,
+  k from 2 to 8, returns `[u64; k]`; `x = g(..)` followed by projections
+  takes the components with no heap tuple. A suspension delivers the
+  boxed tuple. Not for `main`, nor for a function that has a native
+  scalar, destination-passing or base-case form (`MITHRIL_NO_NTUP`
+  disables it).
+* **Base-case wrapper** (`q_<f>`, `fast.rs`): for a self-recursive dive
+  function, a wrapper derived from its own body. It follows matches on
+  parameters whose arms carry no cell, and pure int code; when the
+  arguments reach a call-free, allocation-free tail it returns that
+  value inline, otherwise it calls `d_<f>`. Every fallback happens before
+  any side effect. Dive-form call sites call `q_<f>`.
 * **Rule form** (segments): the function as rules over records. It dives
   too and allocates records only on suspension. At most 4 dives nest
   inline in one rule-form body before the rest is deferred to a memoized
   record, so generated code is linear in chain length.
 * **Native scalar form** (`s_<f>`, `scalar.rs`): a function whose
   parameters and results are ints, int tuples or int arrays becomes plain
-  `i64` code, including tuple-valued join points. Array parameters are
+  `i64` code, including tuple-valued join points. It is ruled out by an
+  f64 or constructor local, a non-int array parameter or result, a tuple
+  parameter without an int layout, or a `pmixed` parameter (section
+  4.1). f32 values are ints by then, so f32 code stays native. Native
+  code never suspends, so a function that forks (forking recursion or a
+  proven fold), and every function that transitively calls one, runs in
+  dive form instead; its leaves still call native code. Array parameters are
   borrowed or owned by fixpoint; tuple results carry an array mask. A
   tuple is held as its leaves: a nested one (a record such as
   `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`: every
@@ -438,8 +520,9 @@ Each function is emitted in the forms its uses need.
   id in an inner scope). The dive bridge unpacks and packs nested tuple
   cells. `MITHRIL_WHY_BOXED=1` prints why each function has no native
   form.
-* **Bounded functions**: a function on no call cycle cannot run out of
-  budget, so it is a plain call with no capture.
+* **Bounded functions**: a function on no call cycle, or with a native
+  scalar form, cannot run out of budget, so it is a plain call with no
+  capture.
 
 The native int representation is chosen per function. Plain holds the
 canonical i56 in an i64 and re-wraps an op whose range is not proven with
@@ -510,8 +593,11 @@ split.
   k live-outs, did not split and never forked: gameoflife, nbody, queens
   and symreg ran at one-thread speed at 16 threads (gameoflife 8.45 s,
   queens 4.79 s at t16) and fork now (1.12 s and 0.45 s).
-* **Multi-value join.** Several live values cross the join as one tuple,
-  bound to a fresh variable and projected in J. A 4-way fork is then
+* **Multi-value join.** When the independent calls are all calls to one
+  function (the siblings of a fork tree), several live values cross the
+  join as one tuple, bound to a fresh variable and projected in J. A
+  chain of calls to different functions keeps the one-live-out rule:
+  splitting every frame of it costs code cubic in its length. A 4-way fork is then
   three nested fork sites rather than one fork and two sequential cuts.
   Without it tree-matmul's `gen` had one fork site and the device ran
   49,890 grow sweeps with a flat frontier. Code size grows (tree-matmul:
@@ -568,13 +654,23 @@ error ("recursion too deep for the device"). Guarding every non-leaf
 native function cost raytrace 3x (`isect` is called 10^8 times), hence
 the recursion test.
 
+Every native loop counts its own iterations in a register and calls
+`loop_guard(it)` per iteration: a no-op on the CPU; on the device a read
+of the abort flag once per `WORK_CAP` iterations, leaving the frame when
+the run is aborting (section 7.3).
+
 ### 5.6 Fold splitting
 
 `mithril-reassoc` detects folds, proves the combiner associative with an
 identity (polynomial normal form), and emits Lean obligations for each
-proven fold (section 8). A proven fold heavier than one budget is split:
-chunks run in parallel and their results are combined in order. The
-split estimate reads the phase's budget.
+proven fold (section 8). The accepted combiners are wrapping add (mod
+2^56, or the low 32 bits) and the same elementwise over a tuple
+accumulator whose entry value is the identity; anything else is
+declined. A proven fold's CALL rule splits its range into a binary fork
+of records while (hi - lo) x est exceeds max(budget, 256), where est is
+the measured budget per iteration (`FOLD_EST_<f>`, taken when a chunk's
+dive runs out of budget; 1 until then). A join rule combines the two
+partial results in order.
 
 ### 5.7 Core rewrites owned by codegen
 
@@ -617,12 +713,14 @@ that worker, up to 64 nested levels; beyond that it waits for the next
 wave. A chain of nested joins then completes in one wave. A ready record
 (no inputs, the rest of a body after a fork) is queued for the next wave.
 
-**Budget.** Sequential runs use a budget of 2^40 per dive (one dive). A
+**Budget.** Unless the program is given one (`--fuel N`), sequential
+runs use a budget of 2^40 per dive (one dive; the runner thread has a
+1 GiB stack, so recursion depth, not the budget, is the bound). A
 parallel run uses 16,384 per dive while a wave holds at most four entries
 per worker, and `16384 x ceil(entries / (4 x workers))` (capped at 2^10
 times) beyond that (`wave_fuel`), because suspension exists to expose
 work to idle workers and splitting past that only costs records and
-locality. hashmap PAR16 measured 0.49 s without this rule and 0.23 s with
+locality (`MITHRIL_FIXED_FUEL` turns this off). hashmap PAR16 measured 0.49 s without this rule and 0.23 s with
 it: every suspension in the batch spine had split off a sibling subtree
 until all 2,048 tables were in flight (20 M live cells). The **boost**
 covers sequential chains: while a wave's frontier did not grow and is
@@ -637,15 +735,27 @@ independent siblings.
 **Arenas.** Cells (16 bytes plus a 4-byte count) and records are carved
 from reserved arenas in chunks of 2^16 slots by a global bump; memory is
 committed only as chunks are touched, with transparent huge pages
-requested. Freed cells and records go on the worker's intrusive free
-list: unbounded, no atomic on the alloc or free path. Defaults are 2^26
+requested. A freed cell goes on the worker's intrusive free list (the
+link in cell word 0), a freed record on the worker's stack of free
+record indices: both unbounded, no atomic on the alloc or free path. Defaults are 2^26
 cells (`MITHRIL_NODES`) and 2^27 records (`MITHRIL_RECS`), at most 2^32
 each, and capped at half of the memory available at start, so a runaway
 program ends in "arena exhausted", not in swap. Teardown runs in place on
 the worker that drops the last reference.
 
-Diagnostics: `MITHRIL_STATS` (cells, waves, rewrites), `MITHRIL_TRACE_PICK`
-(every bucket pick with its size, work, boost and time).
+**Result.** When the run ends, `show` walks the port delivered to the
+root and prints it: ints as numbers, f64 with Rust's `{:?}`, closures as
+`<closure>`, tuples as `(..)`, constructors as `C<k>(..)` (an unboxed
+one as `C<cid>(v)`), arrays as `[..]`. Any other port is an internal
+error ("unprintable result port").
+
+Diagnostics: `MITHRIL_STATS` (peak and live cells, waves, rewrites, live
+arrays), `MITHRIL_TRACE_PICK` (every bucket pick with its size, work,
+boost and time), `MITHRIL_CHECK_FREE` (double-free check, debug builds). Lowering
+switches for probes: `MITHRIL_PLAIN_INTS` forces the plain int
+representation, `MITHRIL_NO_TRMC` and `MITHRIL_NO_NTUP` turn those forms
+off, `MITHRIL_WHY_BOXED` (section 5.2), `MITHRIL_DBG_FORK` prints the
+fork-site decisions.
 
 ## 7. Device runtime
 
@@ -668,8 +778,10 @@ Every scheduler rule below reduces the first factor.
 
 ### 7.2 One cooperative kernel, grow and work
 
-`k_run` is one cooperative launch (all lanes resident; 32,768 lanes on
-the RTX 4090) with grid barriers between phases. A host loop with one
+`k_run` is one cooperative launch with grid barriers between phases.
+All lanes are resident: blocks of 256 threads, as many per SM as the
+kernel's occupancy allows, at most 65,536 lanes (`MITHRIL_GPU_LANES`
+caps them; one lane is the determinism probe). A host loop with one
 launch and one sync per round cost about 130 us per round; a device round
 costs 10 to 20 us. The host launches once and waits.
 
@@ -680,19 +792,20 @@ adopted, not derived here; section 14):
   (tasks whose rule can fork, and `ERA`), and the frontier (tasks pushed
   by the last phase).
 * **GROW** while some pending task can fork, the frontier is narrower
-  than the grow width (default: the lane count), and the last grow sweep
-  pushed anything. Every forkable task below the snapshot fires in the
-  **parallel world**: a fork site's callee gets `fork_fuel`, a zero
-  budget, so it suspends at entry and becomes a task; a segment's tail
-  call is a task; a cut runs inline with the phase's budget; the
+  than the grow width (default: the lane count, `MITHRIL_GPU_GROW_WIDTH`),
+  and the last grow sweep pushed anything. Every forkable task below
+  the snapshot fires in the **parallel world**: a fork site's callee
+  gets `fork_fuel`, a zero budget, so it suspends at entry and becomes a
+  task; a segment's tail call is a task; a cut runs inline with the grow
+  budget (`MITHRIL_GPU_GROW_FUEL`, default the dive budget); the
   continuation is captured as records. The frontier widens by one fork
   level per sweep.
 * **WORK** otherwise. Every lane is dealt every nl-th pending task of the
   snapshot (dealt, not claimed: a claim race left 90% of lanes idle) and
   drains it and everything it spawns depth-first on its lane stack in the
-  **sequential world**, with the dive budget. After `WORK_STEPS` fires
-  (default 2^30) a lane hands its remaining tasks back to the global
-  rings.
+  **sequential world**, with the dive budget. After a number of fires
+  (`MITHRIL_GPU_WORK_STEPS`, default 2^30) a lane hands its remaining
+  tasks back to the global rings.
 * The run ends when nothing is pending or the run aborted.
 
 Making every call a task (no cuts) doubles the frontier exactly but
@@ -769,7 +882,7 @@ place; the rules are the same either way.
 | task rings | one ring per rule, a power of two | 2^27 / rules entries, clamped to [2^14, 2^21] (`MITHRIL_GPU_BUCKET`) |
 | lane stacks | 64 tasks per lane, overflow to the global rings | fixed |
 | net worklists | 64 redex pairs per lane, spill to the program's net rule | fixed |
-| array heap | blocks in size classes, 8 per octave (a block is at most 1/8 larger than its array, minimum 8 words); per-lane intrusive free list per class (link in word 0, class in word 1 bits 48 to 55); global bump | a third of the budget, clamped to [2^26, 2^32] words (`MITHRIL_GPU_HEAP`) |
+| array heap | blocks in size classes, 8 per octave (a block is at most 1/8 larger than its array, minimum 8 words); per-lane intrusive free list per class (link in word 0, class in word 1 bits 48 to 55); global bump | a third of the budget, clamped to [2^20, 2^32] words (`MITHRIL_GPU_HEAP`) |
 
 The budget is free VRAM at start, less the fixed buffers, less the
 driver's stack reserve for all resident threads (SMs x threads per SM x
@@ -796,10 +909,11 @@ Setup cost is paid only for memory a run touches:
 * The runner uses the device's primary context. The CLI sets one
   hardware connection (`CUDA_DEVICE_MAX_CONNECTIONS=1` unless set)
   before any thread starts. Runs are serialized (the kernel is
-  cooperative over the whole device). A run frees its buffers and module
-  and releases the context when it ends; a successful run of a process
-  that is exiting leaves that to the driver, and a run past its deadline
-  leaves it to the context reset.
+  cooperative over the whole device). A run frees its buffers and module and
+  releases the context when it ends; a successful run of a process
+  that is exiting (`run --gpu`, `exec`) leaves that to the driver's exit
+  path, and a run abandoned at twice its deadline (section 7.6) frees
+  nothing, because every free would wait for its kernel.
 
 Measured on a bare process: one connection 0.05 s; 16 GB eager arenas
 with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
@@ -819,21 +933,36 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
   early reads as suspended, and its work keeps expanding as tasks): at
   twice the deadline the run returns an error and the kernel is
   abandoned until the process exits, and every later run in the process
-  fails at once (it would queue behind that kernel). A context reset does
-  not stop a running kernel (measured), so none is attempted.
+  fails at once (it would queue behind that kernel; a process-wide
+  `STUCK` flag). A context reset does not stop a running kernel
+  (measured), so none is attempted.
 * A failed run that left a sticky device error (700) in the context
   resets it; a clean abort leaves the context as it is.
-* Any arena exhaustion, out-of-bounds index, bad cell index or stack
-  overflow sets the abort flag; every lane stops at its next check and
-  the host reports the named cause. The first abort wins: a later one is
+* Any arena exhaustion (cells, records, a rule ring, the array heap),
+  out-of-bounds index, cell index outside the arena, stack overflow,
+  unreachable match arm, unsupported device feature, cell walk past
+  2^22 steps (a corrupted arena) or the round limit sets the abort flag;
+  every lane stops at its next check and the host reports the named
+  cause. The first abort wins: a later one is
   a consequence of it. Two independent faults in one run may be reported
   in either order.
 
-Diagnostics: `MITHRIL_GPU_STATS` (setup and run time, rounds, grow sweeps
-and work phases with their cycles, widest frontier, cells and records
-issued); `MITHRIL_GPU_TRACE` adds the per-round log (phase, pending,
-frontier, K cycles, slowest lane, busy lanes) and per-rule pending counts
-for the first rounds.
+**Readback.** After the kernel the host reads the port delivered to the
+root (a run that delivered none is an error), copies the cells in use in
+one transfer (one copy per cell cost about 1.7 s for a 512 x 512 image),
+and formats the value on the host with a `show` that mirrors the CPU's
+(section 6), reading arrays from the heap by their headers.
+
+Diagnostics: `MITHRIL_GPU_STATS` (context creation and release, module
+load, arena setup, run time and readback, rounds, grow sweeps and work
+phases with their cycles, widest frontier, cells and records issued);
+with it, `MITHRIL_GPU_TRACE` adds the per-round log (phase, pending,
+frontier, K cycles, slowest lane, busy lanes), per-rule pending counts
+for the first rounds, and a histogram of lanes by cycles for the last
+work phase. `MITHRIL_GPU_CU` runs a hand-edited `program.cu`;
+`MITHRIL_GPU_NET_FUEL` (default 4,096) is the rewrites a lane's net
+reduction runs before spilling to the net rule;
+`MITHRIL_GPU_POISON` and `MITHRIL_GPU_DEBUG` are probes.
 
 ## 8. Verification
 
@@ -844,9 +973,9 @@ what is checked and what is only claimed:
 |---|---|---|
 | fold reassociation: each proven combiner is associative with an identity; folding chunk results equals folding the concatenation | **proved** | Lean 4 obligations emitted per fold by `mithril-reassoc`, checked by `lean` in `reassoc_test` and `cli_test` (skipped when lean is not installed); the generic `chunked_foldl` lemma proved once |
 | specialization preserves meaning | checked | `specialize_test` (every fixture: specialized equals original under `eval_core`); `examples/spec_oracle.rs` bisects a program to the function whose specialization changed its value |
-| generated code equals the oracle | checked | `codegen_test` over the fixtures in `crates/mithril-codegen/tests/fixtures`, at 1, 4 and 16 threads and under budget starvation |
+| generated code equals the oracle | checked | `codegen_test` over the fixtures in `crates/mithril-codegen/tests/fixtures`, at 1 to 16 threads (the counts vary per test) and under budget starvation (budgets of 1 to 64) |
 | parallel equals sequential | checked | the same tests; fast.py compares t1 and t16 checksums per port |
-| both int representations equal the oracle | checked | forced-representation runs (`int_reps.py`) |
+| both int representations equal the oracle | checked | the `int_reps` codegen test: fixture `int_reps.py` with each representation forced |
 | device equals CPU | checked | `tests/ci/gpu.py` (every port at its small size, plus the closure corpus); `MITHRIL_GPU=1 cargo test -p mithril-gpu --release -- --include-ignored --test-threads=1` (the codegen fixtures against the oracle, plus capacity and abort tests) |
 | ports compute the right answer | checked | every run's checksum against `bench/expected.txt`, which the C twin and the CPython shim agree with |
 | the rule table is confluent | **claimed** | the parallelism argument rests on it; no proof exists |
@@ -856,8 +985,7 @@ what is checked and what is only claimed:
 The oracle agrees with the net, not the other way round: an unused
 binding is never evaluated. `eval_core` shares payloads (`Arc`), so a
 clone copies nothing; a deep copy per variable read cost 21 GB on the
-shared-tree fixture. Test suites run under a memory watcher that kills
-them past a cap.
+shared-tree fixture. fast.py caps each build's memory (`ulimit -v`).
 
 Every bug fix lands with a fixture that fails on the tree before the fix.
 
@@ -870,35 +998,38 @@ Every bug fix lands with a fixture that fails on the tree before the fix.
 Lanes: `C` (the C twin, `gcc -O2`), `SEQ` (`--threads 1`), `PAR16`
 (`--threads 16`), `GPU` (`--gpu`, when `MITHRIL_GPU=1`). Programs are
 built once with `mithril build`; build time is reported, not timed. Times
-are wall clock, minimum of n runs (n = 1 by default), timeout 300 s.
-Every run's output is checked against `bench/expected.txt`. On "arena
+are wall clock, minimum of n runs (by default 3 when the first run takes
+under 60 s, else 1), timeout 1,200 s per run (`--timeout`; the recorded
+results used 300 s). Every run's output is checked against
+`bench/expected.txt`. On "arena
 exhausted" at defaults the lane is retried with
 `MITHRIL_NODES=2^32 MITHRIL_RECS=2^28` and the retry is recorded.
 
 **GPU timing.** The device program is compiled by nvcc in a container on
-first use (5 to 77 s per port) and cached by source hash; the harness
-runs the GPU lane once untimed to warm that cache. Two numbers exist:
+first use (5 to 77 s per port) and cached by source hash. The harness's
+GPU lane builds the artefact once (`build --gpu`, which compiles or loads
+the cubin) and times `exec` of it. Two numbers exist:
 
 * **kernel time**: the runner's `run` time, from the cooperative launch
   to completion (`MITHRIL_GPU_STATS`). It excludes process start, context
   creation, module load, and arena allocation and clearing, which
   together cost about 0.4 s;
-* **wall**: the whole process, warm cache.
+* **wall**: the whole `exec` process, warm cache.
 
 **Instruction counts.** fast.py measures a mid-size run with `perf stat`
 (noise-free) and compares against `tests/ci/baseline.json`.
 
-**reference** (`bench/reference-notes.md`, results in `bench/reference.csv`). reference
-2.0.31 (the exact revision is in `bench/reference-notes.md`), C emitted by
-`reference -o`, compiled with clang 21 `-O3` in a container (the generated C
-needs clang 19+), run on the host. seq: `--threads 1 --gpu off`; par:
-`--threads 16 --gpu off`; gpu: `--gpu <mem>` from reference's own memory
-table, the CUDA device code built by NVRTC. Minimum of 3 timed runs after
-one warm-up, wall clock including process start; for gpu that includes
-context creation and cubin load (0.05 to 0.1 s). The machine was shared:
-every run waited for a 1-minute load of 8 or lower; load at run start
-averaged 5.1 (max 7.97). This most likely inflates reference's par numbers.
-The JS lane was not measured. These are same-machine numbers for
+**reference** (`bench/reference-notes.md`, results in `bench/reference_quiet.csv`).
+reference.0.31 (the exact revision is in `bench/reference-notes.md`), C emitted
+by reference's compiler (`-o main.c`), compiled with clang 21 `-O3` in a
+container (the generated C needs clang 19+), run on the host. seq:
+`--threads 1 --gpu off`; par: `--threads 16 --gpu off`; gpu:
+`--gpu <mem>` from reference's own memory table, the CUDA device code built by
+NVRTC. Every lane waited for a 1-minute load below 2; minimum of 3 timed
+runs after one warm-up, wall clock including process start; for gpu that
+includes context creation and cubin load (0.05 to 0.1 s). An earlier
+measurement on a loaded machine (`bench/reference.csv`, load about 5) is not
+used. The JS lane was not measured. These are same-machine numbers for
 comparison, not a reproduction of reference's own pins (Apple M4 Max), which
 are 1.2 to 3.8x faster sequentially than this x86 box.
 
@@ -909,43 +1040,39 @@ unless marked ms.
 
 | port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device kernel (wall) | reference gpu wall |
 |---|---|---|---|---|---|---|---|
-| bfs | 4.56 | 4.83 | 0.432 | 4.543 | 0.397 | 255 ms (0.48 wall) | 0.217 |
-| editdist | 2.20 | 2.25 | 0.255 | 2.389 | 0.308 | 212 ms (0.48 wall) | 0.234 |
-| gameoflife | 28.29 | 8.45 | 1.121 | 9.706 | 1.146 | 18 ms (0.28 wall) | 0.089 |
-| hashmap | 0.769 | 1.82 | 0.237 | 3.112 | 0.288 | fails: a rule ring (2^21) exhausted by a 7.5 M-task frontier | 0.662 |
-| kdtree | 0.341 | 0.41 | 0.090 | no port | no port | 603 ms (1.30 wall) | no port |
-| kmeans | 10.18 | 11.86 | 1.462 | 5.610 | 0.677 | 339 ms (0.63 wall) | 0.299 |
-| lexer | 1.07 | 2.51 | 0.347 | 2.868 | 0.310 | 157 ms (0.39 wall) | 0.348 |
-| mandelbrot | 1.95 | 4.08 | 0.850 r | 4.806 | 0.468 | 76 ms (0.29 wall) | 0.093 |
-| merkle | 5.78 | 5.43 | 0.601 | 5.463 | 0.535 | 14 ms (0.27 wall) | 0.101 |
+| bfs | 4.48 | 4.83 | 0.432 | 4.543 | 0.397 | 255 ms (0.48 wall) | 0.217 |
+| editdist | 2.17 | 2.25 | 0.255 | 2.389 | 0.308 | 212 ms (0.48 wall) | 0.234 |
+| gameoflife | 28.32 | 8.45 | 1.121 | 9.706 | 1.146 | 18 ms (0.28 wall) | 0.089 |
+| hashmap | 0.767 | 1.82 | 0.237 | 3.112 | 0.288 | fails: a rule ring (2^21) exhausted by a 7.5 M-task frontier | 0.662 |
+| kdtree | 0.333 | 0.41 | 0.090 | no port | no port | 603 ms (1.30 wall) | no port |
+| kmeans | 10.16 | 11.86 | 1.462 | 5.610 | 0.677 | 339 ms (0.63 wall) | 0.299 |
+| lexer | 1.03 | 2.51 | 0.347 | 2.868 | 0.310 | 157 ms (0.39 wall) | 0.348 |
+| mandelbrot | 1.92 | 4.08 | 0.850 r | 4.806 | 0.468 | 76 ms (0.29 wall) | 0.093 |
+| merkle | 5.75 | 5.43 | 0.601 | 5.463 | 0.535 | 14 ms (0.27 wall) | 0.101 |
 | nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.524 | 6.220 | 0.521 | 4 ms (0.28 wall) | 0.086 |
-| queens | 3.91 | 4.71 | 0.454 | 8.118 | 0.911 | 1,204 ms (1.45 wall) | 0.760 |
-| raytrace | 9.04 | 7.68 | 0.849 | 7.263 | 0.724 | 58 ms (0.29 wall) | 0.545 |
-| symreg | 2.96 | 3.02 | 0.400 | 4.608 | 0.431 | 2,028 ms (2.34 wall) | 0.261 |
-| terrain | 4.17 | 4.58 | 0.559 | 3.040 | 0.346 | 296 ms (0.47 wall) | 0.212 |
-| tree-bitonic | 8.46 | 10.79 | 1.554 | 10.077 | 1.455 | 990 ms (1.27 wall) | 0.568 |
-| tree-matmul | 4.24 | 3.80 | 0.575 | 4.094 | 0.460 | 383 ms (0.70 wall) | 0.225 |
-| tree-radix | 2.67 | 4.05 | 0.579 | 4.622 | 0.537 | 373 ms (0.65 wall) | 0.333 |
+| queens | 3.90 | 4.71 | 0.454 | 8.118 | 0.911 | 1,204 ms (1.45 wall) | 0.760 |
+| raytrace | 9.03 | 7.68 | 0.849 | 7.263 | 0.724 | 58 ms (0.29 wall) | 0.545 |
+| symreg | 3.01 | 3.02 | 0.400 | 4.608 | 0.431 | 2,028 ms (2.34 wall) | 0.261 |
+| terrain | 4.13 | 4.58 | 0.559 | 3.040 | 0.346 | 296 ms (0.47 wall) | 0.212 |
+| tree-bitonic | 8.50 | 10.79 | 1.554 | 10.077 | 1.455 | 990 ms (1.27 wall) | 0.568 |
+| tree-matmul | 4.20 | 3.80 | 0.575 | 4.094 | 0.460 | 383 ms (0.70 wall) | 0.225 |
+| tree-radix | 2.57 | 4.05 | 0.579 | 4.622 | 0.537 | 373 ms (0.65 wall) | 0.333 |
+
 Conditions:
 
-* C twin: `bench/results.md`, harness at `15f51dd`, one run.
-* Mithril t1, t16: `bench/results.md`, harness at `723be4c`, a load
-  below 2, min of 3 runs, wall clock (the same conditions as reference's).
+* C twin, Mithril t1, t16: `bench/results.md` (one harness run; the
+  Mithril lanes at `723be4c`), a load below 2, min of 3 runs, wall clock
+  (the same conditions as reference's).
 * **r**: default arenas exhausted; run with `MITHRIL_NODES=2^32
   MITHRIL_RECS=2^28`.
 * reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
   compiler output rebuilt, a load below 2, min of 3 runs, wall clock.
 * Mithril device: kernel time (section 9), warm cache, default arenas,
   at `723be4c`; the wall clock in parentheses is the harness's timing of
-  the built artefact (`build --gpu` once, `exec` per run, min of 3), the
-  same measurement as reference's gpu lane. The difference between the two is
+  the built artefact at `2a3f23e` (`build --gpu` once, `exec` per run,
+  min of 3), the same measurement as reference's gpu lane. The difference between the two is
   the fixed cost: CUDA context creation (73 ms) and teardown of the
   arenas (133 ms), module load, arena setup and readback (about 45 ms).
-
-Warm wall clock on the device, same tree: gameoflife 0.47 s, nbody
-0.42 s, kmeans 0.62 s, mandelbrot 0.55 s (reference gpu wall 0.148, 0.090,
-0.301, 0.095). On wall clock the small ports are slower than reference
-because of the fixed startup cost.
 
 Read plainly:
 
@@ -954,8 +1081,9 @@ Read plainly:
 * **CPU, 16 threads.** At or under reference par on 5 of 16 ports. Over it:
   bfs (0.43 against 0.40), kmeans (1.46 against 0.68), lexer (0.35 against 0.31), mandelbrot (0.85 against 0.47), merkle (0.60 against 0.54), nbody (0.52 against 0.52), raytrace (0.85 against 0.72), terrain (0.56 against 0.35), tree-bitonic (1.55 against 1.46), tree-matmul (0.57 against 0.46), tree-radix (0.58 against 0.54).
 * **Device.** Every measured port is checksum-equal. Wall clock of the
-  built artefact is under reference's gpu wall on 1 of 15 measured ports
-  (raytrace 0.29 against 0.55) and over it on 14, by 1.1x to 9x. The
+  built artefact is under reference's gpu wall on 1 of the 14 ports measured
+  on both (raytrace 0.29 against 0.55) and over it on 13, by 1.1x to
+  9x. The
   fixed cost (about 0.25 s) is most of the difference on the small
   ports; symreg (17,902 grow sweeps), tree-bitonic (966 rounds), queens
   and tree-matmul are also round-bound, because a sweep counts as growth
@@ -968,30 +1096,31 @@ Read plainly:
 `bench/general/run.py`: programs unlike the suite, each checked against
 the Python oracle at a small size and against an idiomatic Rust twin
 (`rust/*.rs`, `Rc`/`Vec`, written the way the source is written; nobody
-hoists by hand), then timed. Times in seconds, measured by `run.py` when
-each program was added; not re-measured on the current tree.
+hoists by hand), then timed. Times in seconds, measured by `run.py` at
+`ce63d1e` (one run each, a load below 1).
 
 | program | shape | Rust | Mithril t1 | Mithril t16 |
 |---|---|---|---|---|
-| collatz_mutual | mutual recursion | 0.30 | 0.43 | 0.43 |
-| cow_versions | copy-on-write array versions | 1.00 | 0.98 | 0.97 |
-| dag_share | heavily shared DAG | 1.68 | 1.87 | 0.29 |
-| graph_dfs | DFS over an array of adjacency lists | 0.86 | 1.20 | 0.27 |
-| interp | expression interpreter, env as a list | 2.36 | 1.21 | 0.14 |
-| persist_map | persistent BST with live old versions | 1.47 | 1.49 | 1.49 |
-| sorts | list merge sort and quicksort | 6.21 | 1.41 | 0.60 |
+| collatz_mutual | mutual recursion | 0.29 | 0.41 | 0.41 |
+| cow_versions | copy-on-write array versions | 1.00 | 0.91 | 0.91 |
+| dag_share | heavily shared DAG | 1.67 | 1.91 | 0.27 |
+| graph_dfs | DFS over an array of adjacency lists | 0.86 | 1.30 | 0.25 |
+| interp | expression interpreter, env as a list | 2.45 | 1.23 | 0.14 |
+| persist_map | persistent BST with live old versions | 1.47 | 1.55 | 1.56 |
+| sorts | list merge sort and quicksort | 6.04 | 1.43 | 0.55 |
 | stage_closure | W2: `mk(k) = λx. x + heavy(k)`, 20k applications | 0.00 | 0.00 | 0.00 |
 | pipeline_cfg | stage closures from a runtime config, in a list, over 20k inputs | 0.29 | 0.01 | 0.01 |
-| interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 5.8 | 6.1 |
+| interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 3.77 | 3.83 |
 
-Sequentially Mithril is within 1.0 to 1.4x of idiomatic Rust, faster
-where Rust pays per-node refcounting; 16 threads are never slower than
-one. `stage_closure`: LLVM hoists the pure call out of the loop inside
+Sequentially Mithril is at most 1.5x slower than idiomatic Rust, and
+faster where Rust pays per-node refcounting; 16 threads are never slower
+than one (within noise: persist_map 1.55 against 1.56, interp_closure
+3.77 against 3.83). `stage_closure`: LLVM hoists the pure call out of the loop inside
 one function, so both do the work once. `pipeline_cfg` is the thesis at
 runtime: Rust cannot hoist across `Box<dyn Fn>`, and the net runs each
 stage's setup once. `interp_closure` is the price: every application
 copies a closure whose whole body depends on its parameter, so lazy
-copying gains nothing and costs about 450x. reference's closures are affine,
+copying gains nothing and costs about 300x. reference's closures are affine,
 so on these shapes reference runs the strict twin, which the Rust column
 measures; a reference lane for the corpus is not set up.
 
@@ -1008,12 +1137,11 @@ It is a generality result: the program ran oracle-equal at every size
 after six general fixes, none of which looks at the program. They are the
 access model of section 4.3 (lent data, int immediates, owned-unless-
 aliasing bindings, 32-bit counts), per-lane intrusive arenas, erasure as
-a rule, and bounds on both runtimes. CPU (condition b): 0.416 s at one
-thread, 0.109 s at 16, C twin 0.341 s. The device run is dominated by the
+a rule, and bounds on both runtimes. CPU (section 10): 0.41 s at one
+thread, 0.090 s at 16, C twin 0.333 s. The device run is dominated by the
 build's sequential prefix (partitioning a 2^18 list on one lane), a
-property of the program's shape that reference shares; the last device
-measurement (0.54 s, of which about 0.45 s was the prefix, taken while
-another process held 6 GB of VRAM) predates the current device arenas.
+property of the program's shape that reference shares. The device
+measurement is in section 10 (603 ms kernel, 1.30 s wall).
 
 ### 11.3 Scope: ML runtimes and graph compilers
 
@@ -1045,7 +1173,7 @@ Does not fit:
 
 What a combination with Blaze (`../simple-lang`: typed arrays, loops, a
 schedule language, native kernels) would need, in order: the static f32
-type and f32 arrays; buffers crossing a foreign-call boundary without
+type and f32 arrays (these now exist, section 4.1); buffers crossing a foreign-call boundary without
 copies (an engine rule that hands a buffer out and takes one back); a
 probe done like the k-d tree (a MoE router with top-2 gating and capacity
 overflow over hashed logits, C twin, oracle-checked, CPU and device)
@@ -1105,11 +1233,10 @@ Device:
    (reference 0.09), nbody 0.28 to 0.12 (0.09), raytrace 0.29 to 0.16 (0.55),
    lexer 0.39 to 0.26 (0.35), terrain 0.47 to 0.29, symreg 2.34 to 1.68.
    The standings table in section 10 predates this.
-4. Not measured on the current tree: tree-matmul and kdtree.
-5. The grow/work policy (section 7.2) is reference's design. It is to be
+4. The grow/work policy (section 7.2) is reference's design. It is to be
    replaced by a policy derived from Mithril's own cost model (section
    14).
-6. Register pressure: the whole program is one kernel (`k_run` inlines
+5. Register pressure: the whole program is one kernel (`k_run` inlines
    the dispatch of every rule). With the Cornell demos it takes 255
    registers per thread (Whitted; path 144) and spills to a 1,200-byte
    stack, so an SM holds 256 resident threads. Whitted's kernel runs in
@@ -1119,7 +1246,7 @@ Device:
 
 CPU:
 
-7. Values built by the net that reach compiled code keep their fields
+6. Values built by the net that reach compiled code keep their fields
    as unresolved wires: `apply` (rt template.rs) resolves only the
    top-level port it returns, and so do the continuation delivery and the
    arguments of a net call fired into a rule form. Compiled code then
@@ -1137,26 +1264,29 @@ CPU:
    by each pending field that writes the field in place and delivers the
    value when none is left. Both runtimes need it (one runtime model).
    Open.
-8. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
-   0.771. It needs lane-level (u32) vectorization; a hand-edited proof
+7. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
+   0.677. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
-9. terrain at one thread (4.59 s against 3.21); mandelbrot at 16 threads
-   (0.827 s against 0.616, and default arenas exhausted); tree-matmul at
-   16 threads (0.66 s against 0.61).
-10. `interp_closure`: a closure body with no parameter-free work should be
+8. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
+   (0.850 s against 0.468, and default arenas exhausted); tree-matmul at
+   16 threads (0.575 s against 0.460). Section 10 lists every port over
+   reference.
+9. `interp_closure`: a closure body with no parameter-free work should be
    applied by compiled code directly, the rule table deciding when.
-11. Inference: one heterogeneous array poisons connected ints to `Dyn`.
-
-Semantic core:
-
-12. Readback: a closure created in an arm, capturing a pattern binder and
-    applied twice, is an ICE in the reader (the ignored test in
+10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+11. Readback: a closure created in an arm, capturing a pattern binder and
+    applied twice, is an ICE in the reader (the ignored test
+    `a_closure_capturing_an_arm_binder_applied_twice` in
     `specialize_test.rs`). Two specializer crashes on nested closures with
     conditionals (in `mithril-core` `net.rs` and `rules.rs`).
-13. The Dup cache is keyed by the whole selection, so a captured shared
+12. The Dup cache is keyed by the whole selection, so a captured shared
     value read under three selections is bound three times (duplicated
     work, not a wrong answer). Keying by the selections a read consults
     fixes it.
+13. The clone discipline (section 3.4) is not enforced: the compiler does
+    not call `check_clone_discipline`, so a closure applied to itself
+    (`f = lambda g: 3; f(f)`) compiles and runs. Undecided: run it in the
+    pipeline, or state what self-application does.
 
 Constraint and proofs:
 
@@ -1170,19 +1300,17 @@ Constraint and proofs:
 
 Measurement:
 
-17. reference re-measured on a quiet machine: not done.
-18. The efficiency study: work per port against the C twin and a hand
+17. The efficiency study: work per port against the C twin and a hand
     CUDA kernel; speedup per core; lanes busy per phase. Not started.
-19. The nbody C twin does not compile with gcc 11 (`musttail` placement).
-20. A reference lane for the generality corpus is not set up.
+18. The nbody C twin does not compile with gcc 11 (`musttail` placement).
+19. A reference lane for the generality corpus is not set up.
 
 Unconfirmed findings from source review (argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a
 thread-local read before it is set on the device path; the borrow
 inference's round cap.
 
-Planned: the static f32 type and f32 arrays; a Cornell box demo; the MoE
-router probe (section 11.3).
+Planned: the MoE router probe (section 11.3).
 
 Undecided: Mithril's role as the graph generator for Blaze's irregular
 and sparse computation (section 11.3).
@@ -1215,7 +1343,7 @@ The working rules are in `CLAUDE.md`. The ones that shape this design:
   exponential, found only by full runs.
 * `tests/ci/gpu.py` (about two minutes warm) runs for device changes.
 * The language crates (front, core, net, reassoc, codegen, cli) are held
-  under 15,000 lines; they are at 13,239.
+  under 15,000 lines of source (`src/`); they are at 14,513.
 * Design decisions are recorded here with the numbers that justify them.
 
 ## 14. Prior art and provenance
