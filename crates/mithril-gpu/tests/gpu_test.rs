@@ -354,7 +354,10 @@ fn gpu_failed_runs_leave_no_memory_behind() {
         assert_eq!(got.map(|r| r.text), Ok(want));
     }
     // free memory is a device-wide figure other processes move (a
-    // desktop shares the device); a leak persists, noise does not
+    // desktop shares the device); a leak persists, noise does not. Most
+    // arenas are managed and committed on touch, so this sees buffers
+    // committed at allocation and context/module memory; under
+    // MITHRIL_GPU_EAGER=1 it sees every arena.
     let mut lost = usize::MAX;
     for _ in 0..10 {
         lost = lost.min(before.saturating_sub(mithril_gpu::free_vram().unwrap()));

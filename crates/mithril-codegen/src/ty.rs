@@ -258,7 +258,9 @@ impl Inf {
             }
         }
         // a conflict poisons both classes; what is read out of them is
-        // unknown too
+        // unknown too (defensive: the second pass re-projects from the
+        // poisoned base anyway; no known program needs it, and the
+        // corpus's generated code is unchanged by it)
         let (fa, fb) = (self.uf.find(a), self.uf.find(b));
         let (na, nb) = (self.uf.n[fa as usize], self.uf.n[fb as usize]);
         self.uf.union(a, b);
@@ -270,6 +272,21 @@ impl Inf {
                     Node::Arr(e) => self.poison_all(e),
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// `Uf::set` that, on a conflict, also poisons what is read out of the
+    /// tuple or array the class was.
+    fn set(&mut self, t: u32, k: Node) {
+        let r = self.uf.find(t);
+        let old = self.uf.n[r as usize];
+        self.uf.set(t, k);
+        if self.uf.n[r as usize] == Node::Adt(u32::MAX) && old != Node::Adt(u32::MAX) {
+            match old {
+                Node::Tup(_, c) => self.tups[c as usize].clone().into_iter().for_each(|x| self.poison_all(x)),
+                Node::Arr(e) => self.poison_all(e),
+                _ => {}
             }
         }
     }
@@ -396,7 +413,7 @@ impl Inf {
                 return;
             }
         }
-        self.uf.set(t, k);
+        self.set(t, k);
     }
 
     /// Type of expression `e`; unifies as it walks. `env[v]` = tyvar.
@@ -430,7 +447,7 @@ impl Inf {
             }
             Core::If(c, x, y) => {
                 let tc = self.walk(fid, c, env);
-                self.uf.set(tc, Node::Int);
+                self.set(tc, Node::Int);
                 let tx = self.walk(fid, x, env);
                 let ty = self.walk(fid, y, env);
                 self.unify(tx, ty);
@@ -636,4 +653,25 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
         inf.uf.n[r as usize] == Node::Adt(u32::MAX)
     }).collect()).collect();
     Types { class_of, params, ret, field, locals, pshape, rshape, pmixed }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Self-referential types (a list of pairs, an array of arrays) seeded
+    /// by a closure's untyped result: inference ends, and the parameters
+    /// that hold them are unknown (never native ints).
+    #[test]
+    fn self_referential_types_meeting_a_closure_are_unknown() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/self_types.py")).unwrap();
+        let m = mithril_front::desugar(&mithril_front::parse(&src).unwrap()).unwrap();
+        let t = infer(&m);
+        for f in ["build", "nest"] {
+            let id = m.fns.iter().position(|x| x.name == f).unwrap();
+            assert_eq!(t.params[id][0], Ty::Dyn, "{f}'s first parameter");
+            assert_eq!(t.ret[id], Ty::Dyn, "{f}'s result");
+            assert!(t.pmixed[id][0], "{f}'s first parameter is not marked mixed");
+        }
+    }
 }
