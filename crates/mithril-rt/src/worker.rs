@@ -245,7 +245,7 @@ impl<'e> Wctx<'e> {
     /// True when the caller's reference is the only one.
     #[inline(always)]
     pub fn rc_unique(&self, i: u32) -> bool {
-        self.ar.rc_get(i) == 1
+        self.ar.rc_unique(i)
     }
 
     /// Return a cell to this worker's free list (the caller owns it linearly).
@@ -326,8 +326,7 @@ impl<'e> Wctx<'e> {
             return;
         }
         let r = &self.ar.recs[ri as usize];
-        r.args[(parent & 7) as usize].store(val, Ordering::Release);
-        if r.pend.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if crate::sync::join_arrive(&r.pend, &r.args[(parent & 7) as usize], val) {
             let rule = r.rule.load(Ordering::Relaxed) as u16;
             // The last child fires the record right here: a chain of
             // nested joins then completes in one wave instead of one hop
@@ -401,7 +400,8 @@ impl<'e> Wctx<'e> {
     #[inline]
     pub(crate) fn fire_rec(&mut self, rule: u16, ri: u32) {
         let r = &self.ar.recs[ri as usize];
-        let e = Redex { a: r.args[0].load(Ordering::Acquire), b: r.args[1].load(Ordering::Acquire), aux: ri as u64 };
+        let (a, b) = crate::sync::join_args(&r.args);
+        let e = Redex { a, b, aux: ri as u64 };
         self.fire_redex(rule, e);
         self.rfree.push(ri);
     }

@@ -769,6 +769,12 @@ entries from a shared cursor. Otherwise the coordinator drains it alone,
 keeping its caches. Pool workers are spawned once per run and park
 between waves.
 
+Synchronization. Per redex and per record the runtime uses only atomic
+counters (`mithril-rt/src/sync.rs`: the join counter, the wave's claim
+cursor, refcounts). The control plane takes a mutex, a read-write lock and
+a condvar once per wave per worker (parking, the wave's shared slices,
+each worker's context).
+
 **Records.** The delivery that completes a record fires it at once on
 that worker, up to 64 nested levels; beyond that it waits for the next
 wave. A chain of nested joins then completes in one wave. A ready record
@@ -1068,7 +1074,10 @@ what is checked and what is only claimed:
 | both int representations equal the oracle | checked | the `int_reps` codegen test: fixture `int_reps.py` with each representation forced |
 | device equals CPU | checked | `tests/ci/gpu.py` (every port at its small size, plus the closure corpus); `MITHRIL_GPU=1 cargo test -p mithril-gpu --release -- --include-ignored --test-threads=1` (the codegen fixtures against the oracle, plus capacity and abort tests) |
 | ports compute the right answer | checked | every run's checksum against `bench/expected.txt`, which the C twin and the CPython shim agree with |
-| the rule table is confluent | **claimed** | the parallelism argument rests on it; no proof exists |
+| every redex order reaches the same value | checked on samples | `mithril-net/tests/schedule_test.rs`: 10,000 random programs (arithmetic, branches, a shared closure applied twice, a shared list consumed twice, tuples), each reduced by `mithril_core::rules` under 5 sampled redex orders, equal to `eval_core` |
+| every redex order takes the same number of rewrites | **false** for the extended table | most generated programs take order-dependent counts, a spread of about 1% per program: OP's half step fires only when its first operand arrives before the second; values never differ. The test is kept, ignored with this reason |
+| the rule table is confluent | **claimed**, tested as above | a Lean proof is not started |
+| lockless protocols (CPU runtime): a join record fires once and sees every argument; a wave entry is claimed once; a refcounted cell or array is torn down once, after every other owner's reads | **model-checked** | loom over the functions the runtime calls (`mithril-rt/src/sync.rs`), every interleaving and C11 ordering: `cargo test -p mithril-rt --features loom --release --test loom_test`. It found two orderings that let a cell's last owner free or reuse it before another owner's read was ordered before it (a stale or reused value, not undefined behaviour, since cells are atomics): the release was `Release` only, and the unique-owner check a `Relaxed` load. The release is `AcqRel` and the check `Acquire` |
 | the device rule table equals `mithril_core::rules` | **claimed**, checked by tests only | two implementations held together by the oracle |
 | lowering preserves meaning | **claimed**, checked by tests only | oracle equality of generated code |
 
@@ -1355,19 +1364,24 @@ Device:
    results, not free-list balance; a double free or a leaked block would
    pass them.
 
+6. The device refcount decrement (`rc_dec` in `engine.cu`) is a bare
+   `atomicSub` with no fence before the last owner frees and reuses the
+   cell: the same ordering bug the CPU had (section 8, loom). It needs a
+   fence on the freeing path and a device test.
+
 CPU:
 
-6. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
+7. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
    0.677. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
-7. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
+8. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
    (0.850 s against 0.468, and default arenas exhausted); tree-matmul at
    16 threads (0.575 s against 0.460). Section 10 lists every port over
    reference.
-8. `interp_closure`: a closure body with no parameter-free work should be
+9. `interp_closure`: a closure body with no parameter-free work should be
    applied by compiled code directly, the rule table deciding when.
-9. Inference: one heterogeneous array poisons connected ints to `Dyn`.
-10. An array of tuples built by the net (in a closure applied at runtime)
+10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
+11. An array of tuples built by the net (in a closure applied at runtime)
     and read by compiled code gives a wrong value: `array_new(2, (y * 3,
     1))` returned from a closure reads its first field as a float bit
     pattern (`net_array_tuples.py`, an ignored test). Arrays of ints and
@@ -1375,37 +1389,37 @@ CPU:
 
 Semantic core:
 
-11. Readback: a closure created in an arm, capturing a pattern binder and
+12. Readback: a closure created in an arm, capturing a pattern binder and
     applied twice, is an ICE in the reader (the ignored test
     `a_closure_capturing_an_arm_binder_applied_twice` in
     `specialize_test.rs`). Two specializer crashes on nested closures with
     conditionals (in `mithril-core` `net.rs` and `rules.rs`).
-12. The Dup cache is keyed by the whole selection, so a captured shared
+13. The Dup cache is keyed by the whole selection, so a captured shared
     value read under three selections is bound three times (duplicated
     work, not a wrong answer). Keying by the selections a read consults
     fixes it.
-13. The clone discipline (section 3.4) is not enforced: the compiler does
+14. The clone discipline (section 3.4) is not enforced: the compiler does
     not call `check_clone_discipline`, so a closure applied to itself
     (`f = lambda g: 3; f(f)`) compiles and runs. Undecided: run it in the
     pipeline, or state what self-application does.
 
 Constraint and proofs:
 
-14. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
+15. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
     with unmarked thresholds (64, 32, 128), and the inline decision uses a
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
-15. Lean proof of confluence of the core rule table: not started.
-16. One rule-table source for the CPU and the device: not started.
+16. Lean proof of confluence of the core rule table: not started.
+17. One rule-table source for the CPU and the device: not started.
 
 Measurement:
 
-17. The efficiency study: work per port against the C twin and a hand
+18. The efficiency study: work per port against the C twin and a hand
     CUDA kernel; speedup per core; lanes busy per phase. Not started.
-18. The nbody C twin does not compile with gcc 11 (`musttail` placement).
-19. A reference lane for the generality corpus is not set up.
-20. Fork detection counts direct self calls only: a tree recursion whose
+19. The nbody C twin does not compile with gcc 11 (`musttail` placement).
+20. A reference lane for the generality corpus is not set up.
+21. Fork detection counts direct self calls only: a tree recursion whose
     calls go through a loop helper (`for c in range(n): best = max(best,
     solve(r + 1, c))`, unless the loop is a proven fold) or through mutual
     recursion is taken as linear and runs native and sequential (a lost

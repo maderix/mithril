@@ -265,12 +265,8 @@ impl Drop for QuitOnDrop<'_> {
 fn drain(wv: &Wave, ctx: &mut Wctx) {
     let nx = wv.redexes.len();
     let n = nx + wv.recs.len();
-    loop {
-        let i = wv.next.fetch_add(wv.block, Ordering::Relaxed);
-        if i >= n {
-            return;
-        }
-        for j in i..(i + wv.block).min(n) {
+    while let Some(range) = crate::sync::claim_block(&wv.next, wv.block, n) {
+        for j in range {
             if j < nx {
                 ctx.fire_redex(wv.rule, wv.redexes[j]);
             } else {

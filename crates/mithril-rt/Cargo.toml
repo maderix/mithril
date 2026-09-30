@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 mithril-core = { path = "../mithril-core" }
+loom = { version = "0.7", optional = true }
+
+[features]
+loom = ["dep:loom"]

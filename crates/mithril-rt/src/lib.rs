@@ -43,6 +43,7 @@ mod alloc;
 mod engine;
 mod worker;
 pub mod prelude;
+pub mod sync;
 pub mod template;
 
 pub use engine::Engine;

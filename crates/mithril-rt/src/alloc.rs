@@ -192,15 +192,15 @@ impl Arena {
     /// reader then saw the cell as unique and freed a shared tree.
     #[inline(always)]
     pub fn rc_inc(&self, i: u32) {
-        self.rcs(i).fetch_add(1, Ordering::Relaxed);
+        crate::sync::rc_share::<u32, _>(self.rcs(i));
     }
 
     /// Decrement; returns true when this was the last reference (the caller
-    /// then owns the cell's teardown). Release/Acquire pairs the contents
-    /// writes with the freeing reader, HVM2-style.
+    /// then owns the cell's teardown). AcqRel (`sync::rc_release`): other
+    /// owners' reads happen before the last owner's teardown and reuse.
     #[inline(always)]
     pub fn rc_dec(&self, i: u32) -> bool {
-        self.rcs(i).fetch_sub(1, Ordering::Release) == 1
+        crate::sync::rc_release(self.rcs(i))
     }
 
     #[inline(always)]
@@ -208,10 +208,10 @@ impl Arena {
         self.rcs(i).store(1, Ordering::Relaxed);
     }
 
-    /// Current count (racy; only meaningful to a caller holding one ref).
+    /// True when the caller holds the only reference (`sync::rc_unique`).
     #[inline(always)]
-    pub fn rc_get(&self, i: u32) -> u32 {
-        self.rcs(i).load(Ordering::Relaxed) as u32
+    pub fn rc_unique(&self, i: u32) -> bool {
+        crate::sync::rc_unique(self.rcs(i))
     }
 
     #[inline(always)]

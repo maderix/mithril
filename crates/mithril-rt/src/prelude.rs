@@ -486,6 +486,18 @@ pub fn mk_con<T: Tables>(ctx: &mut Wctx, k: u16, fs: &[u64]) -> u64 {
 
 #[inline(always)] pub fn mk_con2<T: Tables>(ctx: &mut Wctx, k: u16, f0: u64, f1: u64) -> u64 { let a = calloc::<T>(ctx, k, f0, f1); con(a, k, 2) }
 
+/// The shared path of a consume let go of its reference after copying the
+/// fields out. If another owner let go at the same moment, this was the
+/// last reference: the cell and the references it holds are released here.
+#[inline]
+fn drop_shared_cell<T: Tables>(ctx: &mut Wctx, a: u32, c: [u64; 2]) {
+    if ctx.rc_dec(a) {
+        ctx.free(a);
+        free_val::<T>(ctx, c[0]);
+        free_val::<T>(ctx, c[1]);
+    }
+}
+
 /// Consume an arity<=2 constructor: move both fields out. Unique owner
 /// moves raw and frees the cell; shared increfs the fields and decrefs the
 /// root. (Chained arity>2 ctors take the generic dup+free path instead.)
@@ -499,7 +511,7 @@ pub fn consume2<T: Tables>(ctx: &mut Wctx, p: u64) -> (u64, u64) {
     } else {
         let f0 = dup_val::<T>(ctx, c[0]);
         let f1 = dup_val::<T>(ctx, c[1]);
-        let _ = ctx.rc_dec(a);
+        drop_shared_cell::<T>(ctx, a, c);
         (f0, f1)
     }
 }
@@ -516,7 +528,7 @@ pub fn consume2k<T: Tables>(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64) {
     } else {
         let f0 = dup_val::<T>(ctx, c[0]);
         let f1 = dup_val::<T>(ctx, c[1]);
-        let _ = ctx.rc_dec(a);
+        drop_shared_cell::<T>(ctx, a, c);
         (f0, f1)
     }
 }
@@ -530,7 +542,7 @@ pub fn consume2r<T: Tables>(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64, u32) {
     } else {
         let f0 = dup_val::<T>(ctx, c[0]);
         let f1 = dup_val::<T>(ctx, c[1]);
-        let _ = ctx.rc_dec(a);
+        drop_shared_cell::<T>(ctx, a, c);
         (f0, f1, NOTOK)
     }
 }
@@ -603,7 +615,7 @@ pub fn dup_val<T: Tables>(ctx: &mut Wctx, p: u64) -> u64 {
             p
         }
         T_ARR => {
-            arr_rc(p).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::sync::rc_share::<u64, _>(arr_rc(p));
             p
         }
         _ => p,
@@ -717,7 +729,7 @@ pub fn arr_copy<T: Tables>(ctx: &mut Wctx, a: u64) -> u64 {
 
 #[inline]
 pub fn arr_drop<T: Tables>(ctx: &mut Wctx, p: u64) {
-    if arr_rc(p).fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
+    if !crate::sync::rc_release(arr_rc(p)) {
         return;
     }
     if arr_boxed(p) {
