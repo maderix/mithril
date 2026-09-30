@@ -7,7 +7,7 @@
 # written by two tasks: each is owned by the one call that built it.
 # Checksum: sum over bins i of mix(i, count_i), u32 (position-weighted, so
 # it depends on which bin holds which count).
-# Sizes (S): small 18 expect 334924889; big 24 expect 3310280667.
+# Sizes (S): small 20 expect 3454372420; big 24 expect 3310280667.
 
 
 def prng(x):

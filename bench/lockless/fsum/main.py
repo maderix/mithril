@@ -6,8 +6,9 @@
 # and schedule. main returns the f32 sum, printed as its bit pattern.
 # The C twin's OpenMP reduction and the Rust twin's rayon sum group the
 # additions by thread and by work split, so their bits may differ from this
-# and from run to run.
-# Sizes (S): small 12 expect 3224226931 (-2.7156036); big 24 expect
+# and from run to run. The same fixed-shape tree written in C or Rust
+# (main_tree.c, rust/src/bin/fsum_tree.rs) prints the same bits as this.
+# Sizes (S): small 18 expect 3231587146 (-4.940831); big 24 expect
 # 3232996432 (-5.612831).
 
 

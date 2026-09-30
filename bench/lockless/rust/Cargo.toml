@@ -1,5 +1,6 @@
-# Rust twins of the bench/lockless programs: one binary per program,
-# rayon for parallelism, Mutex or atomics where the problem needs them.
+# Rust twins of the bench/lockless programs: one binary per implementation,
+# rayon for parallelism; <name>.rs updates a shared structure (Mutex or
+# atomics), <name>_fold.rs and fsum_tree.rs fold into local values.
 # Not a member of the root workspace (the empty [workspace] table below).
 [package]
 name = "lockless"

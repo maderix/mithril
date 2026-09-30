@@ -1,8 +1,8 @@
 {
-  "_comment": "Small sizes for tests. 'sed' applies to main.py, main.c and rust/src/bin/<name>.rs alike (it rewrites the first number on the line marked SIZE). 'expected' is the checksum line every implementation prints at that size (fsum: Mithril only).",
-  "histogram": {"size": 18, "sed": "/SIZE/s/[0-9][0-9]*/18/", "expected": "334924889"},
+  "_comment": "Small sizes for the determinism test, chosen so every Mithril program forks at --threads 4 (MITHRIL_STATS=1 shows waves > 0) while running well under a second. 'sed' applies to every source of the program (main.py, main*.c, rust/src/bin/<name>*.rs); it rewrites the first number on the line marked SIZE. 'expected' is the checksum line every implementation prints at that size, except fsum's c and rust variants (idiomatic reductions, their own bits); fsum's value is the fixed-shape tree sum's (Mithril, c_tree, rust_tree).",
+  "histogram": {"size": 20, "sed": "/SIZE/s/[0-9][0-9]*/20/", "expected": "3454372420"},
   "hashbuild": {"size": 12, "sed": "/SIZE/s/[0-9][0-9]*/12/", "expected": "(2581, 2337151009)"},
   "bfs": {"size": 12, "sed": "/SIZE/s/[0-9][0-9]*/12/", "expected": "(4096, 17156)"},
   "components": {"size": 12, "sed": "/SIZE/s/[0-9][0-9]*/12/", "expected": "(642, 2368481500)"},
-  "fsum": {"size": 12, "sed": "/SIZE/s/[0-9][0-9]*/12/", "expected": "3224226931", "mithril_only": true}
+  "fsum": {"size": 18, "sed": "/SIZE/s/[0-9][0-9]*/18/", "expected": "3231587146"}
 }

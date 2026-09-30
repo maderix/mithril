@@ -1,7 +1,8 @@
 # Expected big-size checksums, one per line: <name> <checksum line>.
-# Every implementation (main.py, main.c, rust/src/bin/<name>.rs) prints
-# exactly this, except fsum: its line is the Mithril tree sum's f32 bits
-# (-5.612831); the C OpenMP reduction and the Rust rayon sum print their
+# Every implementation (main.py, main*.c, rust/src/bin/<name>*.rs) prints
+# exactly this, except fsum's c and rust variants: fsum's line is the
+# fixed-shape tree sum's f32 bits (-5.612831), printed by Mithril, c_tree
+# and rust_tree; the C OpenMP reduction and the Rust rayon sum print their
 # own bits, which can vary with thread count and run.
 histogram 3310280667
 hashbuild (660939, 2427044196)
