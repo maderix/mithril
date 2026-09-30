@@ -314,7 +314,7 @@ fn small_fuel_still_correct() {
 fn dive_form<'a>(cm: &CoreModule, rs: &'a str, name: &str) -> &'a str {
     let fid = cm.fns.iter().position(|f| f.name == name).unwrap_or_else(|| panic!("no fn {name}"));
     let start = rs.find(&format!("fn d_{fid}(")).unwrap_or_else(|| panic!("no d_{fid} for {name}"));
-    let end = rs[start..].find(&format!("fn x_{fid}(")).map(|e| start + e).unwrap_or(rs.len());
+    let end = rs[start..].find(&format!("fn fc_{fid}(")).map(|e| start + e).unwrap_or(rs.len());
     &rs[start..end]
 }
 

@@ -19,9 +19,9 @@
 //! rule.
 
 use crate::lir::{c, do_, i64_, let_, rec_addr, set, u16_, u32_, u64_, cast, bin, v, Bop, FnDef, Inline, Ty, E, S};
-use crate::seq::{vn, vparams, Ex};
+use crate::seq::{vn, Ex};
 use crate::{cnt_rule, free_vars, has_call};
-use mithril_front::core::{Core, CoreModule};
+use mithril_front::core::Core;
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -311,29 +311,6 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
 /// The rule form's dead fuel local (bounded callees never read it).
 fn fuel_local() -> S {
     let_("fl0", Ty::I64, i64_(0))
-}
-
-/// The rule-form expansion of function `fid` (used when its dive unwinds):
-/// evaluates the body event-driven from the original arguments (owned).
-pub(crate) fn expand_fn(
-    m: &CoreModule,
-    fid: u32,
-    body: &Core,
-    bor: &[Vec<bool>],
-    sq: &mut SegQ,
-    unbox: &std::collections::HashMap<u32, u8>,
-    tys: &crate::ty::Types,
-    iret: &[bool],
-    shared: &std::cell::RefCell<crate::seq::Shared>,
-) -> FnDef {
-    let ar = m.fns[fid as usize].arity;
-    let mut params = vec![("parent".to_string(), Ty::U64)];
-    params.extend(vparams(ar));
-    let mut ex = Ex::new(false, fid, false, body, HashSet::new(), bor, None, unbox, iret, tys, shared);
-    let mut bb = vec![fuel_local()];
-    ex.free_dead(0..ar as u32, &mut bb);
-    rtail(&mut ex, body, &v("parent"), &mut bb, sq);
-    FnDef { name: format!("x_{fid}"), ctx: true, params, ret: Ty::Unit, body: bb, inline: Inline::Default, cold: false }
 }
 
 /// The parameters of a rule function: the redex's two ports and its aux

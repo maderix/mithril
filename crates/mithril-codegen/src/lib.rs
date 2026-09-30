@@ -427,7 +427,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         if let Some((p, c)) = dps[fid] {
             emit(vec![seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared)]);
         }
-        emit(vec![rules::expand_fn(m, fid as u32, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared), call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid])]);
+        emit(vec![call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid])]);
         if let Some(pf) = &folds[fid] {
             emit(vec![fold::join_fn(fid as u32, pf)]);
         }
