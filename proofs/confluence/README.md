@@ -47,7 +47,10 @@ Layer A (`Abstract.lean`, any relation with the diamond property):
 `steps_le` (every sequence from `x` is at most as long as a sequence to a
 normal form, and can still finish in the remaining steps),
 `no_infinite_reduction`, `strongly_normalizing` (`Acc`),
-`partial_reduction_sound`. The labelled form is `LDiamond`, with redexes as
+`partial_reduction_sound`. The termination results (`steps_le`,
+`no_infinite_reduction`, `strongly_normalizing`) assume one sequence from
+`x` reaches a normal form: termination of one order implies termination of
+every order. They do not prove that any program terminates. The labelled form is `LDiamond`, with redexes as
 labels.
 
 Layer B, for any oriented table with arbitrary local right-hand sides
@@ -97,12 +100,17 @@ Mithril (`Rules.lean`):
 | `dup_dup`, same label | `(.dup l, .dup l) ↦ linkAux 2` |
 | `dup_dup`, different labels | `(.dup l, .dup l') ↦ commute l (.dup l')` for `l < l'` |
 | `Prog::unfold` (REF–anything) | `(.ref e n, K) ↦ P.unfold e n K` |
+| `Prog::unfold` (REF–Var, pushed by `swi_rule`/`mat_rule`) | not modelled (see below) |
 
 ## What is NOT covered (P2, spec section 3.3)
 
 - **OP reading its operand through `resolve`.** P1 has only the two-agent
   OP0/OP1 form. The one-step compute of `op_rule`, when the other operand is
   already resolved, is not shown equal to it.
+- **REF unfolding against a Var.** `process` unfolds a REF whose other
+  side is an unfilled wire (`swi_rule` and `mat_rule` push such pairs).
+  That is a one-agent firing, not an active pair of two agents, so it is
+  outside the step relation here.
 - **OP–SUP** (`op_rule` with a DUP operand). It consumes three agents and
   is not modelled.
 - **`copy_closure`** (DUP meeting a closure REF, and the arm copies in

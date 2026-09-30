@@ -79,7 +79,8 @@ def N2 : Net Kind := fire T (r 3) (r 2) N1
 /-- The two firings leave no live agent among the four. -/
 theorem N2_empty : ∀ n < 4, N2.agents (r n) = none := by decide
 
-/-- `(0,1)` then `(3,2)` is a two-step reduction to a normal form. -/
+/-- `(0,1)` then `(3,2)` is a two-step reduction after which none of the four
+agents is live (`N2_empty`; normality of `N2` is not proved here). -/
 theorem two_steps : StepN (NStep T) 2 N0 N2 :=
   StepN.cons ⟨(r 0, r 1), redex0, rfl⟩ (StepN.cons ⟨(r 3, r 2), redex1, rfl⟩ (StepN.refl _))
 
