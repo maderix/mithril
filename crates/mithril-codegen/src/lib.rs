@@ -870,9 +870,20 @@ pub(crate) fn callees(e: &Core) -> std::collections::HashSet<u32> {
     call_sites(e).into_iter().collect()
 }
 
-/// Two or more self calls, not all in tail position: recursion that forks.
+/// Recursion that can fork: one activation can make two or more self calls
+/// (not all in tail position; dependent calls such as `f(f(x))` count
+/// too). Calls in different arms of a branch are alternatives: a function
+/// recursing once per arm is linear. Only direct self calls are counted
+/// (a fork through a helper or mutual recursion is not seen). A closure
+/// body is counted as if it ran once (no native form admits one).
 fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
-    !f.self_tail_rec && f.body.sum(&mut |e| matches!(e, Core::Call(g, _) if *g == fid) as usize) >= 2
+    // the most self calls any single execution of `e` makes
+    let per_run = f.body.fold(&mut |e, ks: Vec<usize>| match e {
+        Core::If(..) => ks[0] + ks[1].max(ks[2]),
+        Core::Match(..) => ks[0] + ks[1..].iter().copied().max().unwrap_or(0),
+        _ => matches!(e, Core::Call(g, _) if *g == fid) as usize + ks.iter().sum::<usize>(),
+    });
+    !f.self_tail_rec && per_run >= 2
 }
 
 /// Whether evaluating `e` may run a suspendable call (calls to bounded

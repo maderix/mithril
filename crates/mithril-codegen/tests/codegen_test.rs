@@ -524,6 +524,22 @@ fn forks_reached_from_scalar_callers_stay_splittable() {
     assert!(rs.contains(&format!("fn s_{}(", id("leafwork"))), "leafwork is not native");
 }
 
+#[test]
+fn self_calls_in_different_arms_are_not_a_fork() {
+    let (cm, rs) = trmc_golden("branch_recursion.py");
+    let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
+    // one self call per execution whichever arm runs: linear, native
+    assert!(rs.contains(&format!("fn s_{}(", id("walk"))), "walk (one self call per arm) is not native");
+    // two self calls in one arm: a fork, kept splittable
+    assert!(!rs.contains(&format!("fn s_{}(", id("tree"))), "tree has a native form");
+    assert!(!rs.contains(&format!("fn s_{}(", id("choose"))), "choose (a fork in one arm) has a native form");
+    // a self call in a condition or before a branch adds to the arm's
+    assert!(!rs.contains(&format!("fn s_{}(", id("cond_fork"))), "cond_fork has a native form");
+    assert!(!rs.contains(&format!("fn s_{}(", id("seq_fork"))), "seq_fork has a native form");
+    // calling linear recursion does not demote the caller
+    assert!(rs.contains(&format!("fn s_{}(", id("via_walk"))), "via_walk (calls walk) is not native");
+}
+
 // ---- ownership at projections and branch points ----
 
 #[test]

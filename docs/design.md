@@ -551,7 +551,15 @@ Each function is emitted in the forms its uses need.
   4.1). f32 values are ints by then, so f32 code stays native. Native
   code never suspends, so a function that forks (forking recursion or a
   proven fold), and every function that transitively calls one, runs in
-  dive form instead; its leaves still call native code. Array parameters are
+  dive form instead; its leaves still call native code. Recursion counts
+  as forking when one activation can make two or more direct self calls:
+  calls in sequence add up, the arms of a branch are alternatives (the
+  larger count counts). A function recursing once per arm is linear and
+  stays native. Counting alternatives as forks boxes the path tracer's
+  `path` and every caller: measured 992 against 66 ms for the device
+  kernel, 0.40 against 0.171 s at 16 CPU threads. Native recursion runs
+  on the native stack with no budget cut-off, as plain linear recursion
+  does (section 12). Array parameters are
   borrowed or owned by fixpoint; tuple results carry an array mask. A
   tuple is held as its leaves: a nested one (a record such as
   `(t, (x, y, z), m)`) is flattened by its layout (`ty::Shape`: every
@@ -1344,6 +1352,12 @@ Measurement:
     CUDA kernel; speedup per core; lanes busy per phase. Not started.
 18. The nbody C twin does not compile with gcc 11 (`musttail` placement).
 19. A reference lane for the generality corpus is not set up.
+20. Fork detection counts direct self calls only: a tree recursion whose
+    calls go through a loop helper (`for c in range(n): best = max(best,
+    solve(r + 1, c))`, unless the loop is a proven fold) or through mutual
+    recursion is taken as linear and runs native and sequential (a lost
+    parallelism, not a wrong result). Counting calls within the strongly
+    connected call group fixes it.
 
 Unconfirmed findings from source review (argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a
