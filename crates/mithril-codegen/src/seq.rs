@@ -403,7 +403,6 @@ impl<'m> Ex<'m> {
     /// (`fork_fuel` hands it no budget); a cut runs inline with the
     /// caller's budget; the CPU has one world.
     fn fork_site(call: &mut E, x: u32, bo: &Core) {
-        if std::env::var_os("MITHRIL_DBG_FORK").is_some() { eprintln!("fork_site x={x} split={} bo={:?}", split_frame(x, bo).is_some(), bo); }
         if split_frame(x, bo).is_some() {
             if let E::Call { args, .. } = call {
                 args[0] = p("fork_fuel", vec![v("fuel")]);

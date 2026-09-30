@@ -22,7 +22,6 @@ pub const T_LAM: u64 = 6; // mithril_core::port::Tag::Lam
 pub const TU: u64 = 16;
 #[inline] pub fn ic(slot: u64, v: i64) -> u64 { ((TU + slot) << 56) | ((v as u64) & M56) }
 /// match dispatch key: boxed ctors -> ctor tag, unboxed -> 0x1000 + slot
-#[inline] pub fn mtag(p: u64) -> u32 { let t = tag(p); if t >= TU { 0x1000 + (t - TU) as u32 } else { con_tag(p) as u32 } }
 
 #[inline] pub fn num(v: i64) -> u64 { (T_NUM << 56) | ((v as u64) & M56) }
 #[inline] pub fn as_i(p: u64) -> i64 { ((p << 8) as i64) >> 8 }
@@ -498,25 +497,8 @@ fn drop_shared_cell<T: Tables>(ctx: &mut Wctx, a: u32, c: [u64; 2]) {
     }
 }
 
-/// Consume an arity<=2 constructor: move both fields out. Unique owner
-/// moves raw and frees the cell; shared increfs the fields and decrefs the
-/// root. (Chained arity>2 ctors take the generic dup+free path instead.)
-#[inline(always)]
-pub fn consume2<T: Tables>(ctx: &mut Wctx, p: u64) -> (u64, u64) {
-    let a = con_addr(p);
-    let c = ctx.cell(a);
-    if lin::<T>(con_tag(p)) || ctx.rc_unique(a) {
-        ctx.free(a);
-        (c[0], c[1])
-    } else {
-        let f0 = dup_val::<T>(ctx, c[0]);
-        let f1 = dup_val::<T>(ctx, c[1]);
-        drop_shared_cell::<T>(ctx, a, c);
-        (f0, f1)
-    }
-}
-
-/// consume2 with the constructor statically known (the match arm's ctor):
+/// Consume an arity <= 2 constructor whose ctor is statically known (the match arm's):
+/// the unique owner moves the fields out and frees the cell; a shared one copies them.
 /// `lin::<T>(k)` constant-folds, so linear types move with zero rc traffic.
 #[inline(always)]
 pub fn consume2k<T: Tables>(ctx: &mut Wctx, p: u64, k: u16) -> (u64, u64) {

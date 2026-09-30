@@ -110,68 +110,6 @@ pub(crate) fn ints_of(tys: &ty::Types, fid: usize) -> std::collections::HashSet<
         .collect()
 }
 
-/// Alpha-rename every binder (Let, match field) of every function to a
-/// unique id, so one var id means one value everywhere in the body (the
-/// desugarer reuses ids across match arms). Parameters keep 0..arity.
-fn uniquify(m: &CoreModule) -> CoreModule {
-    type Env = std::collections::HashMap<u32, u32>;
-    /// Fresh ids for the binders `xs` over `b`; outer bindings restored after.
-    fn scoped(xs: &[u32], b: &Core, env: &mut Env, next: &mut u32) -> (Vec<u32>, Core) {
-        let nxs: Vec<u32> = xs.iter().map(|_| { *next += 1; *next - 1 }).collect();
-        let saved: Vec<(u32, Option<u32>)> = xs.iter().zip(&nxs).map(|(x, n)| (*x, env.insert(*x, *n))).collect();
-        let b2 = go(b, env, next);
-        for (x, old) in saved.into_iter().rev() {
-            match old {
-                Some(v) => env.insert(x, v),
-                None => env.remove(&x),
-            };
-        }
-        (nxs, b2)
-    }
-    fn go(e: &Core, env: &mut Env, next: &mut u32) -> Core {
-        match e {
-            Core::Var(i) => Core::Var(*env.get(i).unwrap_or(i)),
-            Core::Num(_) | Core::Flo(_) => e.clone(),
-            Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
-            Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(go(a, env, next)), Box::new(go(b, env, next))),
-            Core::If(c, t, f) => Core::If(Box::new(go(c, env, next)), Box::new(go(t, env, next)), Box::new(go(f, env, next))),
-            Core::Lam(x, b) => {
-                let (nx, b2) = scoped(&[*x], b, env, next);
-                Core::Lam(nx[0], Box::new(b2))
-            }
-            Core::App(f, a) => Core::App(Box::new(go(f, env, next)), Box::new(go(a, env, next))),
-            Core::Let(x, r, b) => {
-                let r2 = go(r, env, next);
-                let (nx, b2) = scoped(&[*x], b, env, next);
-                Core::Let(nx[0], Box::new(r2), Box::new(b2))
-            }
-            Core::Call(g, a) => Core::Call(*g, a.iter().map(|x| go(x, env, next)).collect()),
-            Core::Ctor(c, a) => Core::Ctor(*c, a.iter().map(|x| go(x, env, next)).collect()),
-            Core::Reuse(v, c, a) => Core::Reuse(*env.get(v).unwrap_or(v), *c, a.iter().map(|x| go(x, env, next)).collect()),
-            Core::Tuple(a) => Core::Tuple(a.iter().map(|x| go(x, env, next)).collect()),
-            Core::Prim(p, a) => Core::Prim(*p, a.iter().map(|x| go(x, env, next)).collect()),
-            Core::Proj(b, i) => Core::Proj(Box::new(go(b, env, next)), *i),
-            Core::Match(sc, arms) => {
-                let sc2 = go(sc, env, next);
-                let arms2 = arms
-                    .iter()
-                    .map(|(c, bs, body)| {
-                        let (nbs, body2) = scoped(bs, body, env, next);
-                        (*c, nbs, body2)
-                    })
-                    .collect();
-                Core::Match(Box::new(sc2), arms2)
-            }
-        }
-    }
-    let mut out = m.clone();
-    for f in out.fns.iter_mut() {
-        let mut env = std::collections::HashMap::new();
-        let mut next = f.arity as u32;
-        f.body = go(&f.body, &mut env, &mut next);
-    }
-    out
-}
 
 /// Native int representation override (tests): `None` = chosen per
 /// function by cost, `Some(false)` = all plain, `Some(true)` = all
@@ -272,7 +210,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     // codegen itself owns: mutual tail recursion into loops, and
     // if-conversion of loop back-edges.
     let m_s = rewrite::tail_inline(m);
-    let m_u = rewrite::if_convert(&uniquify(&m_s));
+    let m_u = rewrite::if_convert(&m_s);
     let m = &m_u;
     let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
     // Const path: the whole program reduced to its value at compile time.

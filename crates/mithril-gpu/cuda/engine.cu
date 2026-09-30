@@ -316,7 +316,6 @@ __device__ __forceinline__ void free_node(u32 i) {
 }
 
 __device__ inline u32 alloc2(u64 a, u64 b) { u32 i = alloc_node(a, b); G.rc[nclamp(i)] = 1; return i; }
-__device__ inline void cell_free(u32 i) { free_node(i); }
 __device__ inline void tok_free(u32 tok) { if (tok != NOTOK) free_node(tok); }
 __device__ inline void rc_inc(u32 i) { atomicAdd(&G.rc[nclamp(i)], 1u); }
 __device__ inline bool rc_dec(u32 i) { return atomicSub(&G.rc[nclamp(i)], 1u) == 1u; }
