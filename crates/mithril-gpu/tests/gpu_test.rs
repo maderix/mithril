@@ -170,7 +170,7 @@ fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
 }
 
 #[test]
-#[ignore = "requires MITHRIL_GPU=1 (4090 + docker blaze-ptx:cu13x)"]
+#[ignore = "requires MITHRIL_GPU=1 (4090 + docker mithril-nvcc image)"]
 fn gpu_fixtures_match_the_oracle() {
     if !gpu_on() {
         return;

@@ -5,7 +5,7 @@ corpus at run.py's small sizes, run on the device through `mithril run
 the same result the CPU build prints (the port checksums of fast.py; the
 CPU program's own output for the corpus).
 
-Needs the 4090 and the docker nvcc image (blaze-ptx:cu13x). Programs are
+Needs the 4090 and the docker nvcc image (docker/nvcc.Dockerfile). Programs are
 compiled once per source hash (cached under target/mithril-cache/gpu), so a
 warm run is seconds; a cold run is dominated by nvcc (~20 s per port).
 

@@ -185,9 +185,13 @@ fn fnv1a(s: &str) -> u64 {
 
 pub(crate) const ENGINE_CU: &str = include_str!("../cuda/engine.cu");
 
-/// The docker nvcc build command for `dir` (mounted at /w), per the global
-/// constraint: the host has no nvcc.
+/// The image `nvcc` runs in: `docker/nvcc.Dockerfile`, or `MITHRIL_NVCC_IMAGE`.
+const NVCC_IMAGE: &str = "mithril-nvcc:cu13.0";
+
+/// Compile `dir/program.cu` with nvcc inside docker (the host needs no CUDA
+/// toolkit); `dir` is mounted at /w.
 fn nvcc_compile(dir: &Path) -> Result<(), String> {
+    let image = std::env::var("MITHRIL_NVCC_IMAGE").unwrap_or_else(|_| NVCC_IMAGE.to_string());
     let dir = dir
         .canonicalize()
         .map_err(|e| format!("mithril-gpu: cache dir {}: {e}", dir.display()))?;
@@ -199,7 +203,7 @@ fn nvcc_compile(dir: &Path) -> Result<(), String> {
             "all",
             "-v",
             &format!("{}:/w", dir.display()),
-            "blaze-ptx:cu13x",
+            &image,
             "nvcc",
             "-O3",
             "-arch=sm_89",
