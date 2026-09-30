@@ -1127,9 +1127,16 @@ CPU:
    tuple fails ("unprintable result port") or gives a silently wrong
    value (`t = ap(lambda y: (y, y), n, n); t[0] + t[1]` prints a float
    for 6). Programs whose applications the net removes at compile time
-   are correct. Fix: one boundary that resolves every field of a net
-   value (reducing or suspending on a pending one) wherever a net value
-   enters compiled code. Open.
+   are correct. Fix: one boundary that settles a net value before
+   compiled code reads it, wherever a net value enters compiled code
+   (`apply`, continuation delivery, net calls into rule forms): follow
+   every field's wire and write the value back into its slot. A field can
+   still be pending (its value waits on a compiled result delivered
+   later, or on net work the budget spawned elsewhere), so the boundary
+   also needs a continuation that waits for a whole value: a record fed
+   by each pending field that writes the field in place and delivers the
+   value when none is left. Both runtimes need it (one runtime model).
+   Open.
 8. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
    0.771. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.
