@@ -66,6 +66,9 @@ const BOOT: Redex = Redex { a: 0, b: 0, aux: 0 };
 
 /// Every fixture the CPU backend is tested on, closures included.
 const FIXTURES: &[&str] = &[
+    "array_erase_frontier.py",
+    "array_erase_depth.py",
+    "readback_values.py",
     "fact_while.py",
     "tree_sum.py",
     "fib_naive.py",
@@ -162,7 +165,7 @@ fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
     match cu {
         Ok(cu) => (want.clone(), compile_and_run(&cu, BOOT, &cache_dir())),
         // nothing to run: the constant is the result
-        Err(v) => (want, Ok(mithril_gpu::GpuResult { port: 0, text: v, rounds: 0 })),
+        Err(v) => (want, Ok(mithril_gpu::GpuResult { port: 0, text: v, rounds: 0, cell_readback_bytes: 0 })),
     }
 }
 
@@ -435,6 +438,7 @@ fn gpu_timeout_abandons_a_runaway_loop_and_other_processes_run() {
     let mut child = cmd
         .env("MITHRIL_GPU_TIMEOUT_CHILD", "1")
         .env("MITHRIL_GPU_TIMEOUT", "2")
+        .env("MITHRIL_GPU_STATS", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -467,4 +471,65 @@ fn gpu_timeout_child() {
     let (_, cu) = pipeline_src(src);
     let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("the run cannot finish in 2 s");
     println!("child error: {err}");
+}
+
+/// Dead intermediate cells must not be transferred for an immediate result.
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_scalar_readback_does_not_copy_dead_cells() {
+    if !gpu_on() { return; }
+    let (want, got) = run_fixture("tree_sum.py");
+    let r = got.expect("device run");
+    assert_eq!(r.text, want);
+    assert!(r.rounds > 0, "exercise the device, not a constant result");
+    assert_eq!(r.cell_readback_bytes, 0, "the scalar result has no cell references");
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_readback_follows_value_storage_including_array_elements() {
+    if !gpu_on() { return; }
+    for (body, needs_cells) in [
+        ("return n", false),
+        ("return lambda x: x + n", false),
+        ("if n == 3:\n        return Empty()\n    return Wrap(n)", false),
+        ("return Wrap(n)", false),
+        ("return array_new(n, n)", false),
+        ("return array_new(n, array_new(n, n))", false),
+        ("return array_get(array_new(n, 2.5), 0)", true),
+        ("return array_new(n, 2.5)", true),
+        ("return (n, n)", true),
+        ("return array_new(n, (n, n))", true),
+    ] {
+        let src = format!("@data\nclass Box:\n    Empty: ()\n    Wrap: (v,)\n\ndef main():\n    n = array_len(array_new(3, 0))\n    {body}\n");
+        let (want, cubin) = cubin_of(&src);
+        let r = mithril_gpu::run_cubin(&cubin, BOOT).expect(body);
+        assert_eq!(r.text, want, "{body}");
+        assert_eq!(r.cell_readback_bytes != 0, needs_cells, "{body}: cell storage demand");
+    }
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_BUCKET; run --test-threads=1)"]
+fn gpu_array_erasure_does_not_expand_a_suffix_into_a_frontier() {
+    if !gpu_on() { return; }
+    let programs: Vec<_> = [0, 1, 255, 256, 257, 1024].into_iter().map(|n| {
+        cubin_of(&fixture("array_erase_frontier.py").replace("array_new(1024, 0)", &format!("array_new({n}, 0)")))
+    }).collect();
+    std::env::set_var("MITHRIL_GPU_BUCKET", "64");
+    let results: Vec<_> = programs.iter().map(|(_, p)| mithril_gpu::run_cubin(p, BOOT)).collect();
+    std::env::remove_var("MITHRIL_GPU_BUCKET");
+    for ((want, _), got) in programs.iter().zip(results) {
+        assert_eq!(got.map(|r| r.text), Ok(want.clone()), "bounded erasure must preserve shared elements");
+    }
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_deep_array_erasure_resumes_after_the_depth_bound() {
+    if !gpu_on() { return; }
+    let (want, got) = run_fixture("array_erase_depth.py");
+    let r = got.expect("deep array erasure");
+    assert_eq!(r.text, want);
+    assert!(r.rounds > 1, "the remaining suffix must resume as scheduled work");
 }

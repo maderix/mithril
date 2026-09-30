@@ -891,13 +891,25 @@ __device__ inline u64 arr_set_i(u64 a, i64 i, u64 v) {
   arr_elems(a)[i] = (u64)sh(v);
   return a;
 }
-__device__ __noinline__ void arr_drop(u64 p) {
-  if (atomicAdd((unsigned long long *)arr_block(p), 0xffffffffffffffffull) != 1ull) return;
-  if (arr_boxed(p)) {
-    usize n = arr_len_of(p);
-    for (usize k = 0; k < n; k++) free_val(arr_elems(p)[k]);
+// An ERA continuation owns the zero-reference array until its suffix is erased.
+// e1 encodes next index + 1; ordinary ERA tasks keep e1 == 0.
+__device__ void arr_erase(u64 p, usize start) {
+  if (s_era_depth[threadIdx.x]++ == 0) s_era[threadIdx.x] = 0;
+  struct Leave { __device__ ~Leave() { s_era_depth[threadIdx.x]--; } } leave;
+  usize n = arr_len_of(p);
+  for (usize k = start; k < n; k++) {
+    if (s_era[threadIdx.x] >= ERA_CHUNK || s_era_depth[threadIdx.x] > ERA_DEPTH) {
+      spawn_global(ERA_RULE, p, k + 1, 0);
+      return;
+    }
+    ++s_era[threadIdx.x];
+    free_val(arr_elems(p)[k]);
   }
   arr_free_block(p);
+}
+__device__ __noinline__ void arr_drop(u64 p) {
+  if (atomicAdd((unsigned long long *)arr_block(p), 0xffffffffffffffffull) != 1ull) return;
+  if (arr_boxed(p)) arr_erase(p, 0); else arr_free_block(p);
 }
 
 // ---- closures: the net region (below, after the value helpers) ----
@@ -1914,7 +1926,7 @@ __device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
 // fires through the table, and a fired record is dead.
 __device__ inline void fire(u32 rule, u64 e0, u64 e1, u64 e2) {
   if (rule == ERA_RULE) {
-    free_val(e0);
+    if (e1) arr_erase(e0, e1 - 1); else free_val(e0);
     return;
   }
   prog_fire(rule, e0, e1, e2);

@@ -30,6 +30,10 @@ const CU_MEM_ADVISE_SET_PREFERRED_LOCATION: i32 = 3;
 
 extern "C" {
     fn cuInit(flags: u32) -> CUresult;
+    fn cuEventCreate(event: *mut *mut c_void, flags: u32) -> CUresult;
+    fn cuEventRecord(event: *mut c_void, stream: *mut c_void) -> CUresult;
+    fn cuEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> CUresult;
+    fn cuEventDestroy_v2(event: *mut c_void) -> CUresult;
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> CUresult;
     fn cuCtxSetLimit(limit: i32, value: usize) -> CUresult;
     fn cuStreamQuery(stream: *mut c_void) -> CUresult;
@@ -145,6 +149,8 @@ pub struct GpuResult {
     /// rounds of the device driver (grow sweeps + work phases): the
     /// schedule's length, bounded by the program's fork levels
     pub rounds: u64,
+    /// Cell arena bytes transferred to format the result (arrays are separate).
+    pub cell_readback_bytes: usize,
 }
 
 const REC_SIZE: usize = 40; // sizeof(Rec) in engine.cu
@@ -414,6 +420,7 @@ impl GpuRunner {
 /// A successful run of an exiting process leaves it to the driver.
 struct Mem {
     bufs: Vec<CUdeviceptr>,
+    events: Vec<*mut c_void>,
     module: *mut c_void,
     /// a successful run of an exiting process: the driver reclaims it
     keep: bool,
@@ -427,6 +434,7 @@ impl Drop for Mem {
             return;
         }
         unsafe {
+            for &e in &self.events { let _ = cuEventDestroy_v2(e); }
             for &b in &self.bufs {
                 let _ = cuMemFree_v2(b);
             }
@@ -500,7 +508,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let t0 = std::time::Instant::now();
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
-    let mut mem = Mem { bufs: Vec::new(), module: std::ptr::null_mut(), keep: false, abandon: false };
+    let mut mem = Mem { bufs: Vec::new(), events: Vec::new(), module: std::ptr::null_mut(), keep: false, abandon: false };
     cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
     let module = mem.module;
     let t_load = t0.elapsed();
@@ -674,6 +682,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let mut k_boot: *mut c_void = std::ptr::null_mut();
     cu(cuModuleGetFunction(&mut k_boot, module, c"k_boot".as_ptr()), "get k_boot")?;
 
+    let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
+    if stats {
+        for _ in 0..4 {
+            let mut event = std::ptr::null_mut();
+            cu(cuEventCreate(&mut event, 0), "create timing event")?;
+            mem.events.push(event);
+        }
+        cu(cuEventRecord(mem.events[0], std::ptr::null_mut()), "record boot start")?;
+    }
     // which rules can fork (published by the program)
     let t_setup = t0.elapsed();
     // boot fires rule 0 with the redex, parent = ROOT (aux), in the
@@ -693,8 +710,9 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         )?;
     }
 
+    let t_boot = t0.elapsed();
+    if stats { cu(cuEventRecord(mem.events[1], std::ptr::null_mut()), "record boot end")?; }
     // The driver on the device: k_run, one cooperative launch.
-    let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
     let abort_message = |ab: u32| -> String {
         match ab {
             1 => "mithril-gpu: unreachable match arm reached".to_string(),
@@ -719,6 +737,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     // MITHRIL_GPU_LANES caps the lanes (the one-lane run is the determinism probe)
     let blocks = ((per_sm.max(1) * sms.max(1)) as u32).min(MAXLANES as u32 / TPB).min(env_cap("MITHRIL_GPU_LANES", MAXLANES as u64).clamp(1, MAXLANES as u64).div_ceil(TPB as u64) as u32).max(1);
     let lanes = blocks * TPB;
+    let t_prepare = t0.elapsed();
+    if stats { cu(cuEventRecord(mem.events[2], std::ptr::null_mut()), "record run start")?; }
     let t_run = std::time::Instant::now();
     let mut width: u32 = env_cap("MITHRIL_GPU_GROW_WIDTH", lanes as u64).clamp(1, lanes as u64) as u32;
     let mut steps: u32 = env_cap("MITHRIL_GPU_WORK_STEPS", 1 << 30).clamp(1, u32::MAX as u64) as u32;
@@ -732,6 +752,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         cuLaunchCooperativeKernel(k_run, blocks, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr()),
         "launch k_run (cooperative)",
     )?;
+    if stats { cu(cuEventRecord(mem.events[3], std::ptr::null_mut()), "record run end")?; }
     // wait with a deadline: a run past MITHRIL_GPU_TIMEOUT seconds is an
     // error; lanes that do not stop (a native loop, a runaway forking
     // recursion) leave the kernel running until the process exits
@@ -776,6 +797,10 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_rounds".as_ptr()), "cuModuleGetGlobal(g_rounds)")?;
     let r = dtoh::<u64>(ptr, 8, "read g_rounds")?;
     if stats {
+        let (mut boot_ms, mut run_ms) = (0f32, 0f32);
+        cu(cuEventElapsedTime(&mut boot_ms, mem.events[0], mem.events[1]), "time boot")?;
+        cu(cuEventElapsedTime(&mut run_ms, mem.events[2], mem.events[3]), "time run")?;
+        eprintln!("mithril-gpu: device events: boot {boot_ms:.3} ms, run {run_ms:.3} ms");
         let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
         eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[3]);
@@ -817,13 +842,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let mut ub_sz = 0usize;
     cu(cuModuleGetGlobal_v2(&mut ub_ptr, &mut ub_sz, module, c"UNBOX_CID".as_ptr()), "cuModuleGetGlobal(UNBOX_CID)")?;
     let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
-    // the cells in use, copied once: the result is read on the host (one
-    // copy per cell cost ~1.7 s for a 512 x 512 image)
-    let used = (dtoh::<u32>(d.nbump, 1, "read nbump")?[0] as u64).min(ncap as u64) as usize;
-    let cells = dtoh::<u64>(d.nodes, 2 * used, "read cells")?;
-    let text = show(&d, &cells, &unbox, res[1])?;
+    // Snapshot the cell arena only if the result walk reaches a cell.
+    // Immediate values and arrays of immediate values need none of it.
+    let mut cells = Vec::new();
+    let text = show(&d, &mut cells, &unbox, res[1])?;
+    if stats {
+        eprintln!("mithril-gpu: detail: boot launch {:.3} ms, prepare run {:.3} ms, readback + format {:.3} ms ({} cell bytes), stack {stack}", (t_boot - t_setup).as_secs_f64() * 1e3, (t_prepare - t_boot).as_secs_f64() * 1e3, (t0.elapsed() - t_before_read).as_secs_f64() * 1e3, cells.len() * 8);
+    }
     mem.keep = EXITING.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(GpuResult { port: res[1], text, rounds: r[0] })
+    Ok(GpuResult { port: res[1], text, rounds: r[0], cell_readback_bytes: cells.len() * 8 })
 }
 
 // ---- readback of a result port (mirrors mithril_rt::prelude::show) ----
@@ -836,19 +863,25 @@ const T_ARR: u64 = 14;
 const TU: u64 = 16;
 const M56: u64 = (1u64 << 56) - 1;
 
-fn cell(cells: &[u64], i: u32) -> Result<[u64; 2], String> {
+unsafe fn cell(d: &Dev, cells: &mut Vec<u64>, i: u32) -> Result<[u64; 2], String> {
+    if cells.is_empty() {
+        // Keep bulk transfer for aggregate results: a transfer per cell
+        // cost ~1.7 s for a 512 x 512 image. All later reads use this snapshot.
+        let used = dtoh::<u32>(d.nbump, 1, "read nbump")?[0].min(d.ncap) as usize;
+        *cells = dtoh::<u64>(d.nodes, 2 * used, "read cells")?;
+    }
     let k = 2 * i as usize;
     cells.get(k..k + 2).map(|c| [c[0], c[1]]).ok_or_else(|| format!("mithril-gpu: result cell {i} is outside the cells in use"))
 }
 
-unsafe fn show(d: &Dev, cells: &[u64], unbox: &[u32], p: u64) -> Result<String, String> {
+unsafe fn show(d: &Dev, cells: &mut Vec<u64>, unbox: &[u32], p: u64) -> Result<String, String> {
     let as_i = |p: u64| ((p << 8) as i64) >> 8;
     let t = p >> 56;
     Ok(match t {
         t if t >= TU => format!("C{}({})", unbox.get((t - TU) as usize).copied().unwrap_or(0), as_i(p)),
         T_LAM => "<closure>".to_string(),
         T_NUM => as_i(p).to_string(),
-        T_FLO => format!("{:?}", f64::from_bits(cell(cells, (p & M56) as u32)?[0])),
+        T_FLO => format!("{:?}", f64::from_bits(cell(d, cells, (p & M56) as u32)?[0])),
         T_CON => {
             let k = ((p >> 4) & 0xFFF) as u16;
             let mut q = p;
@@ -856,7 +889,7 @@ unsafe fn show(d: &Dev, cells: &[u64], unbox: &[u32], p: u64) -> Result<String, 
             if p & 0xF != 0 {
                 loop {
                     let ar = (q & 0xF) as usize;
-                    let c = cell(cells, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
+                    let c = cell(d, cells, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
                     if ar > 2 {
                         fs.push(show(d, cells, unbox, c[0])?);
                         q = c[1];

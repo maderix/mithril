@@ -929,6 +929,18 @@ end-of-run teardown (2^19 cells) cost 3.1 G cycles on one lane, the whole
 work phase, as a walk; it is parallel as a rule. The CPU tears down in
 place; the rules are the same either way.
 
+Boxed arrays use the same node/depth budget. The last reference decrement
+starts an element walk; on budget exhaustion one ERA continuation owns the
+remaining suffix. Its second payload is the next element index plus one
+(zero denotes ordinary value erasure). Resuming does not decrement the
+reference count again, and the array block is freed only after its last
+element. This bounds queued work by exposed subtrees, rather than array
+length: hashmap's eager teardown exposed 7,569,521 ERA tasks and overflowed
+a 2^21 ring; the continuation probe kept the widest frontier at 4,096,
+with the same 33,423,361 cells and checksum 1307803744. No ring enlargement
+or program-specific decision is needed. CPU array erasure already walks
+elements in place; ownership and ERA semantics are identical.
+
 ### 7.5 Arenas and sizing
 
 | arena | structure | size |
@@ -1009,14 +1021,30 @@ with a 32 KiB stack 0.31 s; the same arenas managed 0.06 s.
   in either order.
 
 **Readback.** After the kernel the host reads the port delivered to the
-root (a run that delivered none is an error), copies the cells in use in
-one transfer (one copy per cell cost about 1.7 s for a 512 x 512 image),
-and formats the value on the host with a `show` that mirrors the CPU's
-(section 6), reading arrays from the heap by their headers.
+root (a run that delivered none is an error). `show` follows the result's
+storage: immediate ints, unboxed and nullary constructors, and closure
+markers need no cell transfer. Arrays are read through their heap headers;
+only an element that refers to a cell demands the cell arena. At the first
+cell read the host takes one bulk snapshot, shared by the rest of the walk.
+This preserves aggregate throughput (one transfer per cell cost about
+1.7 s for a 512 x 512 image) without transferring dead intermediate cells
+for a scalar result. The cost is zero cell bytes for a cell-free result,
+otherwise the allocation high-water range, independent of program names.
+The full suite transfers zero cell bytes for all 17 scalar ports; the
+two aggregate demo results retain their bulk snapshots.
+Measured scalar results: tree-matmul copied 1.64 GB in 556 ms and tree-radix
+2.11 GB in 708 ms. A hand-edited merkle kernel suppressing that dead range
+kept its checksum and 32 rounds while wall time fell from 243 to 140 ms.
+The generated path measures tree-matmul at 0.565 s (from 1.243),
+tree-radix at 0.650 s (from 1.515), and merkle at 0.142 s (from 0.249),
+all checksum-equal.
+The CPU already walks only the root value; neither lowering nor the rule
+table changes.
 
 Diagnostics: `MITHRIL_GPU_STATS` (context creation and release, module
 load, arena setup, run time and readback, rounds, grow sweeps and work
-phases with their cycles, widest frontier, cells and records issued);
+phases with their cycles, widest frontier, cells and records issued, stream-event
+intervals for boot and run, readback time and cell bytes);
 with it, `MITHRIL_GPU_TRACE` adds the per-round log (phase, pending,
 frontier, K cycles, slowest lane, busy lanes), per-rule pending counts
 for the first rounds, and a histogram of lanes by cycles for the last
@@ -1069,13 +1097,26 @@ exhausted" at defaults the lane is retried with
 **GPU timing.** The device program is compiled by nvcc in a container on
 first use (5 to 77 s per port) and cached by source hash. The harness's
 GPU lane builds the artefact once (`build --gpu`, which compiles or loads
-the cubin) and times `exec` of it. Two numbers exist:
+the cubin) and times `exec` of it after a warm-up that persists the
+program's stack hint. Distinct measurements are:
 
-* **kernel time**: the runner's `run` time, from the cooperative launch
-  to completion (`MITHRIL_GPU_STATS`). It excludes process start, context
-  creation, module load, and arena allocation and clearing, which
-  together cost about 0.4 s;
-* **wall**: the whole `exec` process, warm cache.
+* **run time**: the runner's host wait around the cooperative `k_run`
+  launch (`MITHRIL_GPU_STATS`), including launch and polling overhead.
+  It omits most `k_boot` execution; wall minus run is not all host cost.
+* **boot and run stream intervals**: CUDA events surrounding each launch.
+  These include small host enqueue gaps as well as device execution.
+  Kdtree measures 531 ms in boot and 581 ms in `k_run`; neither belongs
+  in context creation (typically about 42 ms, observed 34--56 ms).
+* **wall**: the whole `exec` process, warm cache, including setup,
+  readback, output and exit. Readback follows result storage (section
+  7.6); it is not a fixed startup constant.
+
+Phase cycle counters include useful work and the closing grid barrier;
+they are not sums of work over all lanes. A calibration of three empty
+grid barriers costs 1.56--1.64 us per round on the measured launch widths.
+Nsight warp-stall percentages describe warp cycles, not additive shares
+of process wall time. Profile clocks differ from ordinary runs, so use
+unprofiled runs for before/after performance comparisons.
 
 **Instruction counts.** fast.py measures a mid-size run with `perf stat`
 (noise-free) and compares against `tests/ci/baseline.json`.
@@ -1099,56 +1140,55 @@ are 1.2 to 3.8x faster sequentially than this x86 box.
 All at the big size, on the machine of section 9. Times in seconds
 unless marked ms.
 
-| port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device kernel (wall) | reference gpu wall |
+| port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device run (wall) | reference gpu wall |
 |---|---|---|---|---|---|---|---|
-| bfs | 4.48 | 4.83 | 0.432 | 4.543 | 0.397 | 255 ms (0.48 wall) | 0.217 |
-| editdist | 2.17 | 2.25 | 0.255 | 2.389 | 0.308 | 212 ms (0.48 wall) | 0.234 |
-| gameoflife | 28.32 | 8.45 | 1.121 | 9.706 | 1.146 | 18 ms (0.28 wall) | 0.089 |
-| hashmap | 0.767 | 1.82 | 0.237 | 3.112 | 0.288 | fails: a rule ring (2^21) exhausted by a 7.5 M-task frontier | 0.662 |
-| kdtree | 0.333 | 0.41 | 0.090 | no port | no port | 603 ms (1.30 wall) | no port |
-| kmeans | 10.16 | 11.86 | 1.462 | 5.610 | 0.677 | 339 ms (0.63 wall) | 0.299 |
-| lexer | 1.03 | 2.51 | 0.347 | 2.868 | 0.310 | 157 ms (0.39 wall) | 0.348 |
-| mandelbrot | 1.92 | 4.08 | 0.850 r | 4.806 | 0.468 | 76 ms (0.29 wall) | 0.093 |
-| merkle | 5.75 | 5.43 | 0.601 | 5.463 | 0.535 | 14 ms (0.27 wall) | 0.101 |
-| nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.524 | 6.220 | 0.521 | 4 ms (0.28 wall) | 0.086 |
-| queens | 3.90 | 4.71 | 0.454 | 8.118 | 0.911 | 1,204 ms (1.45 wall) | 0.760 |
-| raytrace | 9.03 | 7.68 | 0.849 | 7.263 | 0.724 | 58 ms (0.29 wall) | 0.545 |
-| symreg | 3.01 | 3.02 | 0.400 | 4.608 | 0.431 | 2,028 ms (2.34 wall) | 0.261 |
-| terrain | 4.13 | 4.58 | 0.559 | 3.040 | 0.346 | 296 ms (0.47 wall) | 0.212 |
-| tree-bitonic | 8.50 | 10.79 | 1.554 | 10.077 | 1.455 | 990 ms (1.27 wall) | 0.568 |
-| tree-matmul | 4.20 | 3.80 | 0.575 | 4.094 | 0.460 | 383 ms (0.70 wall) | 0.225 |
-| tree-radix | 2.57 | 4.05 | 0.579 | 4.622 | 0.537 | 373 ms (0.65 wall) | 0.333 |
+| bfs | 4.48 | 4.83 | 0.433 | 4.543 | 0.397 | 284 ms (0.426 wall) | 0.217 |
+| editdist | 2.17 | 2.25 | 0.252 | 2.389 | 0.308 | 233 ms (0.344 wall) | 0.234 |
+| gameoflife | 28.32 | 8.45 | 1.089 | 9.706 | 1.146 | 27 ms (0.129 wall) | 0.089 |
+| hashmap | 0.767 | 1.82 | 0.237 | 3.112 | 0.288 | 523 ms (0.643 wall) | 0.662 |
+| kdtree | 0.333 | 0.41 | 0.088 | no port | no port | 578 ms (1.232 wall) | no port |
+| kmeans | 10.16 | 11.86 | 1.458 | 5.610 | 0.677 | 335 ms (0.455 wall) | 0.299 |
+| lexer | 1.03 | 2.51 | 0.343 | 2.868 | 0.310 | 159 ms (0.268 wall) | 0.348 |
+| mandelbrot | 1.92 | 4.08 | 0.853 r | 4.806 | 0.468 | 81 ms (0.184 wall) | 0.093 |
+| merkle | 5.75 | 5.43 | 0.615 | 5.463 | 0.535 | 31 ms (0.142 wall) | 0.101 |
+| nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.532 | 6.220 | 0.521 | 14 ms (0.119 wall) | 0.086 |
+| queens | 3.90 | 4.71 | 0.465 | 8.118 | 0.911 | 1205 ms (1.306 wall) | 0.760 |
+| raytrace | 9.03 | 7.68 | 0.855 | 7.263 | 0.724 | 62 ms (0.164 wall) | 0.545 |
+| symreg | 3.01 | 3.02 | 0.384 | 4.608 | 0.431 | 1966 ms (2.080 wall) | 0.261 |
+| terrain | 4.13 | 4.58 | 0.563 | 3.040 | 0.346 | 181 ms (0.293 wall) | 0.212 |
+| tree-bitonic | 8.50 | 10.79 | 1.562 | 10.077 | 1.455 | 953 ms (1.078 wall) | 0.568 |
+| tree-matmul | 4.20 | 3.80 | 0.577 | 4.094 | 0.460 | 405 ms (0.565 wall) | 0.225 |
+| tree-radix | 2.57 | 4.05 | 0.576 | 4.622 | 0.537 | 466 ms (0.650 wall) | 0.333 |
 
 Conditions:
 
-* C twin, Mithril t1, t16: `bench/results.md` (one harness run; the
-  Mithril lanes at `723be4c`), a load below 2, min of 3 runs, wall clock
-  (the same conditions as reference's).
+* C twin and Mithril t1: `bench/results.md` (one harness run; the
+  Mithril lane at `723be4c`), a load below 2, min of 3 runs, wall clock.
+* Mithril t16 and device: 2026-09-30 measured built artefacts, load below
+  2, min of three warm runs; every checksum equals the CPU and
+  `bench/expected.txt`. Device `run` is sampled separately (section 9).
+  Raw results: `/home/maderix/Mithril-codex-logs/ab_after.json`.
 * **r**: default arenas exhausted; run with `MITHRIL_NODES=2^32
   MITHRIL_RECS=2^28`.
 * reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
   compiler output rebuilt, a load below 2, min of 3 runs, wall clock.
-* Mithril device: kernel time (section 9), warm cache, default arenas,
-  at `723be4c`; the wall clock in parentheses is the harness's timing of
-  the built artefact at `2a3f23e` (`build --gpu` once, `exec` per run,
-  min of 3), the same measurement as reference's gpu lane. The difference between the two is
-  the fixed cost: CUDA context creation (73 ms) and teardown of the
-  arenas (133 ms), module load, arena setup and readback (about 45 ms).
+* Wall and run differ for several reasons, not a fixed startup constant:
+  boot execution, context/module/arena setup, readback, output and exit.
+  Root-driven readback avoids dead cell transfers for scalar results
+  (section 7.6); phase measurements distinguish boot from `k_run`.
 
 Read plainly:
 
 * **CPU, one thread.** At or under reference seq on 11 of 16 ports. Over it:
   bfs (4.83 against 4.54), kmeans (11.86 against 5.61), raytrace (7.68 against 7.26), terrain (4.58 against 3.04), tree-bitonic (10.79 against 10.08).
-* **CPU, 16 threads.** At or under reference par on 5 of 16 ports. Over it:
-  bfs (0.43 against 0.40), kmeans (1.46 against 0.68), lexer (0.35 against 0.31), mandelbrot (0.85 against 0.47), merkle (0.60 against 0.54), nbody (0.52 against 0.52), raytrace (0.85 against 0.72), terrain (0.56 against 0.35), tree-bitonic (1.55 against 1.46), tree-matmul (0.57 against 0.46), tree-radix (0.58 against 0.54).
-* **Device.** Every measured port is checksum-equal. Wall clock of the
-  built artefact is under reference's gpu wall on 1 of the 14 ports measured
-  on both (raytrace 0.29 against 0.55) and over it on 13, by 1.1x to
-  9x. The
-  fixed cost (about 0.25 s) is most of the difference on the small
-  ports; symreg (17,902 grow sweeps), tree-bitonic (966 rounds), queens
-  and tree-matmul are also round-bound, because a sweep counts as growth
-  when it pushed anything (section 12). hashmap fails.
+* **CPU, 16 threads.** At or under reference par on 5 of 16 compared ports.
+* **Device.** All 17 ports complete with the expected checksum. Device
+  wall is under CPU t16 on 11 of 17 ports and under reference gpu on 3 of
+  16 compared ports. The two Cornell outputs are byte-identical to the CPU.
+  Queens uses only 16 rounds and spends 99.7% of baseline phase cycles
+  in WORK. GROW also performs useful reductions: editdist finishes in
+  15 GROW sweeps with no WORK phase. Empty rounds cost 1.56--1.64 us at
+  the measured launch widths; these are not uniformly round-bound ports.
 
 ## 11. Use cases and scope
 
@@ -1266,44 +1306,47 @@ stage times; the same file runs on the CPU and the device.
   through glass dimmed. The path tracer leaves caustics out (after a
   diffuse bounce light arrives by next-event estimation only).
 
-| demo | CPU 16 threads (run) | device (run) |
+| demo | CPU 16 threads (wall) | device (wall) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.077 s | 0.145 s |
-| path, 256 x 256 x 64 paths | 0.40 s | 1.06 s |
+| Whitted, 512 x 512 x 4 samples | 0.077 s | 0.187 s |
+| path, 256 x 256 x 64 paths | 0.183 s | 0.190 s |
 
 The device image is byte-identical to the CPU image for both. All ray
 code is native (vectors and hit records are nested tuples held in
-registers, section 5.2); before that the hot functions were boxed and
-the two demos took 0.34 s and 1.37 s on the CPU, 2.73 s and 7.59 s on the
-device. The device is still 2 to 3 times slower than 16 CPU threads here
-(section 12). A test renders the Whitted
-demo at 12 x 12 and checks it against the oracle at 1, 4 and 16 threads.
+registers, section 5.2). Times use the built-artefact method and conditions
+of section 10. Device wall includes result formatting and process setup;
+its `k_run` interval alone does not describe end-to-end rendering cost.
+A test renders the Whitted demo at 12 x 12 and checks it against the
+oracle at 1, 4 and 16 threads.
 
 ## 12. Open items
 
 Device:
 
-1. Grow policy: a sweep counts as growth when it pushed anything; it
-   should count only when a fork happened. symreg runs 17,902 grow sweeps
-   and tree-bitonic 966 rounds.
-2. hashmap: per-rule rings of 2^21 entries overflow on a 7.5 M-task
-   frontier. Replace them with one chunked shared task ring (reference's
-   cube holds 16 M tasks).
-3. Fixed startup cost: reduced by the mechanisms in section 7.5. Device
-   wall clock, harness, n=3, before and after: gameoflife 0.28 to 0.13 s
-   (reference 0.09), nbody 0.28 to 0.12 (0.09), raytrace 0.29 to 0.16 (0.55),
-   lexer 0.39 to 0.26 (0.35), terrain 0.47 to 0.29, symreg 2.34 to 1.68.
-   The standings table in section 10 predates this.
-4. The grow/work policy (section 7.2) is reference's design. It is to be
-   replaced by a policy derived from Mithril's own cost model (section
-   14).
-5. Register pressure: the whole program is one kernel (`k_run` inlines
-   the dispatch of every rule). With the Cornell demos it takes 255
-   registers per thread (Whitted; path 144) and spills to a 1,200-byte
-   stack, so an SM holds 256 resident threads. Whitted's kernel runs in
-   19 ms and its wall clock is fixed cost; the path tracer's kernel takes
-   0.97 s. A register budget or out-of-line functions would be a tuning
-   knob; it needs a cost model (spill traffic against occupancy) first.
+1. Grow policy: a sweep counts as growth when it pushed anything. A
+   hand-edited test requiring net growth of the total queued frontier reduced
+   symreg from 17,904 to 400 rounds and its `k_run` stream interval from
+   1,955 to 1,639 ms, checksum-equal. The 316 ms saving includes reduced
+   dispatch and scheduling work; empty grid barriers account for only
+   about 28 ms at the original round count. A general replacement needs
+   suite-wide evidence and the same CPU/device runtime model.
+2. Work efficiency and divergence: baseline Nsight profiles measure 3.10 active threads
+   per warp instruction for symreg, 2.01 for queens, 4.71 for kdtree and
+   17.86 for tree-bitonic, with about eight active warps per SM. Their
+   profiled kernels use 255, 210, 224 and 226 registers respectively. These are
+   shape-dependent costs, not evidence for a register cap. A diagnostic
+   removing native work accounting cuts queens' stream interval from
+   1,192 to 771 ms but does not help symreg (1,955 to 1,966 ms). Any
+   region-level accounting lowering must retain budget and stop behavior.
+3. Startup and result costs: context creation is typically about 42 ms (34--56 ms
+   across selected warm runs). Root-driven readback avoids cell copies for scalar
+   results; aggregates referencing cells still copy the allocation
+   high-water range. Kdtree's 531 ms boot interval is sequential program
+   work, not context creation. Eager allocation leaves it at 523 ms, so
+   managed-memory faults do not explain that cost.
+4. The grow/work policy (section 7.2) is reference's design. Its replacement
+   must follow Mithril's own measured cost model (section 14). No reference
+   implementation source is needed to derive it.
 
 CPU:
 

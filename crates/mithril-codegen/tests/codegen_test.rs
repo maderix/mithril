@@ -980,3 +980,18 @@ fn boxed_float_comparisons_read_before_release_and_are_ieee() {
     // (a freed cell's first word is its free-list link) and panicked on NaN
     golden("float_compare.py", 0, &["1", "4"]);
 }
+
+#[test]
+fn readback_values_match_the_oracle_at_all_budgets() {
+    trmc_golden("readback_values.py");
+}
+
+#[test]
+fn array_erase_frontier_matches_the_oracle_at_all_budgets() {
+    trmc_golden("array_erase_frontier.py");
+}
+
+#[test]
+fn array_erasure_depth_matches_oracle_at_starved_budgets() {
+    trmc_golden("array_erase_depth.py");
+}
