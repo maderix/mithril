@@ -64,8 +64,8 @@ image (CUDA 13.0), so the host needs no CUDA toolkit. Build the image once:
 docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 ```
 
-`MITHRIL_NVCC_IMAGE` selects another image. Kernels are currently compiled
-for `sm_89` (RTX 40 series) and cached under `target/mithril-cache/gpu`.
+`MITHRIL_NVCC_IMAGE` selects another image. Compiled kernels are cached under
+`target/mithril-cache/gpu`.
 
 ## The language
 
@@ -154,15 +154,6 @@ teardown (about 0.1 s). Every run prints the same checksum.
 
 `bench/results.md` has the CPU table with C ratios, and `docs/design.md`
 section 10 the comparison with reference.
-
-## Limitations
-
-- Programs are a subset of Python with no mutation of shared state; I/O is the
-  value `main()` returns.
-- The GPU backend is young: on programs with little parallel work or long
-  serial phases it is slower than the CPU (see the table above).
-- Kernels are compiled for `sm_89` (RTX 40 series) only.
-- Known bugs and planned work are tracked in the issues.
 
 ## Repository layout
 
