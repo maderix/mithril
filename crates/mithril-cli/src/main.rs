@@ -5,6 +5,7 @@
 //! - `mithril build f.py -o out`              — same, binary copied to `out`.
 //! - `mithril net f.py`                       — print the reduced residual net.
 //! - `mithril prove f.py`                     — write + check obligations.lean.
+//! - `mithril oracle f.py`                    — print `eval_core` of main (the reference interpreter).
 //!
 //! Any `Diag` exits 1 with `line <n>: <msg>` on stderr. The compiled
 //! `mithril_rt` rlib (and its `mithril_core` dep) is cached under
@@ -74,7 +75,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
+const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
 
 fn dispatch(args: &[String]) -> Result<i32, CliErr> {
     match args.first().map(String::as_str) {
@@ -83,6 +84,7 @@ fn dispatch(args: &[String]) -> Result<i32, CliErr> {
         Some("net") => cmd_net(&args[1..]),
         Some("prove") => cmd_prove(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
+        Some("oracle") => cmd_oracle(&args[1..]),
         Some(other) => Err(format!("unknown subcommand '{}'\n{}", other, USAGE).into()),
         None => Err(USAGE.into()),
     }
@@ -461,6 +463,19 @@ fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
         return Ok(0);
     }
     exec_gpu(path)
+}
+
+/// `mithril oracle f.py`: the reference interpreter's value of `main`
+/// (the same front stages as `run`, then `eval_core`, printed by `fmt_val`).
+fn cmd_oracle(args: &[String]) -> Result<i32, CliErr> {
+    let (m, _) = front(&parse_opts(args)?.file)?;
+    let cm = to_core(&m)?;
+    // eval_core recurses once per loop iteration; give it a deep stack
+    let t = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || mithril_codegen::fmt_val(&mithril_front::eval_core(&cm, cm.main, &[])))?;
+    println!("{}", t.join().map_err(|_| "oracle: evaluation panicked")?);
+    Ok(0)
 }
 
 fn cmd_net(args: &[String]) -> Result<i32, CliErr> {

@@ -96,6 +96,43 @@ fn run_fold_sum_prints_value() {
     assert_eq!(stdout(&out).trim(), "328350"); // sum i*i, i in 0..100
 }
 
+// ---------------------------------------------------------------- oracle
+
+#[test]
+fn oracle_prints_the_reference_interpreters_value() {
+    for (f, want) in [("fact_while.py", "3628800"), ("fold_sum.py", "328350")] {
+        let out = mithril(&["oracle", fixture(f).to_str().unwrap()]);
+        assert!(out.status.success(), "oracle {f} failed: {}", stderr(&out));
+        assert_eq!(stdout(&out), format!("{want}\n"), "oracle {f}");
+    }
+}
+
+#[test]
+fn oracle_prints_structured_values_like_the_compiled_program() {
+    let d = fresh_dir("oracle_values");
+    let f = write_prog(&d, "def main():\n    return (1, 2.5, array_new(2, 3), (0 - 5, 6))\n");
+    let out = mithril(&["oracle", f.to_str().unwrap()]);
+    assert!(out.status.success(), "oracle failed: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "(1, 2.5, [3, 3], (-5, 6))");
+    if codegen_ready() {
+        let run = mithril(&["run", f.to_str().unwrap()]);
+        assert_eq!(stdout(&run), stdout(&out), "run and oracle print differently");
+    }
+}
+
+#[test]
+fn oracle_reports_front_end_errors_like_run() {
+    let out = mithril(&["oracle", fixture("bad.py").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("line 2"), "stderr: {}", stderr(&out));
+    let out = mithril(&["oracle", fixture("no_main.py").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("no main function"), "stderr: {}", stderr(&out));
+    let out = mithril(&["oracle"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("missing input file"), "stderr: {}", stderr(&out));
+}
+
 #[test]
 fn run_gpu_without_feature_reports_and_exits_1() {
     let out = mithril(&["run", fixture("fact_while.py").to_str().unwrap(), "--gpu"]);

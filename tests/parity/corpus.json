@@ -1,0 +1,3534 @@
+{
+ "_comment": "Write tests/parity/corpus.json: every program the parity harness runs,",
+ "programs": [
+  {
+   "name": "fixture/mithril-cli/bad",
+   "path": "crates/mithril-cli/tests/fixtures/bad.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-cli/fact_while",
+   "path": "crates/mithril-cli/tests/fixtures/fact_while.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-cli/fold_sum",
+   "path": "crates/mithril-cli/tests/fixtures/fold_sum.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-cli/no_main",
+   "path": "crates/mithril-cli/tests/fixtures/no_main.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/arith",
+   "path": "crates/mithril-codegen/tests/fixtures/arith.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/array_erase_depth",
+   "path": "crates/mithril-codegen/tests/fixtures/array_erase_depth.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/array_erase_frontier",
+   "path": "crates/mithril-codegen/tests/fixtures/array_erase_frontier.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/arrays",
+   "path": "crates/mithril-codegen/tests/fixtures/arrays.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/borrow_eval",
+   "path": "crates/mithril-codegen/tests/fixtures/borrow_eval.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/branch_recursion",
+   "path": "crates/mithril-codegen/tests/fixtures/branch_recursion.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/chain_boxed",
+   "path": "crates/mithril-codegen/tests/fixtures/chain_boxed.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/closure_parts",
+   "path": "crates/mithril-codegen/tests/fixtures/closure_parts.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/closure_result",
+   "path": "crates/mithril-codegen/tests/fixtures/closure_result.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/closures",
+   "path": "crates/mithril-codegen/tests/fixtures/closures.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/deep_leaves",
+   "path": "crates/mithril-codegen/tests/fixtures/deep_leaves.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/f32_ops",
+   "path": "crates/mithril-codegen/tests/fixtures/f32_ops.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/f32_surface",
+   "path": "crates/mithril-codegen/tests/fixtures/f32_surface.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fact_while",
+   "path": "crates/mithril-codegen/tests/fixtures/fact_while.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fast_leaf",
+   "path": "crates/mithril-codegen/tests/fixtures/fast_leaf.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fib_naive",
+   "path": "crates/mithril-codegen/tests/fixtures/fib_naive.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/float_compare",
+   "path": "crates/mithril-codegen/tests/fixtures/float_compare.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/float_params",
+   "path": "crates/mithril-codegen/tests/fixtures/float_params.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fold_sum",
+   "path": "crates/mithril-codegen/tests/fixtures/fold_sum.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fold_sum_masked",
+   "path": "crates/mithril-codegen/tests/fixtures/fold_sum_masked.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fork_chain",
+   "path": "crates/mithril-codegen/tests/fixtures/fork_chain.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fork_reach",
+   "path": "crates/mithril-codegen/tests/fixtures/fork_reach.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/fork_split_shapes",
+   "path": "crates/mithril-codegen/tests/fixtures/fork_split_shapes.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/heavy_fold",
+   "path": "crates/mithril-codegen/tests/fixtures/heavy_fold.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/hetero_array",
+   "path": "crates/mithril-codegen/tests/fixtures/hetero_array.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/ifconv_native",
+   "path": "crates/mithril-codegen/tests/fixtures/ifconv_native.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/int_reps",
+   "path": "crates/mithril-codegen/tests/fixtures/int_reps.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/lent_pick",
+   "path": "crates/mithril-codegen/tests/fixtures/lent_pick.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/loop_unread_param",
+   "path": "crates/mithril-codegen/tests/fixtures/loop_unread_param.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/mixed_params",
+   "path": "crates/mithril-codegen/tests/fixtures/mixed_params.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/mutual_tail",
+   "path": "crates/mithril-codegen/tests/fixtures/mutual_tail.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/native_arrays",
+   "path": "crates/mithril-codegen/tests/fixtures/native_arrays.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/net_array_tuples",
+   "path": "crates/mithril-codegen/tests/fixtures/net_array_tuples.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/net_lists",
+   "path": "crates/mithril-codegen/tests/fixtures/net_lists.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/net_values",
+   "path": "crates/mithril-codegen/tests/fixtures/net_values.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/ntup_after_call",
+   "path": "crates/mithril-codegen/tests/fixtures/ntup_after_call.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/readback_values",
+   "path": "crates/mithril-codegen/tests/fixtures/readback_values.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/self_types",
+   "path": "crates/mithril-codegen/tests/fixtures/self_types.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/shared_tree",
+   "path": "crates/mithril-codegen/tests/fixtures/shared_tree.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/stale_ret",
+   "path": "crates/mithril-codegen/tests/fixtures/stale_ret.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/table_loop",
+   "path": "crates/mithril-codegen/tests/fixtures/table_loop.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/tree_sum",
+   "path": "crates/mithril-codegen/tests/fixtures/tree_sum.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/trmc_list",
+   "path": "crates/mithril-codegen/tests/fixtures/trmc_list.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/trmc_tree",
+   "path": "crates/mithril-codegen/tests/fixtures/trmc_tree.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/tuple_fork",
+   "path": "crates/mithril-codegen/tests/fixtures/tuple_fork.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/tuple_leaves",
+   "path": "crates/mithril-codegen/tests/fixtures/tuple_leaves.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/tuple_nested",
+   "path": "crates/mithril-codegen/tests/fixtures/tuple_nested.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/tuple_whole",
+   "path": "crates/mithril-codegen/tests/fixtures/tuple_whole.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/unfold_wrap",
+   "path": "crates/mithril-codegen/tests/fixtures/unfold_wrap.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/unit_tail",
+   "path": "crates/mithril-codegen/tests/fixtures/unit_tail.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/value_branch_ownership",
+   "path": "crates/mithril-codegen/tests/fixtures/value_branch_ownership.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/w2_runtime",
+   "path": "crates/mithril-codegen/tests/fixtures/w2_runtime.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/wide_loop",
+   "path": "crates/mithril-codegen/tests/fixtures/wide_loop.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "ports/kdtree",
+   "path": "bench/ports/kdtree.py",
+   "sed": [
+    "s/    n = 18/    n = 10/",
+    "s/return qbatch(t, 18, 0)/return qbatch(t, 10, 0)/"
+   ],
+   "expect": "2478099586",
+   "timeout": 300
+  },
+  {
+   "name": "general/collatz_mutual",
+   "path": "bench/general/collatz_mutual.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(3000)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/cow_versions",
+   "path": "bench/general/cow_versions.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(3000)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/dag_share",
+   "path": "bench/general/dag_share.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(3)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/graph_dfs",
+   "path": "bench/general/graph_dfs.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(1)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/interp",
+   "path": "bench/general/interp.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(5)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/interp_closure",
+   "path": "bench/general/interp_closure.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(200)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/persist_map",
+   "path": "bench/general/persist_map.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(2000)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/pipeline_cfg",
+   "path": "bench/general/pipeline_cfg.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(20)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/sorts",
+   "path": "bench/general/sorts.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(300)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "general/stage_closure",
+   "path": "bench/general/stage_closure.py",
+   "sed": [
+    "s/return run([0-9][0-9]*)/return run(50)/g"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "lockless/bfs",
+   "path": "bench/lockless/bfs/main.py",
+   "sed": [
+    "/SIZE/s/[0-9][0-9]*/12/"
+   ],
+   "expect": "(4096, 17156)",
+   "timeout": 300
+  },
+  {
+   "name": "lockless/components",
+   "path": "bench/lockless/components/main.py",
+   "sed": [
+    "/SIZE/s/[0-9][0-9]*/12/"
+   ],
+   "expect": "(642, 2368481500)",
+   "timeout": 300
+  },
+  {
+   "name": "lockless/fsum",
+   "path": "bench/lockless/fsum/main.py",
+   "sed": [
+    "/SIZE/s/[0-9][0-9]*/18/"
+   ],
+   "expect": "3231587146",
+   "timeout": 300
+  },
+  {
+   "name": "lockless/hashbuild",
+   "path": "bench/lockless/hashbuild/main.py",
+   "sed": [
+    "/SIZE/s/[0-9][0-9]*/12/"
+   ],
+   "expect": "(2581, 2337151009)",
+   "timeout": 300
+  },
+  {
+   "name": "lockless/histogram",
+   "path": "bench/lockless/histogram/main.py",
+   "sed": [
+    "/SIZE/s/[0-9][0-9]*/20/"
+   ],
+   "expect": "3454372420",
+   "timeout": 300
+  },
+  {
+   "name": "demos/cornell_path",
+   "path": "demos/cornell_path.py",
+   "sed": [
+    "/^def size/,/return/s/return [0-9][0-9]*/return 12/",
+    "/^def spp/,/return/s/return [0-9][0-9]*/return 2/"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "demos/cornell_whitted",
+   "path": "demos/cornell_whitted.py",
+   "sed": [
+    "/^def size/,/return/s/return [0-9][0-9]*/return 12/"
+   ],
+   "timeout": 300
+  },
+  {
+   "name": "gen/g001",
+   "path": "tests/parity/gen/g001.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g002",
+   "path": "tests/parity/gen/g002.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g003",
+   "path": "tests/parity/gen/g003.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g004",
+   "path": "tests/parity/gen/g004.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g005",
+   "path": "tests/parity/gen/g005.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g006",
+   "path": "tests/parity/gen/g006.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g007",
+   "path": "tests/parity/gen/g007.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g008",
+   "path": "tests/parity/gen/g008.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g009",
+   "path": "tests/parity/gen/g009.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g010",
+   "path": "tests/parity/gen/g010.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g011",
+   "path": "tests/parity/gen/g011.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g012",
+   "path": "tests/parity/gen/g012.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g013",
+   "path": "tests/parity/gen/g013.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g014",
+   "path": "tests/parity/gen/g014.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g015",
+   "path": "tests/parity/gen/g015.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g016",
+   "path": "tests/parity/gen/g016.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g017",
+   "path": "tests/parity/gen/g017.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g018",
+   "path": "tests/parity/gen/g018.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g019",
+   "path": "tests/parity/gen/g019.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g020",
+   "path": "tests/parity/gen/g020.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g021",
+   "path": "tests/parity/gen/g021.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g022",
+   "path": "tests/parity/gen/g022.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g023",
+   "path": "tests/parity/gen/g023.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g024",
+   "path": "tests/parity/gen/g024.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g025",
+   "path": "tests/parity/gen/g025.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g026",
+   "path": "tests/parity/gen/g026.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g027",
+   "path": "tests/parity/gen/g027.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g028",
+   "path": "tests/parity/gen/g028.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g029",
+   "path": "tests/parity/gen/g029.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g030",
+   "path": "tests/parity/gen/g030.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g031",
+   "path": "tests/parity/gen/g031.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g032",
+   "path": "tests/parity/gen/g032.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g033",
+   "path": "tests/parity/gen/g033.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g034",
+   "path": "tests/parity/gen/g034.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g035",
+   "path": "tests/parity/gen/g035.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g036",
+   "path": "tests/parity/gen/g036.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g037",
+   "path": "tests/parity/gen/g037.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g038",
+   "path": "tests/parity/gen/g038.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g039",
+   "path": "tests/parity/gen/g039.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g040",
+   "path": "tests/parity/gen/g040.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g041",
+   "path": "tests/parity/gen/g041.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g042",
+   "path": "tests/parity/gen/g042.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g043",
+   "path": "tests/parity/gen/g043.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g044",
+   "path": "tests/parity/gen/g044.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g045",
+   "path": "tests/parity/gen/g045.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g046",
+   "path": "tests/parity/gen/g046.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g047",
+   "path": "tests/parity/gen/g047.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g048",
+   "path": "tests/parity/gen/g048.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g049",
+   "path": "tests/parity/gen/g049.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g050",
+   "path": "tests/parity/gen/g050.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g051",
+   "path": "tests/parity/gen/g051.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g052",
+   "path": "tests/parity/gen/g052.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g053",
+   "path": "tests/parity/gen/g053.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g054",
+   "path": "tests/parity/gen/g054.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g055",
+   "path": "tests/parity/gen/g055.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g056",
+   "path": "tests/parity/gen/g056.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g057",
+   "path": "tests/parity/gen/g057.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g058",
+   "path": "tests/parity/gen/g058.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g059",
+   "path": "tests/parity/gen/g059.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g060",
+   "path": "tests/parity/gen/g060.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g061",
+   "path": "tests/parity/gen/g061.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g062",
+   "path": "tests/parity/gen/g062.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g063",
+   "path": "tests/parity/gen/g063.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g064",
+   "path": "tests/parity/gen/g064.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g065",
+   "path": "tests/parity/gen/g065.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g066",
+   "path": "tests/parity/gen/g066.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g067",
+   "path": "tests/parity/gen/g067.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g068",
+   "path": "tests/parity/gen/g068.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g069",
+   "path": "tests/parity/gen/g069.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g070",
+   "path": "tests/parity/gen/g070.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g071",
+   "path": "tests/parity/gen/g071.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g072",
+   "path": "tests/parity/gen/g072.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g073",
+   "path": "tests/parity/gen/g073.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g074",
+   "path": "tests/parity/gen/g074.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g075",
+   "path": "tests/parity/gen/g075.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g076",
+   "path": "tests/parity/gen/g076.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g077",
+   "path": "tests/parity/gen/g077.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g078",
+   "path": "tests/parity/gen/g078.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g079",
+   "path": "tests/parity/gen/g079.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g080",
+   "path": "tests/parity/gen/g080.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g081",
+   "path": "tests/parity/gen/g081.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g082",
+   "path": "tests/parity/gen/g082.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g083",
+   "path": "tests/parity/gen/g083.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g084",
+   "path": "tests/parity/gen/g084.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g085",
+   "path": "tests/parity/gen/g085.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g086",
+   "path": "tests/parity/gen/g086.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g087",
+   "path": "tests/parity/gen/g087.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g088",
+   "path": "tests/parity/gen/g088.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g089",
+   "path": "tests/parity/gen/g089.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g090",
+   "path": "tests/parity/gen/g090.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g091",
+   "path": "tests/parity/gen/g091.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g092",
+   "path": "tests/parity/gen/g092.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g093",
+   "path": "tests/parity/gen/g093.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g094",
+   "path": "tests/parity/gen/g094.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g095",
+   "path": "tests/parity/gen/g095.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g096",
+   "path": "tests/parity/gen/g096.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g097",
+   "path": "tests/parity/gen/g097.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g098",
+   "path": "tests/parity/gen/g098.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g099",
+   "path": "tests/parity/gen/g099.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g100",
+   "path": "tests/parity/gen/g100.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g101",
+   "path": "tests/parity/gen/g101.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g102",
+   "path": "tests/parity/gen/g102.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g103",
+   "path": "tests/parity/gen/g103.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g104",
+   "path": "tests/parity/gen/g104.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g105",
+   "path": "tests/parity/gen/g105.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g106",
+   "path": "tests/parity/gen/g106.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g107",
+   "path": "tests/parity/gen/g107.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g108",
+   "path": "tests/parity/gen/g108.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g109",
+   "path": "tests/parity/gen/g109.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g110",
+   "path": "tests/parity/gen/g110.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g111",
+   "path": "tests/parity/gen/g111.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g112",
+   "path": "tests/parity/gen/g112.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g113",
+   "path": "tests/parity/gen/g113.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g114",
+   "path": "tests/parity/gen/g114.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g115",
+   "path": "tests/parity/gen/g115.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g116",
+   "path": "tests/parity/gen/g116.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g117",
+   "path": "tests/parity/gen/g117.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g118",
+   "path": "tests/parity/gen/g118.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g119",
+   "path": "tests/parity/gen/g119.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g120",
+   "path": "tests/parity/gen/g120.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g121",
+   "path": "tests/parity/gen/g121.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g122",
+   "path": "tests/parity/gen/g122.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g123",
+   "path": "tests/parity/gen/g123.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g124",
+   "path": "tests/parity/gen/g124.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g125",
+   "path": "tests/parity/gen/g125.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g126",
+   "path": "tests/parity/gen/g126.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g127",
+   "path": "tests/parity/gen/g127.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g128",
+   "path": "tests/parity/gen/g128.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g129",
+   "path": "tests/parity/gen/g129.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g130",
+   "path": "tests/parity/gen/g130.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g131",
+   "path": "tests/parity/gen/g131.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g132",
+   "path": "tests/parity/gen/g132.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g133",
+   "path": "tests/parity/gen/g133.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g134",
+   "path": "tests/parity/gen/g134.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g135",
+   "path": "tests/parity/gen/g135.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g136",
+   "path": "tests/parity/gen/g136.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g137",
+   "path": "tests/parity/gen/g137.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g138",
+   "path": "tests/parity/gen/g138.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g139",
+   "path": "tests/parity/gen/g139.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g140",
+   "path": "tests/parity/gen/g140.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g141",
+   "path": "tests/parity/gen/g141.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g142",
+   "path": "tests/parity/gen/g142.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g143",
+   "path": "tests/parity/gen/g143.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g144",
+   "path": "tests/parity/gen/g144.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g145",
+   "path": "tests/parity/gen/g145.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g146",
+   "path": "tests/parity/gen/g146.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g147",
+   "path": "tests/parity/gen/g147.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g148",
+   "path": "tests/parity/gen/g148.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g149",
+   "path": "tests/parity/gen/g149.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g150",
+   "path": "tests/parity/gen/g150.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g151",
+   "path": "tests/parity/gen/g151.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g152",
+   "path": "tests/parity/gen/g152.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g153",
+   "path": "tests/parity/gen/g153.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g154",
+   "path": "tests/parity/gen/g154.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g155",
+   "path": "tests/parity/gen/g155.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g156",
+   "path": "tests/parity/gen/g156.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g157",
+   "path": "tests/parity/gen/g157.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g158",
+   "path": "tests/parity/gen/g158.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g159",
+   "path": "tests/parity/gen/g159.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g160",
+   "path": "tests/parity/gen/g160.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g161",
+   "path": "tests/parity/gen/g161.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g162",
+   "path": "tests/parity/gen/g162.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g163",
+   "path": "tests/parity/gen/g163.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g164",
+   "path": "tests/parity/gen/g164.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g165",
+   "path": "tests/parity/gen/g165.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g166",
+   "path": "tests/parity/gen/g166.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g167",
+   "path": "tests/parity/gen/g167.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g168",
+   "path": "tests/parity/gen/g168.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g169",
+   "path": "tests/parity/gen/g169.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g170",
+   "path": "tests/parity/gen/g170.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g171",
+   "path": "tests/parity/gen/g171.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g172",
+   "path": "tests/parity/gen/g172.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g173",
+   "path": "tests/parity/gen/g173.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g174",
+   "path": "tests/parity/gen/g174.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g175",
+   "path": "tests/parity/gen/g175.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g176",
+   "path": "tests/parity/gen/g176.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g177",
+   "path": "tests/parity/gen/g177.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g178",
+   "path": "tests/parity/gen/g178.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g179",
+   "path": "tests/parity/gen/g179.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g180",
+   "path": "tests/parity/gen/g180.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g181",
+   "path": "tests/parity/gen/g181.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g182",
+   "path": "tests/parity/gen/g182.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g183",
+   "path": "tests/parity/gen/g183.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g184",
+   "path": "tests/parity/gen/g184.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g185",
+   "path": "tests/parity/gen/g185.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g186",
+   "path": "tests/parity/gen/g186.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g187",
+   "path": "tests/parity/gen/g187.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g188",
+   "path": "tests/parity/gen/g188.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g189",
+   "path": "tests/parity/gen/g189.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g190",
+   "path": "tests/parity/gen/g190.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g191",
+   "path": "tests/parity/gen/g191.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g192",
+   "path": "tests/parity/gen/g192.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g193",
+   "path": "tests/parity/gen/g193.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g194",
+   "path": "tests/parity/gen/g194.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g195",
+   "path": "tests/parity/gen/g195.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g196",
+   "path": "tests/parity/gen/g196.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g197",
+   "path": "tests/parity/gen/g197.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g198",
+   "path": "tests/parity/gen/g198.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g199",
+   "path": "tests/parity/gen/g199.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g200",
+   "path": "tests/parity/gen/g200.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g201",
+   "path": "tests/parity/gen/g201.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g202",
+   "path": "tests/parity/gen/g202.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g203",
+   "path": "tests/parity/gen/g203.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g204",
+   "path": "tests/parity/gen/g204.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g205",
+   "path": "tests/parity/gen/g205.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g206",
+   "path": "tests/parity/gen/g206.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g207",
+   "path": "tests/parity/gen/g207.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g208",
+   "path": "tests/parity/gen/g208.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g209",
+   "path": "tests/parity/gen/g209.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g210",
+   "path": "tests/parity/gen/g210.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g211",
+   "path": "tests/parity/gen/g211.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g212",
+   "path": "tests/parity/gen/g212.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g213",
+   "path": "tests/parity/gen/g213.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g214",
+   "path": "tests/parity/gen/g214.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g215",
+   "path": "tests/parity/gen/g215.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g216",
+   "path": "tests/parity/gen/g216.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g217",
+   "path": "tests/parity/gen/g217.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g218",
+   "path": "tests/parity/gen/g218.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g219",
+   "path": "tests/parity/gen/g219.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g220",
+   "path": "tests/parity/gen/g220.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g221",
+   "path": "tests/parity/gen/g221.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g222",
+   "path": "tests/parity/gen/g222.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g223",
+   "path": "tests/parity/gen/g223.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g224",
+   "path": "tests/parity/gen/g224.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g225",
+   "path": "tests/parity/gen/g225.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g226",
+   "path": "tests/parity/gen/g226.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g227",
+   "path": "tests/parity/gen/g227.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g228",
+   "path": "tests/parity/gen/g228.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g229",
+   "path": "tests/parity/gen/g229.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g230",
+   "path": "tests/parity/gen/g230.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g231",
+   "path": "tests/parity/gen/g231.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g232",
+   "path": "tests/parity/gen/g232.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g233",
+   "path": "tests/parity/gen/g233.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g234",
+   "path": "tests/parity/gen/g234.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g235",
+   "path": "tests/parity/gen/g235.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g236",
+   "path": "tests/parity/gen/g236.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g237",
+   "path": "tests/parity/gen/g237.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g238",
+   "path": "tests/parity/gen/g238.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g239",
+   "path": "tests/parity/gen/g239.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g240",
+   "path": "tests/parity/gen/g240.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g241",
+   "path": "tests/parity/gen/g241.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g242",
+   "path": "tests/parity/gen/g242.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g243",
+   "path": "tests/parity/gen/g243.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g244",
+   "path": "tests/parity/gen/g244.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g245",
+   "path": "tests/parity/gen/g245.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g246",
+   "path": "tests/parity/gen/g246.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g247",
+   "path": "tests/parity/gen/g247.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g248",
+   "path": "tests/parity/gen/g248.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g249",
+   "path": "tests/parity/gen/g249.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g250",
+   "path": "tests/parity/gen/g250.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g251",
+   "path": "tests/parity/gen/g251.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g252",
+   "path": "tests/parity/gen/g252.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g253",
+   "path": "tests/parity/gen/g253.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g254",
+   "path": "tests/parity/gen/g254.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g255",
+   "path": "tests/parity/gen/g255.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g256",
+   "path": "tests/parity/gen/g256.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g257",
+   "path": "tests/parity/gen/g257.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g258",
+   "path": "tests/parity/gen/g258.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g259",
+   "path": "tests/parity/gen/g259.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g260",
+   "path": "tests/parity/gen/g260.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g261",
+   "path": "tests/parity/gen/g261.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g262",
+   "path": "tests/parity/gen/g262.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g263",
+   "path": "tests/parity/gen/g263.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g264",
+   "path": "tests/parity/gen/g264.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g265",
+   "path": "tests/parity/gen/g265.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g266",
+   "path": "tests/parity/gen/g266.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g267",
+   "path": "tests/parity/gen/g267.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g268",
+   "path": "tests/parity/gen/g268.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g269",
+   "path": "tests/parity/gen/g269.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g270",
+   "path": "tests/parity/gen/g270.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g271",
+   "path": "tests/parity/gen/g271.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g272",
+   "path": "tests/parity/gen/g272.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g273",
+   "path": "tests/parity/gen/g273.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g274",
+   "path": "tests/parity/gen/g274.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g275",
+   "path": "tests/parity/gen/g275.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g276",
+   "path": "tests/parity/gen/g276.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g277",
+   "path": "tests/parity/gen/g277.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g278",
+   "path": "tests/parity/gen/g278.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g279",
+   "path": "tests/parity/gen/g279.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g280",
+   "path": "tests/parity/gen/g280.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g281",
+   "path": "tests/parity/gen/g281.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g282",
+   "path": "tests/parity/gen/g282.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g283",
+   "path": "tests/parity/gen/g283.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g284",
+   "path": "tests/parity/gen/g284.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g285",
+   "path": "tests/parity/gen/g285.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g286",
+   "path": "tests/parity/gen/g286.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g287",
+   "path": "tests/parity/gen/g287.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g288",
+   "path": "tests/parity/gen/g288.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g289",
+   "path": "tests/parity/gen/g289.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g290",
+   "path": "tests/parity/gen/g290.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g291",
+   "path": "tests/parity/gen/g291.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g292",
+   "path": "tests/parity/gen/g292.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g293",
+   "path": "tests/parity/gen/g293.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g294",
+   "path": "tests/parity/gen/g294.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g295",
+   "path": "tests/parity/gen/g295.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g296",
+   "path": "tests/parity/gen/g296.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g297",
+   "path": "tests/parity/gen/g297.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g298",
+   "path": "tests/parity/gen/g298.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g299",
+   "path": "tests/parity/gen/g299.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g300",
+   "path": "tests/parity/gen/g300.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g301",
+   "path": "tests/parity/gen/g301.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g302",
+   "path": "tests/parity/gen/g302.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g303",
+   "path": "tests/parity/gen/g303.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g304",
+   "path": "tests/parity/gen/g304.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g305",
+   "path": "tests/parity/gen/g305.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g306",
+   "path": "tests/parity/gen/g306.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g307",
+   "path": "tests/parity/gen/g307.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g308",
+   "path": "tests/parity/gen/g308.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g309",
+   "path": "tests/parity/gen/g309.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g310",
+   "path": "tests/parity/gen/g310.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g311",
+   "path": "tests/parity/gen/g311.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g312",
+   "path": "tests/parity/gen/g312.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g313",
+   "path": "tests/parity/gen/g313.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g314",
+   "path": "tests/parity/gen/g314.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g315",
+   "path": "tests/parity/gen/g315.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g316",
+   "path": "tests/parity/gen/g316.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g317",
+   "path": "tests/parity/gen/g317.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g318",
+   "path": "tests/parity/gen/g318.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g319",
+   "path": "tests/parity/gen/g319.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g320",
+   "path": "tests/parity/gen/g320.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g321",
+   "path": "tests/parity/gen/g321.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g322",
+   "path": "tests/parity/gen/g322.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g323",
+   "path": "tests/parity/gen/g323.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g324",
+   "path": "tests/parity/gen/g324.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g325",
+   "path": "tests/parity/gen/g325.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g326",
+   "path": "tests/parity/gen/g326.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g327",
+   "path": "tests/parity/gen/g327.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g328",
+   "path": "tests/parity/gen/g328.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g329",
+   "path": "tests/parity/gen/g329.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g330",
+   "path": "tests/parity/gen/g330.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g331",
+   "path": "tests/parity/gen/g331.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g332",
+   "path": "tests/parity/gen/g332.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g333",
+   "path": "tests/parity/gen/g333.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g334",
+   "path": "tests/parity/gen/g334.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g335",
+   "path": "tests/parity/gen/g335.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g336",
+   "path": "tests/parity/gen/g336.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g337",
+   "path": "tests/parity/gen/g337.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g338",
+   "path": "tests/parity/gen/g338.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g339",
+   "path": "tests/parity/gen/g339.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g340",
+   "path": "tests/parity/gen/g340.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g341",
+   "path": "tests/parity/gen/g341.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g342",
+   "path": "tests/parity/gen/g342.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g343",
+   "path": "tests/parity/gen/g343.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g344",
+   "path": "tests/parity/gen/g344.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g345",
+   "path": "tests/parity/gen/g345.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g346",
+   "path": "tests/parity/gen/g346.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g347",
+   "path": "tests/parity/gen/g347.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g348",
+   "path": "tests/parity/gen/g348.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g349",
+   "path": "tests/parity/gen/g349.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g350",
+   "path": "tests/parity/gen/g350.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g351",
+   "path": "tests/parity/gen/g351.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g352",
+   "path": "tests/parity/gen/g352.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g353",
+   "path": "tests/parity/gen/g353.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g354",
+   "path": "tests/parity/gen/g354.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g355",
+   "path": "tests/parity/gen/g355.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g356",
+   "path": "tests/parity/gen/g356.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g357",
+   "path": "tests/parity/gen/g357.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g358",
+   "path": "tests/parity/gen/g358.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g359",
+   "path": "tests/parity/gen/g359.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g360",
+   "path": "tests/parity/gen/g360.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g361",
+   "path": "tests/parity/gen/g361.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g362",
+   "path": "tests/parity/gen/g362.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g363",
+   "path": "tests/parity/gen/g363.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g364",
+   "path": "tests/parity/gen/g364.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g365",
+   "path": "tests/parity/gen/g365.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g366",
+   "path": "tests/parity/gen/g366.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g367",
+   "path": "tests/parity/gen/g367.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g368",
+   "path": "tests/parity/gen/g368.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g369",
+   "path": "tests/parity/gen/g369.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g370",
+   "path": "tests/parity/gen/g370.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g371",
+   "path": "tests/parity/gen/g371.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g372",
+   "path": "tests/parity/gen/g372.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g373",
+   "path": "tests/parity/gen/g373.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g374",
+   "path": "tests/parity/gen/g374.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g375",
+   "path": "tests/parity/gen/g375.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g376",
+   "path": "tests/parity/gen/g376.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g377",
+   "path": "tests/parity/gen/g377.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g378",
+   "path": "tests/parity/gen/g378.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g379",
+   "path": "tests/parity/gen/g379.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g380",
+   "path": "tests/parity/gen/g380.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g381",
+   "path": "tests/parity/gen/g381.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g382",
+   "path": "tests/parity/gen/g382.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g383",
+   "path": "tests/parity/gen/g383.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g384",
+   "path": "tests/parity/gen/g384.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g385",
+   "path": "tests/parity/gen/g385.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g386",
+   "path": "tests/parity/gen/g386.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g387",
+   "path": "tests/parity/gen/g387.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g388",
+   "path": "tests/parity/gen/g388.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g389",
+   "path": "tests/parity/gen/g389.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g390",
+   "path": "tests/parity/gen/g390.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g391",
+   "path": "tests/parity/gen/g391.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g392",
+   "path": "tests/parity/gen/g392.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g393",
+   "path": "tests/parity/gen/g393.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g394",
+   "path": "tests/parity/gen/g394.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g395",
+   "path": "tests/parity/gen/g395.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g396",
+   "path": "tests/parity/gen/g396.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g397",
+   "path": "tests/parity/gen/g397.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g398",
+   "path": "tests/parity/gen/g398.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g399",
+   "path": "tests/parity/gen/g399.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g400",
+   "path": "tests/parity/gen/g400.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g401",
+   "path": "tests/parity/gen/g401.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g402",
+   "path": "tests/parity/gen/g402.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g403",
+   "path": "tests/parity/gen/g403.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g404",
+   "path": "tests/parity/gen/g404.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g405",
+   "path": "tests/parity/gen/g405.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g406",
+   "path": "tests/parity/gen/g406.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g407",
+   "path": "tests/parity/gen/g407.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g408",
+   "path": "tests/parity/gen/g408.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g409",
+   "path": "tests/parity/gen/g409.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g410",
+   "path": "tests/parity/gen/g410.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g411",
+   "path": "tests/parity/gen/g411.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g412",
+   "path": "tests/parity/gen/g412.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g413",
+   "path": "tests/parity/gen/g413.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g414",
+   "path": "tests/parity/gen/g414.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g415",
+   "path": "tests/parity/gen/g415.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g416",
+   "path": "tests/parity/gen/g416.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g417",
+   "path": "tests/parity/gen/g417.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g418",
+   "path": "tests/parity/gen/g418.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g419",
+   "path": "tests/parity/gen/g419.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g420",
+   "path": "tests/parity/gen/g420.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g421",
+   "path": "tests/parity/gen/g421.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g422",
+   "path": "tests/parity/gen/g422.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g423",
+   "path": "tests/parity/gen/g423.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g424",
+   "path": "tests/parity/gen/g424.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g425",
+   "path": "tests/parity/gen/g425.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g426",
+   "path": "tests/parity/gen/g426.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g427",
+   "path": "tests/parity/gen/g427.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g428",
+   "path": "tests/parity/gen/g428.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g429",
+   "path": "tests/parity/gen/g429.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g430",
+   "path": "tests/parity/gen/g430.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g431",
+   "path": "tests/parity/gen/g431.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g432",
+   "path": "tests/parity/gen/g432.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g433",
+   "path": "tests/parity/gen/g433.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g434",
+   "path": "tests/parity/gen/g434.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g435",
+   "path": "tests/parity/gen/g435.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g436",
+   "path": "tests/parity/gen/g436.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g437",
+   "path": "tests/parity/gen/g437.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g438",
+   "path": "tests/parity/gen/g438.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g439",
+   "path": "tests/parity/gen/g439.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g440",
+   "path": "tests/parity/gen/g440.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g441",
+   "path": "tests/parity/gen/g441.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g442",
+   "path": "tests/parity/gen/g442.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g443",
+   "path": "tests/parity/gen/g443.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g444",
+   "path": "tests/parity/gen/g444.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g445",
+   "path": "tests/parity/gen/g445.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g446",
+   "path": "tests/parity/gen/g446.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g447",
+   "path": "tests/parity/gen/g447.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g448",
+   "path": "tests/parity/gen/g448.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g449",
+   "path": "tests/parity/gen/g449.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g450",
+   "path": "tests/parity/gen/g450.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g451",
+   "path": "tests/parity/gen/g451.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g452",
+   "path": "tests/parity/gen/g452.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g453",
+   "path": "tests/parity/gen/g453.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g454",
+   "path": "tests/parity/gen/g454.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g455",
+   "path": "tests/parity/gen/g455.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g456",
+   "path": "tests/parity/gen/g456.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g457",
+   "path": "tests/parity/gen/g457.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g458",
+   "path": "tests/parity/gen/g458.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g459",
+   "path": "tests/parity/gen/g459.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g460",
+   "path": "tests/parity/gen/g460.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g461",
+   "path": "tests/parity/gen/g461.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g462",
+   "path": "tests/parity/gen/g462.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g463",
+   "path": "tests/parity/gen/g463.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g464",
+   "path": "tests/parity/gen/g464.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g465",
+   "path": "tests/parity/gen/g465.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g466",
+   "path": "tests/parity/gen/g466.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g467",
+   "path": "tests/parity/gen/g467.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g468",
+   "path": "tests/parity/gen/g468.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g469",
+   "path": "tests/parity/gen/g469.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g470",
+   "path": "tests/parity/gen/g470.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g471",
+   "path": "tests/parity/gen/g471.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g472",
+   "path": "tests/parity/gen/g472.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g473",
+   "path": "tests/parity/gen/g473.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g474",
+   "path": "tests/parity/gen/g474.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g475",
+   "path": "tests/parity/gen/g475.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g476",
+   "path": "tests/parity/gen/g476.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g477",
+   "path": "tests/parity/gen/g477.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g478",
+   "path": "tests/parity/gen/g478.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g479",
+   "path": "tests/parity/gen/g479.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g480",
+   "path": "tests/parity/gen/g480.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g481",
+   "path": "tests/parity/gen/g481.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g482",
+   "path": "tests/parity/gen/g482.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g483",
+   "path": "tests/parity/gen/g483.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g484",
+   "path": "tests/parity/gen/g484.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g485",
+   "path": "tests/parity/gen/g485.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g486",
+   "path": "tests/parity/gen/g486.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g487",
+   "path": "tests/parity/gen/g487.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g488",
+   "path": "tests/parity/gen/g488.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g489",
+   "path": "tests/parity/gen/g489.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g490",
+   "path": "tests/parity/gen/g490.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g491",
+   "path": "tests/parity/gen/g491.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g492",
+   "path": "tests/parity/gen/g492.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g493",
+   "path": "tests/parity/gen/g493.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g494",
+   "path": "tests/parity/gen/g494.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g495",
+   "path": "tests/parity/gen/g495.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g496",
+   "path": "tests/parity/gen/g496.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g497",
+   "path": "tests/parity/gen/g497.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g498",
+   "path": "tests/parity/gen/g498.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g499",
+   "path": "tests/parity/gen/g499.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "gen/g500",
+   "path": "tests/parity/gen/g500.py",
+   "sed": [],
+   "timeout": 60
+  },
+  {
+   "name": "known/con_share3",
+   "path": "tests/parity/known/con_share3.py",
+   "sed": [],
+   "timeout": 60,
+   "expect": "(61, 60, 150)"
+  },
+  {
+   "name": "known/con_share_bug",
+   "path": "tests/parity/known/con_share_bug.py",
+   "sed": [],
+   "timeout": 60,
+   "expect": "(31, 60, 150)"
+  },
+  {
+   "name": "known/flo_share",
+   "path": "tests/parity/known/flo_share.py",
+   "sed": [],
+   "timeout": 60,
+   "expect": "(4.75, 9.5, 4.0)"
+  },
+  {
+   "name": "known/p6",
+   "path": "tests/parity/known/p6.py",
+   "sed": [],
+   "timeout": 60,
+   "expect": "0"
+  },
+  {
+   "name": "known/v2_shared",
+   "path": "tests/parity/known/v2_shared.py",
+   "sed": [],
+   "timeout": 60,
+   "expect": "(4.75, 3.75)"
+  }
+ ]
+}

@@ -1,0 +1,32 @@
+{
+ "_comment": "Reference perf (target/parity-ref/mithril), big sizes; seconds (wall) and device kernel ms; min of 3 after a warm-up at load < 2. Machine: 16 threads, RTX 4090.",
+ "results": {
+  "cornell_path": {
+   "cpu_t1": 1.6222,
+   "cpu_t16": 0.1724,
+   "dev_kernel_ms": 64,
+   "dev_wall": 0.1961,
+   "out_dev": "sha256:ccf8a4874ea93b91:725351",
+   "out_t1": "sha256:ccf8a4874ea93b91:725351",
+   "out_t16": "sha256:ccf8a4874ea93b91:725351"
+  },
+  "cornell_whitted": {
+   "cpu_t1": 0.2465,
+   "cpu_t16": 0.0772,
+   "dev_kernel_ms": 16,
+   "dev_wall": 0.1892,
+   "out_dev": "sha256:709272bde763accf:2888556",
+   "out_t1": "sha256:709272bde763accf:2888556",
+   "out_t16": "sha256:709272bde763accf:2888556"
+  },
+  "kdtree": {
+   "cpu_t1": 0.4148,
+   "cpu_t16": 0.0898,
+   "dev_kernel_ms": 623,
+   "dev_wall": 1.3427,
+   "out_dev": "1660315459",
+   "out_t1": "1660315459",
+   "out_t16": "1660315459"
+  }
+ }
+}

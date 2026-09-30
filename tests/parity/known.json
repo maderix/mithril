@@ -1,0 +1,17 @@
+{
+ "_comment": "Correct answers that are not the reference oracle's output (the oracle is the default correct answer). See KNOWN.md.",
+ "lockless/histogram": {
+  "correct": {
+   "out": "3454372420\n",
+   "rc": 0
+  },
+  "why": "bench/lockless/small.json expected value, printed by every twin (C, C fold, Rust, Rust fold) and by every compiled lane; the oracle copies the 2^16-bin array per update and exceeds the 6 GB oracle cap"
+ },
+ "general/graph_dfs": {
+  "correct": {
+   "out": "3909815682\n",
+   "rc": 0
+  },
+  "why": "the oracle's value without the memory cap (27 GB peak RSS at run(1)); every compiled lane agrees; with the 6 GB oracle cap the oracle lane aborts"
+ }
+}
