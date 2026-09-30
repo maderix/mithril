@@ -127,12 +127,21 @@ fn stays_bool(name: &str, stmts: &[Stmt], bool_vars: &HashSet<String>) -> bool {
 
 /// The bool variables among `names` after `bodies` ran (a join or a loop):
 /// bool before and never assigned a non-bool value.
+/// A name that is new after a join (every body defines it) starts out bool.
 fn bools_after(names: &[String], bodies: &[&[Stmt]], scope: &Scope) -> HashSet<String> {
-    names
-        .iter()
-        .filter(|n| scope.bool_vars.contains(*n) && bodies.iter().all(|b| stays_bool(n, b, &scope.bool_vars)))
-        .cloned()
-        .collect()
+    let mut out = HashSet::new();
+    for n in names {
+        let bool_before = if scope.vars.contains_key(n) {
+            scope.bool_vars.contains(n)
+        } else {
+            bodies.iter().all(|b| assigned_names(b).contains(n))
+        };
+        let stays = bodies.iter().all(|b| stays_bool(n, b, &scope.bool_vars));
+        if bool_before && stays {
+            out.insert(n.clone());
+        }
+    }
+    out
 }
 
 fn check_cond(e: &Expr, scope: &Scope) -> Result<(), Diag> {
@@ -157,6 +166,57 @@ fn always_returns(stmts: &[Stmt]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Names assigned on every path through `stmts` that falls through (a loop or an
+/// int match may not run, so neither guarantees its assignments).
+fn surely_assigned(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for s in stmts {
+        match s {
+            Stmt::Assign(n, _) => {
+                out.insert(n.clone());
+            }
+            Stmt::If(_, then, els) => {
+                let arms: Vec<(Vec<String>, &[Stmt])> = vec![(vec![], then), (vec![], els)];
+                out.extend(defined_by_every_fall_through(&arms));
+            }
+            Stmt::Match(_, cases) if cases.iter().all(|(p, _)| p.as_int_lit().is_none()) => {
+                let arms: Vec<(Vec<String>, &[Stmt])> =
+                    cases.iter().map(|(p, b)| (p.binds.clone(), b.as_slice())).collect();
+                out.extend(defined_by_every_fall_through(&arms));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The names every fall-through arm defines: its pattern binders (they stay bound
+/// after the statement, as in Python) and what it surely assigns.
+fn defined_by_every_fall_through(arms: &[(Vec<String>, &[Stmt])]) -> BTreeSet<String> {
+    let mut common: Option<BTreeSet<String>> = None;
+    for (binds, body) in arms {
+        if always_returns(body) {
+            continue;
+        }
+        let mut defined = surely_assigned(body);
+        defined.extend(binds.iter().cloned());
+        common = Some(match common {
+            None => defined,
+            Some(c) => c.intersection(&defined).cloned().collect(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// `stmts` is a straight-line tail ending in `return` (no control flow of its own):
+/// copying it into several arms keeps the program linear.
+fn straight_return(stmts: &[Stmt]) -> bool {
+    let straight = stmts
+        .iter()
+        .all(|s| matches!(s, Stmt::Assign(..) | Stmt::ExprStmt(_) | Stmt::Return(_)));
+    straight && always_returns(stmts)
 }
 
 fn contains_return(stmts: &[Stmt]) -> bool {
@@ -465,7 +525,12 @@ fn bind_join_and_continue(
 /// Join form applies when no arm returns anywhere and every name any arm
 /// assigns already exists in the enclosing scope: `rest` is then compiled
 /// exactly once instead of once per arm (the SSA-style merge), which
-/// keeps code size linear. Otherwise each fall-through arm inlines `rest`.
+/// keeps code size linear.
+///
+/// Otherwise a fall-through arm inlines `rest` as its own tail, unless several
+/// arms fall through and `rest` has control flow of its own: copying such a `rest`
+/// into each arm doubles the code per statement (16 sequential ifs gave 22.9 MB of
+/// Core). Those arms call a join function instead (see `compile_join`).
 fn compile_dispatch_arms(
     arms: &[(Vec<String>, &[Stmt])],
     rest: &[Stmt],
@@ -484,6 +549,12 @@ fn compile_dispatch_arms(
         })
         && assigned.iter().all(|n| scope.vars.contains_key(n));
     let mutated: Vec<String> = assigned.into_iter().collect();
+    let falling = arms.iter().filter(|(_, b)| !always_returns(b)).count();
+    let join = if !joinable && !rest.is_empty() && falling > 1 && !straight_return(rest) {
+        Some(compile_join(arms, rest, scope, t, g, k)?)
+    } else {
+        None
+    };
     let mut cores = Vec::new();
     let mut binder_idxs = Vec::new();
     for (binds, body) in arms {
@@ -494,6 +565,12 @@ fn compile_dispatch_arms(
             compile_block(body, &mut s, t, g, &move |sc: &Scope, _g2: &mut Gen| Ok(state_value(&m, sc)))?
         } else if always_returns(body) {
             compile_block(body, &mut s, t, g, &unreachable_tail)?
+        } else if let Some((id, names)) = &join {
+            let call_join = |sc: &Scope, _: &mut Gen| {
+                let args = names.iter().map(|n| Core::Var(sc.vars[n])).collect();
+                Ok(Core::Call(*id, args))
+            };
+            compile_block(body, &mut s, t, g, &call_join)?
         } else {
             compile_block(body, &mut s, t, g, &|sc: &Scope, g2: &mut Gen| compile_block(rest, &mut sc.clone(), t, g2, k))?
         };
@@ -501,6 +578,39 @@ fn compile_dispatch_arms(
         binder_idxs.push(idxs);
     }
     Ok((cores, binder_idxs, if joinable { Some(mutated) } else { None }))
+}
+
+/// The join function `__join<id>` of an if/match statement: `rest` compiled once,
+/// over the names in scope after the arms (the enclosing ones and those every
+/// fall-through arm defines). Returns its id and parameter names.
+fn compile_join(
+    arms: &[(Vec<String>, &[Stmt])],
+    rest: &[Stmt],
+    scope: &Scope,
+    t: &Tables,
+    g: &mut Gen,
+    k: &Cont,
+) -> Result<(FnId, Vec<String>), Diag> {
+    let mut names: BTreeSet<String> = scope.vars.keys().cloned().collect();
+    names.extend(defined_by_every_fall_through(arms));
+    let names: Vec<String> = names.into_iter().collect();
+
+    let id = g.fresh_fn_id();
+    let mut js = Scope::default();
+    for n in &names {
+        js.fresh(n);
+    }
+    let falling: Vec<&[Stmt]> = arms.iter().map(|(_, b)| *b).filter(|b| !always_returns(b)).collect();
+    js.bool_vars = bools_after(&names, &falling, scope);
+    let body = compile_block(rest, &mut js, t, g, k)?;
+    g.out_fns[id as usize] = CoreFn {
+        name: format!("__join{id}"),
+        arity: names.len(),
+        self_tail_rec: compute_self_tail_rec(id, &body),
+        body,
+        fold: None,
+    };
+    Ok((id, names))
 }
 
 fn compile_match(

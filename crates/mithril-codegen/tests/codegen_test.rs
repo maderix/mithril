@@ -1014,3 +1014,16 @@ fn dead_bindings_are_never_evaluated() {
         golden(name, 0, &["1", "4", "16"]);
     }
 }
+
+/// 16 sequential ifs gave 2^16 copies of the tail (22.9 MB of Core) before the join;
+/// the bounds only separate linear from exponential.
+#[test]
+fn if_arms_join_instead_of_copying_the_tail() {
+    for (name, most) in [("join_blowup.py", 5_000), ("join_returns.py", 20_000)] {
+        let mut m = mithril_front::parse(&fixture(name)).unwrap();
+        mithril_reassoc::analyze(&mut m);
+        let size: usize = desugar(&m).unwrap().fns.iter().map(|f| f.body.size()).sum();
+        assert!(size < most, "{name}: Core of {size} nodes");
+        golden(name, 0, &["1", "4", "16"]);
+    }
+}
