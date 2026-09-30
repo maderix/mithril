@@ -1090,7 +1090,14 @@ what is checked and what is only claimed:
 | lowering preserves meaning | **claimed**, checked by tests only | oracle equality of generated code |
 
 The oracle agrees with the net, not the other way round: an unused
-binding is never evaluated. `eval_core` shares payloads (`Arc`), so a
+binding is never evaluated. `eval_core` skips a `Let` whose variable is
+not free in its body; `instantiate` never builds such a right-hand side
+(the uses of outer variables it would take are linked to ERA); a REF
+whose result wire already holds ERA erases the call and its arguments
+instead of unfolding it; and an op whose other operand arrives as ERA
+(its enclosing closure was erased) is erased with it. The device rules do
+the same. Fixtures `dead_binding`, `dead_division` (a diverging and a
+failing dead binding: every lane returns 5). `eval_core` shares payloads (`Arc`), so a
 clone copies nothing; a deep copy per variable read cost 21 GB on the
 shared-tree fixture. fast.py caps each build's memory (`ulimit -v`).
 

@@ -170,6 +170,14 @@ fn fields<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, v: Port) -> Vec<Po
     fs
 }
 
+/// Wire `p` already holds ERA, through filled wires.
+fn erased<C: Cells>(c: &C, mut p: Port) -> bool {
+    while p.tag() == Tag::Var && c.cell(p.payload() as u32)[0] != EMPTY.0 {
+        p = Port(c.cell(p.payload() as u32)[0]);
+    }
+    p.tag() == Tag::Era
+}
+
 fn is_value<C: Cells, P: Prog<C> + ?Sized>(prog: &P, p: Port) -> bool {
     matches!(p.tag(), Tag::Num | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
 }
@@ -185,7 +193,10 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
         if other.tag() == Tag::Ref {
             panic!("ICE: no interaction rule for Ref–Ref (two producers head-on)");
         }
-        if other.tag() == Tag::Era {
+        // a call whose result is already erased (directly or through filled wires) is
+        // erased with its arguments, never unfolded: an unused call is not evaluated
+        if other.tag() == Tag::Era || erased(c, other) {
+            resolve(c, other);
             for p in list_collect(c, ref_head(r)) {
                 link(c, era(), p);
             }
@@ -310,6 +321,13 @@ fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Po
         let a2 = c.alloc(s2, r2);
         link(c, op_port(a1, code), v1);
         link(c, op_port(a2, code), v2);
+        return;
+    }
+    if other.tag() == Tag::Era {
+        // the other operand was erased (its enclosing closure was): the op is dead code
+        c.free_cell(addr);
+        link(c, era(), val);
+        link(c, era(), Port(cell[1]));
         return;
     }
     if !is_value(prog, other) {

@@ -115,6 +115,19 @@ impl Core {
         }
     }
 
+    /// `v` is free in `self`: read outside any rebinding of it.
+    pub fn reads(&self, v: u32) -> bool {
+        match self {
+            Core::Var(u) => *u == v,
+            Core::Let(u, r, b) => r.reads(v) || (*u != v && b.reads(v)),
+            Core::Lam(u, b) => *u != v && b.reads(v),
+            Core::Match(s, arms) => {
+                s.reads(v) || arms.iter().any(|(_, bs, b)| !bs.contains(&v) && b.reads(v))
+            }
+            _ => self.kids().into_iter().any(|k| k.reads(v)),
+        }
+    }
+
     /// The largest variable index mentioned or bound (0 if none).
     pub fn max_var(&self) -> u32 {
         let mut m = 0;
@@ -380,6 +393,8 @@ fn eval(m: &CoreModule, env: &HashMap<u32, Val>, e: &Core) -> Val {
                 eval(m, env, e2)
             }
         }
+        // a dead binding is never evaluated, as in the net (which erases it unbuilt)
+        Core::Let(i, _, body) if !body.reads(*i) => eval(m, env, body),
         Core::Let(i, rhs, body) => {
             let v = eval(m, env, rhs);
             let mut env2 = env.clone();

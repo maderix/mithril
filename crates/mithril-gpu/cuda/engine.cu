@@ -1237,6 +1237,16 @@ __device__ __noinline__ u64 resolve(u64 p) {
   return p;
 }
 
+// Wire p already holds ERA, through filled wires
+__device__ __noinline__ bool erased(u64 p) {
+  u32 g = 0;
+  while (tag(p) == T_VAR && cell0((u32)payload(p)) != EMPTY) {
+    GUARDV(g, false);
+    p = cell0((u32)payload(p));
+  }
+  return tag(p) == T_ERA;
+}
+
 // ---- the program's half (prog_* supplied by program.cu) ----
 
 __device__ void prog_inst(u16 entry, const u64 *args, int n, u64 ret);
@@ -1483,6 +1493,13 @@ __device__ __noinline__ void op_rule(u64 op, u64 val) {
     u32 a2 = alloc_node(d1, r2);
     link(op_port(a1, code), v1);
     link(op_port(a2, code), v2);
+    return;
+  }
+  if (tag(other) == T_ERA) {
+    // the other operand was erased (its enclosing closure was): the op is dead code
+    free_node(addr);
+    link(era(), val);
+    link(era(), c1);
     return;
   }
   if (!is_value(other)) { g_abort(AB_UNREACHABLE); return; }
@@ -1740,7 +1757,9 @@ __device__ __noinline__ int process(u64 a, u64 b) {
   if (ta == T_REF || tb == T_REF) {
     u64 r = ta == T_REF ? a : b, other = ta == T_REF ? b : a;
     if (tag(other) == T_REF) { g_abort(AB_UNREACHABLE); return 1; }
-    if (tag(other) == T_ERA) {
+    // a call whose result is already erased is erased with its arguments, never unfolded
+    if (tag(other) == T_ERA || erased(other)) {
+      resolve(other);
       u64 ps[LISTCAP];
       int n = list_collect(ref_head(r), ps);
       for (int i = 0; i < n; i++) link(era(), ps[i]);

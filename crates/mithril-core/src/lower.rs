@@ -177,6 +177,39 @@ fn insts<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, xs: &[NExpr]) -> 
 }
 
 /// Instantiate one expression, returning the port its value flows out of.
+/// The erasure of an expression that is never built: the uses of outer variables it
+/// would have taken are linked to ERA, exactly as if ERA had met its value first.
+fn erase<C: Cells>(net: &mut C, env: &mut Env, e: &NExpr, bound: &mut Vec<u32>) {
+    let (uses, kids): (Vec<u32>, Vec<&NExpr>) = match e {
+        NExpr::Var(v) => (vec![*v], vec![]),
+        NExpr::If(c, t, f) => ([&t.caps[..], &f.caps[..]].concat(), vec![c]),
+        NExpr::Match(s, _, specs) => (specs.iter().flat_map(|sp| sp.caps.clone()).collect(), vec![s]),
+        NExpr::Op2(_, a, b) | NExpr::App(a, b) => (vec![], vec![a, b]),
+        NExpr::Call(_, xs) | NExpr::Ctor(_, xs) | NExpr::Tuple(xs) | NExpr::Prim(_, xs) => {
+            (vec![], xs.iter().collect())
+        }
+        NExpr::Proj(a, _) => (vec![], vec![a]),
+        NExpr::Let(u, r, b) => {
+            erase(net, env, r, bound);
+            return erase_under(net, env, *u, b, bound);
+        }
+        NExpr::Lam(u, b) => return erase_under(net, env, *u, b, bound),
+        NExpr::Num(_) | NExpr::Flo(_) => return,
+    };
+    for v in uses.into_iter().filter(|v| !bound.contains(v)) {
+        let p = env.take(v);
+        link(net, era(), p);
+    }
+    kids.into_iter().for_each(|k| erase(net, env, k, bound));
+}
+
+/// `erase` of `b` with `u` bound inside it (its uses are not outer ones).
+fn erase_under<C: Cells>(net: &mut C, env: &mut Env, u: u32, b: &NExpr, bound: &mut Vec<u32>) {
+    bound.push(u);
+    erase(net, env, b, bound);
+    bound.pop();
+}
+
 fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port {
     match e {
         NExpr::Num(n) => Port::num(*n),
@@ -188,8 +221,14 @@ fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port
             agent2(net, |c| op_port(c, *code), p1, p2)
         }
         NExpr::Let(v, r, b) => {
-            let pr = inst(net, prog, env, r);
-            bind(net, env, *v, pr, count_uses(*v, b));
+            match count_uses(*v, b) {
+                // a dead binding's value is never built
+                0 => erase(net, env, r, &mut vec![]),
+                k => {
+                    let pr = inst(net, prog, env, r);
+                    bind(net, env, *v, pr, k)
+                }
+            }
             inst(net, prog, env, b)
         }
         NExpr::Call(f, args) => {

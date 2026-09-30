@@ -1005,3 +1005,12 @@ fn values_shared_by_compiled_code_and_the_net_match_oracle() {
         golden(name, 0, &["1", "4", "16"]);
     }
 }
+
+/// A dead binding is never evaluated: a diverging or failing right-hand side
+/// neither runs in the oracle nor in the net, and the program returns 5.
+#[test]
+fn dead_bindings_are_never_evaluated() {
+    for name in ["dead_binding.py", "dead_division.py"] {
+        golden(name, 0, &["1", "4", "16"]);
+    }
+}
