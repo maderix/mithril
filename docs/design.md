@@ -133,6 +133,13 @@ and annihilate; different labels commute. A single label class is wrong
 as soon as a copied closure shares its own parameter (`twice(sq, 3)`).
 Each fan-out cell has its own label.
 
+At runtime a constructor or float cell may be shared (refcount > 1)
+between compiled code and a closure in the net region. `Prog::shared`
+says so, and a rule consuming such a value (MAT, DUP, ERA, and OP on
+floats) copies its fields out and drops one reference instead of freeing
+the cells; the device rules do the same (`shared_val`). Compile time never
+shares. Fixtures `con_share`, `flo_share`, `flo_share_ops`.
+
 The device carries a second, hand-written implementation of the same
 rules in `crates/mithril-gpu/cuda/engine.cu`. It is held to the first by
 the oracle tests (section 8). One source for both is an open item.

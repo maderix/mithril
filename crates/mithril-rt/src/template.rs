@@ -119,6 +119,14 @@ impl<'e> Prog<Wctx<'e>> for Pg {
         assert!(t >= TU, "runtime: match on an array");
         (UNBOX_CID[(t - TU) as usize] as u16, vec![Port(num(as_i(p.0)))])
     }
+    // a boxed float or constructor compiled code also holds (refcount > 1)
+    fn shared(&self, ctx: &Wctx<'e>, p: Port) -> bool {
+        match tag(p.0) {
+            T_FLO => !ctx.rc_unique((p.0 & M56) as u32),
+            T_CON => con_ar(p.0) > 0 && !lin::<Tb>(con_tag(p.0)) && !ctx.rc_unique(con_addr(p.0)),
+            _ => false,
+        }
+    }
     fn deliver(&self, ctx: &mut Wctx<'e>, kont: Port, val: Port) {
         // compiled code reads the value whole: deliver it once settled
         let pending = net_settle(ctx, val);
@@ -175,8 +183,9 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
         return Some(num(wrap56(r)));
     }
     let (a, b) = (flo_val(ctx, x), flo_val(ctx, y));
-    ctx.free((x & M56) as u32);
-    ctx.free((y & M56) as u32);
+    // the operands may be shared with compiled code: drop one reference each
+    free_val(ctx, x);
+    free_val(ctx, y);
     if code >= 16 {
         let r = match code { 16 => a < b, 17 => a <= b, 18 => a > b, 19 => a >= b, 20 => a == b, 21 => a != b, _ => unreachable!() };
         return Some(num(r as i64));

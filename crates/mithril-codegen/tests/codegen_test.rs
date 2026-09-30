@@ -995,3 +995,13 @@ fn array_erase_frontier_matches_the_oracle_at_all_budgets() {
 fn array_erasure_depth_matches_oracle_at_starved_budgets() {
     trmc_golden("array_erase_depth.py");
 }
+
+/// A constructor or float that compiled code shares with a closure is copied out of,
+/// not freed, by the net's MAT, DUP, ERA and OP rules (these printed (31, 36, 150),
+/// (4.75, 4.75) and a garbage first field).
+#[test]
+fn values_shared_by_compiled_code_and_the_net_match_oracle() {
+    for name in ["con_share.py", "flo_share.py", "flo_share_ops.py"] {
+        golden(name, 0, &["1", "4", "16"]);
+    }
+}

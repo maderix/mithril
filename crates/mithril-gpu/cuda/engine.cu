@@ -1179,14 +1179,21 @@ __device__ __noinline__ u64 con_alloc(u16 ctag, const u64 *fields, int n) {
   return con(alloc2(fields[0], rest), ctag, (u8)(n < 15 ? n : 15));
 }
 // walk and free a constructor chain into buf
-__device__ __noinline__ int con_collect(u64 p, u64 *buf) {
+// A constructor's fields in order. The chain is freed, or with `copy` (a value
+// compiled code also holds) left in place and each field copied.
+__device__ __noinline__ int con_collect(u64 p, u64 *buf, bool copy = false) {
   int n = 0;
   for (;;) {
     u8 ar = con_ar(p);
     u32 a = con_addr(p);
     if (ar == 0) return n;
     u64 c0 = cell0(a), c1 = cell1(a);
-    free_node(a);
+    if (copy) {
+      c0 = dup_val(c0);
+      if (ar <= 2) c1 = dup_val(c1);
+    } else {
+      free_node(a);
+    }
     if (ar == 1) { buf[n++] = c0; return n; }
     if (ar == 2) { buf[n++] = c0; buf[n++] = c1; return n; }
     buf[n++] = c0;
@@ -1338,8 +1345,9 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
     return true;
   }
   double a = flo_val(x), b = flo_val(y);
-  free_node((u32)(x & M56));
-  free_node((u32)(y & M56));
+  // the operands may be shared with compiled code: drop one reference each
+  free_val(x);
+  free_val(y);
   if (code >= 16) {
     bool r = false;
     switch (code) {
@@ -1367,10 +1375,18 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
 
 // ---- the rules ----
 
+// A boxed float or constructor compiled code also holds (refcount > 1): a rule
+// consuming it copies what it needs and drops one reference (as the CPU rules)
+__device__ inline bool shared_val(u64 p) {
+  if (tag(p) == T_FLO) return !rc_unique((u32)payload(p));
+  return tag(p) == T_CON && con_ar(p) > 0 && !lin(con_tag(p)) && !rc_unique(con_addr(p));
+}
+
 // ERA-anything: consume and erase the value/agent p
 __device__ __noinline__ void era_value(u64 p) {
   u64 t = tag(p);
   if (t == T_ERA || t == T_NUM) return;
+  if (shared_val(p)) { free_val(p); return; }
   if (t == T_FLO) { free_node((u32)payload(p)); return; }
   if (t == T_CON) {
     u64 fs[LISTCAP];
@@ -1507,7 +1523,9 @@ __device__ __noinline__ void mat_rule(u64 mat, u64 val) {
   u16 ct;
   if (tag(val) == T_CON) {
     ct = con_tag(val);
-    nf = con_collect(val, fields);
+    bool shared = shared_val(val);
+    nf = con_collect(val, fields, shared);
+    if (shared) free_val(val);
   } else {
     // an unboxed constructor: its tag byte names the ctor, its field rides the payload
     u64 t = tag(val);
@@ -1589,6 +1607,9 @@ __device__ __noinline__ void dup_rule(u64 dup, u64 val) {
   if (t == T_NUM) {
     link(val, o1);
     link(val, o2);
+  } else if (shared_val(val)) {
+    link(val, o1);
+    link(dup_val(val), o2);
   } else if (t == T_FLO) {
     u32 a = (u32)payload(val);
     u32 copy = alloc2(cell0(a), cell1(a)); // a new value: one reference

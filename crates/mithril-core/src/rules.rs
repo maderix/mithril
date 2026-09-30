@@ -67,6 +67,13 @@ pub trait Prog<C: Cells> {
     fn deliver(&self, _c: &mut C, kont: Port, _val: Port) {
         panic!("ICE: continuation {:?} at compile time", kont.tag())
     }
+    /// The runtime shares value `p` (a constructor or float) with compiled code: a rule
+    /// consuming it copies what it needs (`copy_ext`) and drops one reference
+    /// (`erase_ext`) instead of freeing cells compiled code still reads. Compile time
+    /// never shares.
+    fn shared(&self, _c: &C, _p: Port) -> bool {
+        false
+    }
 }
 
 /// Connect two ports. Wire cells hold the first arrival in slot 0; the
@@ -152,6 +159,17 @@ fn fan<C: Cells>(c: &mut C, label: u32, p: Port) -> (Port, Port) {
     (w1, w2)
 }
 
+/// A constructor's fields for a rule consuming it: moved out of cells the net owns,
+/// copied out of a value shared with compiled code.
+fn fields<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, v: Port) -> Vec<Port> {
+    if !prog.shared(c, v) {
+        return con_collect(c, v);
+    }
+    let fs = con_fields(c, v).into_iter().map(|f| prog.copy_ext(c, f)).collect();
+    prog.erase_ext(c, v);
+    fs
+}
+
 fn is_value<C: Cells, P: Prog<C> + ?Sized>(prog: &P, p: Port) -> bool {
     matches!(p.tag(), Tag::Num | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
 }
@@ -227,6 +245,7 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
 fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
     match p.tag() {
         Tag::Era | Tag::Num => {}
+        Tag::Flo | Tag::Con if prog.shared(c, p) => prog.erase_ext(c, p),
         Tag::Flo => c.free_cell(p.payload() as u32),
         Tag::Con => {
             for f in con_collect(c, p) {
@@ -327,7 +346,7 @@ fn swi_rule<C: Cells>(c: &mut C, swi: Port, num: Port) {
 fn mat_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, mat: Port, val: Port) {
     let mid = mat_id(mat);
     let (ret, arms) = take(c, mat_addr(mat));
-    let (ct, fields) = if val.tag() == Tag::Con { (val.con_tag(), con_collect(c, val)) } else { prog.ext_ctor(c, val) };
+    let (ct, fields) = if val.tag() == Tag::Con { (val.con_tag(), fields(c, prog, val)) } else { prog.ext_ctor(c, val) };
     match prog.mat_meta(mid) {
         MatMeta::Proj(i) => {
             assert_eq!(ct, CTAG_TUPLE, "ICE: projection on non-tuple constructor {}", ct);
@@ -373,6 +392,11 @@ fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: 
         Tag::Num => {
             link(c, val, o1);
             link(c, val, o2);
+        }
+        Tag::Flo | Tag::Con if prog.shared(c, val) => {
+            let copy = prog.copy_ext(c, val);
+            link(c, val, o1);
+            link(c, copy, o2);
         }
         Tag::Flo => {
             let bits = c.cell(val.payload() as u32);
