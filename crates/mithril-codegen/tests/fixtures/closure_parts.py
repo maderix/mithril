@@ -1,6 +1,6 @@
 # Elements read out of a closure result (untyped): a function that also
-# takes ints must not read them as ints. (A closure returning a tuple
-# through a self-recursive caller is a known bug: design.md s12.)
+# takes ints must not read them as ints. (A tuple returned by a closure
+# applied at runtime is a known bug: design.md s12.)
 def ap(f, s, n):
     if n == 0:
         return f(s)

@@ -789,7 +789,7 @@ fn mixed_type_params_are_not_read_as_ints() {
 
 #[test]
 fn stale_result_types_and_closure_results_match_oracle() {
-    for (name, want) in [("stale_ret.py", "(0, 4, 100.0)"), ("closure_result.py", "(6.25, 3)"), ("closure_parts.py", "(5.0, 6)")] {
+    for (name, want) in [("stale_ret.py", "(0, 4, 100.0)"), ("closure_result.py", "(6.25, 3)"), ("closure_parts.py", "(5.0, 6)"), ("self_types.py", "(1, 1)")] {
         let (cm, rs) = pipeline(&fixture(name), 1 << 20);
         assert_eq!(oracle(&cm), want, "{name} oracle");
         let bin = compile(&rs, name.trim_end_matches(".py"));

@@ -94,6 +94,7 @@ const FIXTURES: &[&str] = &[
     "stale_ret.py",
     "closure_result.py",
     "closure_parts.py",
+    "self_types.py",
     "heavy_fold.py",
     "fork_reach.py",
     "fork_chain.py",
@@ -352,8 +353,16 @@ fn gpu_failed_runs_leave_no_memory_behind() {
         let (want, got) = run_fixture("fib_naive.py");
         assert_eq!(got.map(|r| r.text), Ok(want));
     }
-    let after = mithril_gpu::free_vram().unwrap();
-    let lost = before.saturating_sub(after);
+    // free memory is a device-wide figure other processes move (a
+    // desktop shares the device); a leak persists, noise does not
+    let mut lost = usize::MAX;
+    for _ in 0..10 {
+        lost = lost.min(before.saturating_sub(mithril_gpu::free_vram().unwrap()));
+        if lost < 64 << 20 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     assert!(lost < 64 << 20, "{} MiB of device memory not returned", lost >> 20);
 }
 

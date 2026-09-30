@@ -1119,12 +1119,17 @@ Device:
 
 CPU:
 
-7. A closure that returns a tuple, applied by a self-recursive function
-   whose result is returned (`def ap(f, s, n): return f(s) if n == 0
-   else ap(f, s, n - 1)` with `f = lambda y: (y, y)` and runtime `n`),
-   delivers a raw int instead of the tuple port on the CPU ("unprintable
-   result port"). The same program without the recursion, or with
-   constant arguments, is correct. Open.
+7. Values built by the net that reach compiled code keep their fields
+   as unresolved wires: `apply` (rt template.rs) resolves only the
+   top-level port it returns, and so do the continuation delivery and the
+   arguments of a net call fired into a rule form. Compiled code then
+   reads a wire as a field. A closure applied at runtime that returns a
+   tuple fails ("unprintable result port") or gives a silently wrong
+   value (`t = ap(lambda y: (y, y), n, n); t[0] + t[1]` prints a float
+   for 6). Programs whose applications the net removes at compile time
+   are correct. Fix: one boundary that resolves every field of a net
+   value (reducing or suspending on a pending one) wherever a net value
+   enters compiled code. Open.
 8. kmeans: 11.81 s at one thread against reference 7.84, 1.45 s at 16 against
    0.771. It needs lane-level (u32) vectorization; a hand-edited proof
    reached 5.81 s at one thread.

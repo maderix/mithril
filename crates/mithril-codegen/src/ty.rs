@@ -231,10 +231,11 @@ impl Inf {
         // read out of it is unknown too
         let (ra, rb) = (self.uf.find(a), self.uf.find(b));
         let poison = Node::Adt(u32::MAX);
-        for (x, y) in [(ra, rb), (rb, ra)] {
-            if self.uf.n[y as usize] == poison && x != y {
-                self.poison_inside(x, 0);
-            }
+        if ra != rb && (self.uf.n[ra as usize] == poison || self.uf.n[rb as usize] == poison) {
+            self.poison_all(ra);
+            self.poison_all(rb);
+            self.uf.union(ra, rb); // both poison now: one class
+            return;
         }
         // arrays unify their element types, tuples their components
         let (ra, rb) = (self.uf.find(a), self.uf.find(b));
@@ -256,24 +257,38 @@ impl Inf {
                 _ => {}
             }
         }
+        // a conflict poisons both classes; what is read out of them is
+        // unknown too
+        let (fa, fb) = (self.uf.find(a), self.uf.find(b));
+        let (na, nb) = (self.uf.n[fa as usize], self.uf.n[fb as usize]);
         self.uf.union(a, b);
+        let fr = self.uf.find(a);
+        if self.uf.n[fr as usize] == Node::Adt(u32::MAX) {
+            for n in [na, nb] {
+                match n {
+                    Node::Tup(_, c) => self.tups[c as usize].clone().into_iter().for_each(|t| self.poison_all(t)),
+                    Node::Arr(e) => self.poison_all(e),
+                    _ => {}
+                }
+            }
+        }
     }
 
-    /// Poison the components or elements of a tuple or array tyvar.
-    fn poison_inside(&mut self, v: u32, depth: u32) {
-        let r = self.uf.find(v);
-        let inner: Vec<u32> = match self.uf.n[r as usize] {
-            Node::Tup(_, c) => self.tups[c as usize].clone(),
-            Node::Arr(e) => vec![e],
-            _ => return,
-        };
-        if depth > 8 {
-            return;
-        }
-        for t in inner {
-            let p = self.node(Node::Adt(u32::MAX));
-            self.unify(t, p);
-            self.poison_inside(t, depth + 1);
+    /// Poison a tyvar and everything read out of it (tuple components,
+    /// array elements), transitively. A worklist that marks each class
+    /// before visiting its parts, so a type that contains itself ends.
+    fn poison_all(&mut self, v: u32) {
+        let poison = Node::Adt(u32::MAX);
+        let mut work = vec![v];
+        while let Some(t) = work.pop() {
+            let r = self.uf.find(t);
+            match self.uf.n[r as usize] {
+                Node::Tup(_, c) => work.extend(self.tups[c as usize].iter().copied()),
+                Node::Arr(e) => work.push(e),
+                n if n == poison => continue,
+                _ => {}
+            }
+            self.uf.n[r as usize] = poison;
         }
     }
 
@@ -560,7 +575,6 @@ fn bind(env: &mut Vec<u32>, x: u32, t: u32) {
 /// Infer module types. Two passes over every body (the second lets sigs
 /// settled late propagate), then a readout.
 pub(crate) fn infer(m: &CoreModule) -> Types {
-    let _nf = m.fns.len();
     let mut inf = Inf {
         uf: Uf { n: Vec::new() },
         fparam: Vec::new(),
