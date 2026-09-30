@@ -202,6 +202,14 @@ fn a_local_named_like_a_builtin_shadows_it_from_its_assignment_on() {
 }
 
 #[test]
+fn an_int_literal_beside_an_f64_is_a_float() {
+    assert_eq!(run("def main():\n    g = 2.5\n    return (g + 1, 2 * g)\n"), Val::T(std::sync::Arc::new(vec![Val::F(3.5), Val::F(5.0)])));
+    // f64 stays dynamically typed: a helper may take ints and f64s
+    let src = "def dbl(x):\n    return x + x\n\ndef main():\n    return (dbl(2), dbl(1.5))\n";
+    assert_eq!(run(src), Val::T(std::sync::Arc::new(vec![Val::I(4), Val::F(3.0)])));
+}
+
+#[test]
 fn a_user_function_named_int_keeps_its_float_literals() {
     assert_eq!(run("def int(x):\n    return x * 0.1\n\ndef main():\n    return int(0.3)\n"), Val::F(0.3 * 0.1));
 }

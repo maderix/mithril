@@ -272,7 +272,10 @@ field holding both ints and closures poisons to `Dyn` (a closure is never
 an immediate). An operator unifies its operands, and its result is a
 fresh int (or float) once they are known: a conflict where a result is
 used (an int stored in a tree that also holds tuples) stays at that use
-and does not flow back into the arithmetic that made it. One
+and does not flow back into the arithmetic that made it; a result whose
+operand is poisoned later takes the operand's type again (a fixpoint
+after each pass). A closure's result has no known type and conflicts
+with any type it meets, so a parameter that receives it is not native. One
 heterogeneous array (ints and lists in one array) still poisons the ints
 unified with its elements to `Dyn`: correct tagged code, slower. No port
 does this; `hetero_array.py` covers the runtime conversion.
@@ -290,7 +293,9 @@ constructor field, tuple component and array element has one type, found
 by unification. `sqrt(x)` and `f32(n)` introduce f32; it spreads through
 assignments, operators, calls and returns, and a float literal written as
 the argument of `f32()` or `int()` is f32 (any other f64 expression passed
-to either is an error, not a retyping). Where a value is f32, a literal becomes its bit
+to either is an error, not a retyping). An int literal written as an
+operand beside an f64 is that float (`g + 1`). f64 stays dynamically
+typed (a helper may take ints and f64s; the rules dispatch on the value). Where a value is f32, a literal becomes its bit
 pattern and `+ - * /` and comparisons become the `f32_*` builtins, so
 Core, the net and every backend see ints and the existing rules: `x + y`
 on f32 is `f32_add(x, y)`, nothing new in the rule table but `f32_le`
@@ -728,13 +733,14 @@ at once.
   a dive form's next budget check to suspend, so no dive runs unbounded;
   a runaway loop cycles rounds to the round limit instead of freezing the
   device, which the desktop shares. A native loop never suspends: once
-  per `WORK_CAP` iterations of the frame it checks the abort flag, and
-  leaves when the run is aborting (an abort, or the host's stop at the
-  deadline; a no-op on the CPU). Native recursion needs no check: without
-  a fork it is bounded by the stack guard, and forking recursion runs in
-  dive forms. A counter shared across frames and checked at every
-  recursive entry cost the Whitted demo's kernel 19 to 32 ms; the
-  per-frame register check costs 2 ms.
+  per `WORK_CAP` of its own iterations (a register count per frame) it
+  checks the abort flag, and leaves when the run is aborting (an abort,
+  or the host's stop at the deadline; a no-op on the CPU). Not covered: a
+  native loop whose body calls a function with an inner loop, each under
+  `WORK_CAP` iterations per frame, and long non-forking native recursion;
+  neither is checked. A counter shared across frames and checked at every
+  recursive entry covered them but cost the Whitted demo's kernel 19 to
+  32 ms; the per-frame check costs 2 ms.
 * The stack guard (`stack_deep` on the device) compares against the
   thread's stack less a 4 KiB margin.
   The host writes the limit before the first launch (`k_boot` runs dives

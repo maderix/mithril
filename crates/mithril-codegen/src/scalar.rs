@@ -1768,8 +1768,15 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     body.push(let_("fl", Ty::I64, i64_(1)));
     if lp {
         // a native loop never suspends: on the device it leaves the frame
-        // when the host asked the run to stop (checked once per work cap)
-        let mut lb = vec![set("fl", bin(Bop::Add, v("fl"), i64_(1))), do_(p("loop_guard", vec![v("fl")]))];
+        // when the run is aborting, checked once per work cap of its own
+        // iterations (`it`: fuel `fl` also counts leaf calls, by varying
+        // steps; dead code on the CPU)
+        body.push(let_("it", Ty::I64, i64_(0)));
+        let mut lb = vec![
+            set("fl", bin(Bop::Add, v("fl"), i64_(1))),
+            set("it", bin(Bop::Add, v("it"), i64_(1))),
+            do_(p("loop_guard", vec![v("it")])),
+        ];
         lb.extend(bb);
         body.push(S::Loop(lb));
     } else {

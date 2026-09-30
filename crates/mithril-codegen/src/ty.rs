@@ -185,6 +185,9 @@ struct Inf {
     /// projections whose base was not yet known to be a tuple: (base, i,
     /// result), resolved after each pass
     pending: Vec<(u32, usize, u32)>,
+    /// op results given a fresh type from their operand's: (operand,
+    /// result, the kind minted)
+    minted: Vec<(u32, u32, Node)>,
 }
 
 impl Inf {
@@ -285,6 +288,26 @@ impl Inf {
         }
     }
 
+    /// A minted op result whose operand no longer has the kind it was
+    /// minted from (a later walk poisoned the operand) takes the operand's
+    /// type again, until nothing changes. (A result poisoned by its own
+    /// consumer does not flow back: that is what minting is for.)
+    fn relink(&mut self) {
+        loop {
+            let mut changed = false;
+            for (o, res, kind) in self.minted.clone() {
+                let (ro, rr) = (self.uf.find(o), self.uf.find(res));
+                if ro != rr && self.uf.n[ro as usize] != kind {
+                    self.unify(res, o);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
     /// Resolve projections recorded before their base was known.
     fn settle(&mut self) {
         for (b, i, res) in std::mem::take(&mut self.pending) {
@@ -340,11 +363,14 @@ impl Inf {
                 // conflict where the result is used stays there, instead of
                 // flowing back into the operands
                 let r = self.uf.find(ta);
-                match self.uf.n[r as usize] {
+                let kind = self.uf.n[r as usize];
+                let fresh = match kind {
                     Node::Int => self.int(),
                     Node::Flo => self.node(Node::Flo),
-                    _ => ta,
-                }
+                    _ => return ta,
+                };
+                self.minted.push((ta, fresh, kind));
+                fresh
             }
             Core::Cmp(_, a, b) => {
                 let ta = self.walk(fid, a, env);
@@ -409,7 +435,9 @@ impl Inf {
                 let fun = self.node(Node::Fun);
                 self.unify(tf, fun);
                 let _ = self.walk(fid, a, env);
-                self.uf.fresh()
+                // a closure's result has no known type: it conflicts with any
+                // type it meets, so what receives it is not read natively
+                self.node(Node::Adt(u32::MAX))
             }
             Core::Prim(p, args) => {
                 use mithril_front::core::Prim;
@@ -506,6 +534,7 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
         cclass: (0..m.ctors.len() as u32).collect(),
         tups: Vec::new(),
         pending: Vec::new(),
+        minted: Vec::new(),
     };
     for f in &m.fns {
         let ps = (0..f.arity).map(|_| inf.uf.fresh()).collect();
@@ -524,18 +553,27 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
             inf.unify(tr, fr);
         }
         inf.settle();
+        inf.relink();
     }
     // readout (locals need a third walk capturing every Let/binder var)
-    let mut locals: Vec<Vec<Ty>> = Vec::with_capacity(nf);
-    for (fid, f) in m.fns.iter().enumerate() {
-        let mut env: Vec<u32> = inf.fparam[fid].clone();
-        let _ = inf.walk(fid as u32, &f.body, &mut env);
-        let tys = env
-            .iter()
-            .map(|&v| if v == u32::MAX { Ty::Dyn } else { inf.uf.read(v) })
-            .collect();
-        locals.push(tys);
-    }
+    let envs: Vec<Vec<u32>> = m
+        .fns
+        .iter()
+        .enumerate()
+        .map(|(fid, f)| {
+            let mut env: Vec<u32> = inf.fparam[fid].clone();
+            let _ = inf.walk(fid as u32, &f.body, &mut env);
+            env
+        })
+        .collect();
+    // (the readout walk unifies too: its op results relink before reading)
+    inf.settle();
+    inf.relink();
+    let locals: Vec<Vec<Ty>> = envs
+        .iter()
+        .map(|env| env.iter().map(|&v| if v == u32::MAX { Ty::Dyn } else { inf.uf.read(v) }).collect())
+        .collect();
+    let _ = nf;
     let class_of: Vec<u32> = (0..m.ctors.len() as u32).map(|c| inf.cfind(c)).collect();
     let canon = |t: Ty| if let Ty::Adt(c) = t { Ty::Adt(class_of[c as usize]) } else { t };
     let mut rd = |vs: &[u32]| -> Vec<Ty> { vs.iter().map(|&v| canon(inf.uf.read(v))).collect() };

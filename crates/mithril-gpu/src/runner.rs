@@ -309,6 +309,9 @@ impl Drop for ContextHold {
 /// Free device memory in bytes, as the runner sees it between runs.
 pub fn free_vram() -> Result<usize, String> {
     let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
+    if STUCK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("mithril-gpu: an earlier run of this process was abandoned and still occupies the device".into());
+    }
     unsafe {
         cu(cuInit(0), "cuInit")?;
         let mut dev = 0i32;

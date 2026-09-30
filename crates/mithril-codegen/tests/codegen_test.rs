@@ -787,6 +787,18 @@ fn mixed_type_params_are_not_read_as_ints() {
     }
 }
 
+#[test]
+fn stale_result_types_and_closure_results_match_oracle() {
+    for (name, want) in [("stale_ret.py", "(0, 4, 100.0)"), ("closure_result.py", "(6.25, 3)")] {
+        let (cm, rs) = pipeline(&fixture(name), 1 << 20);
+        assert_eq!(oracle(&cm), want, "{name} oracle");
+        let bin = compile(&rs, name.trim_end_matches(".py"));
+        for t in ["1", "4"] {
+            assert_eq!(run(&bin, &[t]), want, "{name} --threads {t}");
+        }
+    }
+}
+
 /// The Cornell box demo at a small size (its `size()` replaced).
 fn cornell_small(n: u32) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demos/cornell_whitted.py");
