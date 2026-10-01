@@ -68,8 +68,8 @@ Python-subset source
   -> specialization by the interaction rules (mithril-net::specialize):
      each function body is a net over unknown parameters, reduced to
      quiescence and read back as Core
-  -> Core rewrites codegen owns (mithril-codegen::rewrite): tail
-     inlining, if-conversion of loop back-edges
+  -> Core rewrite codegen still owns (mithril-codegen::rewrite): tail
+     inlining (remaining drift; section 12)
   -> ANF normalization, then over the normalized bodies: type inference
      (monomorphic), unboxing, native-scalar classification, linearity,
      borrowing, reuse marking
@@ -207,8 +207,7 @@ Nothing in the specializer knows what an interpreter is. Test:
 The residual net is read back as Core. Single-use scalar expressions
 nest. Calls, projections, data and matches are let-bound where used. A
 value shared through `Dup` is bound once. Let-normal form is used only
-where sharing or evaluation order needs it, because codegen's cost models
-read the shape (if-conversion measures arm work, not bindings).
+where sharing or evaluation order needs it.
 
 Placement is one rule, `place`, for plain, shared and call values.
 
@@ -762,19 +761,20 @@ tree form: the in-order apply is one serial chain on one GPU thread
 
 ### 5.7 Core rewrites owned by codegen
 
-Two Core-to-Core rewrites run in codegen, not in the rules:
+One Core-to-Core rewrite remains in codegen, not in the rules:
 
 * `tail_inline`: a small (size at most 64), non-self-recursive `g`
   tail-called from `f`, whose own calls are tail calls back to `f` or
   calls to call-free functions, is inlined at that site, so mutual tail
   recursion becomes a loop.
-* `if_convert`: a tail if-tree whose leaves are the function's own
-  back-edge and whose arms are cheap (at most 32 ops, 128 bindings, int
-  selects only) becomes one call with selected arguments.
+
+Runtime branch back-edges stay in the residual program. The former
+fixed-threshold if-conversion pass speculated both arms outside the rules;
+it has been removed. `branch_lowering_test` checks that lowering preserves
+those branches, including nested arms and an untaken division by zero.
 
 The core constraint forbids Core-level rewrites that duplicate what a
-rule does. Whether these two are rules, lowering decisions with a stated
-cost model, or tunables to be marked is undecided (section 12). The same
+rule does. `tail_inline` remains a drift to resolve (section 12). The same
 holds for the `#[inline(always)]` decision: a call-free body of size at
 most 192, plus a `__while`/`__for` helper with a single call site on a
 recursive cycle with its caller (without the latter, which member of a
@@ -879,21 +879,25 @@ caps them; one lane is the determinism probe). A host loop with one
 launch and one sync per round cost about 130 us per round; a device round
 costs 10 to 20 us. The host launches once and waits.
 
-A round (this grow/work policy is reference's published runtime design,
-adopted, not derived here; section 14):
+A round (the phase structure was adopted earlier; section 14):
 
 * The leader snapshots the per-rule rings: pending tasks, forkable tasks
-  (tasks whose rule can fork, and `ERA`), and the frontier (tasks pushed
-  by the last phase).
+  (tasks whose rule can fork, and `ERA`), and the ready frontier (the
+  total pending count). Each forkable rule keeps its largest ready count
+  seen in this GROW episode. Newly pushed tasks are traced separately.
 * **GROW** while some pending task can fork, the frontier is narrower
   than the grow width (default: the lane count, `MITHRIL_GPU_GROW_WIDTH`),
-  and the last grow sweep pushed anything. Every forkable task below
+  and at least one forkable rule's ready count exceeds its episode's
+  high-water mark. A newly ready rule can grow even when the total count
+  contracts or stays unchanged. Replacements and oscillation cannot keep
+  reusing an old peak. Boot and the snapshot after WORK seed a fresh episode.
+  Every forkable task below
   the snapshot fires in the **parallel world**: a fork site's callee
   gets `fork_fuel`, a zero budget, so it suspends at entry and becomes a
   task; a segment's tail call is a task; a cut runs inline with the grow
   budget (`MITHRIL_GPU_GROW_FUEL`, default the dive budget); the
-  continuation is captured as records. The frontier widens by one fork
-  level per sweep.
+  continuation is captured as records. WORK reopens the opportunity to
+  grow after it executes the exposed work; existing budgets remain in force.
 * **WORK** otherwise. Every lane is dealt every nl-th pending task of the
   snapshot (dealt, not claimed: a claim race left 90% of lanes idle) and
   drains it and everything it spawns depth-first on its lane stack in the
@@ -915,6 +919,73 @@ the same way, so a body reaches all its fork sites in one step. Queuing
 completed joins globally cost a round per join level: tree-bitonic depth
 16 with hand-edited fork sites took 196,511 rounds, and 4,586 with join
 at once.
+
+**Measured frontier bottleneck (2026-10-01, RTX 4090).** The old any-push
+stop rule kept one-for-one continuations in GROW, paying a grid barrier for
+replacement work. Global ready-count growth fixes that chain but misses a new
+subproblem whose arrival coincides with siblings finishing. Matmul's trace
+contracts from 24,576 tasks to 384 tasks of a different rule; draining those
+384 before they branch costs parallelism. Treating every contraction as
+progress restores matmul but revives symreg's false growth. Per-rule high-water
+marks retain new ready populations without permitting that oscillation.
+
+The marks only increase within GROW. While the total ready count stays below
+the grow width, their finite sum bounds further growth sweeps; WORK resets
+them from its next snapshot. This is a scheduling progress measure, not a
+prediction of future work: a same-rule replacement with different arguments
+can still be drained before its later forks become visible. No rules, records,
+launch settings, budgets or tuning constants changed. No program name is
+consulted; no reference implementation source was studied.
+
+Hand-edited copies of exact generated CUDA first tested this mechanism.
+A rotating three-way comparison gave symreg 2,040.988 ms on the old engine,
+1,662.730 ms with strict total-count growth and 1,668.115 ms with rule peaks;
+the latter uses 560 rounds instead of 17,904. Matmul gave 423.693, 463.835 and
+424.628 ms respectively, keeping its original 90 rounds. All checksums agree.
+The contraction-only alternative was rejected: its normal generated symreg
+interval returned to 1,979 ms, losing the gain despite passing result tests.
+
+Final generated-path measurements are recorded separately below. Both sides
+use the same compiler, including the pre-existing working-tree fork-dependency
+analysis, with Core if-conversion removed. Only device growth accounting
+differs. Warm built artifacts run through one host runner in three rotating
+before/intermediate/final rounds. Minima are selected separately for wall and
+run; build time is excluded. `MITHRIL_GPU_STATS=1 mithril exec <artifact>` reports
+the CUDA stream interval between run events (including host enqueue gaps),
+excluding boot. Wall includes setup, boot, readback and teardown.
+
+| program | original run ms | strict-total run ms | final run ms | original wall s | final wall s |
+|---|---:|---:|---:|---:|---:|
+| tree-matmul | 421.346 | 459.480 | 424.812 | 0.590 | 0.592 |
+| symreg | 2043.449 | 1674.586 | 1695.410 | 2.165 | 1.816 |
+| queens | 1230.849 | 1242.404 | 1235.605 | 1.348 | 1.350 |
+| nbody | 7.412 | 7.408 | 8.376 | 0.116 | 0.117 |
+
+Symreg's final run interval drops 17.0%, wall 16.1%, and rounds from
+17,904 to 560. Matmul recovers the strict-total regression (7.5% less run
+time than that variant), staying within 0.8% of the original. Queens is
+unchanged within 0.4%. Nbody's minimum rises 0.964 ms (13.0%), with nearly
+unchanged wall; this is not a universal speedup. No final whole-suite speed
+claim is inferred from these four cases. `paired-rule-final.json` and
+`rule-final-provenance.json` retain every sample and the final hashes.
+
+
+The focused regression runs 64 combinations: same-rule and oscillating
+continuations, a newly ready binary-tree rule, 0/127 finishing siblings,
+0/1/128 delay, depth 0/8, ring-counter wrap and WORK budgets of one/default.
+All return the independent expected leaf count. Default-budget rounds remain
+bounded; newly ready branching still grows. The original engine fails the
+chain upper bound; global-count variants fail the new-rule branch lower bound.
+Both failures were reproduced before promotion. The final production device
+gate passes all 17 small ports and three closure programs; the focused GPU
+test passes all 64 runs. The prior full workspace and 42-fixture GPU-oracle
+checks covered the unchanged lowering/rules, and final timeout checks cover
+stop/cleanup behavior separately. Broad CPU parity covers 596 programs at
+eight settings. Its only 16 reference mismatches are the two Cornell demos'
+pre-existing tuple-to-array output change; all 16 exactly match the pre-change
+binary. No reference file was rewritten. Local samples, traces, source/
+binary/cubin hashes and measurement scripts are in `target/gpu-improve/`;
+rejected variants are retained there, outside the source tree.
 
 ### 7.3 Budgets on the device
 
@@ -1182,8 +1253,9 @@ are 1.2 to 3.8x faster sequentially than this x86 box.
 
 ## 10. Standings
 
-All at the big size, on the machine of section 9. Times in seconds
-unless marked ms.
+This is the 2026-09-30 comparison snapshot, at the big size on the machine
+of section 9. Times are seconds unless marked ms. The current GPU frontier
+measurements are in section 7.2.
 
 | port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device run (wall) | reference gpu wall |
 |---|---|---|---|---|---|---|---|
@@ -1367,13 +1439,11 @@ oracle at 1, 4 and 16 threads.
 
 Device:
 
-1. Grow policy: a sweep counts as growth when it pushed anything. A
-   hand-edited test requiring net growth of the total queued frontier reduced
-   symreg from 17,904 to 400 rounds and its `k_run` stream interval from
-   1,955 to 1,639 ms, checksum-equal. The 316 ms saving includes reduced
-   dispatch and scheduling work; empty grid barriers account for only
-   about 28 ms at the original round count. A general replacement needs
-   suite-wide evidence and the same CPU/device runtime model.
+1. Scheduling after rule populations stop growing: per-rule high-water
+   accounting fixes replacement and oscillation barriers (section 7.2).
+   A same-rule handoff can still hide future forks. A further general policy
+   needs evidence about useful exposed work and lane imbalance; changing a
+   width or budget to rescue one port is not a solution.
 2. Work efficiency and divergence: baseline Nsight profiles measure 3.10 active threads
    per warp instruction for symreg, 2.01 for queens, 4.71 for kdtree and
    17.86 for tree-bitonic, with about eight active warps per SM. Their
@@ -1388,9 +1458,9 @@ Device:
    high-water range. Kdtree's 531 ms boot interval is sequential program
    work, not context creation. Eager allocation leaves it at 523 ms, so
    managed-memory faults do not explain that cost.
-4. The grow/work policy (section 7.2) is reference's design. Its replacement
-   must follow Mithril's own measured cost model (section 14). No reference
-   implementation source is needed to derive it.
+4. Global snapshots and barriers still serialize rounds. The initial
+   phase structure has the provenance in section 14; subsequent scheduling
+   changes must follow Mithril's measured work and communication costs.
 
 5. Array teardown on the device is one continuation chain per array: a
    single boxed array of 2^20 elements is erased over about 4,096 rounds in
@@ -1440,8 +1510,8 @@ Semantic core:
 
 Constraint and proofs:
 
-15. `tail_inline` and `if_convert` are Core-level rewrites in codegen,
-    with unmarked thresholds (64, 32, 128), and the inline decision uses a
+15. `tail_inline` remains a Core-level rewrite in codegen with an
+    unmarked threshold (64), and the inline decision uses a
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
@@ -1499,7 +1569,7 @@ The working rules are in `CLAUDE.md`. The ones that shape this design:
   exponential, found only by full runs.
 * `tests/ci/gpu.py` (about two minutes warm) runs for device changes.
 * The language crates (front, core, net, reassoc, codegen, cli) are held
-  under 15,000 lines of source (`src/`); they are at 14,513.
+  under 15,000 lines of source (`src/`); the working tree is at 14,964.
 * Design decisions are recorded here with the numbers that justify them.
 
 ## 14. Prior art and provenance
@@ -1509,12 +1579,17 @@ audited what came from reference. Findings:
 
 * **No runtime or compiler code is copied.** The rule table, lowering,
   CPU runtime and device engine are written here.
-* **Device scheduling policy is reference's design** (the reference paper,
+* **The original device phase structure came from reference** (the reference paper,
   sections 3.1, 3.2, 5 and 6.3): the grow/work round, the frontier as
   tasks pushed by the last phase, the sequential and parallel worlds, a
   completed join run at once in the parallel world, fork-free tasks
-  skipped in grow, and the stop rule. It was adopted after reading
-  reference's paper and runtime. It will be replaced by a policy derived from
+  skipped in grow, and the original stop rule. These were adopted before
+  this investigation. The grow stop rule now tracks per-rule ready-count
+  high-water marks, derived from Mithril's own continuation, oscillation
+  and new-rule traces. Replacement tasks are no longer counted as new
+  parallel work. The CPU already measures frontier growth to
+  control its chain budget. No reference implementation source was studied for
+  this change. The remaining phase structure needs a policy derived from
   Mithril's own model (demand-driven sharing: a fork is shared only when
   lanes are idle; classical work stealing, Blumofe and Leiserson 1999,
   Arora, Blumofe and Plaxton 1998), on the CPU and the device together.

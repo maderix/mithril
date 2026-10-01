@@ -2018,9 +2018,9 @@ __device__ u32 g_wcyc, g_wbusy, g_wsteps_of_max; // a work phase: the slowest la
 __device__ u32 g_whist[40];            // lanes per log2(K cycles) bucket, the last work phase (trace)
 __device__ u32 g_wlog[LOGCAP * 6];     // per round: work steps (max lane, sum), K cycles, slowest lane K cycles, its steps, busy lanes; trace
 __device__ int g_phase;                // 0 exit, 1 grow, 2 work
-__device__ int g_grew = 1;
 __device__ u64 g_prev = 0;             // total pushes at the previous snapshot
-__device__ u32 g_log[LOGCAP * 3];      // per round: phase, pending, forkable (trace)
+__device__ u32 g_frontier[NRULES_ALL]; // per-rule high-water during GROW
+__device__ u32 g_log[LOGCAP * 3];      // per round: phase, pending, newly pushed (trace)
 #define RLOG 64
 __device__ u32 g_rlog[RLOG * NRULES_ALL]; // the first rounds' pending tasks per rule (trace)
 
@@ -2104,12 +2104,12 @@ __device__ void work_phase(u32 max_steps) {
 
 // ---- the driver on the device ----
 //
-// One cooperative launch runs the whole program in a grow/work rhythm adopted from
-// reference's runtime design (design.md s14; to be replaced). A round:
+// One cooperative launch runs the whole program. Grow while a forkable
+// rule exposes more ready work than seen during this GROW episode. A round:
 // while the frontier (pending global tasks) is narrower than the lanes and
 // some pending task can fork, GROW sweeps: every forkable task below a
 // snapshot fires in the parallel world, one grid barrier per sweep, until
-// the frontier is wide or a sweep grew nothing; then one WORK phase: every
+// the frontier is wide or no rule exposes new ready work. In WORK each
 // lane drains its column in the sequential world. It stops when nothing is
 // pending (the root delivered) or the run aborted. The host launches once.
 
@@ -2121,6 +2121,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
   for (;;) {
     if (gid == 0) {
       u32 total = 0, forkable = 0, off = 0;
+      bool grew = g_phase != 1;
       for (u32 r = 0; r < G.nrules; r++) {
         u32 len = *(volatile u32 *)&G.blen[r];
         u32 pend = len - G.bdone[r];
@@ -2129,6 +2130,8 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         g_woff[r] = total;
         if (g_rounds[0] < RLOG) g_rlog[g_rounds[0] * NRULES_ALL + r] = pend;
         if (rule_forks(r)) {
+          if (pend > g_frontier[r]) grew = true;
+          if (g_phase != 1 || pend > g_frontier[r]) g_frontier[r] = pend;
           off += pend;
           forkable += pend;
         }
@@ -2136,19 +2139,17 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       }
       g_off[G.nrules] = off;
       g_woff[G.nrules] = total;
-      // reference's rule (adopted): a grow sweep grew when it pushed anything (some task
-      // forked); growth stops when a sweep forks nothing or the frontier
-      // is as wide as the lanes
+      // Per-rule high-water marks distinguish new subproblems from task
+      // replacement or oscillation. WORK starts a fresh growth episode.
       u64 pushed = 0;
       for (u32 r = 0; r < G.nrules; r++) pushed += g_snap[r];
-      u64 f = pushed - g_prev; // the frontier: tasks pushed by the last phase
-      if (g_phase == 1) g_grew = f > 0;
+      u64 f = pushed - g_prev; // diagnostic: tasks pushed by the last phase
       g_prev = pushed;
       if (total > g_rounds[3]) g_rounds[3] = total;
       if (g_rounds[0] >= max_rounds) g_abort(AB_ROUNDS);
       if (*(volatile u32 *)G.abortf != 0 || total == 0)
         g_phase = 0;
-      else if (forkable > 0 && f < grow_width && g_grew)
+      else if (forkable > 0 && total < grow_width && grew)
         g_phase = 1;
       else
         g_phase = 2;
@@ -2190,7 +2191,6 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
       grid.sync();
       if (gid == 0) {
         for (u32 r = 0; r < G.nrules; r++) G.bdone[r] = g_snap[r];
-        g_grew = 1;
         g_rounds[2]++;
         g_rounds[5] += clock64() - c0;
         u64 i = g_rounds[0] - 1;

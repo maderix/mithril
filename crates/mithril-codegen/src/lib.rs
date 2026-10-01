@@ -207,10 +207,8 @@ pub struct LirProgram {
 pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     // Constant folding, inlining, branch selection and static evaluation
     // happened in the net (specialize); what remains here are the shapes
-    // codegen itself owns: mutual tail recursion into loops, and
-    // if-conversion of loop back-edges.
-    let m_s = rewrite::tail_inline(m);
-    let m_u = rewrite::if_convert(&m_s);
+    // codegen itself owns: mutual tail recursion into loops.
+    let m_u = rewrite::tail_inline(m);
     let m = &m_u;
     let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
     // Const path: the whole program reduced to its value at compile time.
