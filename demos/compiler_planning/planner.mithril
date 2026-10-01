@@ -1,0 +1,149 @@
+# Fusion, vectorization, storage and placement decisions share one input net.
+
+
+def popcount(bits):
+    count = 0
+    while bits > 0:
+        count = count + (bits & 1)
+        bits = bits >> 1
+    return count
+
+
+def reference_bit(ref, n):
+    if ref < 0:
+        return 1 << (n - ref - 1)
+    return 1 << ref
+
+
+@data
+class Leaves:
+    NoLeaves: ()
+    Leaf: (index, summary, later_reads, rest)
+
+
+def join_summary(left, right):
+    return (left[0] | right[0], left[1] | right[1], left[2] + right[2], left[3] & right[3])
+
+
+@data
+class Nodes:
+    NoNodes: ()
+    Node: (opcode, left, right, rest)
+
+
+def pure_leaves(nodes, n, index):
+    match nodes:
+        case NoNodes():
+            return (NoLeaves(), 0)
+        case Node(opcode, left, right, rest):
+            tail = pure_leaves(rest, n, index + 1)
+            operands = reference_bit(left, n) | reference_bit(right, n)
+            summary = (1 << index, operands, 8 if opcode == 3 else 1, 0 if opcode == 3 else 1)
+            return (Leaf(index, summary, tail[1], tail[0]), operands | tail[1])
+
+
+# Compiler decisions are computed inside the net; costs are explicit model inputs.
+
+@data
+class Boundaries:
+    NoBoundaries: ()
+    Boundary: (start, end, facts, rest)
+
+
+def joint_facts(summary, later, outputs):
+    return (summary[0], summary[1] & (65535 ^ summary[0]), summary[0] & (later | outputs), summary[2], summary[3])
+
+
+def extend_boundaries(leaves, start, summary, outputs, rest):
+    match leaves:
+        case NoLeaves():
+            return rest
+        case Leaf(index, leaf, later, tail):
+            merged = join_summary(summary, leaf)
+            following = extend_boundaries(tail, start, merged, outputs, rest)
+            return Boundary(start, index + 1, joint_facts(merged, later, outputs), following)
+
+
+def boundaries(leaves, outputs):
+    match leaves:
+        case NoLeaves():
+            return NoBoundaries()
+        case Leaf(index, summary, later, tail):
+            rest = boundaries(tail, outputs)
+            following = extend_boundaries(tail, index, summary, outputs, rest)
+            return Boundary(index, index + 1, joint_facts(summary, later, outputs), following)
+
+
+def find_boundary(table, start, end):
+    match table:
+        case NoBoundaries():
+            return (0, 0, 0, 0, 0)
+        case Boundary(a, b, facts, rest):
+            if a == start and b == end:
+                return facts
+            return find_boundary(rest, start, end)
+
+
+def joint_evaluate(table, n, outputs, mask, placement, tile, config):
+    start = 0
+    score = 0
+    transfers = 0
+    materialized = 0
+    valid = 1
+    full = config[0] // tile
+    tail = config[0] % tile
+    blocks = full + (1 if tail > 0 else 0)
+    for i in range(n):
+        if i == n - 1 or (mask & (1 << i)) != 0:
+            f = find_boundary(table, start, i + 1)
+            assigned = f[0] & placement
+            accelerated = assigned != 0
+            if assigned != 0 and assigned != f[0]:
+                valid = 0
+            loads = popcount(f[1])
+            stores = popcount(f[2])
+            if accelerated:
+                width = 16
+                local_bytes = (loads + i + 1 - start) * tile * 4
+                if f[4] == 0 or local_bytes > config[2]:
+                    valid = 0
+                cross = popcount(f[1] & (65535 ^ placement)) + popcount(f[2] & outputs)
+                overhead = 8
+            else:
+                width = 4 if f[4] == 1 else 1
+                cross = popcount(f[1] & placement)
+                overhead = 4
+            iterations = full * (tile // width) + tail // width + tail % width
+            score = score + iterations * (f[3] + loads + stores) + blocks * (overhead + cross * config[3])
+            transfers = transfers + cross
+            materialized = materialized | (f[2] & (65535 ^ outputs))
+            start = i + 1
+    scratch = popcount(materialized) * tile * 4
+    if scratch > config[1]:
+        valid = 0
+    return (score, scratch, transfers, valid)
+
+
+def joint_better(candidate, best):
+    if candidate[0] != best[0]:
+        return candidate[0] < best[0]
+    if candidate[1] != best[1]:
+        return candidate[1] < best[1]
+    if candidate[2] != best[2]:
+        return candidate[2] < best[2]
+    if candidate[3] != best[3]:
+        return candidate[3] < best[3]
+    if candidate[4] != best[4]:
+        return candidate[4] < best[4]
+    return candidate[5] < best[5]
+
+
+def joint_tile(table, n, outputs, tile, config, best):
+    for mask in range(1 << (n - 1)):
+        for placement in range(1 << n):
+            result = joint_evaluate(table, n, outputs, mask, placement, tile, config)
+            if result[3] == 1:
+                candidate = (result[0], result[1], result[2], mask, placement, tile)
+                if joint_better(candidate, best) == True:
+                    best = candidate
+    return best

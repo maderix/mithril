@@ -10,3 +10,7 @@ mithril-front = { path = "../mithril-front" }
 
 [dev-dependencies]
 mithril-reassoc = { path = "../mithril-reassoc" }
+
+[[example]]
+name = "compiler_planning"
+path = "../../demos/compiler_planning/runtime.rs"

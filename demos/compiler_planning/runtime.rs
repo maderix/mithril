@@ -168,7 +168,7 @@ fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
         (2..=4).contains(&args.len()),
-        "usage: schedule_probe SOURCE [RANDOM_SEEDS] [--demo]"
+        "usage: compiler_planning SOURCE [RANDOM_SEEDS] [--demo]"
     );
     let seeds: u64 = args
         .get(2)

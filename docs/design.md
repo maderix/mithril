@@ -1537,83 +1537,24 @@ audited what came from reference. Findings:
 Rule: reference is a measured baseline. Its runtime source is not read to
 design Mithril's.
 
-## 15. Compiler-decision experiment
+## 15. Compiler planning demo
 
-`experiments/vectorize/` uses Mithril as a compiler planner for a restricted
-pointwise u32 SSA language. It explores contiguous fusion partitions, SIMD
-widths and tile sizes under temporary-storage and abstract SIMD register-byte
-budgets. Python handles I/O and a common x86 emitter; no language/runtime rule
-or production backend changes are needed.
+`demos/compiler_planning/` is one standalone demo of coupled fusion, SIMD,
+tiling, scratch storage and CPU/accelerator placement. Immutable SSA input
+becomes shared boundary summaries; an explicit synthetic cost and SRAM contract
+selects the plan. Division is CPU-only. Python supplies I/O and an independent
+set-based exhaustive reference; all decisions also execute inside the net.
 
-A region closure contains query-independent legality/liveness analysis. The
-existing net specialization moves that analysis before closure construction in
-generated Rust. In the six-operation, five-configuration experiment, observed
-analyzer entries are 105 for 1,120 requests, equal to explicit conventional
-memoization (uncached: 1,120). All planners select the same plans and generated
-x86 results agree with scalar semantics. This establishes automatic staging of
-compiler analysis, not superior search, runtime DUP sharing of unfinished work,
-or a wall-time improvement. The experiment README specifies the restricted
-candidate space, synthetic objective, checks and reproduction commands.
+The viewer shows four resource scenarios, reduction traces and saved-net
+continuations. It replays actual captures from the shared rule table. LIFO,
+FIFO, random and alternating orders must match Core evaluation and the reference.
+Saved states contain the arena and pending work; each continuation starts from
+an actual copied state, without replaying the prefix. These are sequential net
+runs, with modeled accelerator decisions. Arena counts exclude vector capacity,
+queue and process overhead; no device kernel or speedup is claimed.
 
-The opcode-edit extension retains unaffected region closures across five graph
-versions. Observed Mithril analyzer entries are 65, equal to conventional
-dependency invalidation (rebuilding the region cache: 105). A conventional
-history cache needs 49 evaluations while retaining more facts. The update policy
-is explicit in both implementations; the result establishes incremental reuse,
-not an IN-specific advantage. All edited plans pass Core and x86 checks.
-
-Composable boundary summaries now union member/operand sets, add operation
-weights and intersect SIMD eligibility. Suffix uses determine exports without
-rescanning dependency edges. Scratch-monotone prefix search rejects impossible
-completions. For six operations, a zero-scratch query needs 12 region queries
-instead of 224 in exhaustive search, selecting the same optimum. Generated
-Mithril constructs 21 boundary facts once across three resource cases (GDB).
-The matched conventional worklist has the same reuse and pruning; its measured
-operand reads are 12 versus 252 for cached region scans. These are partial work
-counts, not speed or IN-specific superiority. The slice requires a nonbinding
-conservative register bound; exact liveness remains the independent reference.
-
-A direct shared-rule-table probe varies only reduction order on a pure-input
-version of the same planner. LIFO, FIFO and eight seeded random orders all
-return identical plans and search counters for three resource configurations.
-LIFO peaks at 712,463 occupied arena cells; FIFO at 674,844 (5.3% fewer), with a
-larger pending worklist. Arena capacity and process RSS are not measured. This
-demonstrates sampled sequential scheduling freedom with a space tradeoff in
-net evaluation, not generated CPU/GPU performance or a proof for all orders.
-The existing pure-core Lean proof builds; extended-rule proof gaps remain as
-listed in section 8. Reproduction: `experiments/vectorize/schedule.py`.
-
-The executable joint-planning demo adds CPU/accelerator placement to fusion,
-SIMD, tiling and storage. Accelerator legality and SRAM, host scratch and
-transfer costs jointly change the selected plan. An independent Python solver
-uses direct SSA/set analysis and exhaustive enumeration. The net computes its
-own boundary summaries and decisions under the same explicit synthetic model;
-no accelerator hardware is invoked. The README specifies every cost and limit.
-
-Four cases on add/multiply/xor/division at 1,023 elements select: accelerator
-prefix plus CPU division (tile64, scratch256, cost12009); zero-scratch fused
-scalar CPU (tile64, cost14386); SRAM320 accelerator prefix (tile16, scratch64,
-cost12873); expensive transfers CPU-vector prefix plus division (tile64,
-scratch256, cost12929). This is optimality within the specified candidate/model
-space, not hardware optimality.
-
-`schedule_probe --demo` adds alternating reduction order and actual saved-state
-forks. After17/4096 pops under each LIFO/FIFO prefix, three deep copies of the
-net/worklist finish under LIFO/FIFO/random, retaining the completed work. Parent
-fingerprints must remain unchanged. Every final value must equal Core and the
-independent exhaustive solver. The viewer replays captured reductions and pins
-source, binary, checker and presenter hashes. This establishes executable
-scheduling and continuation freedom on the sample without a new rule or
-production scheduler. Reproduction: `experiments/vectorize/demo.py`.
-Final18-run receipts: LIFO327,562 peak cells; FIFO69,329 (78.8% fewer);
-random68,294–68,655; alternating67,688; final52 cells in every execution.
-All41 experiment tests, six probe tests, four frontend regressions, workspace
-tests and fast CI pass. Generated runtime-bound loops return literal expected
-results at1/4/16threads. Captured artifacts: `target/vectorize/demo-proof/`.
-
-The independent checker found a generic frontend bug in `compile_for`: its
-continuation captured variable indices that changed after a lifted join.
-Immutable hidden iterator/bound names now survive those joins; resolving them
-in the current scope also preserves iteration when source code reassigns the
-visible loop variable. Lowering regression tests check hand-computed results,
-nested loops, if/match joins and one-time range-bound evaluation.
+Run `python3 demos/compiler_planning/demo.py --out target/compiler-planning/demo`.
+Open the generated `demo.html`. Today’s broader proof experiments and receipts
+are archived locally in `target/archives/compiler-proofs-2026-10-01.tar.gz` and
+Git branch `archive/compiler-proofs-2026-10-01` (snapshot `de22f34`). The generic
+loop-join correction and its frontend regressions remain part of the compiler.

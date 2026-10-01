@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mithril · Same plan, different reductions</title>
+<style>
+:root { color-scheme:light; --bg:#edf2f6; --paper:#fff; --ink:#163047; --muted:#52677a; --line:#cbd7e1; --blue:#245e9b; --orange:#aa612c; --green:#247458; --accent:#e4eef8; }
+body.dark { color-scheme:dark; --bg:#101c27; --paper:#192938; --ink:#e3edf5; --muted:#a9bccb; --line:#3c5163; --blue:#89b9ee; --orange:#f0ae77; --green:#89d2b1; --accent:#243e56; }
+* { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 system-ui,sans-serif; }
+[hidden] { display:none !important; } .diagram { overflow-x:auto; } #graph { min-width:780px; } #chart { min-width:680px; }
+main { max-width:1240px; padding:36px 32px 64px; margin:auto; } h1 { font:normal clamp(32px,5vw,52px)/1.12 Georgia,serif; margin:12px 0 18px; letter-spacing:-1px; }
+h2 { font-size:20px; margin:0 0 8px; } p { margin:8px 0 16px; } .eyebrow { text-transform:uppercase; letter-spacing:2px; font-size:11px; color:var(--muted); }
+.top,.row { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; } .intro { max-width:800px; color:var(--muted); font-size:17px; }
+button,select { font:inherit; padding:8px 12px; border:1px solid var(--line); border-radius:5px; background:var(--paper); color:var(--ink); cursor:pointer; }
+button:hover { border-color:var(--blue); } button[aria-pressed="true"] { background:var(--blue); border-color:var(--blue); color:var(--paper); } body.dark button[aria-pressed="true"] { color:var(--bg); }
+:focus-visible { outline:3px solid var(--orange); outline-offset:3px; } .scenarios { display:flex; gap:8px; flex-wrap:wrap; margin:22px 0 12px; }
+.panel { padding:24px; border:1px solid var(--line); background:var(--paper); margin:16px 0; } .contract,.small { color:var(--muted); font-size:13px; } .contract { min-height:24px; }
+.metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; border-top:1px solid var(--line); padding-top:16px; margin-top:12px; }
+.metric strong { display:block; font-size:24px; font-weight:550; } .metric span { color:var(--muted); font-size:12px; }
+svg { display:block; width:100%; height:auto; overflow:visible; } svg text { fill:var(--ink); font:13px system-ui,sans-serif; } svg .muted { fill:var(--muted); }
+.legend { display:flex; gap:18px; flex-wrap:wrap; margin:14px 0 10px; font-size:13px; } .legend i { display:inline-block; width:20px; height:3px; vertical-align:middle; margin-right:6px; }
+.controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top:14px; } .controls label { display:flex; align-items:center; gap:8px; } input[type="range"] { flex:1; min-width:120px; accent-color:var(--blue); }
+.badge { color:var(--green); font-weight:600; } .status { border-left:3px solid var(--green); padding:2px 16px; margin:16px 0; }
+.tablewrap { overflow:auto; } table { width:100%; border-collapse:collapse; font-size:13px; white-space:nowrap; } th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); } th { color:var(--muted); font-weight:500; }
+code { font:12px/1.6 ui-monospace,monospace; overflow-wrap:anywhere; } .command { display:block; padding:12px; background:var(--bg); white-space:pre-wrap; } a { color:var(--blue); } .footer { max-width:900px; }
+@media(max-width:650px) { main { padding:24px 14px; } .panel { padding:16px; } .metrics { grid-template-columns:repeat(2,1fr); } h1 { letter-spacing:-.5px; } .controls select { max-width:260px; } }
+</style>
+<main>
+  <div class="top"><span class="eyebrow">Mithril / compiler planning demo</span><button id="theme" aria-label="Toggle dark theme">Dark theme</button></div>
+  <h1>Same plan.<br>Different reductions.</h1>
+  <p class="intro">Fusion, SIMD width, tile storage and placement are solved together inside an interaction net. Change the reduction order—or resume a saved, unfinished net—and the compiler still selects the same plan.</p>
+  <div class="status"><span class="badge" id="verdict"></span><br><span class="small">Every result is checked against an independent exhaustive Python solver and the Core interpreter.</span></div>
+  <div class="scenarios" id="scenarios" aria-label="Compiler constraints"></div>
+  <div class="contract" id="contract"></div>
+  <section class="panel" aria-labelledby="plan-title">
+    <div class="row"><h2 id="plan-title">The selected plan</h2><span class="small">Final result · identical in every recorded run</span></div>
+    <div class="diagram"><svg id="graph" viewBox="0 0 1000 215" role="img" aria-label="Operations grouped into fused CPU and accelerator regions"></svg></div>
+    <div class="metrics" id="metrics"></div>
+    <p class="small" id="explanation"></p>
+  </section>
+  <section class="panel" aria-labelledby="trace-title">
+    <div class="row"><h2 id="trace-title">How the net gets there</h2><span class="small">Replay of captured reductions · no browser simulation</span></div>
+    <div class="controls">
+      <label>Execution <select id="mode"><option value="full">Full runs</option><option value="resume">Resume saved net</option></select></label>
+      <label id="checkpoint-label" hidden>Checkpoint <select id="checkpoint"></select></label>
+      <label>Plot <select id="measure"><option value="2">Occupied arena cells</option><option value="3">Pending worklist pairs</option></select></label>
+    </div>
+    <p class="small" id="checkpoint-note"></p>
+    <div class="legend" id="legend"></div>
+    <p class="small" id="space-witness"></p>
+    <div class="diagram"><svg id="chart" viewBox="0 0 1000 300" role="img" aria-label="Recorded net allocation histories under different reduction orders"></svg></div>
+    <div class="controls"><button id="play">Replay</button><input id="scrub" type="range" min="0" max="1000" value="1000" aria-label="Replay progress"><span id="progress" class="small"></span></div>
+    <p class="small">Lines connect recorded samples every 4,096 worklist pops, plus pause and completion points. Peak counts below include allocations between samples.</p>
+    <div class="tablewrap"><table><thead><tr><th>Continuation order</th><th>Worklist pops</th><th>Rule rewrites</th><th>Peak arena cells</th><th>Peak pending pairs</th><th>Final cells</th><th>Plan</th></tr></thead><tbody id="runs"></tbody></table></div>
+  </section>
+  <section class="footer">
+    <h2>What this executes</h2>
+    <p>The Rust probe builds one input net and invokes Mithril’s existing rule table. Full runs change only which ready pair fires next. For resumed runs it clones an actual partially reduced net, including its worklist, then finishes each copy under another order. The saved parent is checked for mutation.</p>
+    <p class="small">The CPU/accelerator costs and memory limits are an explicit synthetic contract. This demo executes compiler decisions; it does not execute an accelerator kernel. Arena cell counts exclude vector capacity, queue storage and process overhead. The graph trace is shared across the displayed scenarios because each execution solves all scenarios together.</p>
+    <code class="command">python3 demos/compiler_planning/demo.py --out target/compiler-planning/my-demo --seeds 3</code>
+    <p><a href="demo-report.json" download>Download complete receipts</a> <span class="small">· JSON results, source hashes, probe hash and reduction traces</span></p>
+    <p class="small" id="hash"></p>
+  </section>
+</main>
+<script>
+const proof = __PROOF_DATA__;
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString('en-US');
+const colors = ['var(--blue)','var(--orange)','var(--green)','#9b78bf','#cc738b','#668799'];
+let selectedCase = 0, frame = 1000, timer = null;
+const full = proof.runs.filter(r => !r.checkpoint);
+const lifo = full.find(r=>r.policy==='lifo'), fifo = full.find(r=>r.policy==='fifo');
+$('space-witness').textContent = `Same answers, different storage: full LIFO peaks at ${fmt(lifo.peak_cells)} arena cells; full FIFO at ${fmt(fifo.peak_cells)} (${(100*(1-fifo.peak_cells/lifo.peak_cells)).toFixed(1)}% fewer). This is schedule freedom applied to the compiler's own execution.`;
+const groups = [...new Set(proof.runs.filter(r => r.checkpoint).map(r => `${r.prefix_policy}:${r.checkpoint}`))];
+$('verdict').textContent = `${proof.runs.length} executions agree · ${proof.cases.length} coupled compiler cases · ${groups.length} saved states`;
+proof.cases.forEach((c,i) => {
+  const button = document.createElement('button'); button.textContent = c.label || `Case ${i+1}`;
+  button.addEventListener('click', () => { selectedCase = i; drawPlan(); }); $('scenarios').append(button);
+});
+groups.forEach(key => { const option = document.createElement('option'); option.value = key; option.textContent = `${key.split(':')[0].toUpperCase()} prefix · ${fmt(key.split(':')[1])} pops`; $('checkpoint').append(option); });
+function element(tag, attrs, text) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg',tag);
+  Object.entries(attrs).forEach(([k,v]) => e.setAttribute(k,v)); if(text !== undefined) e.textContent=text; return e;
+}
+function drawPlan() {
+  const c = Object.assign({length:255,scratch:4096,sram:2048,transfer_price:2},proof.cases[selectedCase]);
+  const p = proof.plans[selectedCase], tile = p.key[5], graph = $('graph'); graph.replaceChildren();
+  [...$('scenarios').children].forEach((b,i) => b.setAttribute('aria-pressed',String(i === selectedCase)));
+  $('contract').textContent = `${fmt(c.length)} elements · scratch budget ${fmt(c.scratch)} B · accelerator SRAM ${fmt(c.sram)} B · transfer price ${fmt(c.transfer_price)} units per buffer per tile`;
+  const n = proof.graph.nodes.length, step = 920/n, x = i => 40+step*(i+.5);
+  p.regions.forEach(r => {
+    const color = r.device === 'cpu' ? 'var(--blue)' : 'var(--orange)';
+    graph.append(element('rect',{x:40+r.start*step,y:32,width:(r.end-r.start)*step-6,height:162,rx:5,fill:color,opacity:.09}));
+    graph.append(element('text',{x:46+r.start*step,y:20,fill:color},`${r.device.toUpperCase()} · width ${r.width} · fused ${r.end-r.start}`));
+  });
+  proof.graph.nodes.forEach((node,i) => {
+    const deps = [...new Set(node.slice(1).filter(v => v >= 0))];
+    deps.forEach(d => { const height = 42+Math.abs(i-d)*10; graph.append(element('path',{d:`M ${x(d)} 98 Q ${(x(d)+x(i))/2} ${height} ${x(i)} 98`,fill:'none',stroke:'var(--muted)','stroke-width':1.4})); });
+    graph.append(element('rect',{x:x(i)-47,y:98,width:94,height:44,rx:4,fill:'var(--paper)',stroke:'var(--line)'}));
+    graph.append(element('text',{x:x(i),y:125,'text-anchor':'middle'},`${i}: ${node[0]}`));
+    const operands = node.slice(1).map(v => v < 0 ? `input ${-v-1}` : `v${v}`).join(', ');
+    graph.append(element('text',{x:x(i),y:166,'text-anchor':'middle',class:'muted'},operands));
+    if(proof.graph.outputs.includes(i)) graph.append(element('text',{x:x(i),y:186,'text-anchor':'middle',class:'muted'},'→ CPU output'));
+  });
+  $('metrics').replaceChildren();
+  [[p.key[0],'Model cost units'],[`${tile} elements`,'Tile size'],[`${p.key[1]} B`,'Scratch required'],[p.key[2],'Transfer buffers per tile']].forEach(([v,label]) => {
+    const div=document.createElement('div'); div.className='metric'; const strong=document.createElement('strong'); strong.textContent=typeof v==='number'?fmt(v):v;
+    const span=document.createElement('span'); span.textContent=label; div.append(strong,span); $('metrics').append(div);
+  });
+  $('explanation').textContent = `Winning key: [${p.key.join(', ')}] = cost, scratch, transfers, fusion cuts, placement bits, tile. Accelerator SRAM required: ${Math.max(...p.regions.map(r=>r.sram))} B. Division is CPU-only in this contract.`;
+}
+function activeRuns() { return $('mode').value==='full' ? full : proof.runs.filter(r => `${r.prefix_policy}:${r.checkpoint}`===$('checkpoint').value); }
+function redraw() {
+  const runs=activeRuns(), metric=Number($('measure').value), chart=$('chart'); chart.replaceChildren();
+  const xmax=Math.max(...runs.map(r=>r.pops)), ymax=Math.max(1,...runs.map(r => metric===2?r.peak_cells:r.peak_pending));
+  const x=v=>70+890*v/xmax, y=v=>248-214*v/ymax, until=xmax*frame/1000;
+  for(let i=0;i<=4;i++) {
+    const value=ymax*i/4; chart.append(element('line',{x1:70,y1:y(value),x2:960,y2:y(value),stroke:'var(--line)'}));
+    chart.append(element('text',{x:60,y:y(value)+4,'text-anchor':'end',class:'muted'},fmt(Math.round(value))));
+    chart.append(element('text',{x:x(xmax*i/4),y:273,'text-anchor':'middle',class:'muted'},fmt(Math.round(xmax*i/4))));
+  }
+  chart.append(element('text',{x:515,y:296,'text-anchor':'middle',class:'muted'},'Worklist pops'));
+  const resumed=$('mode').value==='resume'; $('checkpoint-label').hidden=!resumed;
+  $('checkpoint-note').textContent = resumed ? `Saved state ${runs[0].checkpoint_hash} · ${fmt(runs[0].checkpoint)} pops already executed with ${runs[0].prefix_policy.toUpperCase()}. All three continuations start from this same net; none reruns the prefix.` : 'All orders start from the same input net. Each complete run solves every scenario above.';
+  if(resumed) chart.append(element('line',{x1:x(runs[0].checkpoint),x2:x(runs[0].checkpoint),y1:32,y2:248,stroke:'var(--muted)','stroke-dasharray':'4 4'}));
+  $('legend').replaceChildren(); $('runs').replaceChildren();
+  runs.forEach((r,i) => {
+    const color=colors[i%colors.length], name=r.policy.toUpperCase()+(r.policy==='random'?` ${r.seed}`:'');
+    const points=r.trace.filter(t=>t[0]<=until).map(t=>`${x(t[0])},${y(t[metric])}`).join(' ');
+    chart.append(element('polyline',{points,fill:'none',stroke:color,'stroke-width':2.2,'stroke-linejoin':'round'}));
+    const label=document.createElement('span'), swatch=document.createElement('i'); swatch.style.background=color; label.append(swatch,document.createTextNode(name)); $('legend').append(label);
+    const row=document.createElement('tr'); [name,fmt(r.pops),fmt(r.rewrites),fmt(r.peak_cells),fmt(r.peak_pending),fmt(r.final_cells),'Matches'].forEach((v,j)=> { const cell=document.createElement('td');cell.textContent=v;if(j===6)cell.className='badge';row.append(cell); }); $('runs').append(row);
+  });
+  chart.append(element('line',{x1:x(until),x2:x(until),y1:32,y2:248,stroke:'var(--muted)','stroke-dasharray':'2 3'}));
+  $('progress').textContent=`${Math.round(frame/10)}% · ${fmt(Math.round(until))} pops`;
+}
+function stop() { clearInterval(timer); timer=null; $('play').textContent='Replay'; }
+$('play').addEventListener('click',()=> {
+  if(timer) {stop();return;} if(frame===1000)frame=0; $('play').textContent='Pause';
+  timer=setInterval(()=> {frame=Math.min(1000,frame+8); $('scrub').value=frame;redraw();if(frame===1000)stop();},70);
+});
+$('scrub').addEventListener('input',()=> {stop();frame=Number($('scrub').value);redraw();});
+['mode','checkpoint','measure'].forEach(id=>$(id).addEventListener('change',redraw));
+$('theme').addEventListener('click',()=> {document.body.classList.toggle('dark');$('theme').textContent=document.body.classList.contains('dark')?'Light theme':'Dark theme';});
+if(window.matchMedia('(prefers-color-scheme: dark)').matches) {document.body.classList.add('dark');$('theme').textContent='Light theme';}
+$('hash').textContent=`Input SHA-256 ${proof.source_sha256} · Probe SHA-256 ${proof.probe_sha256}`;
+drawPlan();redraw();
+</script>
+</html>
