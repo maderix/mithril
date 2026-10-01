@@ -740,6 +740,26 @@ the measured budget per iteration (`FOLD_EST_<f>`, taken when a chunk's
 dive runs out of budget; 1 until then). A join rule combines the two
 partial results in order.
 
+### 5.6.1 Independent loop iterations
+
+A `for` loop that ends in `s = E(s, ..)`, whose other work never reads or
+writes `s` and calls a user function, is split by `mithril-reassoc`
+(`split.rs`). The work runs as a balanced tree of independent calls; each
+leaf is a generated constructor holding that iteration's values. The tree
+is then walked left to right, applying `E` in iteration order, so the
+result is the sequential one. A loop is not split when its function is
+already reached from parallel work: a split loop's work, a proven fold's
+body, or a function that calls itself twice on one path.
+
+The apply walk is native code: the scalar lowering accepts constructor
+values and a `match` on them in tail position (tag dispatch). A value the
+dive side lends is read in place (`PTy::H`); an owned one has exactly one
+use and is consumed cell by cell as the dive form does (`PTy::O`). Measured on the plain-loop demos:
+path tracer CPU 1.61 s at 1 thread, 0.168 s at 16; GPU 0.27 s (the
+hand-split tree form: 0.20 s). Whitted GPU 0.51 s against 0.19 s for the
+tree form: the in-order apply is one serial chain on one GPU thread
+(about 1.2 us per pixel).
+
 ### 5.7 Core rewrites owned by codegen
 
 Two Core-to-Core rewrites run in codegen, not in the rules:

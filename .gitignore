@@ -17,6 +17,7 @@ obligations.lean
 /.claude/
 /.devlog/
 /.superpowers/
+/docs/superpowers/
 /dev_log.md
 .vscode/
 .idea/

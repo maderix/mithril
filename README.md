@@ -21,27 +21,52 @@ def path(o, d, depth, h, seen):
     more = path(add(p, scale(n, eps())), bounce(n, hash(h + 4)), depth - 1, hash(h + 5), 0)
     return mul(albedo(m), add((direct, direct, direct), more))
 
-# split the image into halves, then halves again: each half is independent work
-def rows(y0, n):
-    if n == 1:
-        return cols(y0, 0, size())
-    h = n // 2
-    return (rows(y0, h), rows(y0 + h, n - h))
+def main():
+    n = size()
+    img = array_new(n * n, 0)
+    for y in range(n):
+        for x in range(n):
+            img = array_set(img, y * n + x, pixel(x, y))
+    return (n, n, img)
 ```
 
 ```
-mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 1.62 s
+mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 1.60 s
 mithril run --image cornell.ppm demos/cornell_path.py                # 0.17 s, 16 threads
-mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.20 s, RTX 4090
+mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.27 s, RTX 4090
 ```
 
 All three write the same image, bit for bit (times are run time, excluding
 compilation).
 
-How it works: a Mithril program means a set of interaction-net rewrite rules,
-and those rules give the same result in any order, so the runtime is free to
-run them in parallel. The same rules run at compile time on everything that
-does not depend on input. `docs/design.md` has the details.
+## How it works
+
+A Mithril program means a set of interaction-net rewrite rules. A rule only
+ever touches two nodes, and two rules never touch the same node, so the rules
+give the same result in any order: the runtime is free to run them in
+parallel, and the compiler is free to run them early.
+
+```
+source (Python subset)  ->  Core  ->  net + rules  ->  residual  ->  LIR  ->  CPU: Rust + mithril-rt
+mithril-front            oracle    compile-time     what input           GPU: CUDA + engine.cu
+                                   reduction        still needs
+```
+
+- **The optimizer is the rules.** At compile time every rule that does not
+  wait on input fires: constant folding, inlining, branch selection and dead
+  code removal are rule firings, not separate passes (`mithril-net`).
+- **What remains becomes native code.** Each function is emitted as plain
+  native code where it can be, plus forms that can pause and split work
+  across workers (`mithril-codegen`).
+- **Parallel work comes from the program's shape.** Independent calls,
+  proven folds and loops whose iterations are independent run as trees of
+  tasks; the result is the sequential one.
+- **One runtime model on both devices.** Tasks are pending rule firings,
+  records wait for their inputs, dives run native code on a budget
+  (`mithril-rt` on the CPU, `engine.cu` on the GPU).
+
+`docs/guide.html` walks through this with pictures; `docs/design.md` is the
+full design.
 
 ## Build
 
@@ -133,8 +158,8 @@ teardown (about 0.1 s). Every run prints the same checksum.
 | program | C twin (gcc -O2, 1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
 |---|---:|---:|---:|---:|
 | bfs | 4.48 s | 4.87 s | 0.44 s | 0.43 s |
-| cornell_path | - | 1.62 s | 0.17 s | 0.20 s |
-| cornell_whitted | - | 0.25 s | 0.08 s | 0.19 s |
+| cornell_path | - | 1.60 s | 0.17 s | 0.27 s |
+| cornell_whitted | - | 0.22 s | 0.05 s | 0.52 s |
 | editdist | 2.17 s | 2.26 s | 0.25 s | 0.35 s |
 | gameoflife | 28.32 s | 8.59 s | 1.09 s | 0.13 s |
 | hashmap | 0.77 s | 1.87 s | 0.23 s | 0.65 s |
@@ -154,6 +179,11 @@ teardown (about 0.1 s). Every run prints the same checksum.
 
 `bench/results.md` has the CPU table with C ratios, and `docs/design.md`
 section 10 the comparison with reference.
+
+## Limitations
+
+Generated CPU code is mostly scalar: it targets baseline x86-64 (no AVX or
+FMA), and independent calls such as pixels are not vectorized together.
 
 ## Repository layout
 
