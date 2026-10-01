@@ -510,7 +510,10 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     assert!(leaf.contains(&format!(") = s_{b}(fuel")) || leaf.contains(&format!(") = s_{b}(ctx, fuel")), "leaf does not call bins natively");
     assert!(!leaf.contains("field(ctx"), "leaf reads its tuple from the heap");
     // a branch choosing between boxed subtrees is not if-converted
-    assert_eq!(dive_form(&cm, &rs, "pick").matches("continue 'l").count(), 2, "pick's subtree choice became a select");
+    let pid = cm.fns.iter().position(|f| f.name == "pick").unwrap();
+    let pick = &rs[rs.find(&format!("fn s_{pid}(")).expect("pick is native")..];
+    let pick = &pick[..pick[1..].find("\nfn ").map_or(pick.len(), |e| e + 1)];
+    assert_eq!(pick.matches("continue 'l").count(), 2, "pick's subtree choice became a select");
 }
 
 #[test]
@@ -1026,4 +1029,38 @@ fn if_arms_join_instead_of_copying_the_tail() {
         assert!(size < most, "{name}: Core of {size} nodes");
         golden(name, 0, &["1", "4", "16"]);
     }
+}
+
+/// Arrays lent to a call in tail position are freed after it returns (#30).
+#[test]
+fn arrays_lent_to_a_tail_call_outlive_it() {
+    for name in ["lent_tail_call.py", "lent_tail_read.py"] {
+        golden(name, 0, &["1", "4", "16"]);
+    }
+}
+
+fn split_loops(name: &str) -> usize {
+    let mut m = mithril_front::parse(&fixture(name)).unwrap();
+    mithril_reassoc::analyze(&mut m);
+    m.fns.iter().filter(|f| f.name.starts_with("__gen")).count()
+}
+
+/// Independent loop iterations run as a tree; the update applies in order (#29).
+#[test]
+fn independent_loop_iterations_split_and_keep_sequential_results() {
+    assert_eq!(split_loops("loop_split_shapes.py"), 5);
+    assert_eq!(split_loops("loop_split_kept.py"), 0);
+    assert_eq!(split_loops("loop_image.py"), 2);
+    for name in ["loop_split_shapes.py", "loop_split_kept.py", "loop_image.py"] {
+        golden(name, 0, &["1", "4", "16"]);
+    }
+}
+
+/// A match on constructor values in native code (consumed and lent) equals the oracle.
+#[test]
+fn constructor_matches_in_native_code_match_oracle() {
+    let (cm, rs) = pipeline(&fixture("native_match.py"), 0);
+    let total = cm.fns.iter().position(|f| f.name == "total").unwrap();
+    assert!(rs.contains(&format!("fn s_{total}(")), "total has no native form");
+    golden("native_match.py", 0, &["1", "4", "16"]);
 }

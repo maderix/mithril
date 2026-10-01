@@ -28,7 +28,7 @@
 
 use crate::lir::{do_, as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
-use mithril_front::core::{Core, CoreModule, Prim};
+use mithril_front::core::{Core, CoreModule, Prim, UNREACHABLE_CTOR};
 use crate::ty::Shape;
 use std::collections::HashMap;
 
@@ -42,13 +42,17 @@ pub(crate) enum Kind {
 /// Scalar parameter type: a bare i64, a k-tuple of i64s passed as k
 /// native components (read only through constant `Proj`), or an int array
 /// (its port bits in an i64) the function owns (`A`: consumed, or freed at
-/// the end of each path) or borrows (`B`: only read; the caller keeps it).
+/// the end of each path) or borrows (`B`: only read; the caller keeps it),
+/// or a constructor value it only matches on (`H`: borrowed, like `B`) or
+/// consumes (`O`: its one use matches it, freeing the cells, or moves it on).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum PTy {
     I,
     T(usize),
     A,
     B,
+    H,
+    O,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -140,9 +144,18 @@ struct Chk<'m> {
     demote: Vec<u32>,
     /// borrowed alias -> the parameter it names
     root: HashMap<u32, u32>,
+    /// constructor handles (owned: true): params and the fields a match binds
+    hvars: HashMap<u32, bool>,
+    /// occurrences of each variable in the body (an owned handle has one)
+    uses: crate::Cnt,
 }
 
 impl<'m> Chk<'m> {
+    /// An owned handle's one use (a match or a move); anything else leaks or frees twice.
+    fn once(&self, h: u32) -> bool {
+        self.uses.get(&h).copied().unwrap_or(0) == 1
+    }
+
     /// A tuple returned by `fid` has the layout its callers read: the
     /// inferred result layout (flat when inference found none).
     fn ret_shape(&mut self, e: &Core, fid: u32, sh: &Shape) {
@@ -296,7 +309,7 @@ impl<'m> Chk<'m> {
             Core::Prim(Prim::ArrLen, xs) => self.read(&xs[0]),
             Core::Prim(p, xs) if p.is_f32() => xs.iter().for_each(|x| self.expr(x)),
             // an array, or a tuple var escaping without Proj
-            Core::Var(i) if self.arrs.contains_key(i) || self.tvars.contains_key(i) => self.fail(e),
+            Core::Var(i) if self.arrs.contains_key(i) || self.tvars.contains_key(i) || self.hvars.contains_key(i) => self.fail(e),
             Core::Var(_) => {}
             Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
                 self.expr(a);
@@ -338,6 +351,9 @@ impl<'m> Chk<'m> {
                     self.read(a);
                     lent.extend(self.slot(a));
                 }
+                PTy::H if matches!(a, Core::Var(x) if self.hvars.get(x) == Some(&false)) => {}
+                PTy::O if matches!(a, Core::Var(x) if self.hvars.get(x) == Some(&true) && self.once(*x)) => {}
+                PTy::H | PTy::O => self.fail(a),
                 PTy::I if self.akind(a) => self.fail(a),
                 PTy::I => self.expr(a),
                 PTy::T(k) => self.targ(a, &pshape(g, j, *k)),
@@ -404,6 +420,7 @@ impl<'m> Chk<'m> {
         self.tvars.remove(&x);
         self.tarr.remove(&x);
         self.arrs.remove(&x);
+        self.hvars.remove(&x);
         match bound {
             Bound::Tup(sh, mask) => {
                 for (i, a) in mask.iter().enumerate() {
@@ -487,6 +504,46 @@ impl<'m> Chk<'m> {
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
                 self.tail(b, fid)
+            }
+            Core::Match(sc, arms) => {
+                let owned = match &**sc {
+                    Core::Var(h) => match self.hvars.get(h) {
+                        Some(&o) if !o || self.once(*h) => o,
+                        _ => {
+                            self.fail(e);
+                            return (Kind::No, vec![]);
+                        }
+                    },
+                    _ => {
+                        self.fail(e);
+                        return (Kind::No, vec![]);
+                    }
+                };
+                let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone(), self.live.clone());
+                let mut kind: Option<(Kind, Vec<bool>)> = None;
+                for (ctor, binders, body) in arms.iter().filter(|a| a.0 != UNREACHABLE_CTOR) {
+                    (self.tvars, self.tarr, self.arrs, self.root, self.live) = scope.clone();
+                    for (j, x) in binders.iter().enumerate() {
+                        match field_ty(*ctor, j) {
+                            crate::ty::Ty::Int => {}
+                            crate::ty::Ty::Adt(_) if !owned || self.uses.get(x).copied().unwrap_or(0) <= 1 => {
+                                self.hvars.insert(*x, owned);
+                            }
+                            _ => self.fail(e),
+                        }
+                    }
+                    let k = self.tail(body, fid);
+                    kind = match kind {
+                        None => Some(k),
+                        Some(prev) if prev == k || k.0 == Kind::No => Some(prev),
+                        Some(prev) if prev.0 == Kind::No => Some(k),
+                        Some(_) => {
+                            self.fail(e);
+                            Some((Kind::No, vec![]))
+                        }
+                    };
+                }
+                kind.unwrap_or((Kind::No, vec![]))
             }
             Core::If(c, x, y) => {
                 let (a, b, _) = self.arms(c, x, y, |s, e| s.tail(e, fid));
@@ -690,8 +747,16 @@ thread_local! {
     /// `CTX[g]`: native `g` takes the worker context (it touches arrays,
     /// itself or through a callee); the rest keep their argument registers.
     pub(crate) static CTX: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// (ctor, field) -> inferred type, for the fields a native match binds.
+    static FIELDS: std::cell::RefCell<Vec<Vec<crate::ty::Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Unboxed constructors (ctor -> tag slot), for native match dispatch.
+    pub(crate) static UNBOX: std::cell::RefCell<HashMap<u32, u8>> = std::cell::RefCell::new(HashMap::new());
     /// Test override of `choose_reps` (see `EmitOpts`).
     pub(crate) static FORCE_REP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn field_ty(ctor: u32, j: usize) -> crate::ty::Ty {
+    FIELDS.with(|f| f.borrow().get(ctor as usize).and_then(|fs| fs.get(j).copied()).unwrap_or(crate::ty::Ty::Dyn))
 }
 
 /// Entry `g` of a per-function flag table (`d` past its end).
@@ -714,6 +779,7 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     fn prims(e: &Core, out: &mut bool, calls: &mut Vec<u32>) {
         e.walk(&mut |e| match e {
             Core::Prim(p, _) if !p.is_f32() => *out = true,
+            Core::Match(..) => *out = true,
             Core::Call(g, _) => calls.push(*g),
             _ => {}
         });
@@ -725,7 +791,7 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
             let Some(sig) = &sigs[f] else { return true };
             let mut p = false;
             prims(&m.fns[f].body, &mut p, &mut calls[f]);
-            p || sig.params.iter().any(|t| matches!(t, PTy::A | PTy::B)) || sig.ra.iter().any(|a| *a)
+            p || sig.params.iter().any(|t| matches!(t, PTy::A | PTy::B | PTy::H | PTy::O)) || sig.ra.iter().any(|a| *a)
         })
         .collect();
     crate::fixpoint(need, |f, s| calls[f].iter().any(|g| s[*g as usize]))
@@ -912,16 +978,19 @@ fn rshape(g: u32, k: usize) -> Shape {
 /// A tuple param's component count cannot be read off the body alone (a
 /// caller may pass a wider tuple); seed with maxproj+1 and demote on caller
 /// mismatch. Bare use of a param whose callers pass tuples also demotes.
-pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig>> {
+/// `bor[f][p]`: the dive side lends parameter `p` (a constructor value is
+/// matched natively only then; an owned one is consumed cell by cell).
+pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types, bor: &[Vec<bool>]) -> Vec<Option<Sig>> {
     use crate::ty::Ty;
     SHAPES.with(|s| *s.borrow_mut() = (tys.pshape.clone(), tys.rshape.clone()));
+    FIELDS.with(|f| *f.borrow_mut() = tys.field.clone());
     let n = m.fns.len();
     // a value native code cannot represent (a non-int array at the
-    // boundary, a float or a constructor anywhere) rules the function out
+    // boundary, a float anywhere) rules the function out
     let forbid: Vec<bool> = (0..n)
         .map(|fi| {
             tys.params[fi].iter().chain(std::iter::once(&tys.ret[fi])).any(|t| matches!(t, Ty::Arr(false)))
-                || tys.locals[fi].iter().any(|t| matches!(t, Ty::Flo | Ty::Adt(_)))
+                || tys.locals[fi].iter().any(|t| matches!(t, Ty::Flo))
                 // a tuple parameter holding more than ints (native code holds
                 // a parameter's leaves as i64s)
                 || tys.params[fi].iter().zip(&tys.pshape[fi]).any(|(t, sh)| matches!(t, Ty::Tup(_)) && sh.is_none())
@@ -942,6 +1011,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
                 .map(|p| {
                     match tys.params[fi].get(p as usize) {
                         Some(Ty::Arr(true)) => return PTy::B, // optimistic: demoted when consumed
+                        Some(Ty::Adt(_)) => return if bor[fi][p as usize] { PTy::H } else { PTy::O },
                         // a tuple with an int layout (type inference): exact,
                         // and the parameter may then be used whole; a tuple
                         // holding other values takes the width its body reads
@@ -990,6 +1060,12 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
             live: Default::default(),
             demote: Vec::new(),
             root: HashMap::new(),
+            hvars: HashMap::new(),
+            uses: {
+                let mut u = crate::Cnt::new();
+                crate::cnt_expr(&m.fns[fid].body, &mut u);
+                u
+            },
         };
         for (p, pt) in params.iter().enumerate() {
             match pt {
@@ -1002,6 +1078,9 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
                 }
                 PTy::B => {
                     c.arrs.insert(p as u32, true);
+                }
+                PTy::H | PTy::O => {
+                    c.hvars.insert(p as u32, *pt == PTy::O);
                 }
                 PTy::I => {}
             }
@@ -1061,7 +1140,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types) -> Vec<Option<Sig
     // MITHRIL_WHY_BOXED: why each function has no native form (a diagnostic)
     if std::env::var_os("MITHRIL_WHY_BOXED").is_some() {
         for fid in (0..n).filter(|&f| sigs[f].is_none()) {
-            let why = if forbid[fid] { "a float, constructor, boxed array, non-int tuple or mixed-type value".to_string() } else { whys[fid].clone().unwrap_or_else(|| "signature did not settle".into()) };
+            let why = if forbid[fid] { "a float, boxed array, non-int tuple or mixed-type value".to_string() } else { whys[fid].clone().unwrap_or_else(|| "signature did not settle".into()) };
             eprintln!("boxed {}: {why} (params {:?}, result {:?})", m.fns[fid].name, tys.params[fid], tys.ret[fid]);
         }
     }
@@ -1097,6 +1176,8 @@ struct Sem<'m> {
     lens: HashMap<String, String>,
     /// length locals are used in this function (see `scalar_fn`)
     use_lens: bool,
+    /// constructor handles, owned: true (see `Chk::hvars`)
+    hvars: HashMap<u32, bool>,
 }
 
 /// The name an array value is known by (arrays are always locals).
@@ -1327,6 +1408,7 @@ impl<'m> Sem<'m> {
                     es.push(x);
                 }
                 PTy::B => es.push(v(self.rd(a))),
+                PTy::H | PTy::O => es.push(self.val(a, b)),
                 PTy::I => {
                     let x = self.val(a, b);
                     es.push(conv(x, self.shifted, shifted(g)));
@@ -1624,6 +1706,62 @@ impl<'m> Sem<'m> {
                 (self.arrs, self.tarr, self.lens, self.tvars) = (arrs, tarr, lens, tvars);
                 b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
             }
+            Core::Match(sc, arms) => {
+                let Core::Var(h) = &**sc else { unreachable!("native match on a non-handle") };
+                let hv = as_u(v(vn(*h)));
+                let owned = self.hvars.get(h) == Some(&true);
+                let unbox = UNBOX.with(|u| u.borrow().clone());
+                let saved = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone(), self.tvars.clone());
+                let mut bodies = Vec::new();
+                for (ctor, binders, body) in arms {
+                    (self.live, self.arrs, self.tarr, self.lens, self.tvars) = saved.clone();
+                    let mut ab = Vec::new();
+                    if *ctor != UNREACHABLE_CTOR {
+                        let used = crate::free_vars(body);
+                        // each field as a port: read in place, or moved out of the consumed cells
+                        let n = binders.len();
+                        let ports: Vec<E> = if unbox.contains_key(ctor) {
+                            binders.iter().map(|_| hv.clone()).collect()
+                        } else if !owned {
+                            (0..n).map(|j| c("field", vec![hv.clone(), usize_(j)])).collect()
+                        } else {
+                            let names: Vec<String> = (0..n).map(|j| format!("f{h}_{j}")).collect();
+                            let k = u16_(*ctor as u64);
+                            match n {
+                                0 => {}
+                                1 => {
+                                    ab.push(S::Let(Pat::Tup(vec![names[0].clone(), "m_unused".into()]), Ty::Infer, c("consume2k", vec![hv.clone(), k])));
+                                    ab.push(free(v("m_unused")));
+                                }
+                                2 => ab.push(S::Let(Pat::Tup(names.clone()), Ty::Infer, c("consume2k", vec![hv.clone(), k]))),
+                                _ => ab.push(S::Let(Pat::Arr(names.clone()), Ty::Infer, c(&format!("consume_chain::<{n}>"), vec![hv.clone(), k]))),
+                            }
+                            names.into_iter().map(v).collect()
+                        };
+                        for ((j, x), f) in binders.iter().enumerate().zip(ports) {
+                            if !used.contains(x) {
+                                if owned && !unbox.contains_key(ctor) {
+                                    ab.push(free(f));
+                                }
+                                continue;
+                            }
+                            let val = match field_ty(*ctor, j) {
+                                crate::ty::Ty::Adt(_) => {
+                                    self.hvars.insert(*x, owned);
+                                    cast(f, Ty::I64)
+                                }
+                                _ if self.shifted => p("sh", vec![f]),
+                                _ => as_i(f),
+                            };
+                            ab.push(let_(vn(*x), Ty::I64, val));
+                        }
+                        self.tail(body, fid, lp, &mut ab);
+                    }
+                    bodies.push(ab);
+                }
+                (self.arrs, self.tarr, self.lens, self.tvars) = (saved.1, saved.2, saved.3, saved.4);
+                b.push(crate::seq::plan_arms(&hv, arms, &unbox, |i| bodies[i].clone()));
+            }
             Core::Call(g, args) if *g == fid && lp => {
                 let es = self.call_args(*g, args, b);
                 for (i, ea) in es.iter().enumerate() {
@@ -1657,6 +1795,10 @@ impl<'m> Sem<'m> {
                     }
                     _ => self.call(*g, args, b),
                 };
+                // the call reads arrays lent to it: run it before they are freed
+                let t = self.fresh();
+                b.push(let_(&t, Ty::Infer, call));
+                let call = v(t);
                 self.drop_live(b);
                 self.settle_fuel(b);
                 b.push(ret(call));
@@ -1719,6 +1861,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         shifted: shifted(fid),
         lens: HashMap::new(),
         use_lens: false,
+        hvars: HashMap::new(),
     };
     for (pp, pt) in sig.params.iter().enumerate() {
         match pt {
@@ -1731,6 +1874,9 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
             }
             PTy::B => {
                 sem.arrs.insert(pp as u32, true);
+            }
+            PTy::H | PTy::O => {
+                sem.hvars.insert(pp as u32, *pt == PTy::O);
             }
             PTy::I => {}
         }
@@ -1804,12 +1950,13 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
                 unpack.push(let_(vn(pp as u32), Ty::U64, c("arr_own", vec![pv.clone()])));
                 bargs.push(cast(pv, Ty::I64));
             }
-            PTy::B => {
+            PTy::B | PTy::H => {
                 if !bor[fid as usize][pp] {
                     after.push(free(pv.clone()));
                 }
                 bargs.push(cast(pv, Ty::I64));
             }
+            PTy::O => bargs.push(cast(pv, Ty::I64)),
             PTy::T(k) => {
                 // the port's leaves, nested tuples read through
                 fn leaves(src: E, sh: &Shape, name: &str, conv: &dyn Fn(E) -> E, out: &mut Vec<S>, args: &mut Vec<E>) {

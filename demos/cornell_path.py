@@ -311,19 +311,10 @@ def channel(c):
     return int(sqrt(fmin(fmax(v, 0.0), 1.0)) * 255.0 + 0.5)
 
 
-def cols(y, x0, n):
-    if n == 1:
-        return pixel(x0, y)
-    h = n // 2
-    return (cols(y, x0, h), cols(y, x0 + h, n - h))
-
-
-def rows(y0, n):
-    if n == 1:
-        return cols(y0, 0, size())
-    h = n // 2
-    return (rows(y0, h), rows(y0 + h, n - h))
-
-
 def main():
-    return (size(), size(), rows(0, size()))
+    n = size()
+    img = array_new(n * n, 0)
+    for y in range(n):
+        for x in range(n):
+            img = array_set(img, y * n + x, pixel(x, y))
+    return (n, n, img)

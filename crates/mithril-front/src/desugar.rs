@@ -303,7 +303,7 @@ pub fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
-fn free_reads_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+pub fn free_reads_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign(_, e) | Stmt::Return(e) | Stmt::ExprStmt(e) => free_reads_expr(e, out),

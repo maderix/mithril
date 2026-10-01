@@ -14,6 +14,7 @@
 pub mod detect;
 pub mod lean;
 pub mod poly;
+pub mod split;
 
 pub use lean::lean_obligations;
 
@@ -54,6 +55,7 @@ pub fn analyze(m: &mut Module) -> Vec<FoldReport> {
             f.params.iter().map(|p| (p.clone(), Init::Other)).collect();
         walk_block(&mut f.body, &name, &fns, &mut inits, &mut out);
     }
+    split::split_independent_loops(m);
     out
 }
 

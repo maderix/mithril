@@ -254,7 +254,9 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         ty::infer(&mn)
     };
     let unbox = unboxed_ctors(m, &tys);
-    let mut scal = scalar::classify(m, &tys);
+    scalar::UNBOX.with(|u| *u.borrow_mut() = unbox.clone());
+    let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
+    let mut scal = scalar::classify(m, &tys, &bor);
     // Native scalar code never suspends, so it cannot split work: a
     // function that forks, and every function that (transitively) calls
     // one, runs in dive form instead (its leaves still call native code).
@@ -273,7 +275,6 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&scal).map(|(x, s)| *x || s.is_some()).collect());
     CLOSURES.with(|c| *c.borrow_mut() = Some(mithril_net::NetProg::new(m)));
     scalar::SIGS.with(|s| *s.borrow_mut() = scal.clone());
-    let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
     let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
     // static reuse rewrite: consumed same-arity cells are rebuilt in place
     let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();

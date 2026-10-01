@@ -9,10 +9,8 @@
 # it) plus a small ambient term; mirror and glass recurse up to four
 # reflections or refractions. Every pixel averages 2x2 samples.
 #
-# The image forks as a tree of rows and then columns, so the work is
-# parallel with no annotation. main() returns (width, height, pixels):
-# pixels is that tree, each leaf a pixel 0xRRGGBB; depth-first order is
-# row-major. `mithril run --image out.ppm demos/cornell_whitted.py`.
+# The pixel loops run in parallel with no annotation. main() returns
+# (width, height, pixels), pixels a row-major array of 0xRRGGBB. `mithril run --image out.ppm demos/cornell_whitted.py`.
 
 
 def size():
@@ -261,19 +259,10 @@ def pixel(x, y):
     return (channel(c[0]) << 16) | (channel(c[1]) << 8) | channel(c[2])
 
 
-def cols(y, x0, n):
-    if n == 1:
-        return pixel(x0, y)
-    h = n // 2
-    return (cols(y, x0, h), cols(y, x0 + h, n - h))
-
-
-def rows(y0, n):
-    if n == 1:
-        return cols(y0, 0, size())
-    h = n // 2
-    return (rows(y0, h), rows(y0 + h, n - h))
-
-
 def main():
-    return (size(), size(), rows(0, size()))
+    n = size()
+    img = array_new(n * n, 0)
+    for y in range(n):
+        for x in range(n):
+            img = array_set(img, y * n + x, pixel(x, y))
+    return (n, n, img)
