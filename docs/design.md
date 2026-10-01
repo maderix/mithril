@@ -1026,6 +1026,26 @@ and decomposition, including forced spills, one-lane execution, both integer
 representations and oracle equality; then treat deeper splitting as its own case.
 The example README records exact commands, measurements and the current limits.
 
+The first integration attempt was rejected before promotion. It implemented a
+common native continuation machine, live-value captures, structured loop backedges
+and a GPU shared ring with cell-chain overflow. The unchanged full Queens program
+returned the correct checksum, but its final `k_run` took 2063.840 ms versus
+1333.960 ms for a fresh run of the previous artifact. A separate outlined-region
+probe took 1978.682 ms and 2151.968 ms on recheck. These are diagnostic samples,
+not a statistical performance comparison; none establishes a runtime speedup.
+The automatic cache held 20 words per lane (40 KiB per block, one block per SM).
+
+The archived candidate passed 61 existing codegen tests (one existing ignore),
+two new native tests including 32 generated executions across both integer
+representations, thread counts and fuels, and a GPU depth-600 test with a fixed
+8 KiB hardware stack at zero/one/automatic cache capacity. Full workspace and GPU
+gates were not run on the rejected candidate. It also exceeded the language
+budget at 15,312 lines. Its source, patch, tests, artifacts and measurements are
+kept locally in `target/native-continuations/`; production files were restored.
+The integration remains unfinished. Explicit frames plus shared storage alone
+have not reproduced the standalone benefit, so this design needs further evidence
+before another production implementation is justified.
+
 ### 7.3 Budgets on the device
 
 * The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). It bounds native
