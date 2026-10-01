@@ -758,8 +758,12 @@ fn compile_for(
 
     let helper_id = g.fresh_fn_id();
     let mut hscope = Scope::default();
+    let counter = format!("$for{helper_id}");
+    let bound_name = format!("$bound{helper_id}");
     let v_idx = hscope.fresh(var);
-    let bnd_idx = hscope.fresh("__bound");
+    // Immutable iterator state must survive lifted joins and assignments to var.
+    hscope.vars.insert(counter.clone(), v_idx);
+    let bnd_idx = hscope.fresh(&bound_name);
     for p in &extra {
         hscope.fresh(p);
     }
@@ -768,7 +772,10 @@ fn compile_for(
     let then_core = {
         let mut s = hscope.clone();
         compile_block(body, &mut s, t, g, &move |sc: &Scope, _g: &mut Gen| {
-            let mut args = vec![Core::Op2(BinOp::Add, Box::new(Core::Var(v_idx)), Box::new(Core::Num(1))), Core::Var(bnd_idx)];
+            let mut args = vec![
+                Core::Op2(BinOp::Add, Box::new(Core::Var(sc.vars[&counter])), Box::new(Core::Num(1))),
+                Core::Var(sc.vars[&bound_name]),
+            ];
             args.extend(extra_cl.iter().map(|p| Core::Var(sc.vars[p])));
             Ok(Core::Call(helper_id, args))
         })?
