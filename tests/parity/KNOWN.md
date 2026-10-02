@@ -32,6 +32,12 @@ program at `--threads 4 --fuel N`; `device` = `build --gpu` + `exec`.
 | 7 | `general/interp_closure` | fuel1, fuel2 | exit 101: runtime ICE "Op operand has non-value tag Era" | `240264` (oracle; every other lane agrees). |
 | 8 | `lockless/histogram` | fuel2, fuel7, fuel64 | SIGSEGV (exit -11) | `3454372420` (`bench/lockless/small.json`; every twin and every other compiled lane). Seen deterministic under the harness (24 runs); a hand run at fuel 64 once completed, so treat it as schedule-dependent. |
 
+## Image output
+
+The Cornell demos now return a flat row-major pixel array. Their known answers
+preserve every dimension and pixel from the pinned oracle's nested tuples.
+The parity harness checks the new output against these explicit answers.
+
 ## Oracle resource limits (not wrong answers)
 
 The oracle lane runs under a 6 GB virtual-memory cap (`check.py`,

@@ -1,4 +1,6 @@
 """Acceptance must cover lanes even when their baseline entry is absent."""
+import ast
+import json
 import importlib.util
 from pathlib import Path
 import unittest
@@ -34,6 +36,22 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(check.correct('p', ref, {'p': {'correct': other}}), other)
         self.assertEqual(check.correct('p', ref, {}), self.answer)
         self.assertIsNone(check.correct('p', {'p': {'oracle': {'out': '', 'rc': 1}}}, {}))
+
+
+    def test_image_output_migration_preserves_every_reference_pixel(self):
+        here = Path(__file__).parent
+        ref = json.loads((here / 'reference.json').read_text())['results']
+        known = json.loads((here / 'known.json').read_text())
+        def flatten(value):
+            if isinstance(value, (tuple, list)):
+                return [x for child in value for x in flatten(child)]
+            return [value]
+        for name in ['demos/cornell_path', 'demos/cornell_whitted']:
+            with self.subTest(name=name):
+                w, h, tree = ast.literal_eval(ref[name]['oracle']['out'])
+                expected = ast.literal_eval(known[name]['correct']['out'])
+                self.assertEqual(expected, (w, h, flatten(tree)))
+                self.assertEqual(len(expected[2]), w * h)
 
 
 if __name__ == '__main__':
