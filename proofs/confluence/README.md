@@ -10,13 +10,14 @@ firings.
 
 Two consequences follow. If one order finishes, no order runs forever. And
 stopping part-way is safe: a partly reduced net still reaches the same final
-net, which is why the compiler may reduce until its budget runs out and hand
-the half-reduced net to the runtime.
+net. Compile-time reduction relies on this when it stops at its budget and
+hands the half-reduced net to the runtime (it also uses one rule outside this
+model, listed below).
 
-The proof does **not** show that a program finishes, does not cover the extra
-rules listed under "What is not covered", and does not show that the Rust code
-implements the modelled rules (tests check that; see `docs/design.md`,
-section 8).
+Scope: the proof assumes the program finishes. It shows the result is
+independent of order; whether the result is the source program's answer depends
+on the translation to nets and on the rules listed under "What is not covered",
+which tests check against a reference interpreter (`docs/design.md`, section 8).
 
 ## Details
 

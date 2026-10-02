@@ -1157,7 +1157,7 @@ what is checked and what is only claimed:
 
 | property | status | how |
 |---|---|---|
-| fold reassociation: each proven combiner is associative with an identity; folding chunk results equals folding the concatenation | **proved** | Lean 4 obligations emitted per fold by `mithril-reassoc`, checked by `lean` in `reassoc_test` and `cli_test` (skipped when lean is not installed); the generic `chunked_foldl` lemma proved once |
+| fold reassociation: each proven combiner is associative with an identity | **proved** (the combine step from these two facts to "independently folded chunks equal the whole" is not machine-checked; the emitted `chunked_foldl` states only the sequential fold over a concatenation) | Lean 4 obligations emitted per fold by `mithril-reassoc`, checked by `lean` in `reassoc_test` and `cli_test` (skipped when lean is not installed); the generic `chunked_foldl` lemma (sequential fold over a concatenation) proved once |
 | specialization preserves meaning | checked | `specialize_test` (every fixture: specialized equals original under `eval_core`); `examples/spec_oracle.rs` bisects a program to the function whose specialization changed its value |
 | generated code equals the oracle | checked | `codegen_test` over the fixtures in `crates/mithril-codegen/tests/fixtures`, at 1 to 16 threads (the counts vary per test) and under budget starvation (budgets of 1 to 64) |
 | parallel equals sequential | checked | the same tests; fast.py compares t1 and t16 checksums per port |

@@ -77,14 +77,17 @@ obligations.
   same net in the same number of steps. A half-reduced program, which the
   compiler leaves when its work budget runs out, still reaches that same net.
   Machine-checked in Lean 4: [proofs/confluence](proofs/confluence/README.md).
-  Scope: the proof assumes the program finishes, and it covers the core rules
+  Scope: the proof assumes the program finishes and covers the core rules
   (erasing, copying, function application, arithmetic, branching, pattern
-  matching and calls). Rules the implementation adds on top, such as copying a
-  closure, are checked by tests.
-- **Splitting a loop into chunks gives the same total.** Before a loop such as
+  matching and calls). The proof says the answer is independent of order. Tests
+  against a reference interpreter say it is the right answer, and they also
+  cover the rules the implementation adds (copying a closure, unfolding a call
+  whose arguments are still unknown) and the Rust and CUDA code.
+- **Loops are split only with an associative operation.** Before a loop such as
   `total = total + steps(i)` is split across cores, the compiler proves that
   the operation is associative with an identity, and Lean checks the proof
-  (`mithril prove`). Integer sums qualify. Floating-point sums run as one
+  (`mithril prove`). Those two facts are what make the chunks combine to the
+  loop's own answer; that last step is standard algebra, not machine-checked. Integer sums qualify. Floating-point sums run as one
   sequential loop, because their rounding depends on how the terms are grouped.
 - **The CPU runtime's lock-free handoffs are correct under every
   interleaving.** The protocol functions are model-checked with loom: in every
