@@ -2,14 +2,14 @@
 
 **A programming language for deterministic parallelism, built on interaction nets.**
 
-Write ordinary step-by-step code. Mithril runs it on every core of a CPU or
-across a GPU, and the answer is the same whichever order the work runs in. There
-are no threads, locks or parallel annotations in the source.
+Write ordinary step-by-step code: functions, loops, values. Mithril finds the
+calls that can run at the same time and runs them on every core of a CPU or
+across a GPU. The answer is the same whichever order the work runs in.
 
 **Read the introduction:
 [Mithril: a programming language for deterministic parallelism](https://maderix.github.io/articles/mithril/)**,
 an illustrated article covering where the language comes from, how it works,
-animated examples, where it fits and where it does not.
+animated examples, good uses and current limits.
 
 | Whitted ray tracing | Path tracing |
 |---|---|
@@ -39,8 +39,9 @@ mithril run --image cornell.ppm demos/cornell_path.py --gpu
 ## How it works
 
 A Mithril program means what a set of interaction-net rewrite rules says it
-means. Each rule replaces one pair of connected nodes and touches no other node,
-so any two rule firings can happen in either order and the result is the same.
+means. Each rule replaces one pair of connected nodes and changes only those two
+nodes and their wires, so two rule firings can happen in either order and the
+result is the same.
 The runtime can therefore run them in parallel, and the compiler can run them
 early.
 
@@ -52,15 +53,16 @@ mithril-front            oracle    compile-time     the program          GPU: CU
 
 - **The optimizer is the rules.** While compiling, Mithril fires every rule
   whose inputs are written in the source. Constant folding, inlining and branch
-  selection are rule firings, so they cannot change what the program means
-  (`mithril-net`).
-- **Input-dependent work becomes native code.** A function that is one sequence
+  selection are rule firings, so the optimized program computes exactly what the
+  source computes (`mithril-net`).
+- **Work that needs input data becomes native code.** A function that is one sequence
   of steps, such as the arithmetic for a pixel, is emitted as plain machine
   code. A function that can split into independent calls also gets a form that
   can pause and hand work to idle cores (`mithril-codegen`).
-- **Parallel work comes from the program's shape.** Independent calls, proven
-  folds and loops whose iterations do not depend on each other run as trees of
-  tasks, and the result equals the one-thread result.
+- **Parallel work comes from the program's shape.** Two calls with separate
+  inputs, a loop that sums with a proven operation, and a loop where each
+  iteration uses only its own index and shared read-only data all run as trees
+  of tasks, and the result equals the one-thread result.
 - **One runtime model on both devices.** Tasks are pending rule firings, records
   wait for their inputs, and dives run native code under a work budget
   (`mithril-rt` on the CPU, `engine.cu` on the GPU).
@@ -70,25 +72,28 @@ obligations.
 
 ## What is proved
 
-- **The order of rule firings cannot change the result.** For Mithril's core
+- **Every order of rule firings gives the same result.** For Mithril's core
   rules, if one order of firings reaches a final net, every order reaches the
-  same net in the same number of steps, and stopping part-way (as the compiler
-  does when its budget runs out) is safe. Machine-checked in Lean 4:
-  [proofs/confluence](proofs/confluence/README.md). It does not prove that a
-  program finishes, and it does not cover the extra rules the implementation
-  adds; tests check those.
+  same net in the same number of steps. A half-reduced program, which the
+  compiler leaves when its work budget runs out, still reaches that same net.
+  Machine-checked in Lean 4: [proofs/confluence](proofs/confluence/README.md).
+  Scope: the proof assumes the program finishes, and it covers the core rules
+  (erasing, copying, function application, arithmetic, branching, pattern
+  matching and calls). Rules the implementation adds on top, such as copying a
+  closure, are checked by tests.
 - **Splitting a loop into chunks gives the same total.** Before a loop such as
   `total = total + steps(i)` is split across cores, the compiler proves that
   the operation is associative with an identity, and Lean checks the proof
-  (`mithril prove`). Floating-point sums are never split.
-- **The CPU runtime's lock-free handoffs have no races.** The protocol
-  functions are model-checked with loom under every thread interleaving: a join
-  fires once with all its inputs, and a shared value is freed once, after its
-  last reader.
+  (`mithril prove`). Integer sums qualify. Floating-point sums run as one
+  sequential loop, because their rounding depends on how the terms are grouped.
+- **The CPU runtime's lock-free handoffs are correct under every
+  interleaving.** The protocol functions are model-checked with loom: in every
+  thread schedule, a join fires exactly once with all its inputs, and a shared
+  value is freed exactly once, after its last reader.
 
 The compiler, the extra rules and both runtimes are checked by comparing
 compiled programs with a reference interpreter at several thread counts, with
-starved work budgets, and on the GPU (see Tests).
+tiny work budgets that force pausing, and on the GPU (see Tests).
 
 ## The language
 
@@ -101,9 +106,10 @@ starved work budgets, and on the GPU (see Tests).
   (matches must be exhaustive), tuples and `t[i]` on them.
 - Lambdas and closures (`lambda x: x + k`), passed and returned as values.
 - Arrays as values: `array_new(n, v)`, `array_get(a, i)`, `array_set(a, i, v)`
-  (returns the new array; written in place when no other variable refers to
-  the old one), `array_len(a)`.
-- No shared mutable state, no locks, no parallel annotations.
+  (returns the new array; written in place when the old array has a single
+  owner), `array_len(a)`.
+- Values only: updating an array or a tuple produces a new one, and the
+  parallelism comes from the program's dependencies.
 
 ## Build
 
@@ -120,7 +126,8 @@ programs too.
 
 GPU support needs an NVIDIA GPU with a CUDA driver, Docker and the NVIDIA
 Container Toolkit. The generated CUDA is compiled with `nvcc` inside a Docker
-image (CUDA 13.0), so the host needs no CUDA toolkit. Build the image once:
+image (CUDA 13.0), so the host only needs the driver and Docker. Build the image
+once:
 
 ```
 docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
@@ -139,8 +146,8 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 - `bench/ports/kdtree.py`: nearest-neighbour queries over a shared spatial tree,
   with an independent C implementation and a recorded checksum.
 - `bench/general/*.py`: interpreters, persistent maps, pipelines and closures.
-- `bench/lockless/`: five programs that need locks or atomics in C and Rust,
-  written in Mithril without either, each with C and Rust versions.
+- `bench/lockless/`: five programs that use locks or atomics in C and Rust,
+  written in Mithril with plain values, each next to its C and Rust versions.
 
 Inspect what the compiler did with a program:
 
@@ -161,12 +168,13 @@ It runs, in order:
 
 - `cargo test --release --workspace`: unit tests, and every program under
   `crates/*/tests/fixtures` compiled and checked against the reference
-  interpreter at 1, 4 and 16 threads and under starved budgets.
+  interpreter at 1, 4 and 16 threads and with tiny work budgets that force
+  pausing.
 - `tests/ci/fast.py`: the spatial-tree benchmark at a small size (exact checksum
   at 1 and 16 threads) plus regression checks on generated-code size and
   instruction counts.
 - `tests/parity/check.py`: fixtures, benchmarks, demos and generated programs run
-  through the reference interpreter, 1/4/16 threads, starved budgets and the
+  through the reference interpreter, 1/4/16 threads, tiny work budgets and the
   GPU, each compared with a pinned reference build.
 - With `--gpu`: `tests/ci/gpu.py` (the ports on the device) and the device test
   suite.
