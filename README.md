@@ -68,6 +68,28 @@ mithril-front            oracle    compile-time     the program          GPU: CU
 [docs/design.md](docs/design.md) records the full design and its open
 obligations.
 
+## What is proved
+
+- **The order of rule firings cannot change the result.** For Mithril's core
+  rules, if one order of firings reaches a final net, every order reaches the
+  same net in the same number of steps, and stopping part-way (as the compiler
+  does when its budget runs out) is safe. Machine-checked in Lean 4:
+  [proofs/confluence](proofs/confluence/README.md). It does not prove that a
+  program finishes, and it does not cover the extra rules the implementation
+  adds; tests check those.
+- **Splitting a loop into chunks gives the same total.** Before a loop such as
+  `total = total + steps(i)` is split across cores, the compiler proves that
+  the operation is associative with an identity, and Lean checks the proof
+  (`mithril prove`). Floating-point sums are never split.
+- **The CPU runtime's lock-free handoffs have no races.** The protocol
+  functions are model-checked with loom under every thread interleaving: a join
+  fires once with all its inputs, and a shared value is freed once, after its
+  last reader.
+
+The compiler, the extra rules and both runtimes are checked by comparing
+compiled programs with a reference interpreter at several thread counts, with
+starved work budgets, and on the GPU (see Tests).
+
 ## The language
 
 - Functions (`def`), `if`/`elif`/`else`, `while`, `for i in range(a, b)`,
@@ -153,7 +175,22 @@ Useful switches: `MITHRIL_STATS=1` (scheduler statistics of a CPU run),
 `MITHRIL_TIMING=1` (compile and run times), `MITHRIL_GPU_STATS=1` and
 `MITHRIL_GPU_TRACE=1` (per-round device statistics).
 
-Recorded timings and methods are in [bench/results.md](bench/results.md).
+## Results
+
+Recorded wall-clock seconds, compilation excluded. Ryzen 7 7800X3D
+(8 cores, 16 threads), RTX 4090. Render timings are medians of three runs on
+2 October 2026; GPU wall includes context creation and readback. The
+spatial-tree CPU measurements are from 29 September and its GPU measurement
+from 2 October. Every lane produces the same output.
+
+| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
+|---|---:|---:|---:|---:|
+| cornell_path | - | 2.149 s | 0.238 s | 0.335 s |
+| cornell_whitted | - | 0.264 s | 0.061 s | 0.871 s |
+| kdtree | 0.333 s | 0.406 s | 0.090 s | 1.280 s |
+
+[Spatial-tree methods](bench/results.md) ·
+[Render measurements](docs/img/raytracer-static.json).
 
 ## Repository layout
 

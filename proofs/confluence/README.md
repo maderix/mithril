@@ -1,9 +1,28 @@
-# Confluence of Mithril's rule table (Lean 4, phase P1)
+# Confluence of Mithril's rule table (Lean 4)
 
-A machine-checked proof that Mithril's interaction-net rule table (the pure
-core, spec `docs/superpowers/specs/2026-09-30-lockless-proof-evidence-design.md`
-section 3.2) is confluent. Core Lean 4.34.1, no Mathlib, no `sorry`, no
-added axioms.
+## The claim in plain words
+
+Take any net built from Mithril's core rules and fire its active pairs in any
+order. If one order reaches a final net, every order reaches **the same final
+net, in the same number of steps**. For example, in `(2 × 3) + (4 × 5)`,
+computing either multiplication first ends at `26` after the same number of
+firings.
+
+Two consequences follow. If one order finishes, no order runs forever. And
+stopping part-way is safe: a partly reduced net still reaches the same final
+net, which is why the compiler may reduce until its budget runs out and hand
+the half-reduced net to the runtime.
+
+The proof does **not** show that a program finishes, does not cover the extra
+rules listed under "What is not covered", and does not show that the Rust code
+implements the modelled rules (tests check that; see `docs/design.md`,
+section 8).
+
+## Details
+
+A machine-checked proof that the pure core of Mithril's interaction-net rule
+table is confluent. Core Lean 4.34.1, no Mathlib, no `sorry`, no added
+axioms.
 
 ```
 cd proofs/confluence
@@ -102,9 +121,9 @@ Mithril (`Rules.lean`):
 | `Prog::unfold` (REF–anything) | `(.ref e n, K) ↦ P.unfold e n K` |
 | `Prog::unfold` (REF–Var, pushed by `swi_rule`/`mat_rule`) | not modelled (see below) |
 
-## What is NOT covered (P2, spec section 3.3)
+## What is not covered
 
-- **OP reading its operand through `resolve`.** P1 has only the two-agent
+- **OP reading its operand through `resolve`.** The model has only the two-agent
   OP0/OP1 form. The one-step compute of `op_rule`, when the other operand is
   already resolved, is not shown equal to it.
 - **REF unfolding against a Var.** `process` unfolds a REF whose other
@@ -114,12 +133,12 @@ Mithril (`Rules.lean`):
 - **OP–SUP** (`op_rule` with a DUP operand). It consumes three agents and
   is not modelled.
 - **`copy_closure`** (DUP meeting a closure REF, and the arm copies in
-  `dup_commute` for SWI/MAT). P1 has DUP–REF unfold and DUPs on arm ports.
+  `dup_commute` for SWI/MAT). The model has DUP–REF unfold and DUPs on arm ports.
   Nothing is proved to show `copy_closure` is derived from these.
 - **Dynamic DUP labels** from a global counter. Labels here are given
   numbers; no renaming argument is made.
 - **MAT's calling convention.** Rust passes the fields as extra `Ref`
-  arguments; P1 applies the arm through APPs. They are not shown equal.
+  arguments; the model applies the arm through APPs. They are not shown equal.
 - **Kont delivery, `park_op`, the static gate (Var wiring), and Ext / Arr /
   FLO values.** FLO follows the NUM rules and is not modelled separately.
   Rules that only exist at runtime or compile time fall outside this model.
@@ -130,7 +149,8 @@ Mithril (`Rules.lean`):
 - **Every-port-wired (totality) of the right-hand sides** is checked on
   sample arities only (`sample_rules_wf`). The involution half is proved for
   all arities.
-- **No executable JSON reducer (spec 3.4) and no conformance link (spec 4).**
+- **No executable reference reducer, and no proof that the Rust rule code
+  conforms to this model.**
 - A step here is one rule firing, which matches the rewrite count of
   `process` (1 per rule, 0 for `link`). Wiring is part of the net, not a
   step.
