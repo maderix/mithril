@@ -203,6 +203,37 @@ from 2 October. Every lane produces the same output.
 [Spatial-tree methods](bench/results.md) ·
 [Render measurements](docs/img/raytracer-static.json).
 
+### Against Bend 2 on the GPU
+
+Process wall time on an RTX 4090, 2 October 2026: the binaries Bend 2.0.31's own
+compiler produced, against Mithril. Minimum of three alternating runs, machine
+load below 2, builds excluded; all 96 timed and 32 warm-up runs give matching
+checksums. A ratio below 1 means Mithril is faster.
+
+| program | Bend 2 | Mithril | Mithril / Bend 2 |
+|---|---:|---:|---:|
+| bfs | 222.20 ms | 422.15 ms | 1.900 |
+| editdist | 239.32 ms | 340.21 ms | 1.422 |
+| gameoflife | 86.17 ms | 115.77 ms | 1.344 |
+| hashmap | 669.17 ms | 700.99 ms | 1.048 |
+| kmeans | 304.18 ms | 441.57 ms | 1.452 |
+| lexer | 355.60 ms | 258.90 ms | **0.728** |
+| mandelbrot | 93.76 ms | 177.72 ms | 1.896 |
+| merkle | 103.18 ms | 127.57 ms | 1.236 |
+| nbody | 85.15 ms | 102.48 ms | 1.204 |
+| queens | 799.92 ms | 110.87 ms | **0.139** |
+| raytrace | 545.80 ms | 155.42 ms | **0.285** |
+| symreg | 266.46 ms | 1828.25 ms | 6.861 |
+| terrain | 211.80 ms | 291.72 ms | 1.377 |
+| tree-bitonic | 580.62 ms | 1097.44 ms | 1.890 |
+| tree-matmul | 227.04 ms | 575.76 ms | 2.536 |
+| tree-radix | 338.37 ms | 640.73 ms | 1.894 |
+
+Mithril leads on queens (7.2×), raytrace (3.5×) and lexer (1.4×). Bend 2 leads on
+13 of the 16 programs, by up to 6.9× on symreg; closing that gap is the per-lane
+efficiency work described in the introduction. The 16 programs are ports of
+Bend's example set; their sources live outside this repository.
+
 ## Repository layout
 
 | path | contents |
