@@ -154,179 +154,90 @@ fn check_cond(e: &Expr, scope: &Scope) -> Result<(), Diag> {
 
 // ---- static analysis over surface statements ----
 
-/// True iff every control-flow path through `stmts` ends in a `return`.
-fn always_returns(stmts: &[Stmt]) -> bool {
-    match stmts.last() {
-        Some(Stmt::Return(_)) => true,
-        Some(Stmt::If(_, t, e)) => always_returns(t) && always_returns(e),
-        // an int match may match no case (it falls through, like `if`
-        // without `else`); a constructor match is exhaustive
-        Some(Stmt::Match(_, cases)) => {
-            !cases.is_empty() && cases.iter().all(|(p, b)| p.as_int_lit().is_none() && always_returns(b))
-        }
-        _ => false,
-    }
+/// One summary of the assignments and control flow in a surface block.
+/// `returns` deliberately describes its last statement, as the existing
+/// return check does; loops and integer matches may always fall through.
+#[derive(Default)]
+struct BlockFacts {
+    assigned: BTreeSet<String>,
+    surely: BTreeSet<String>,
+    returns: bool,
+    has_return: bool,
+    straight: bool,
 }
 
-/// Names assigned on every path through `stmts` that falls through (a loop or an
-/// int match may not run, so neither guarantees its assignments).
-fn surely_assigned(stmts: &[Stmt]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for s in stmts {
-        match s {
-            Stmt::Assign(n, _) => {
-                out.insert(n.clone());
-            }
-            Stmt::If(_, then, els) => {
-                let arms: Vec<(Vec<String>, &[Stmt])> = vec![(vec![], then), (vec![], els)];
-                out.extend(defined_by_every_fall_through(&arms));
-            }
-            Stmt::Match(_, cases) if cases.iter().all(|(p, _)| p.as_int_lit().is_none()) => {
-                let arms: Vec<(Vec<String>, &[Stmt])> =
-                    cases.iter().map(|(p, b)| (p.binds.clone(), b.as_slice())).collect();
-                out.extend(defined_by_every_fall_through(&arms));
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The names every fall-through arm defines: its pattern binders (they stay bound
-/// after the statement, as in Python) and what it surely assigns.
-fn defined_by_every_fall_through(arms: &[(Vec<String>, &[Stmt])]) -> BTreeSet<String> {
-    let mut common: Option<BTreeSet<String>> = None;
-    for (binds, body) in arms {
-        if always_returns(body) {
-            continue;
-        }
-        let mut defined = surely_assigned(body);
-        defined.extend(binds.iter().cloned());
-        common = Some(match common {
-            None => defined,
-            Some(c) => c.intersection(&defined).cloned().collect(),
-        });
-    }
-    common.unwrap_or_default()
-}
-
-/// `stmts` is a straight-line tail ending in `return` (no control flow of its own):
-/// copying it into several arms keeps the program linear.
-fn straight_return(stmts: &[Stmt]) -> bool {
-    let straight = stmts
-        .iter()
-        .all(|s| matches!(s, Stmt::Assign(..) | Stmt::ExprStmt(_) | Stmt::Return(_)));
-    straight && always_returns(stmts)
-}
-
-fn contains_return(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::Return(_) => true,
-        Stmt::If(_, t, e) => contains_return(t) || contains_return(e),
-        Stmt::While(_, b) => contains_return(b),
-        Stmt::For(_, _, b, _) => contains_return(b),
-        Stmt::Match(_, cases) => cases.iter().any(|(_, b)| contains_return(b)),
-        _ => false,
-    })
-}
-
-/// Names assigned anywhere within `stmts` (recursing into nested blocks).
-/// A `for` loop's induction variable counts as assigned by the loop.
-pub fn assigned_names(stmts: &[Stmt]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    fn go(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+impl BlockFacts {
+    fn of(stmts: &[Stmt]) -> Self {
+        let mut out = Self { straight: true, ..Self::default() };
         for s in stmts {
-            match s {
-                Stmt::Assign(n, _) => {
-                    out.insert(n.clone());
-                }
-                Stmt::If(_, t, e) => {
-                    go(t, out);
-                    go(e, out);
-                }
-                Stmt::While(_, b) => go(b, out),
-                Stmt::For(v, _, b, _) => {
-                    out.insert(v.clone());
-                    go(b, out);
-                }
-                Stmt::Match(_, cases) => {
-                    for (_, b) in cases {
-                        go(b, out);
-                    }
-                }
-                Stmt::Return(_) | Stmt::ExprStmt(_) => {}
+            let arms: Vec<(Vec<String>, Self)> = match s {
+                Stmt::If(_, t, e) => vec![(vec![], Self::of(t)), (vec![], Self::of(e))],
+                Stmt::Match(_, cases) => cases.iter().map(|(p, b)| (p.binds.clone(), Self::of(b))).collect(),
+                Stmt::While(_, b) | Stmt::For(_, _, b, _) => vec![(vec![], Self::of(b))],
+                _ => vec![],
+            };
+            let exhaustive = matches!(s, Stmt::If(..))
+                || matches!(s, Stmt::Match(_, cases) if cases.iter().all(|(p, _)| p.as_int_lit().is_none()));
+            out.returns = matches!(s, Stmt::Return(_)) || (exhaustive && !arms.is_empty() && arms.iter().all(|(_, f)| f.returns));
+            out.has_return |= matches!(s, Stmt::Return(_)) || arms.iter().any(|(_, f)| f.has_return);
+            out.straight &= matches!(s, Stmt::Assign(..) | Stmt::ExprStmt(_) | Stmt::Return(_));
+            if let Stmt::Assign(n, _) = s {
+                out.surely.insert(n.clone());
+            }
+            if exhaustive {
+                out.surely.extend(Self::fallthrough(arms.iter().map(|(bs, f)| (bs.as_slice(), f))));
+            }
+            if let Stmt::Assign(n, _) | Stmt::For(n, _, _, _) = s {
+                out.assigned.insert(n.clone());
+            }
+            for (_, f) in arms {
+                out.assigned.extend(f.assigned);
             }
         }
+        out
     }
-    go(stmts, &mut out);
-    out
+
+    /// Pattern binders and assignments common to every non-returning arm.
+    fn fallthrough<'a>(arms: impl Iterator<Item = (&'a [String], &'a Self)>) -> BTreeSet<String> {
+        let mut common: Option<BTreeSet<String>> = None;
+        for (binds, f) in arms.filter(|(_, f)| !f.returns) {
+            let mut defined = f.surely.clone();
+            defined.extend(binds.iter().cloned());
+            common = Some(match common {
+                None => defined,
+                Some(c) => c.intersection(&defined).cloned().collect(),
+            });
+        }
+        common.unwrap_or_default()
+    }
+}
+
+/// Names assigned anywhere in a block; a for induction variable counts.
+pub fn assigned_names(stmts: &[Stmt]) -> BTreeSet<String> {
+    BlockFacts::of(stmts).assigned
 }
 
 /// Names `e` reads that it does not bind (a lambda's parameters are bound).
 pub fn free_reads_expr(e: &Expr, out: &mut BTreeSet<String>) {
     match e {
-        Expr::Var(n) => {
-            out.insert(n.clone());
-        }
-        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => {
-            free_reads_expr(a, out);
-            free_reads_expr(b, out);
-        }
-        Expr::Not(a) | Expr::Neg(a) => free_reads_expr(a, out),
-        Expr::IfExp(c, t, e2) => {
-            free_reads_expr(c, out);
-            free_reads_expr(t, out);
-            free_reads_expr(e2, out);
-        }
-        Expr::Call(name, args) => {
-            // a local closure called by name is read (the scope filter drops
-            // top-level functions)
-            out.insert(name.clone());
-            for a in args {
-                free_reads_expr(a, out);
-            }
-        }
-        Expr::Tuple(args) => {
-            for a in args {
-                free_reads_expr(a, out);
-            }
-        }
+        Expr::Var(n) | Expr::Call(n, _) => { out.insert(n.clone()); }
         Expr::Lambda(params, body) => {
             let mut inner = BTreeSet::new();
             free_reads_expr(body, &mut inner);
-            for p in params {
-                inner.remove(p);
-            }
+            for p in params { inner.remove(p); }
             out.extend(inner);
+            return;
         }
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => {}
+        _ => {}
     }
+    for child in e.kids() { free_reads_expr(child, out); }
 }
 
 pub fn free_reads_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
-    for s in stmts {
-        match s {
-            Stmt::Assign(_, e) | Stmt::Return(e) | Stmt::ExprStmt(e) => free_reads_expr(e, out),
-            Stmt::If(c, t, el) => {
-                free_reads_expr(c, out);
-                free_reads_stmts(t, out);
-                free_reads_stmts(el, out);
-            }
-            Stmt::While(c, b) => {
-                free_reads_expr(c, out);
-                free_reads_stmts(b, out);
-            }
-            Stmt::For(_, bound, b, _) => {
-                free_reads_expr(bound, out);
-                free_reads_stmts(b, out);
-            }
-            Stmt::Match(scrut, cases) => {
-                free_reads_expr(scrut, out);
-                for (_, b) in cases {
-                    free_reads_stmts(b, out);
-                }
-            }
-        }
+    for st in stmts {
+        let (e, blocks) = st.parts();
+        free_reads_expr(e, out);
+        for block in blocks { free_reads_stmts(block, out); }
     }
 }
 
@@ -539,31 +450,30 @@ fn compile_dispatch_arms(
     g: &mut Gen,
     k: &Cont,
 ) -> Result<(Vec<Core>, Vec<Vec<u32>>, Option<Vec<String>>), Diag> {
-    let mut assigned = BTreeSet::new();
-    for (_, body) in arms {
-        assigned.extend(assigned_names(body));
-    }
+    let facts: Vec<BlockFacts> = arms.iter().map(|(_, b)| BlockFacts::of(b)).collect();
+    let assigned: BTreeSet<String> = facts.iter().flat_map(|f| f.assigned.iter().cloned()).collect();
     let joinable = !rest.is_empty()
-        && arms.iter().all(|(binds, body)| {
-            !contains_return(body) && binds.iter().all(|b| !assigned.contains(b))
+        && arms.iter().zip(&facts).all(|((binds, _), f)| {
+            !f.has_return && binds.iter().all(|b| !assigned.contains(b))
         })
         && assigned.iter().all(|n| scope.vars.contains_key(n));
     let mutated: Vec<String> = assigned.into_iter().collect();
-    let falling = arms.iter().filter(|(_, b)| !always_returns(b)).count();
-    let join = if !joinable && !rest.is_empty() && falling > 1 && !straight_return(rest) {
-        Some(compile_join(arms, rest, scope, t, g, k)?)
+    let falling = facts.iter().filter(|f| !f.returns).count();
+    let rest_facts = BlockFacts::of(rest);
+    let join = if !joinable && !rest.is_empty() && falling > 1 && !(rest_facts.straight && rest_facts.returns) {
+        Some(compile_join(arms, &facts, rest, scope, t, g, k)?)
     } else {
         None
     };
     let mut cores = Vec::new();
     let mut binder_idxs = Vec::new();
-    for (binds, body) in arms {
+    for ((binds, body), f) in arms.iter().zip(&facts) {
         let mut s = scope.clone();
         let idxs: Vec<u32> = binds.iter().map(|n| s.fresh(n)).collect();
         let core = if joinable {
             let m = mutated.clone();
             compile_block(body, &mut s, t, g, &move |sc: &Scope, _g2: &mut Gen| Ok(state_value(&m, sc)))?
-        } else if always_returns(body) {
+        } else if f.returns {
             compile_block(body, &mut s, t, g, &unreachable_tail)?
         } else if let Some((id, names)) = &join {
             let call_join = |sc: &Scope, _: &mut Gen| {
@@ -585,6 +495,7 @@ fn compile_dispatch_arms(
 /// fall-through arm defines). Returns its id and parameter names.
 fn compile_join(
     arms: &[(Vec<String>, &[Stmt])],
+    facts: &[BlockFacts],
     rest: &[Stmt],
     scope: &Scope,
     t: &Tables,
@@ -592,7 +503,7 @@ fn compile_join(
     k: &Cont,
 ) -> Result<(FnId, Vec<String>), Diag> {
     let mut names: BTreeSet<String> = scope.vars.keys().cloned().collect();
-    names.extend(defined_by_every_fall_through(arms));
+    names.extend(BlockFacts::fallthrough(arms.iter().zip(facts).map(|((bs, _), f)| (bs.as_slice(), f))));
     let names: Vec<String> = names.into_iter().collect();
 
     let id = g.fresh_fn_id();
@@ -600,7 +511,7 @@ fn compile_join(
     for n in &names {
         js.fresh(n);
     }
-    let falling: Vec<&[Stmt]> = arms.iter().map(|(_, b)| *b).filter(|b| !always_returns(b)).collect();
+    let falling: Vec<&[Stmt]> = arms.iter().zip(facts).filter(|(_, f)| !f.returns).map(|((_, b), _)| *b).collect();
     js.bool_vars = bools_after(&names, &falling, scope);
     let body = compile_block(rest, &mut js, t, g, k)?;
     g.out_fns[id as usize] = CoreFn {
@@ -699,15 +610,37 @@ fn state_value(names: &[String], s: &Scope) -> Core {
     if vs.len() == 1 { vs.pop().unwrap() } else { Core::Tuple(vs) }
 }
 
+/// Both loop forms compile their body with a next-iteration continuation,
+/// return the unchanged state on exit, and register the same tail helper.
+fn compile_loop(
+    id: FnId, kind: &str, mut scope: Scope, cond: Core, body: &[Stmt], mutated: &[String], fold: Option<FoldInfo>,
+    t: &Tables, g: &mut Gen, next: &Cont,
+) -> Result<(), Diag> {
+    // Parameter indices and exit state precede the body's local bindings.
+    let arity = scope.next_idx as usize;
+    let exit = state_value(mutated, &scope);
+    let then = compile_block(body, &mut scope, t, g, next)?;
+    let body = Core::If(Box::new(cond), Box::new(then), Box::new(exit));
+    g.out_fns[id as usize] = CoreFn {
+        name: format!("__{kind}{id}"),
+        arity,
+        self_tail_rec: compute_self_tail_rec(id, &body),
+        body,
+        fold,
+    };
+    Ok(())
+}
+
 fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut Gen) -> Result<(Core, Vec<String>), Diag> {
     check_cond(cond, scope)?;
-    if contains_return(body) {
+    let facts = BlockFacts::of(body);
+    if facts.has_return {
         return Err(Diag::new(0, "`return` inside a `while` body is not supported"));
     }
     let mut free = BTreeSet::new();
     free_reads_expr(cond, &mut free);
     free_reads_stmts(body, &mut free);
-    let (params_all, mutated) = loop_state(assigned_names(body), &free, scope);
+    let (params_all, mutated) = loop_state(facts.assigned, &free, scope);
 
     let helper_id = g.fresh_fn_id();
     let mut hscope = Scope::default();
@@ -716,22 +649,10 @@ fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut 
     }
     hscope.bool_vars = bools_after(&params_all, &[body], scope);
     let hcond = compile_expr(cond, &hscope, t)?;
-    let params_cl = params_all.clone();
-    let then_core = {
-        let mut s = hscope.clone();
-        compile_block(body, &mut s, t, g, &move |sc: &Scope, _g: &mut Gen| {
-            Ok(Core::Call(helper_id, params_cl.iter().map(|p| Core::Var(sc.vars[p])).collect()))
-        })?
+    let next = |sc: &Scope, _: &mut Gen| {
+        Ok(Core::Call(helper_id, params_all.iter().map(|p| Core::Var(sc.vars[p])).collect()))
     };
-    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(state_value(&mutated, &hscope)));
-    let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);
-    g.out_fns[helper_id as usize] = CoreFn {
-        name: format!("__while{}", helper_id),
-        arity: params_all.len(),
-        body: helper_body,
-        self_tail_rec,
-        fold: None,
-    };
+    compile_loop(helper_id, "while", hscope, hcond, body, &mutated, None, t, g, &next)?;
     let call = Core::Call(helper_id, params_all.iter().map(|p| Core::Var(scope.vars[p])).collect());
     Ok((call, mutated))
 }
@@ -745,7 +666,8 @@ fn compile_for(
     t: &Tables,
     g: &mut Gen,
 ) -> Result<(Core, Vec<String>), Diag> {
-    if contains_return(body) {
+    let facts = BlockFacts::of(body);
+    if facts.has_return {
         return Err(Diag::new(0, "`return` inside a `for` body is not supported"));
     }
     let cbound = compile_expr(bound, scope, t)?;
@@ -754,7 +676,7 @@ fn compile_for(
     let mut free = BTreeSet::new();
     free_reads_stmts(body, &mut free);
     free.remove(var);
-    let (extra, mutated) = loop_state(assigned_names(body).into_iter().filter(|n| n != var).collect(), &free, scope);
+    let (extra, mutated) = loop_state(facts.assigned.into_iter().filter(|n| n != var).collect(), &free, scope);
 
     let helper_id = g.fresh_fn_id();
     let mut hscope = Scope::default();
@@ -768,28 +690,16 @@ fn compile_for(
         hscope.fresh(p);
     }
     hscope.bool_vars = bools_after(&extra, &[body], scope);
-    let extra_cl = extra.clone();
-    let then_core = {
-        let mut s = hscope.clone();
-        compile_block(body, &mut s, t, g, &move |sc: &Scope, _g: &mut Gen| {
-            let mut args = vec![
-                Core::Op2(BinOp::Add, Box::new(Core::Var(sc.vars[&counter])), Box::new(Core::Num(1))),
-                Core::Var(sc.vars[&bound_name]),
-            ];
-            args.extend(extra_cl.iter().map(|p| Core::Var(sc.vars[p])));
-            Ok(Core::Call(helper_id, args))
-        })?
+    let next = |sc: &Scope, _: &mut Gen| {
+        let mut args = vec![
+            Core::Op2(BinOp::Add, Box::new(Core::Var(sc.vars[&counter])), Box::new(Core::Num(1))),
+            Core::Var(sc.vars[&bound_name]),
+        ];
+        args.extend(extra.iter().map(|p| Core::Var(sc.vars[p])));
+        Ok(Core::Call(helper_id, args))
     };
     let hcond = Core::Cmp(CmpOp::Lt, Box::new(Core::Var(v_idx)), Box::new(Core::Var(bnd_idx)));
-    let helper_body = Core::If(Box::new(hcond), Box::new(then_core), Box::new(state_value(&mutated, &hscope)));
-    let self_tail_rec = compute_self_tail_rec(helper_id, &helper_body);
-    g.out_fns[helper_id as usize] = CoreFn {
-        name: format!("__for{}", helper_id),
-        arity: 2 + extra.len(),
-        body: helper_body,
-        self_tail_rec,
-        fold: fold.clone(),
-    };
+    compile_loop(helper_id, "for", hscope, hcond, body, &mutated, fold.clone(), t, g, &next)?;
 
     let mut call_args = vec![Core::Num(0), Core::Var(bound_idx)];
     call_args.extend(extra.iter().map(|p| Core::Var(scope.vars[p])));
@@ -800,7 +710,7 @@ fn compile_for(
 // ---- top-level function compilation ----
 
 fn compile_fn(f: &FnDef, t: &Tables, g: &mut Gen) -> Result<CoreFn, Diag> {
-    if !always_returns(&f.body) {
+    if !BlockFacts::of(&f.body).returns {
         return Err(Diag::new(0, format!("function '{}' does not return on all control-flow paths", f.name)));
     }
     let mut scope = Scope::default();

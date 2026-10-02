@@ -37,7 +37,9 @@ extern "C" {
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> CUresult;
     fn cuCtxSetLimit(limit: i32, value: usize) -> CUresult;
     fn cuStreamQuery(stream: *mut c_void) -> CUresult;
+    fn cuLaunchHostFunc(stream: *mut c_void, callback: unsafe extern "C" fn(*mut c_void), data: *mut c_void) -> CUresult;
     fn cuModuleLoadData(module: *mut *mut c_void, image: *const c_void) -> CUresult;
+    fn cuFuncSetAttribute(f: *mut c_void, attrib: i32, value: i32) -> CUresult;
     fn cuModuleGetFunction(f: *mut *mut c_void, module: *mut c_void, name: *const std::ffi::c_char) -> CUresult;
     fn cuModuleGetGlobal_v2(
         dptr: *mut CUdeviceptr,
@@ -47,6 +49,7 @@ extern "C" {
     ) -> CUresult;
     fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     fn cuMemAllocManaged(dptr: *mut CUdeviceptr, bytesize: usize, flags: u32) -> CUresult;
+    fn cuMemPrefetchAsync_v2(dptr: CUdeviceptr, count: usize, location: CUmemLocation, flags: u32, stream: *mut c_void) -> CUresult;
     fn cuMemAdvise_v2(dptr: CUdeviceptr, count: usize, advice: i32, location: CUmemLocation) -> CUresult;
     fn cuDevicePrimaryCtxRetain(ctx: *mut *mut c_void, dev: i32) -> CUresult;
     fn cuDevicePrimaryCtxRelease_v2(dev: i32) -> CUresult;
@@ -57,6 +60,8 @@ extern "C" {
     fn cuCtxSetCurrent(ctx: *mut c_void) -> CUresult;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> CUresult;
+    fn cuFuncGetAttribute(value: *mut i32, attr: i32, f: *mut c_void) -> CUresult;
+    fn cuOccupancyAvailableDynamicSMemPerBlock(bytes: *mut usize, f: *mut c_void, blocks: i32, threads: i32) -> CUresult;
     fn cuOccupancyMaxActiveBlocksPerMultiprocessor(n: *mut i32, f: *mut c_void, block: i32, shared: usize) -> CUresult;
     #[allow(clippy::too_many_arguments)]
     fn cuLaunchCooperativeKernel(
@@ -103,14 +108,57 @@ fn cu(r: CUresult, what: &str) -> Result<(), String> {
     }
 }
 
+unsafe fn shared_opt_in(kernel: *mut c_void, dev: i32) -> Result<(), String> {
+    let (mut device_limit, mut static_bytes) = (0, 0);
+    cu(cuDeviceGetAttribute(&mut device_limit, 97, dev), "device shared limit")?;
+    cu(cuFuncGetAttribute(&mut static_bytes, 1, kernel), "kernel static shared memory")?;
+    cu(cuFuncSetAttribute(kernel, 8, device_limit.saturating_sub(static_bytes)), "shared memory opt-in")
+}
+
 // ---- device-side Dev struct mirror (field order must match engine.cu) ----
+
+// One address range: its initial allocator burst is committed before execution;
+// later pages retain demand backing. Logical handles never move.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Arena {
+    base: CUdeviceptr,
+}
+impl Arena {
+    fn allocate(count: usize, prefix: usize, width: usize,
+        allocate: impl FnOnce(usize) -> Result<CUdeviceptr, String>,
+        commit: impl FnOnce(CUdeviceptr, usize) -> Result<(), String>) -> Result<Self, String> {
+        let bytes = count.checked_mul(width).ok_or("mithril-gpu: arena byte capacity overflow")?;
+        if bytes == 0 { return Ok(Self::default()); }
+        let base = allocate(bytes)?;
+        let initial = prefix.min(count) * width;
+        if initial != 0 { commit(base, initial)?; }
+        Ok(Self { base })
+    }
+    unsafe fn read<T: Copy + Default>(self, count: usize) -> Result<Vec<T>, String> {
+        dtoh::<T>(self.base, count, "read result cells")
+    }
+    unsafe fn poison(self, count: usize, width: usize) -> Result<(), String> {
+        if count != 0 { cu(cuMemsetD8_v2(self.base, 0xCD, width*count), "poison arena")?; }
+        Ok(())
+    }
+}
+unsafe fn arena(mem: &mut Mem, dev: i32, count: usize, prefix: usize, width: usize, what: &str) -> Result<Arena,String> {
+    Arena::allocate(count, prefix, width,
+        |bytes| alloc(mem, dev, bytes, Commit::OnTouch, what),
+        |base, bytes| {
+            if std::env::var_os("MITHRIL_GPU_EAGER").is_some() { return Ok(()); }
+            let location = CUmemLocation { kind: CU_MEM_LOCATION_TYPE_DEVICE, id: dev };
+            cu(cuMemPrefetchAsync_v2(base, bytes, location, 0, std::ptr::null_mut()), "initial arena residency")
+        })
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Dev {
-    nodes: CUdeviceptr,
-    rc: CUdeviceptr,
-    recs: CUdeviceptr,
+    nodes: Arena,
+    rc: Arena,
+    recs: Arena,
     nbump: CUdeviceptr,
     rbump: CUdeviceptr,
     nfreen: CUdeviceptr,
@@ -137,6 +185,7 @@ struct Dev {
     fuel: i32,
     net_fuel: i32,
 }
+const INITIAL_CHUNK: usize = 64;
 const NWCAP: usize = 64;
 const LSCAP: usize = 64;
 
@@ -157,8 +206,12 @@ const REC_SIZE: usize = 40; // sizeof(Rec) in engine.cu
 const MAXLANES: usize = 1 << 16;
 const TPB: u32 = 256;
 
-/// Parse a capacity env var: decimal, `0x..`, or `1<<k`.
-fn env_cap(name: &str, default: u64) -> u64 {
+fn lane_limit() -> u32 {
+    env_value("MITHRIL_GPU_LANES", MAXLANES as u64).clamp(1, MAXLANES as u64).div_ceil(TPB as u64) as u32
+}
+
+/// Parse an unsigned setting: decimal, `0x..`, or `1<<k`.
+fn env_value(name: &str, default: u64) -> u64 {
     let Ok(s) = std::env::var(name) else { return default };
     let s = s.trim().replace(' ', "");
     let v = if let Some(hex) = s.strip_prefix("0x") {
@@ -171,7 +224,41 @@ fn env_cap(name: &str, default: u64) -> u64 {
     } else {
         s.parse::<u64>().ok()
     };
-    v.filter(|&v| v >= 2).unwrap_or(default)
+    v.unwrap_or(default)
+}
+
+fn env_cap(name: &str, default: u64) -> u64 {
+    let value = env_value(name, default);
+    if value >= 2 { value } else { default }
+}
+
+fn resident_words(limit: u32, residency: i32, mut occupancy: impl FnMut(u32) -> Result<i32, String>) -> Result<u32, String> {
+    if occupancy(0)? < residency {
+        return Err("mithril-gpu: requested residency exceeds the kernel's capacity".into());
+    }
+    let (mut lo, mut hi) = (0, limit);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if occupancy(mid)? >= residency { lo = mid; } else { hi = mid - 1; }
+    }
+    Ok(lo)
+}
+
+unsafe fn native_cache(kernel: *mut c_void, residency: i32) -> Result<(usize, u32), String> {
+    let mut bytes = 0;
+    cu(cuOccupancyAvailableDynamicSMemPerBlock(&mut bytes, kernel, residency, TPB as i32), "native cache residency")?;
+    let mut limit = 0;
+    cu(cuFuncGetAttribute(&mut limit, 8, kernel), "max dynamic shared memory")?;
+    let available = bytes.min(limit.max(0) as usize) / (TPB as usize * 8);
+    let requested = env_value("MITHRIL_GPU_NATIVE_WORDS", available as u64).min(available as u64) as u32;
+    // The available-memory estimate can exceed the occupancy boundary. Check
+    // the actual resource limit rather than silently halving resident blocks.
+    let words = resident_words(requested, residency, |words| {
+        let mut active = 0;
+        cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut active, kernel, TPB as i32, words as usize * TPB as usize * 8), "cache occupancy")?;
+        Ok(active)
+    })?;
+    Ok((words as usize * TPB as usize * 8, words))
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -470,7 +557,7 @@ enum Commit {
 /// diagnostic: it separates demand-paging cost from the rest).
 unsafe fn alloc(mem: &mut Mem, dev: i32, n: usize, commit: Commit, what: &str) -> Result<CUdeviceptr, String> {
     let mut p: CUdeviceptr = 0;
-    if commit == Commit::Now || std::env::var_os("MITHRIL_GPU_EAGER").is_some() {
+    if commit == Commit::Now || (commit != Commit::Shared && std::env::var_os("MITHRIL_GPU_EAGER").is_some()) {
         cu(cuMemAlloc_v2(&mut p, n.max(1)), what)?;
         mem.bufs.push(p);
         return Ok(p);
@@ -483,6 +570,72 @@ unsafe fn alloc(mem: &mut Mem, dev: i32, n: usize, commit: Commit, what: &str) -
     let at = CUmemLocation { kind: CU_MEM_LOCATION_TYPE_DEVICE, id: dev };
     cu(cuMemAdvise_v2(p, n.max(1), CU_MEM_ADVISE_SET_PREFERRED_LOCATION, at), what)?;
     Ok(p)
+}
+
+// Callback userdata is a generation, never a pointer to a waiter's storage.
+// Cancellation and context faults expire its ticket; late callbacks are safe.
+static COMPLETION: crate::completion::Signal = crate::completion::Signal::new();
+unsafe extern "C" fn completed(data: *mut c_void) {
+    COMPLETION.complete(data as usize);
+}
+
+unsafe fn wait_stream(mem: &mut Mem, abortf: CUdeviceptr, concurrent: bool, started: std::time::Instant,
+    deadline: std::time::Duration, stop_sent: &mut bool) -> Result<(),String> {
+    let pending = cuStreamQuery(std::ptr::null_mut());
+    if pending == 0 { return check_deadline(started, deadline); }
+    if pending != 600 { return Err(format!("mithril-gpu: the device run failed with code {pending}")); }
+    let polling = std::time::Instant::now();
+    let ticket = COMPLETION.register()?;
+    let result = cuLaunchHostFunc(std::ptr::null_mut(), completed, ticket.token() as *mut c_void);
+    let ticket = if result == 801 { // CUDA_ERROR_NOT_SUPPORTED
+        drop(ticket);
+        None
+    } else {
+        cu(result, "register completion callback")?;
+        Some(ticket)
+    };
+    let interval=std::time::Duration::from_millis(2);
+    loop {
+        let r = cuStreamQuery(std::ptr::null_mut());
+        if r == 0 {
+            return check_deadline(started, deadline);
+        }
+        if r != 600 {
+            return Err(format!("mithril-gpu: the device run failed with code {r}"));
+        }
+        if started.elapsed() > deadline && !*stop_sent {
+            // ask the lanes to stop: the abort flag, which every lane reads
+            // at its next scheduler check (a native loop never checks)
+            // (only where the host may write managed memory while a kernel
+            // runs, and only when no abort is set: the first abort wins)
+            if concurrent && std::ptr::read_volatile(abortf as *const u32) == 0 {
+                std::ptr::write_volatile(abortf as *mut u32, AB_TIMEOUT);
+            }
+            *stop_sent = true;
+        }
+        if started.elapsed() > 2 * deadline {
+            // the lanes did not stop: the kernel still runs, and freeing,
+            // releasing or resetting would each wait for it; the run is
+            // abandoned (the process's exit ends the kernel)
+            mem.abandon = true;
+            return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT) {ABANDONED}", deadline.as_secs()));
+        }
+        if let Some(ticket) = &ticket {
+            if ticket.wait(interval) { return check_deadline(started, deadline); }
+        } else if polling.elapsed() < interval {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(interval);
+        }
+    }
+}
+
+fn check_deadline(started: std::time::Instant, deadline: std::time::Duration) -> Result<(), String> {
+    if started.elapsed() > deadline {
+        Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT); stopped", deadline.as_secs()))
+    } else {
+        Ok(())
+    }
 }
 
 unsafe fn dtoh<T: Copy + Default>(src: CUdeviceptr, n: usize, what: &str) -> Result<Vec<T>, String> {
@@ -543,8 +696,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     };
     let bcap = bcap.next_power_of_two(); // rings: a power of two
     let hcap_req = std::env::var("MITHRIL_GPU_HEAP").ok().map(|_| env_cap("MITHRIL_GPU_HEAP", 1 << 26));
-    let fuel = env_cap("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
-    let net_fuel = env_cap("MITHRIL_GPU_NET_FUEL", 4096).clamp(1, i32::MAX as u64) as i32;
+    let fuel = env_value("MITHRIL_GPU_FUEL", 64).clamp(1, i32::MAX as u64) as i32;
+    let net_fuel = env_value("MITHRIL_GPU_NET_FUEL", 4096).clamp(1, i32::MAX as u64) as i32;
 
     // Cap the cell arena to what this device can actually serve: free VRAM
     // minus the fixed buffers, the driver's local-memory (stack) reserve for
@@ -593,16 +746,21 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     };
     let chunksz = ((ncap as u64) / 65536).clamp(2, 4096) as u32;
 
-    // device buffers
+    // The first cell chunk and one local-task capacity per admitted lane stay
+    // resident. The suffix retains full logical capacity and commits on demand.
+    // Shared communication rings stay resident because any ring slot can be next.
+    let consumers = lane_limit() as usize * TPB as usize;
+    let cells = 1 + consumers * (chunksz as usize).min(INITIAL_CHUNK);
+    let records = 1 + consumers * LSCAP;
     let d = Dev {
-        nodes: alloc(&mut mem, dev, 16 * ncap as usize, Commit::OnTouch, "alloc nodes")?,
-        rc: alloc(&mut mem, dev, 4 * ncap as usize, Commit::OnTouch, "alloc rc")?,
-        recs: alloc(&mut mem, dev, REC_SIZE * rcap as usize, Commit::OnTouch, "alloc recs")?,
+        nodes: arena(&mut mem, dev, 2*ncap as usize, 2*cells, 8, "alloc nodes")?,
+        rc: arena(&mut mem, dev, ncap as usize, cells, 4, "alloc rc")?,
+        recs: arena(&mut mem, dev, rcap as usize, records, REC_SIZE, "alloc recs")?,
         nbump: alloc(&mut mem, dev, 4, Commit::Now, "alloc nbump")?,
         rbump: alloc(&mut mem, dev, 4, Commit::Now, "alloc rbump")?,
         nfreen: alloc(&mut mem, dev, 4 * MAXLANES, Commit::Now, "alloc nfreen")?,
         nchunk: alloc(&mut mem, dev, 8 * MAXLANES, Commit::Now, "alloc nchunk")?,
-        ebuf: alloc(&mut mem, dev, 24 * bcap as usize * nrules, Commit::OnTouch, "alloc ebuf")?,
+        ebuf: alloc(&mut mem, dev, 24 * bcap as usize * nrules, Commit::Now, "alloc ebuf")?,
         blen: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc blen")?,
         bdone: alloc(&mut mem, dev, 4 * nrules, Commit::Now, "alloc bdone")?,
         result: alloc(&mut mem, dev, 16, Commit::Now, "alloc result")?,
@@ -625,10 +783,13 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         net_fuel,
     };
     if std::env::var_os("MITHRIL_GPU_DEBUG").is_some() {
-        eprintln!("mithril-gpu: nodes {:#x}+{:#x} rc {:#x}+{:#x} recs {:#x}+{:#x} ebuf {:#x}+{:#x} heap {:#x}+{:#x} nw {:#x}+{:#x}",
-            d.nodes, 16 * ncap as u64, d.rc, 4 * ncap as u64, d.recs, REC_SIZE as u64 * rcap as u64, d.ebuf, 24 * bcap as u64 * nrules as u64, d.heap, 8 * hcap, d.nw, (16 * NWCAP * MAXLANES) as u64);
+        for (name, buffer, count, width) in [("nodes",d.nodes,2*ncap as usize,8),("rc",d.rc,ncap as usize,4),("recs",d.recs,rcap as usize,REC_SIZE)] {
+            eprintln!("mithril-gpu: {name} {:#x}+{:#x}", buffer.base, count*width);
+        }
+        eprintln!("mithril-gpu: ebuf {:#x}+{:#x}, heap {:#x}+{:#x}, nw {:#x}+{:#x}",
+            d.ebuf,24*bcap as u64*nrules as u64,d.heap,8*hcap,d.nw,(16*NWCAP*MAXLANES) as u64);
     }
-    cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?;
+    cu(cuMemsetD8_v2(d.nodes.base, 0, 16), "memset cell0")?;
     cu(cuMemsetD8_v2(d.nfreen, 0, 4 * MAXLANES), "memset nfreen")?;
     cu(cuMemsetD8_v2(d.nchunk, 0, 8 * MAXLANES), "memset nchunk")?;
     cu(cuMemsetD8_v2(d.blen, 0, 4 * nrules), "memset blen")?;
@@ -651,8 +812,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     // MITHRIL_GPU_POISON=<buffers>: fill never-initialized buffers with a
     // pattern so a read of unwritten memory is deterministic (a probe)
     if let Ok(pz) = std::env::var("MITHRIL_GPU_POISON") {
-        if pz.contains("nodes") { cu(cuMemsetD8_v2(d.nodes, 0xCD, 16 * ncap as usize), "poison nodes")?; cu(cuMemsetD8_v2(d.nodes, 0, 16), "memset cell0")?; }
-        if pz.contains("recs") { cu(cuMemsetD8_v2(d.recs, 0xCD, REC_SIZE * rcap as usize), "poison recs")?; }
+        if pz.contains("nodes") { d.nodes.poison(2*ncap as usize,8)?; cu(cuMemsetD8_v2(d.nodes.base, 0, 16), "memset cell0")?; }
+        if pz.contains("recs") { d.recs.poison(rcap as usize,REC_SIZE)?; }
         if pz.contains("ebuf") { cu(cuMemsetD8_v2(d.ebuf, 0xCD, 24 * bcap as usize * nrules), "poison ebuf")?; }
         if pz.contains("heap") { cu(cuMemsetD8_v2(d.heap, 0xCD, 8 * hcap as usize), "poison heap")?; }
     }
@@ -683,12 +844,31 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         cu(cuModuleGetGlobal_v2(&mut p, &mut sz, module, c"g_stack_limit".as_ptr()), "cuModuleGetGlobal(g_stack_limit)")?;
         cu(cuMemcpyHtoD_v2(p, (&lim as *const u32).cast(), 4), "set g_stack_limit")?;
     }
+    let mut k_run: *mut c_void = std::ptr::null_mut();
+    cu(cuModuleGetFunction(&mut k_run, module, c"k_run".as_ptr()), "get k_run")?;
+    let mut per_sm: i32 = 0;
+    cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut per_sm, k_run, TPB as i32, 0), "occupancy k_run")?;
+    // Use shared memory left at the kernel's existing residency. Programs
+    // without explicit frames (including older artifacts) allocate none.
+    let (mut native_ptr, mut native_size) = (0, 0);
+    let mut shared = 0usize;
+    if cuModuleGetGlobal_v2(&mut native_ptr, &mut native_size, module, c"g_native_enabled".as_ptr()) == 0
+        && dtoh::<u32>(native_ptr, 1, "native enabled")?[0] != 0 {
+        shared_opt_in(k_run, dev)?;
+        let (bytes, words) = native_cache(k_run, per_sm.max(1))?;
+        shared = bytes;
+        if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: native cache {words} words/lane, {shared} bytes/block, {per_sm} blocks/SM"); }
+        cu(cuModuleGetGlobal_v2(&mut native_ptr, &mut native_size, module, c"g_native_words".as_ptr()), "native cache words")?;
+        cu(cuMemcpyHtoD_v2(native_ptr, (&words as *const u32).cast(), 4), "set native cache words")?;
+        cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut per_sm, k_run, TPB as i32, shared), "occupancy with native cache")?;
+    }
     let mut k_boot: *mut c_void = std::ptr::null_mut();
     cu(cuModuleGetFunction(&mut k_boot, module, c"k_boot".as_ptr()), "get k_boot")?;
 
+    shared_opt_in(k_boot, dev)?;
     let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
     if stats {
-        for _ in 0..4 {
+        for _ in 0..6 {
             let mut event = std::ptr::null_mut();
             cu(cuEventCreate(&mut event, 0), "create timing event")?;
             mem.events.push(event);
@@ -709,7 +889,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
             (&mut bf as *mut i32).cast::<c_void>(),
         ];
         cu(
-            cuLaunchKernel(k_boot, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
+            cuLaunchKernel(k_boot, 1, 1, 1, 1, 1, 1, (shared / TPB as usize) as u32, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
             "launch k_boot",
         )?;
     }
@@ -732,65 +912,71 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
             _ => format!("mithril-gpu: arena exhausted: cells ({ncap}; raise MITHRIL_GPU_NODES)"),
         }
     };
-    let mut k_run: *mut c_void = std::ptr::null_mut();
-    cu(cuModuleGetFunction(&mut k_run, module, c"k_run".as_ptr()), "get k_run")?;
-    let mut per_sm: i32 = 0;
-    cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut per_sm, k_run, TPB as i32, 0), "occupancy k_run")?;
-    let mut sms: i32 = 0;
-    cu(cuDeviceGetAttribute(&mut sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev), "sm count")?;
     // MITHRIL_GPU_LANES caps the lanes (the one-lane run is the determinism probe)
-    let blocks = ((per_sm.max(1) * sms.max(1)) as u32).min(MAXLANES as u32 / TPB).min(env_cap("MITHRIL_GPU_LANES", MAXLANES as u64).clamp(1, MAXLANES as u64).div_ceil(TPB as u64) as u32).max(1);
+    let blocks = ((per_sm.max(1) * mp.max(1)) as u32).min(lane_limit()).max(1);
     let lanes = blocks * TPB;
     let t_prepare = t0.elapsed();
     if stats { cu(cuEventRecord(mem.events[2], std::ptr::null_mut()), "record run start")?; }
     let t_run = std::time::Instant::now();
-    let mut width: u32 = env_cap("MITHRIL_GPU_GROW_WIDTH", lanes as u64).clamp(1, lanes as u64) as u32;
-    let mut steps: u32 = env_cap("MITHRIL_GPU_WORK_STEPS", 1 << 30).clamp(1, u32::MAX as u64) as u32;
+    let mut width: u32 = env_value("MITHRIL_GPU_GROW_WIDTH", lanes as u64).clamp(1, lanes as u64) as u32;
+    let mut steps: u32 = env_value("MITHRIL_GPU_WORK_STEPS", 1 << 30).clamp(1, u32::MAX as u64) as u32;
     // a grow task runs its body with the dive budget; fork-site callees
     // and tail calls become tasks at once
-    let mut gfuel: i32 = env_cap("MITHRIL_GPU_GROW_FUEL", fuel as u64).clamp(1, i32::MAX as u64) as i32;
+    let mut gfuel: i32 = env_value("MITHRIL_GPU_GROW_FUEL", fuel as u64).clamp(1, i32::MAX as u64) as i32;
     // a run that does not converge stops with an error at this many rounds
-    let mut max_rounds: u64 = env_cap("MITHRIL_GPU_ROUNDS", 1 << 24);
+    let mut max_rounds: u64 = env_value("MITHRIL_GPU_ROUNDS", 1 << 24);
     let mut params = [(&mut width as *mut u32).cast::<c_void>(), (&mut steps as *mut u32).cast::<c_void>(), (&mut gfuel as *mut i32).cast::<c_void>(), (&mut max_rounds as *mut u64).cast::<c_void>()];
-    cu(
-        cuLaunchCooperativeKernel(k_run, blocks, 1, 1, TPB, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr()),
-        "launch k_run (cooperative)",
-    )?;
-    if stats { cu(cuEventRecord(mem.events[3], std::ptr::null_mut()), "record run end")?; }
-    // wait with a deadline: a run past MITHRIL_GPU_TIMEOUT seconds is an
-    // error; lanes that do not stop (a native loop, a runaway forking
-    // recursion) leave the kernel running until the process exits
-    let deadline = std::time::Duration::from_secs(env_cap("MITHRIL_GPU_TIMEOUT", 300));
-    let mut stop_sent = false;
-    let mut concurrent = 0i32;
-    cu(cuDeviceGetAttribute(&mut concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, dev), "attr(concurrent managed access)")?;
-    let concurrent = concurrent != 0;
+    let deadline = std::time::Duration::from_secs(env_value("MITHRIL_GPU_TIMEOUT",300));
+    let mut stop_sent=false;
+    let mut concurrent=0;
+    cu(cuDeviceGetAttribute(&mut concurrent,CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS,dev),"concurrent managed access")?;
+    let (mut launch_ptr,mut launch_size)=(0,0);
+    let typed=cuModuleGetGlobal_v2(&mut launch_ptr,&mut launch_size,module,c"g_native_launch".as_ptr())==0;
+    let mut kernels=std::collections::HashMap::new();
     loop {
-        let r = cuStreamQuery(std::ptr::null_mut());
-        if r == 0 {
-            break;
-        }
-        if r != 600 {
-            return Err(format!("mithril-gpu: the device run failed with code {r}"));
-        }
-        if t_run.elapsed() > deadline && !stop_sent {
-            // ask the lanes to stop: the abort flag, which every lane reads
-            // at its next scheduler check (a native loop never checks)
-            // (only where the host may write managed memory while a kernel
-            // runs, and only when no abort is set: the first abort wins)
-            if concurrent && std::ptr::read_volatile(d.abortf as *const u32) == 0 {
-                std::ptr::write_volatile(d.abortf as *mut u32, AB_TIMEOUT);
+        check_deadline(t_run, deadline)?;
+        cu(cuLaunchCooperativeKernel(k_run,blocks,1,1,TPB,1,1,shared as u32,std::ptr::null_mut(),params.as_mut_ptr()),"launch engine")?;
+        if stats { cu(cuEventRecord(mem.events[3],std::ptr::null_mut()),"record run end")?; }
+        wait_stream(&mut mem,d.abortf,concurrent!=0,t_run,deadline,&mut stop_sent)?;
+        if !typed || dtoh::<u32>(d.abortf,1,"read abort")?[0]!=0 { break; }
+        let rule=dtoh::<i32>(launch_ptr,1,"native launch")?[0];
+        if rule<0 { break; }
+        let (kernel,nblocks,bytes,words)=if let Some(plan)=kernels.get(&rule) { *plan } else {
+            let mut kernel=std::ptr::null_mut();
+            let name=std::ffi::CString::new(format!("k_native_{rule}")).unwrap();
+            cu(cuModuleGetFunction(&mut kernel,module,name.as_ptr()),"native kernel")?;
+            shared_opt_in(kernel,dev)?;
+            let mut active=0;
+            cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut active,kernel,TPB as i32,0),"native occupancy")?;
+            let nblocks=((active.max(1)*mp.max(1)) as u32).min(lane_limit()).max(1);
+            active=(nblocks as i32/mp.max(1)).max(1);
+            let (bytes, words) = native_cache(kernel, active)?;
+            let plan=(kernel,nblocks,bytes,words); kernels.insert(rule,plan);
+            if stats {
+                let mut registers=0;
+                let _=cuFuncGetAttribute(&mut registers,4,kernel);
+                eprintln!("mithril-gpu: native rule {rule}, {} lanes, {words} cache words/lane, {registers} registers",nblocks*TPB);
             }
-            stop_sent = true;
+            plan
+        };
+        cu(cuMemcpyHtoD_v2(native_ptr,(&words as *const u32).cast(),4),"native cache words")?;
+        if stats { cu(cuEventRecord(mem.events[4],std::ptr::null_mut()),"native start")?; }
+        check_deadline(t_run, deadline)?;
+        cu(cuLaunchKernel(kernel,nblocks,1,1,TPB,1,1,bytes as u32,std::ptr::null_mut(),std::ptr::null_mut(),std::ptr::null_mut()),"launch native entry")?;
+        if stats { cu(cuEventRecord(mem.events[5],std::ptr::null_mut()),"native end")?; }
+        let mut done=std::ptr::null_mut();
+        cu(cuModuleGetFunction(&mut done,module,c"k_native_done".as_ptr()),"native completion")?;
+        let mut rule=rule as u32;
+        let mut args=[(&mut rule as *mut u32).cast::<c_void>()];
+        cu(cuLaunchKernel(done,1,1,1,1,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()),"complete native entry")?;
+        wait_stream(&mut mem,d.abortf,concurrent!=0,t_run,deadline,&mut stop_sent)?;
+        if stats {
+            let mut elapsed=0f32;
+            if cuEventElapsedTime(&mut elapsed,mem.events[4],mem.events[5])==0 { eprintln!("mithril-gpu: native rule {rule} search {elapsed:.3} ms"); }
         }
-        if t_run.elapsed() > 2 * deadline {
-            // the lanes did not stop: the kernel still runs, and freeing,
-            // releasing or resetting would each wait for it; the run is
-            // abandoned (the process's exit ends the kernel)
-            mem.abandon = true;
-            return Err(format!("{TIMEOUT} {} s (MITHRIL_GPU_TIMEOUT) {ABANDONED}", deadline.as_secs()));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        if dtoh::<u32>(d.abortf,1,"read abort")?[0]!=0 { break; }
+        let words=(shared/(TPB as usize*8)) as u32;
+        cu(cuMemcpyHtoD_v2(native_ptr,(&words as *const u32).cast(),4),"restore engine cache")?;
     }
     let ab = dtoh::<u32>(d.abortf, 1, "read abortf")?[0];
     if ab == AB_TIMEOUT {
@@ -829,7 +1015,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
                     let per: Vec<String> = (0..nrules).filter(|k| rl[i * nrules + k] > 0).map(|k| format!("r{k}:{}", rl[i * nrules + k])).collect();
                     eprintln!("mithril-gpu:   [{}]", per.join(" "));
                 }
-                let ph = ["EXIT", "GROW", "WORK"][log[i * 3].min(2) as usize];
+                let ph = ["EXIT", "GROW", "WORK", "NATIVE"][log[i * 3].min(3) as usize];
                 let w = if log[i * 3] == 2 { format!(" steps max {} sum {} Kcycles {} slowest lane {} Kcycles in {} steps, {} lanes busy", wl[i * 6], wl[i * 6 + 1], wl[i * 6 + 2], wl[i * 6 + 3], wl[i * 6 + 4], wl[i * 6 + 5]) } else { format!(" Kcycles {}", wl[i * 6 + 2]) };
                 eprintln!("mithril-gpu: round {i}: pending {} pushed {} -> {ph}{w}", log[i * 3 + 1], log[i * 3 + 2]);
             }
@@ -876,7 +1062,7 @@ unsafe fn cell(d: &Dev, cells: &mut Vec<u64>, i: u32) -> Result<[u64; 2], String
         // Keep bulk transfer for aggregate results: a transfer per cell
         // cost ~1.7 s for a 512 x 512 image. All later reads use this snapshot.
         let used = dtoh::<u32>(d.nbump, 1, "read nbump")?[0].min(d.ncap) as usize;
-        *cells = dtoh::<u64>(d.nodes, 2 * used, "read cells")?;
+        *cells = d.nodes.read::<u64>(2*used)?;
     }
     let k = 2 * i as usize;
     cells.get(k..k + 2).map(|c| [c[0], c[1]]).ok_or_else(|| format!("mithril-gpu: result cell {i} is outside the cells in use"))
@@ -926,4 +1112,182 @@ unsafe fn show(d: &Dev, cells: &mut Vec<u64>, unbox: &[u32], p: u64) -> Result<S
         }
         _ => return Err(format!("mithril-gpu: unprintable result port {p:#x}")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_residency_commits_a_prefix_without_splitting_addresses() {
+        for count in [0, 1, 2, 17, 257] {
+            for prefix in [0, 1, 2, 16, 257, usize::MAX] {
+                for width in [4, 8, REC_SIZE] {
+                    let mut allocations = Vec::new();
+                    let mut commits = Vec::new();
+                    let arena = Arena::allocate(count, prefix, width,
+                        |bytes| { allocations.push(bytes); Ok(4096) },
+                        |base, bytes| { commits.push((base, bytes)); Ok(()) }).unwrap();
+                    assert_eq!(allocations, if count == 0 { vec![] } else { vec![count*width] });
+                    assert_eq!(commits, if count.min(prefix) == 0 { vec![] } else { vec![(4096,count.min(prefix)*width)] });
+                    assert_eq!(arena.base, if count == 0 { 0 } else { 4096 });
+                }
+            }
+        }
+        assert!(Arena::allocate(usize::MAX, 1, 8, |_| panic!("overflow allocated"), |_,_| Ok(())).is_err());
+        assert!(Arena::allocate(17, 3, 8, |_| Err("allocation failed".into()), |_,_| panic!("failed allocation committed")).is_err());
+        let mut owned = Vec::new();
+        let result = Arena::allocate(17, 3, 8,
+            |n| { owned.push(n); Ok(4096) }, |_,_| Err("commit failed".into()));
+        assert!(matches!(result,Err(e) if e=="commit failed"));
+        assert_eq!(owned, vec![136], "a failed commit must leave its allocation owned for cleanup");
+    }
+
+    #[test]
+    fn lane_limit_uses_the_actual_block_rounded_launch_cap() {
+        for (setting,want) in [("0",1),("1",1),("255",1),("256",1),("257",2),("65536",256),("65537",256),("auto",256)] {
+            std::env::set_var("MITHRIL_GPU_LANES",setting);
+            assert_eq!(lane_limit(),want,"{setting}");
+        }
+        std::env::remove_var("MITHRIL_GPU_LANES");
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; run --test-threads=1"]
+    fn arena_commit_failure_releases_its_allocation_and_readback_spans_the_prefix() {
+        let _one = ONE_RUN.lock().unwrap();
+        unsafe {
+            cu(cuInit(0), "init").unwrap();
+            let mut dev = 0;
+            cu(cuDeviceGet(&mut dev, 0), "device").unwrap();
+            let mut ctx = std::ptr::null_mut();
+            cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "retain").unwrap();
+            let _hold = ContextHold(dev);
+            cu(cuCtxSetCurrent(ctx), "current").unwrap();
+            let (mut before, mut total) = (0, 0);
+            cu(cuMemGetInfo_v2(&mut before, &mut total), "free before").unwrap();
+            {
+                let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                let result = Arena::allocate(2<<18, 1<<18, 8,
+                    |bytes| alloc(&mut mem, dev, bytes, Commit::Now, "test arena"),
+                    |_,_| Err("injected commit error".into()));
+                assert!(matches!(result,Err(e) if e=="injected commit error"));
+                assert_eq!(mem.bufs.len(), 1, "the allocation must remain owned until cleanup");
+            }
+            let mut after = 0;
+            cu(cuMemGetInfo_v2(&mut after, &mut total), "free after").unwrap();
+            assert_eq!(after, before, "failed commitment leaked memory");
+            for count in [1, 17, 257] { for prefix in [0, 1, 16, 257] { for width in [4, 8, REC_SIZE] {
+                let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                let buffer = arena(&mut mem, dev, count, prefix, width, "test arena").unwrap();
+                buffer.poison(count, width).unwrap();
+                assert_eq!(buffer.read::<u8>(count*width).unwrap(), vec![0xCD; count*width]);
+                let expected: Vec<u8> = (0..count*width).map(|i| ((i*17+29)%251) as u8).collect();
+                cu(cuMemcpyHtoD_v2(buffer.base, expected.as_ptr().cast(), expected.len()), "fill arena").unwrap();
+                assert_eq!(buffer.read::<u8>(count*width).unwrap(), expected);
+                assert_eq!(buffer.read::<u8>(0).unwrap(), vec![]);
+            } } }
+        }
+    }
+
+    #[test]
+    fn cache_preserves_residency_at_every_boundary() {
+        let active = |words| Ok(if words <= 7 { 3 } else if words <= 21 { 2 } else { 1 });
+        for (limit, residency, want) in [(0,3,0),(1,3,1),(7,3,7),(8,3,7),(24,3,7),(21,2,21),(22,2,21),(24,2,21),(24,1,24)] {
+            assert_eq!(resident_words(limit, residency, active), Ok(want), "limit={limit} residency={residency}");
+        }
+        assert!(resident_words(24, 4, active).is_err());
+        assert_eq!(resident_words(24, 2, |_| Err("occupancy unavailable".into())), Err("occupancy unavailable".into()));
+        assert_eq!(resident_words(u32::MAX, 2, |n| Ok(if n <= 23 { 2 } else { 1 })), Ok(23));
+        assert_eq!(resident_words(24, 2, |n| Ok(if n == 0 { 2 } else { 1 })), Ok(0));
+        assert_eq!(resident_words(24, 2, |n| if n == 0 { Ok(2) } else { Err("occupancy query failed".into()) }), Err("occupancy query failed".into()));
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and nvcc; run --test-threads=1"]
+    fn native_cache_respects_actual_device_residency() {
+        let _one = ONE_RUN.lock().unwrap();
+        let mut source = String::new();
+        for words in [256, 512, 768, 1024, 1536, 2048] {
+            source.push_str(&format!(r#"
+extern "C" __global__ void probe_{words}(unsigned* output) {{
+  __shared__ volatile unsigned local[{words}];
+  extern __shared__ volatile unsigned cache[];
+  local[threadIdx.x] = cache[threadIdx.x];
+  output[threadIdx.x] = local[(threadIdx.x + 1) % {words}];
+}}
+"#));
+        }
+        let path = compile_to_cubin(&source, &std::env::temp_dir().join("mithril-cache-residency")).unwrap();
+        let cubin = fs::read(path).unwrap();
+        unsafe {
+            cu(cuInit(0), "init").unwrap();
+            let mut dev = 0;
+            cu(cuDeviceGet(&mut dev, 0), "device").unwrap();
+            let mut ctx = std::ptr::null_mut();
+            cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "retain").unwrap();
+            let _hold = ContextHold(dev);
+            cu(cuCtxSetCurrent(ctx), "current").unwrap();
+            let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+            cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr().cast()), "load probes").unwrap();
+            for words in [256, 512, 768, 1024, 1536, 2048] {
+                let name = std::ffi::CString::new(format!("probe_{words}")).unwrap();
+                let mut kernel = std::ptr::null_mut();
+                cu(cuModuleGetFunction(&mut kernel, mem.module, name.as_ptr()), "get probe").unwrap();
+                shared_opt_in(kernel, dev).unwrap();
+                let mut capacity = 0;
+                cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut capacity, kernel, TPB as i32, 0), "probe capacity").unwrap();
+                for residency in 1..=capacity.min(4) {
+                    for setting in ["0", "1", "auto", "4294967295"] {
+                        std::env::set_var("MITHRIL_GPU_NATIVE_WORDS", setting);
+                        let (bytes, selected) = native_cache(kernel, residency).unwrap();
+                        assert_eq!(bytes, selected as usize * TPB as usize * 8);
+                        let mut active = 0;
+                        cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut active, kernel, TPB as i32, bytes), "actual cache residency").unwrap();
+                        assert!(active >= residency, "static={words} request={residency} setting={setting}: words={selected}, actual={active}");
+                        if setting == "0" { assert_eq!(selected, 0); }
+                        if setting == "1" { assert!(selected <= 1); }
+                    }
+                }
+            }
+            std::env::remove_var("MITHRIL_GPU_NATIVE_WORDS");
+        }
+    }
+
+    #[test]
+    fn numeric_settings_preserve_zero_one_and_capacity_limits() {
+        let key = "MITHRIL_GPU_TEST_NUMBER";
+        for (text, value) in [("0",0),("1",1),("0x1",1),("1 << 0",1),(" 0x10 ",16),("2<<3",16),("17",17),("auto",9),("-1",9),("1<<64",9),("18446744073709551616",9)] {
+            std::env::set_var(key, text);
+            assert_eq!(env_value(key, 9), value, "{text}");
+            assert_eq!(env_cap(key, 9), if value >= 2 { value } else { 9 }, "{text}");
+        }
+        std::env::remove_var(key);
+        assert_eq!(env_value(key, 9), 9);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; run --test-threads=1"]
+    fn completed_stream_cannot_bypass_the_run_deadline() {
+        let _one = ONE_RUN.lock().unwrap();
+        unsafe {
+            cu(cuInit(0), "init").unwrap();
+            let mut dev = 0;
+            cu(cuDeviceGet(&mut dev, 0), "device").unwrap();
+            let mut ctx = std::ptr::null_mut();
+            cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "retain").unwrap();
+            let _hold = ContextHold(dev);
+            cu(cuCtxSetCurrent(ctx), "current").unwrap();
+            cu(cuCtxSynchronize(), "complete").unwrap();
+            for concurrent in [false, true] {
+                for mut stop_sent in [false, true] {
+                    let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                    let start = std::time::Instant::now() - std::time::Duration::from_secs(3);
+                    let result = wait_stream(&mut mem, 0, concurrent, start, std::time::Duration::from_secs(2), &mut stop_sent);
+                    assert!(matches!(result, Err(e) if e.starts_with(TIMEOUT) && e.ends_with("stopped")));
+                    assert!(!mem.abandon, "a completed kernel must release its buffers");
+                }
+            }
+        }
+    }
 }

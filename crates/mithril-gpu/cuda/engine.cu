@@ -56,10 +56,16 @@ struct Rec {
   u64 args[2];
 };
 
+// Residency is established by the host; indexing has one address origin.
+template<class T> struct Arena {
+  T *base;
+  __device__ T &operator[](u64 i) const { return base[i]; }
+};
+
 struct Dev {
-  u64 *nodes;  // ncap cell pairs
-  u32 *rc;     // ncap refcounts (only read for non-linear constructors)
-  Rec *recs;   // rcap records (0 = ROOT sink)
+  Arena<u64> nodes;  // ncap cell pairs
+  Arena<u32> rc;     // ncap refcounts (only read for non-linear constructors)
+  Arena<Rec> recs;   // rcap records (0 = ROOT sink)
   u32 *nbump;  // cell bump (starts at 1: cell 0 reserved)
   u32 *rbump;  // record bump (starts at 1: rec 0 = ROOT)
   u32 *nfreen; // MAXLANES free-list heads (index+1)
@@ -83,6 +89,7 @@ struct Dev {
   int fuel;    // per-dive budget
   int net_fuel; // rewrites per net reduction before spilling to the net rule
 };
+#define INITIAL_CHUNK 64
 #define NWCAP 64
 #define LSCAP 64
 
@@ -123,6 +130,9 @@ struct P2R { u64 f0, f1; u32 f2; };
 // WORK lane is running at once): fork sites fork, spawns go global
 __shared__ int s_mode[256];
 #define WORK_MODE (s_mode[threadIdx.x])
+__device__ bool native_ready(const u64 *rules, int n);
+__device__ inline bool native_enter() { bool old = WORK_MODE; WORK_MODE = 0; return old; }
+__device__ inline void native_leave(bool old) { WORK_MODE = old; }
 // a lane-local task whose rule word carries this bit runs in the parallel world
 #define PAR_TASK 0x80000000u
 // the dive budget of the phase (a task's own body; a fork site's callee gets
@@ -134,6 +144,11 @@ __device__ void prog_fire(u32 rule, u64 e0, u64 e1, u64 e2);
 __device__ bool prog_rec_rule(u32 rule);
 // rule -> its tasks can fork (the driver grows the frontier through these)
 __device__ bool prog_forks(u32 rule);
+#if defined(NATIVE_ENTRIES) && NATIVE_ENTRIES
+__device__ bool prog_native_rule(u32 rule);
+#else
+__device__ inline bool prog_native_rule(u32) { return false; }
+#endif
 __device__ inline bool rule_forks(u32 r) { return r == ERA_RULE || prog_forks(r); }
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
@@ -208,6 +223,13 @@ __device__ inline void work_fuel(i64 *fuel, i64 n) {
     *fuel = -1;
   }
   s_work[threadIdx.x] = w;
+}
+// A native region cannot suspend internally. Keep every credit, including
+// overflow across several work quanta, for the next enclosing dive check.
+__device__ inline void native_work_fuel(i64 *fuel, i64 n) {
+  u64 total = (u64)s_work[threadIdx.x] + (u64)n;
+  if (total >= WORK_CAP) *fuel = -1;
+  s_work[threadIdx.x] = (u32)(total % WORK_CAP);
 }
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
@@ -292,8 +314,8 @@ __device__ __forceinline__ u32 alloc_node(u64 a, u64 b) {
   u32 *ck = &G.nchunk[2 * L];
   if (ck[0] >= ck[1]) {
     u32 lg = g_nclog[L];
-    u32 sz = min(64u << lg, G.chunksz);
-    if ((64u << lg) < G.chunksz) g_nclog[L] = lg + 1;
+    u32 sz = min(INITIAL_CHUNK << lg, G.chunksz);
+    if ((INITIAL_CHUNK << lg) < G.chunksz) g_nclog[L] = lg + 1;
     u32 base = atomicAdd(G.nbump, sz);
     if (base >= G.ncap) {
       g_abort(AB_ARENA);
@@ -399,7 +421,7 @@ __device__ __noinline__ void spawn_global(u32 rule, u64 a, u64 b, u64 c) {
   e[2] = c;
 }
 
-// A cross-lane join just completed. The CPU runtime's rule (reference's design too):
+// A cross-lane join just completed. The CPU runtime's rule:
 // the lane whose delivery completed it runs it at once, in the parallel
 // world (what it forks goes to the global rings for the next GROW), in
 // every kernel. It waits on the lane's own stack, not the C stack, and
@@ -422,8 +444,8 @@ __device__ inline void join_ready(u32 rule, u64 a, u64 b, u64 c) {
 }
 // A ready record (a task with no inputs: the rest of a body after a fork
 // site) runs at once on this lane: in the parallel world the body then
-// reaches all its fork sites in one step (adopted from reference's runtime
-// design: a fork releases every child at once); in WORK it is the lane's own.
+// reaches all its fork sites in one step: a fork releases every child
+// at once; in WORK the ready record is the lane's own.
 __device__ inline void ready_rec(u32 rec) {
   Rec &r = G.recs[rclamp(rec)];
   if (r.par)
@@ -461,6 +483,8 @@ __device__ __noinline__ void deliver(u64 parent, u64 val) {
   }
 }
 
+__device__ inline void deliver_deferred(u64 parent, u64 val) { deliver(parent, val); }
+
 // Spawn a saturated call: arity <= 2 rides in (a, b); wider calls put
 // arg0 in `a` and chain args[1..] through cells in `b` (addr+1, 0 = end).
 __device__ __noinline__ void spawn_call(u16 rule, const u64 *args, int n, u64 parent) {
@@ -489,6 +513,132 @@ __device__ inline u64 pop_chain(u64 *ch) {
   *ch = cell1(i);
   free_node(i);
   return v;
+}
+
+// Native frames stay on their owning lane until the native region returns.
+// Shared words are bank-striped by half-word; overflow uses the existing
+// [value, next] cell chain, with exactly the same push/pop order.
+#ifndef NATIVE_FRAMES
+#define NATIVE_FRAMES 0
+#endif
+extern "C" __device__ u32 g_native_enabled = NATIVE_FRAMES;
+extern "C" __device__ u32 g_native_words = 0;
+__shared__ u32 s_native_top[256];
+extern __shared__ u32 native_cache[];
+struct NativeFrames { u64 spill; u32 base, capacity, count, stride; };
+__device__ inline NativeFrames native_frames(u32 stride) {
+  u32 base = s_native_top[threadIdx.x];
+  s_native_top[threadIdx.x] = g_native_words * 2;
+  u32 capacity = g_native_words * 2 - base;
+  if (stride) capacity = capacity / stride * stride;
+  return NativeFrames{0, base, capacity, 0, stride};
+}
+__device__ inline bool native_empty(const NativeFrames *s) { return s->count == 0 && s->spill == 0; }
+__device__ inline bool native_ok() { return *G.abortf == 0; }
+__device__ inline void native_done(NativeFrames *s) { s_native_top[threadIdx.x] = s->base; }
+__device__ inline u32 native_load32(u32 pos) {
+  return native_cache[pos * blockDim.x + threadIdx.x];
+}
+__device__ inline void native_store32(u32 pos, u32 v) {
+  native_cache[pos * blockDim.x + threadIdx.x] = v;
+}
+// Keep a prefix in shared memory; overflow stays on the ordinary LIFO chain.
+// Once spilling starts, later words stay there until that suffix is popped.
+__device__ inline void native_push32(NativeFrames *s, u32 v) {
+  if (s->spill || s->count == s->capacity)
+    s->spill = (u64)alloc_node(v, s->spill) + 1;
+  else native_store32(s->base + s->count++, v);
+}
+__device__ inline u32 native_pop32(NativeFrames *s) {
+  if (s->spill) return (u32)pop_chain(&s->spill);
+  return native_load32(s->base + --s->count);
+}
+__device__ inline void native_push(NativeFrames *s, u64 v) {
+  native_push32(s, (u32)v); native_push32(s, (u32)(v >> 32));
+}
+__device__ inline u64 native_pop(NativeFrames *s) {
+  u64 hi = native_pop32(s); return (hi << 32) | native_pop32(s);
+}
+
+#define NATIVE_SLOW (1ull << 63)
+#define NATIVE_BAD (~0ull)
+__device__ inline u64 native_reserve(NativeFrames *s, u32 width) {
+  if (s->spill || width > s->capacity - s->count) return NATIVE_SLOW;
+  u32 pos = s->count;
+  s->count += width;
+  return pos;
+}
+__device__ inline u64 native_take(NativeFrames *s, u32 width) {
+  if (s->spill) return NATIVE_SLOW;
+  s->count -= width;
+  return s->count;
+}
+__device__ inline void native_release(NativeFrames *, u64) {}
+__device__ inline bool native_check(u64 slot) { return slot == NATIVE_SLOW ? *G.abortf == 0 : slot != NATIVE_BAD; }
+__device__ inline void native_set32(NativeFrames *s, u64 slot, u32 field, u32 v) {
+  if (slot & NATIVE_SLOW) { if (slot != NATIVE_BAD) s->spill = (u64)alloc_node(v,s->spill)+1; return; }
+  u32 pos=(u32)slot+field;
+  if (pos>=s->capacity) pos-=s->capacity;
+  native_store32(s->base+pos,v);
+}
+__device__ inline u32 native_get32(NativeFrames *s, u64 slot, u32 field) {
+  if (slot==NATIVE_SLOW) return (u32)pop_chain(&s->spill);
+  u32 pos=(u32)slot+field;
+  if (pos>=s->capacity) pos-=s->capacity;
+  return native_load32(s->base+pos);
+}
+__device__ inline void native_set64(NativeFrames *s, u64 slot, u32 field, u64 v) {
+  native_set32(s,slot,field,(u32)v); native_set32(s,slot,field+1,(u32)(v >> 32));
+}
+__device__ inline u64 native_get64(NativeFrames *s, u64 slot, u32 field) {
+  u64 hi=native_get32(s,slot,field+1); return (hi << 32) | native_get32(s,slot,field);
+}
+
+__device__ inline bool native_cached(const NativeFrames *s, u64 slot) { return s->stride && !(slot & NATIVE_SLOW); }
+__device__ inline void native_set_fixed32(NativeFrames *s, u64 slot, u32 field, u32 v) { native_store32(s->base+(u32)slot+field,v); }
+__device__ inline u32 native_get_fixed32(NativeFrames *s, u64 slot, u32 field) { return native_load32(s->base+(u32)slot+field); }
+__device__ inline void native_set_fixed64(NativeFrames *s, u64 slot, u32 field, u64 v) { native_set_fixed32(s,slot,field,(u32)v); native_set_fixed32(s,slot,field+1,(u32)(v >> 32)); }
+__device__ inline u64 native_get_fixed64(NativeFrames *s, u64 slot, u32 field) { return (u64)native_get_fixed32(s,slot,field) | ((u64)native_get_fixed32(s,slot,field+1) << 32); }
+
+
+// Grouped records use the same lane prefix and unbounded spill chain. Reads
+// and replacement retain the record; only pop ends its continuation lifetime.
+template<int K> __device__ NativeFrames native_records(A<K>) { return native_frames(K ? 2*K : 1); }
+__device__ inline bool native_record_empty(const NativeFrames*s) { return native_empty(s); }
+__device__ inline void native_record_done(NativeFrames*s) { native_done(s); }
+template<int K> __device__ void native_record_push(NativeFrames*s,A<K> fields) {
+  if(K==0) {native_push32(s,0);return;}
+  u64 slot=native_reserve(s,2*K);
+  for(int i=0;i<K;i++) native_set64(s,slot,2*i,fields.a[i]);
+}
+template<int K> __device__ A<K> native_record_read(const NativeFrames*s,A<K>) {
+  A<K> fields{};
+  if(s->spill) {
+    u64 p=s->spill;
+    for(int i=K-1;i>=0;i--) {
+      u64 hi=cell0((u32)p-1); p=cell1((u32)p-1);
+      u64 lo=cell0((u32)p-1); p=cell1((u32)p-1);
+      fields.a[i]=(hi<<32)|(u32)lo;
+    }
+  } else for(int i=0;i<K;i++) {
+    u32 at=s->base+s->count-2*K+2*i;
+    fields.a[i]=(u64)native_load32(at)|((u64)native_load32(at+1)<<32);
+  }
+  return fields;
+}
+template<int K> __device__ void native_record_replace(NativeFrames*s,A<K> fields) {
+  if(s->spill) {
+    u64 p=s->spill;
+    for(int i=K-1;i>=0;i--) {
+      G.nodes[2*(u64)nclamp((u32)p-1)]=(u32)(fields.a[i]>>32); p=cell1((u32)p-1);
+      G.nodes[2*(u64)nclamp((u32)p-1)]=(u32)fields.a[i]; p=cell1((u32)p-1);
+    }
+  } else for(int i=0;i<K;i++) native_set_fixed64(s,s->count-2*K,2*i,fields.a[i]);
+}
+template<int K> __device__ void native_record_pop(NativeFrames*s,A<K>) {
+  if(K==0) {native_pop32(s);return;}
+  if(s->spill) for(int i=0;i<2*K;i++) native_pop32(s);
+  else s->count-=2*K;
 }
 
 // Dive `f` (args[0] = the destination) and deliver its result there; a
@@ -522,7 +672,7 @@ __device__ __noinline__ void tail_to(u16 f, const u64 *args, int n) {
 // Dive `f` with no destination (args[0] = NONE): ok = the value, else the
 // root record of its residue, whose parent the caller sets.
 //
-// The two worlds (adopted from reference's runtime design; design.md s14): in the sequential world (WORK) a callee gets
+// The two worlds (shared by the CPU and GPU): in the sequential world (WORK) a callee gets
 // the lane's budget and runs here; in the parallel world (a GROW sweep) a
 // callee gets no budget, so it suspends at entry and becomes a task at
 // once, and the caller captures its continuation as records. A task's own
@@ -630,6 +780,13 @@ __device__ __noinline__ u64 field(u64 p, usize i) {
       return i == 0 ? cell0(a) : cell1(a);
     }
   }
+}
+// Borrowed reads retain the same tag, index and chained-field checks.
+__device__ inline A<2> read_pair(u64 p) {
+  expect_con(p, "read_pair");
+  if (con_ar(p) > 2) return A<2>{{field(p, 0), field(p, 1)}};
+  u32 a = nclamp(con_addr(p));
+  return A<2>{{G.nodes[2 * (u64)a], G.nodes[2 * (u64)a + 1]}};
 }
 __device__ inline P2 consume2k(u64 p, u16 k) {
   expect_con(p, "consume2k");
@@ -1990,6 +2147,9 @@ __device__ void drain_local() {
 
 extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
   stack_mark();
+#if NATIVE_FRAMES
+  s_native_top[threadIdx.x] = 0;
+#endif
   s_mode[threadIdx.x] = 0;
   s_fuel = fuel;
   prog_fire(0, a, b, c);
@@ -2017,6 +2177,20 @@ __device__ u32 g_wmax, g_wsum;         // a work phase: the most steps one lane 
 __device__ u32 g_wcyc, g_wbusy, g_wsteps_of_max; // a work phase: the slowest lane's K cycles, lanes that fired, its steps
 __device__ u32 g_whist[40];            // lanes per log2(K cycles) bucket, the last work phase (trace)
 __device__ u32 g_wlog[LOGCAP * 6];     // per round: work steps (max lane, sum), K cycles, slowest lane K cycles, its steps, busy lanes; trace
+__device__ u32 g_native_width;
+extern "C" __device__ int g_native_launch = -1;
+__device__ unsigned long long g_native_next = 0;
+
+// Ready lanes claim a contiguous range together. An independently scheduled
+// subgroup can be smaller than a warp, so both the range and rank use its mask.
+__device__ inline u64 native_task() {
+  u32 mask = __activemask();
+  u32 leader = __ffs(mask) - 1, lane = threadIdx.x % warpSize;
+  u64 base = 0;
+  if (lane == leader) base = atomicAdd(&g_native_next, (unsigned long long)__popc(mask));
+  base = __shfl_sync(mask, base, leader);
+  return base + __popc(mask & ((1u << lane) - 1u));
+}
 __device__ int g_phase;                // 0 exit, 1 grow, 2 work
 __device__ u64 g_prev = 0;             // total pushes at the previous snapshot
 __device__ u32 g_frontier[NRULES_ALL]; // per-rule high-water during GROW
@@ -2102,6 +2276,16 @@ __device__ void work_phase(u32 max_steps) {
   }
 }
 
+// A typed native launch leaves completed cross-lane joins for the engine.
+__device__ void publish_local() {
+ u32 L=lane(), n=G.lsn[L];
+ for (u32 i=0;i<n;i++) {
+  u64 *t=&G.lstk[((u64)L*LSCAP+i)*4];
+  spawn_global((u32)t[0]&~PAR_TASK,t[1],t[2],t[3]);
+ }
+ G.lsn[L]=0;
+}
+
 // ---- the driver on the device ----
 //
 // One cooperative launch runs the whole program. Grow while a forkable
@@ -2116,10 +2300,14 @@ __device__ void work_phase(u32 max_steps) {
 extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, u64 max_rounds) {
   cg::grid_group grid = cg::this_grid();
   stack_mark();
+#if NATIVE_FRAMES
+  s_native_top[threadIdx.x] = 0;
+#endif
   const u32 nl = gridDim.x * blockDim.x;
   const u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
   for (;;) {
     if (gid == 0) {
+      g_native_width = grow_width;
       u32 total = 0, forkable = 0, off = 0;
       bool grew = g_phase != 1;
       for (u32 r = 0; r < G.nrules; r++) {
@@ -2153,6 +2341,14 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         g_phase = 1;
       else
         g_phase = 2;
+      g_native_launch=-1;
+      if (g_phase==2) {
+        for (u32 r=0;r<G.nrules;r++) {
+          if (prog_native_rule(r) && g_snap[r]-G.bdone[r]>=grow_width) {
+            g_native_launch=(int)r; g_phase=3; break;
+          }
+        }
+      }
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
       if (g_phase == 2) for (int k = 0; k < 40; k++) g_whist[k] = 0;
       if (g_rounds[0] < LOGCAP) {
@@ -2164,7 +2360,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
     }
     grid.sync();
     int ph = *(volatile int *)&g_phase;
-    if (ph == 0) return;
+    if (ph == 0 || ph == 3) return;
     long long c0 = clock64();
     if (ph == 1) {
       s_mode[threadIdx.x] = 0;
@@ -2208,3 +2404,17 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
   }
 }
 
+
+__device__ bool native_ready(const u64 *rules, int n) {
+  if (!WORK_MODE) return false;
+  if (n == 0) return true; // read-only region within the lane's owning task
+  u32 pending = 0;
+  for (int i = 0; i < n; ++i) pending += g_snap[rules[i]] - G.bdone[rules[i]];
+  return pending >= g_native_width;
+}
+
+extern "C" __global__ void k_native_done(u32 rule) {
+ g_native_next=0;
+ G.bdone[rule]=g_snap[rule];
+ g_rounds[2]++;
+}

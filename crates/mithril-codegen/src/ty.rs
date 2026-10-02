@@ -118,6 +118,7 @@ enum Node {
     Link(u32),
 }
 
+#[derive(Default)]
 struct Uf {
     n: Vec<Node>,
 }
@@ -133,30 +134,6 @@ impl Uf {
         }
         i
     }
-    fn set(&mut self, i: u32, k: Node) {
-        let r = self.find(i);
-        match (self.n[r as usize], k) {
-            (Node::Free, _) => self.n[r as usize] = k,
-            (a, b) if a == b => {}
-            _ => self.n[r as usize] = Node::Adt(u32::MAX), // conflict: poison (reads as Dyn)
-        }
-    }
-    fn union(&mut self, a: u32, b: u32) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return;
-        }
-        match (self.n[ra as usize], self.n[rb as usize]) {
-            (Node::Free, _) => self.n[ra as usize] = Node::Link(rb),
-            (_, Node::Free) => self.n[rb as usize] = Node::Link(ra),
-            (a_, b_) if a_ == b_ => self.n[ra as usize] = Node::Link(rb),
-            _ => {
-                // conflict: poison both
-                self.n[ra as usize] = Node::Adt(u32::MAX);
-                self.n[rb as usize] = Node::Link(ra);
-            }
-        }
-    }
     fn read(&mut self, i: u32) -> Ty {
         let r = self.find(i);
         match self.n[r as usize] {
@@ -171,6 +148,7 @@ impl Uf {
     }
 }
 
+#[derive(Default)]
 struct Inf {
     uf: Uf,
     fparam: Vec<Vec<u32>>,
@@ -209,116 +187,79 @@ impl Inf {
         Node::Adt(r)
     }
 
-    /// Two ADT nodes meeting in one value: their ctors belong to one
-    /// datatype, so the classes merge (not a conflict).
-    fn merge_adts(&mut self, a: u32, b: u32) -> bool {
-        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
-        match (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
-            (Node::Adt(x), Node::Adt(y)) if x != u32::MAX && y != u32::MAX => {
-                self.cunion(x, y);
-                let k = self.adt(x);
-                self.uf.n[ra as usize] = k;
-                self.uf.n[rb as usize] = k;
-                true
-            }
-            _ => false,
-        }
-    }
-
+    /// Equality has one merge operation for concrete and structured types.
+    /// Link before visiting children so recursive constraints terminate.
     fn unify(&mut self, a: u32, b: u32) {
-        self.merge_adts(a, b);
-        // a tuple or an array meeting an unknown value (poison): what is
-        // read out of it is unknown too
-        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
-        let poison = Node::Adt(u32::MAX);
-        if ra != rb && (self.uf.n[ra as usize] == poison || self.uf.n[rb as usize] == poison) {
-            self.poison_all(ra);
-            self.poison_all(rb);
-            self.uf.union(ra, rb); // both poison now: one class
-            return;
-        }
-        // arrays unify their element types, tuples their components
-        let (ra, rb) = (self.uf.find(a), self.uf.find(b));
-        if ra != rb {
-            match (self.uf.n[ra as usize], self.uf.n[rb as usize]) {
-                (Node::Arr(x), Node::Arr(y)) => {
-                    self.uf.n[ra as usize] = Node::Link(rb);
-                    self.unify(x, y);
-                    return;
-                }
-                (Node::Tup(k, c), Node::Tup(l, d)) if k == l => {
-                    self.uf.n[ra as usize] = Node::Link(rb);
-                    for i in 0..k as usize {
-                        let (x, y) = (self.tups[c as usize][i], self.tups[d as usize][i]);
-                        self.unify(x, y);
-                    }
-                    return;
-                }
-                _ => {}
+        let (a, b) = (self.uf.find(a), self.uf.find(b));
+        if a == b { return; }
+        let (x, y) = (self.uf.n[a as usize], self.uf.n[b as usize]);
+        match (x, y) {
+            (Node::Free, _) => self.uf.n[a as usize] = Node::Link(b),
+            (_, Node::Free) => self.uf.n[b as usize] = Node::Link(a),
+            (Node::Adt(c), Node::Adt(d)) if c != u32::MAX && d != u32::MAX => {
+                self.cunion(c, d);
+                self.uf.n[b as usize] = self.adt(c);
+                self.uf.n[a as usize] = Node::Link(b);
             }
-        }
-        // a conflict poisons both classes; what is read out of them is
-        // unknown too (defensive: the second pass re-projects from the
-        // poisoned base anyway; no known program needs it, and the
-        // corpus's generated code is unchanged by it)
-        let (fa, fb) = (self.uf.find(a), self.uf.find(b));
-        let (na, nb) = (self.uf.n[fa as usize], self.uf.n[fb as usize]);
-        self.uf.union(a, b);
-        let fr = self.uf.find(a);
-        if self.uf.n[fr as usize] == Node::Adt(u32::MAX) {
-            for n in [na, nb] {
-                match n {
-                    Node::Tup(_, c) => self.tups[c as usize].clone().into_iter().for_each(|t| self.poison_all(t)),
-                    Node::Arr(e) => self.poison_all(e),
-                    _ => {}
+            (Node::Arr(c), Node::Arr(d)) => {
+                self.uf.n[a as usize] = Node::Link(b);
+                self.unify(c, d);
+            }
+            (Node::Tup(k, c), Node::Tup(l, d)) if k == l => {
+                self.uf.n[a as usize] = Node::Link(b);
+                for i in 0..k as usize {
+                    self.unify(self.tups[c as usize][i], self.tups[d as usize][i]);
                 }
+            }
+            _ if x == y => self.uf.n[a as usize] = Node::Link(b),
+            _ => {
+                self.poison_all(a);
+                self.poison_all(b);
+                self.uf.n[b as usize] = Node::Link(a);
             }
         }
     }
 
-    /// `Uf::set` that, on a conflict, also poisons what is read out of the
-    /// tuple or array the class was.
     fn set(&mut self, t: u32, k: Node) {
-        let r = self.uf.find(t);
-        let old = self.uf.n[r as usize];
-        self.uf.set(t, k);
-        if self.uf.n[r as usize] == Node::Adt(u32::MAX) && old != Node::Adt(u32::MAX) {
-            match old {
-                Node::Tup(_, c) => self.tups[c as usize].clone().into_iter().for_each(|x| self.poison_all(x)),
-                Node::Arr(e) => self.poison_all(e),
-                _ => {}
-            }
+        let concrete = self.node(k);
+        self.unify(t, concrete);
+    }
+
+    fn children(&self, n: Node) -> Vec<u32> {
+        match n {
+            Node::Tup(_, c) => self.tups[c as usize].clone(),
+            Node::Arr(e) => vec![e],
+            _ => vec![],
         }
     }
 
-    /// Poison a tyvar and everything read out of it (tuple components,
-    /// array elements), transitively. A worklist that marks each class
-    /// before visiting its parts, so a type that contains itself ends.
+    /// Mark before visiting parts: recursive types poison exactly once.
     fn poison_all(&mut self, v: u32) {
         let poison = Node::Adt(u32::MAX);
         let mut work = vec![v];
         while let Some(t) = work.pop() {
             let r = self.uf.find(t);
-            match self.uf.n[r as usize] {
-                Node::Tup(_, c) => work.extend(self.tups[c as usize].iter().copied()),
-                Node::Arr(e) => work.push(e),
-                n if n == poison => continue,
-                _ => {}
-            }
+            let n = self.uf.n[r as usize];
+            if n == poison { continue; }
             self.uf.n[r as usize] = poison;
+            work.extend(self.children(n));
+        }
+    }
+
+    /// Resolve a known tuple component or poison; unknown bases stay pending.
+    fn component(&mut self, base: u32, i: usize) -> Option<u32> {
+        let root = self.uf.find(base);
+        match self.uf.n[root as usize] {
+            Node::Adt(u32::MAX) => Some(self.node(Node::Adt(u32::MAX))),
+            Node::Tup(k, c) if i < k as usize => Some(self.tups[c as usize][i]),
+            _ => None,
         }
     }
 
     /// The tyvar of component `i` of a value typed `tb`.
     fn proj(&mut self, tb: u32, i: usize) -> u32 {
-        let r = self.uf.find(tb);
-        if self.uf.n[r as usize] == Node::Adt(u32::MAX) {
-            return self.node(Node::Adt(u32::MAX));
-        }
-        if let Node::Tup(k, c) = self.uf.n[r as usize] {
-            if i < k as usize {
-                return self.tups[c as usize][i];
-            }
+        if let Some(component) = self.component(tb, i) {
+            return component;
         }
         let res = self.uf.fresh();
         self.pending.push((tb, i, res));
@@ -329,10 +270,7 @@ impl Inf {
     /// code holds leaves as i64s), nesting bounded (a type that reaches
     /// itself has no layout). `None` when it has no such layout.
     fn shape(&mut self, v: u32) -> Option<Shape> {
-        match self.leaf(v, 0)? {
-            Some(sh) => Some(sh),
-            None => None, // an int, not a tuple
-        }
+        self.leaf(v, 0).flatten()
     }
 
     /// `Some(None)`: an int leaf; `Some(Some(s))`: a tuple of layout `s`;
@@ -372,18 +310,9 @@ impl Inf {
 
     /// Resolve projections recorded before their base was known.
     fn settle(&mut self) {
-        for (b, i, res) in std::mem::take(&mut self.pending) {
-            let r = self.uf.find(b);
-            if self.uf.n[r as usize] == Node::Adt(u32::MAX) {
-                let p = self.node(Node::Adt(u32::MAX));
-                self.unify(res, p);
-                continue;
-            }
-            if let Node::Tup(k, c) = self.uf.n[r as usize] {
-                if i < k as usize {
-                    let t = self.tups[c as usize][i];
-                    self.unify(res, t);
-                }
+        for (base, i, result) in std::mem::take(&mut self.pending) {
+            if let Some(component) = self.component(base, i) {
+                self.unify(result, component);
             }
         }
     }
@@ -402,18 +331,6 @@ impl Inf {
 
     fn int(&mut self) -> u32 {
         self.node(Node::Int)
-    }
-
-    fn set_adt(&mut self, t: u32, k: Node) {
-        let r = self.uf.find(t);
-        if let (Node::Adt(x), Node::Adt(y)) = (self.uf.n[r as usize], k) {
-            if x != u32::MAX && y != u32::MAX {
-                self.cunion(x, y);
-                self.uf.n[r as usize] = self.adt(x);
-                return;
-            }
-        }
-        self.set(t, k);
     }
 
     /// Type of expression `e`; unifies as it walks. `env[v]` = tyvar.
@@ -477,7 +394,7 @@ impl Inf {
                 }
                 let t = self.uf.fresh();
                 let k = self.adt(*c);
-                self.set_adt(t, k);
+                self.set(t, k);
                 t
             }
             Core::Tuple(xs) => {
@@ -561,7 +478,7 @@ impl Inf {
                 }
                 if let Some(f) = first {
                     let k = self.adt(f);
-                    self.set_adt(ts, k);
+                    self.set(ts, k);
                 }
                 let mut tout: Option<u32> = None;
                 for (c, binders, body) in &arms {
@@ -592,16 +509,7 @@ fn bind(env: &mut Vec<u32>, x: u32, t: u32) {
 /// Infer module types. Two passes over every body (the second lets sigs
 /// settled late propagate), then a readout.
 pub(crate) fn infer(m: &CoreModule) -> Types {
-    let mut inf = Inf {
-        uf: Uf { n: Vec::new() },
-        fparam: Vec::new(),
-        fret: Vec::new(),
-        cfield: Vec::new(),
-        cclass: (0..m.ctors.len() as u32).collect(),
-        tups: Vec::new(),
-        pending: Vec::new(),
-        minted: Vec::new(),
-    };
+    let mut inf = Inf { cclass: (0..m.ctors.len() as u32).collect(), ..Inf::default() };
     for f in &m.fns {
         let ps = (0..f.arity).map(|_| inf.uf.fresh()).collect();
         inf.fparam.push(ps);
@@ -644,14 +552,25 @@ pub(crate) fn infer(m: &CoreModule) -> Types {
     let mut rd = |vs: &[u32]| -> Vec<Ty> { vs.iter().map(|&v| canon(inf.uf.read(v))).collect() };
     let params = inf.fparam.iter().map(|ps| rd(ps)).collect();
     let ret = rd(&inf.fret);
-    let field = inf.cfield.iter().map(|fs| rd(fs)).collect();
-    let locals = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
+    let field: Vec<Vec<Ty>> = inf.cfield.iter().map(|fs| rd(fs)).collect();
+    let mut locals: Vec<Vec<Ty>> = locals.into_iter().map(|v| v.into_iter().map(canon).collect()).collect();
     let pshape = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| inf.shape(t)).collect()).collect();
     let rshape = inf.fret.clone().iter().map(|&t| inf.shape(t)).collect();
     let pmixed = inf.fparam.clone().iter().map(|ps| ps.iter().map(|&t| {
         let r = inf.uf.find(t);
         inf.uf.n[r as usize] == Node::Adt(u32::MAX)
     }).collect()).collect();
+    // A binder slot reused across constructor arms has a global type only
+    // when every arm agrees. Capture code must retain possible heap values.
+    for (fid, f) in m.fns.iter().enumerate() {
+        f.body.walk(&mut |e| if let Core::Match(_, arms) = e {
+            for (ctor, binders, _) in arms.iter().filter(|a| a.0 != UNREACHABLE_CTOR) {
+                for (x, t) in binders.iter().zip(&field[*ctor as usize]) {
+                    if locals[fid][*x as usize] != *t { locals[fid][*x as usize] = Ty::Dyn; }
+                }
+            }
+        });
+    }
     Types { class_of, params, ret, field, locals, pshape, rshape, pmixed }
 }
 
@@ -675,3 +594,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/type_constraints.rs"]
+mod type_constraints_tests;

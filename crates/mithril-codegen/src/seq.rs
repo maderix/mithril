@@ -280,9 +280,7 @@ impl<'m> Ex<'m> {
 
     /// `dup_val(ctx, v<i>)` into a fresh temp.
     fn dup_into(&mut self, i: u32, b: &mut Vec<S>) -> E {
-        let t = self.fresh();
-        b.push(let_(&t, Ty::U64, c("dup_val", vec![v(vn(i))])));
-        v(t)
+        self.temp(c("dup_val", vec![v(vn(i))]), b)
     }
 
     /// Take one use of `i`: `Some(true)` on its last use (count now 0),
@@ -488,6 +486,12 @@ impl<'m> Ex<'m> {
         format!("t{}", self.tmp)
     }
 
+    /// Bind a port-valued expression to a fresh temporary.
+    fn temp(&mut self, e: E, b: &mut Vec<S>) -> E {
+        let t = self.fresh();
+        crate::value::bind(t, Ty::U64, e, b)
+    }
+
     /// A boxed value this frame owns (not an immediate, not lent, not a
     /// native tuple's locals).
     fn owned(&self, x: u32) -> bool {
@@ -584,22 +588,10 @@ impl<'m> Ex<'m> {
             return;
         }
         let names: Vec<String> = binders.iter().map(|bv| vn(*bv)).collect();
-        let k = u16_(cid as u64);
         if hold == Hold::Consume {
-            match (reuse_var(body, sv).filter(|_| self.dive && binders.len() == 2), binders.len()) {
-                (Some(x), _) => {
-                    let tk = format!("tok_v{x}");
-                    b.push(S::Let(Pat::Tup(vec![names[0].clone(), names[1].clone(), tk.clone()]), Ty::Infer, c("consume2r", vec![sv.clone(), k])));
-                    self.toks.push(tk);
-                }
-                (None, 1) => {
-                    b.push(S::Let(Pat::Tup(vec![names[0].clone(), "m_unused".into()]), Ty::Infer, c("consume2k", vec![sv.clone(), k])));
-                    b.push(free(v("m_unused")));
-                }
-                (None, 2) => b.push(S::Let(Pat::Tup(names), Ty::Infer, c("consume2k", vec![sv.clone(), k]))),
-                // chained arity: move every field out, dropping the unused ones
-                (None, n) => b.push(S::Let(Pat::Arr(names), Ty::Infer, c(&format!("consume_chain::<{n}>"), vec![sv.clone(), k]))),
-            }
+            let token = reuse_var(body, sv).filter(|_| self.dive && binders.len() == 2).map(|x| format!("tok_v{x}"));
+            crate::value::fields(sv.clone(), cid, names, true, token.clone(), b);
+            self.toks.extend(token);
             for bv in binders {
                 if self.rem.get(bv).copied().unwrap_or(0) == 0 {
                     b.push(free(v(vn(*bv))));
@@ -607,8 +599,8 @@ impl<'m> Ex<'m> {
             }
             return;
         }
-        for (i, bv) in binders.iter().enumerate() {
-            let fld = c("field", vec![sv.clone(), usize_(i)]);
+        let fields = crate::value::fields(sv.clone(), cid, names, false, None, b);
+        for (bv, fld) in binders.iter().zip(fields) {
             match hold {
                 Hold::BorrowRaw => b.push(let_(vn(*bv), Ty::U64, fld)),
                 _ if self.rem.get(bv).copied().unwrap_or(0) > 0 => b.push(let_(vn(*bv), Ty::U64, c("dup_val", vec![fld]))),
@@ -669,11 +661,7 @@ impl<'m> Ex<'m> {
 
     /// A native result component back into a port.
     fn native_back(g: u32, e: E) -> E {
-        if crate::scalar::shifted(g) {
-            p("retag", vec![e])
-        } else {
-            num(e)
-        }
+        crate::value::int_port(e, crate::scalar::shifted(g))
     }
 
     /// A binary op or comparison: native on proven ints, else the runtime helper.
@@ -682,10 +670,8 @@ impl<'m> Ex<'m> {
         let own = (!self.is_braw(x) as u8) | ((!self.is_braw(y) as u8) << 1);
         let ex = self.val(x, false, b);
         let ey = self.val(y, false, b);
-        let t = self.fresh();
         let e = if ints { num(int(as_i(ex), as_i(ey))) } else { c(helper, vec![u8_(code as u64), ex, ey, u8_(own as u64)]) };
-        b.push(let_(&t, Ty::U64, e));
-        v(t)
+        self.temp(e, b)
     }
 
     /// Emit statements computing `e` into `b`; returns the expression
@@ -698,9 +684,7 @@ impl<'m> Ex<'m> {
                 let caps: Vec<u32> = free_vars(e).into_iter().collect();
                 let es: Vec<E> = caps.iter().map(|x| self.use_var(*x, true, b)).collect();
                 let id = crate::closure_entry(caps, e);
-                let t = self.fresh();
-                b.push(let_(&t, Ty::U64, c("build_closure", vec![u16_(id as u64), E::Slice(es)])));
-                v(t)
+                self.temp(c("build_closure", vec![u16_(id as u64), E::Slice(es)]), b)
             }
             Core::App(..) => unreachable!("codegen bug: closure application in value position (ANF binds it)"),
             Core::Prim(pr, args) => {
@@ -751,9 +735,7 @@ impl<'m> Ex<'m> {
             }
             Core::Num(n) => num(i64_(*n)),
             Core::Flo(x) => {
-                let t = self.fresh();
-                b.push(let_(&t, Ty::U64, c("flo", vec![E::Flo(*x)])));
-                v(t)
+                self.temp(c("flo", vec![E::Flo(*x)]), b)
             }
             Core::Var(i) => self.use_var(*i, esc, b),
             // ints: storing is the i56 wrap (num keeps 56 bits, as_i sign-extends)
@@ -782,9 +764,7 @@ impl<'m> Ex<'m> {
             }
             Core::Call(g, args) if crate::scalar::native_sig(*g).is_some_and(|s| s.ret == crate::scalar::Kind::S1) => {
                 let call = self.native_call(*g, args, b);
-                let t = self.fresh();
-                b.push(let_(&t, Ty::U64, Self::native_back(*g, call)));
-                v(t)
+                self.temp(Self::native_back(*g, call), b)
             }
             Core::Call(g, args) => {
                 // a suspendable call in a value-position arm (`let x = (if c
@@ -794,30 +774,22 @@ impl<'m> Ex<'m> {
             }
             Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => {
                 if *cid == UNREACHABLE_CTOR {
-                    let t = self.fresh();
-                    b.push(let_(&t, Ty::U64, p("mith_unreachable", vec![])));
-                    return v(t);
+                    return self.temp(p("mith_unreachable", vec![]), b);
                 }
                 assert!(*cid < 0xFFE, "codegen: ctor id {} collides with reserved tags", cid);
                 if let Some(slot) = self.unbox.get(cid) {
                     let e0 = self.val(&args[0], false, b);
-                    let t = self.fresh();
-                    b.push(let_(&t, Ty::U64, p("ic", vec![u64_(*slot as u64), as_i(e0)])));
-                    return v(t);
+                    return self.temp(p("ic", vec![u64_(*slot as u64), as_i(e0)]), b);
                 }
                 // a Reuse (decided by the reuse rewrite) builds in x's consumed cell
                 let es: Vec<E> = args.iter().map(|a| self.val(a, true, b)).collect();
                 let reuse = if let Core::Reuse(x, ..) = e { Some(*x) } else { None };
-                let t = self.fresh();
                 let con = self.build_con(*cid, reuse, es);
-                b.push(let_(&t, Ty::U64, con));
-                v(t)
+                self.temp(con, b)
             }
             Core::Tuple(items) => {
                 let es: Vec<E> = items.iter().map(|a| self.val(a, true, b)).collect();
-                let t = self.fresh();
-                b.push(let_(&t, Ty::U64, mk_con(0xFFF, es)));
-                v(t)
+                self.temp(mk_con(0xFFF, es), b)
             }
             Core::Proj(x, i) if matches!(&**x, Core::Var(y) if self.ntup.contains(y)) => {
                 let Core::Var(y) = &**x else { unreachable!() };
@@ -831,17 +803,13 @@ impl<'m> Ex<'m> {
             }
             Core::Proj(x, i) => {
                 let (sv, hold) = self.scrutinee(x, b);
-                let t = self.fresh();
-                if hold == Hold::Consume {
-                    // the container dies here: move the field out
-                    b.push(let_(&t, Ty::U64, c("take_field", vec![sv, usize_(*i)])));
+                let field = if hold == Hold::Consume {
+                    c("take_field", vec![sv, usize_(*i)])
                 } else {
-                    // the container stays: the field is now shared, so its
-                    // type must carry a refcount
                     self.share_let();
-                    b.push(let_(&t, Ty::U64, c("dup_val", vec![c("field", vec![sv, usize_(*i)])])));
-                }
-                v(t)
+                    c("dup_val", vec![c("field", vec![sv, usize_(*i)])])
+                };
+                self.temp(field, b)
             }
             Core::Match(s, arms) => {
                 let (sv, hold) = self.scrutinee(s, b);
@@ -971,9 +939,8 @@ impl<'m> Ex<'m> {
     fn hole_exit(&mut self, r: E, b: &mut Vec<S>) -> E {
         match self.trmc {
             Some((_, rule)) => {
-                let t = self.fresh();
-                b.push(let_(&t, Ty::U64, r));
-                c("hole_wrap", vec![v(t), v("th_head"), v("th_hole"), u16_(rule as u64)])
+                let r = self.temp(r, b);
+                c("hole_wrap", vec![r, v("th_head"), v("th_hole"), u16_(rule as u64)])
             }
             None => r,
         }
@@ -1124,17 +1091,6 @@ impl<'m> Ex<'m> {
                 b.push(S::Store("hole_out".into(), v("th_hole")));
                 b.push(lir::ret_unit());
             }
-            Core::Call(g, args) if self.trmc.is_some() => {
-                let (call, post) = self.dive_call(*g, args, b);
-                b.push(let_("tr", Ty::Res, call));
-                for q in post {
-                    b.push(free(q));
-                }
-                let mut eb = Vec::new();
-                let ex = self.hole_exit(v("r"), &mut eb);
-                eb.push(ret(err(ex)));
-                b.push(S::Res(v("tr"), "v".into(), vec![ret(ok(self.hole_value(v("v"))))], "r".into(), eb));
-            }
             Core::Call(g, args)
                 if self.nret > 0
                     && crate::scalar::native_sig(*g).is_some_and(|sig| sig.ret == crate::scalar::Kind::SK(self.nret) && crate::scalar::flat_ret(*g, self.nret)) =>
@@ -1148,38 +1104,13 @@ impl<'m> Ex<'m> {
                 b.push(S::Let(Pat::Tup(rs.clone()), Ty::Infer, call));
                 b.push(ret(ok(E::Arr(rs.iter().map(|r| Self::native_back(*g, v(r.clone()))).collect()))));
             }
-            Core::Call(g, args) if self.nret > 0 => {
-                // native multi-value form: a callee with the same native
-                // shape passes its components straight through; any other
-                // result is unpacked (a suspension still delivers the boxed
-                // tuple to our caller's continuation)
-                let k = self.nret;
-                let native = ntup_of(*g) == k;
-                let (call, post) = self.dive_call_as(*g, args, native, b);
-                b.push(let_("tr", if native { Ty::ResArr(k) } else { Ty::Res }, call));
-                for q in post {
-                    b.push(free(q));
-                }
-                if native {
-                    b.push(ret(v("tr")));
-                } else {
-                    b.push(S::Res(v("tr"), "v".into(), vec![ret(ok(c(&format!("untup::<{k}>"), vec![v("v")])))], "r".into(), vec![ret(err(v("r")))]));
-                }
-            }
             Core::App(f, a) => {
                 let ef = self.val(f, true, b);
                 let ea = self.val(a, true, b);
                 self.flush_toks(b);
                 b.push(ret(c("apply", vec![ef, ea])));
             }
-            Core::Call(g, args) => {
-                // Tail call: pass our own destination through, so a downstream
-                // suspension spawns its pending call against the right parent.
-                let (call, post) = self.dive_call(*g, args, b);
-                b.push(let_("tr", Ty::Res, call));
-                b.extend(post.into_iter().map(free));
-                b.push(ret(v("tr")));
-            }
+            Core::Call(g, args) => self.tail_call(*g, args, b),
             Core::Tuple(items) if self.nret > 0 && self.nret == items.len() => {
                 let es: Vec<E> = items.iter().map(|a| self.val(a, true, b)).collect();
                 self.flush_toks(b);
@@ -1192,6 +1123,28 @@ impl<'m> Ex<'m> {
                 let r = if self.nret > 0 { c(&format!("untup::<{}>", self.nret), vec![x]) } else { self.hole_value(x) };
                 b.push(ret(ok(r)));
             }
+        }
+    }
+
+    /// Tail calls release lent reads after completion, then adapt only
+    /// their successful result: a hole fill, tuple unpack or direct return.
+    fn tail_call(&mut self, g: u32, args: &[Core], b: &mut Vec<S>) {
+        let native = self.nret > 0 && ntup_of(g) == self.nret;
+        let (call, post) = self.dive_call_as(g, args, native, b);
+        b.push(let_("tr", if native { Ty::ResArr(self.nret) } else { Ty::Res }, call));
+        b.extend(post.into_iter().map(free));
+        if self.trmc.is_some() || (self.nret > 0 && !native) {
+            let mut handler = Vec::new();
+            let error = self.hole_exit(v("r"), &mut handler);
+            handler.push(ret(err(error)));
+            let value = if self.nret > 0 {
+                c(&format!("untup::<{}>", self.nret), vec![v("v")])
+            } else {
+                self.hole_value(v("v"))
+            };
+            b.push(S::Res(v("tr"), "v".into(), vec![ret(ok(value))], "r".into(), handler));
+        } else {
+            b.push(ret(v("tr")));
         }
     }
 

@@ -19,6 +19,7 @@
 //! until then a program that reaches it fails with `Err("... closures ...")`.
 
 mod cuda;
+mod completion;
 mod runner;
 
 pub use runner::{compile_and_run, compile_to_cubin, free_vram, hold_context, run_cubin, ContextHold, GpuResult, GpuRunner, EXITING};

@@ -1,0 +1,135 @@
+{
+  "date": "2026-10-02",
+  "frames": 24,
+  "compiler_sha256": "6da131141e98fefc480112d5728447319208a2537d937181dbf2340290795617",
+  "method": "median process wall of built frame strip, after warmup; includes output and GPU context/readback; compilation and GIF encoding excluded",
+  "gif_frame_ms": 80,
+  "results": {
+    "whitted": {
+      "width": 512,
+      "height": 512,
+      "samples_per_pixel": 4,
+      "bounce_limit": 5,
+      "source_sha256": "d3387fe0b7f236e8088bcb9bb3470d5a1f96fad3a165db21136fd5105043d66a",
+      "original_sha256": "cd54e5d3485aeb2cc863fb97343e5dbd347ea5d4150f1af82fdad2c9e46d5d38",
+      "pixels_sha256": "2d90d1958416e2c42a49120f989679a03c8aa1127a86983fddbe00a6222ae3ba",
+      "samples_s": {
+        "cpu16": [
+          1.908284506003838,
+          1.9246408770559356,
+          1.9107112920028158
+        ],
+        "gpu": [
+          17.387316924985498,
+          17.548708454996813,
+          17.345185994985513
+        ]
+      },
+      "fps": {
+        "cpu16": 12.560767343790122,
+        "gpu": 1.38031647456268
+      },
+      "oracle_checked": false,
+      "artifacts_sha256": {
+        "cpu": "0ff3571c64f21369f69dfbf3d0976af3acf28f35b828bf99ece0e99c0a3acac8",
+        "gpu": "554e1da2c4eafafb74d8a4b035818be7b994df57e97ae6c602d86039d9779196"
+      }
+    },
+    "path": {
+      "width": 256,
+      "height": 256,
+      "samples_per_pixel": 64,
+      "bounce_limit": 6,
+      "source_sha256": "7c24306c8ae771c71bd04c760a343b3a555bc32da8f9241003bf2d9693c08c7d",
+      "original_sha256": "19c4001517681ba85b41e02ea8bfa5f2cdffe49be6b28555fff13d9a8825c862",
+      "pixels_sha256": "24a19836e5d881c1262ffff62515f4a5b3e6181052e975bbc654f02e905412bb",
+      "samples_s": {
+        "cpu16": [
+          7.562310759036336,
+          7.563227954960894,
+          7.6147493529715575
+        ],
+        "gpu": [
+          10.627048899012152,
+          10.474782466015313,
+          10.46460789104458
+        ]
+      },
+      "fps": {
+        "cpu16": 3.1732482668670396,
+        "gpu": 2.2912170327036665
+      },
+      "oracle_checked": false,
+      "artifacts_sha256": {
+        "cpu": "2c0ed00fd970926ce35048522645d5d83937ec9cd9ccbb0b56e72cb8af7b1bec",
+        "gpu": "b1dfcc21746d005f93a8dcbb7501edbfd28ce996c1bc4b0b3de96d6df14bf115"
+      }
+    }
+  },
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D, 8 cores / 16 threads",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "small_oracle_verification": {
+    "date": "2026-10-02",
+    "frames": 4,
+    "compiler_sha256": "5c418d9837d61b6f9847075cff17c0ff4977bfe52b0f496d163200d1c8645305",
+    "method": "median process wall of built frame strip, after warmup; includes output and GPU context/readback; compilation and GIF encoding excluded",
+    "gif_frame_ms": 80,
+    "results": {
+      "whitted": {
+        "width": 8,
+        "height": 8,
+        "samples_per_pixel": 2,
+        "bounce_limit": 5,
+        "source_sha256": "526ce8396cb5f504646c91ea667e595451c289dbcb43d6dd0339ff140b65a9c8",
+        "original_sha256": "cd54e5d3485aeb2cc863fb97343e5dbd347ea5d4150f1af82fdad2c9e46d5d38",
+        "pixels_sha256": "50524e9a5dbbee0a36f5efb182123607e9695baabf59afa67a4c5894405b8f14",
+        "samples_s": {
+          "cpu16": [
+            0.002422566991299391
+          ],
+          "gpu": [
+            0.16327054100111127
+          ]
+        },
+        "fps": {
+          "cpu16": 1651.1411302002932,
+          "gpu": 24.499214466207807
+        },
+        "oracle_checked": true,
+        "artifacts_sha256": {
+          "cpu": "1169a4e78f2a3e72a85231ee2e147760daa28cdbca12545ed3529e70531aadc7",
+          "gpu": "31bd6afcb6887f40c18627d0425106e3f77b55b376d394fcdf9fe354afc1d588"
+        }
+      },
+      "path": {
+        "width": 8,
+        "height": 8,
+        "samples_per_pixel": 2,
+        "bounce_limit": 6,
+        "source_sha256": "eac8c738560efa757a070e36a4aacce99b93b62a51229b241db73801766d50db",
+        "original_sha256": "19c4001517681ba85b41e02ea8bfa5f2cdffe49be6b28555fff13d9a8825c862",
+        "pixels_sha256": "779f6d2649297b4b80341b6592a3dbfe610349df4d29af35d7eb04fc394ab7de",
+        "samples_s": {
+          "cpu16": [
+            0.002250317018479109
+          ],
+          "gpu": [
+            0.1722722810227424
+          ]
+        },
+        "fps": {
+          "cpu16": 1777.5273293286587,
+          "gpu": 23.21905750741144
+        },
+        "oracle_checked": true,
+        "artifacts_sha256": {
+          "cpu": "2e8de962e33d0388e9f164959a1d62503eaa7897ecbcd0fcff0ed114b9d01f08",
+          "gpu": "0ad6cf94c9c8a343030f427b4d6fbc43bde1a4fc0cfdc4f4779e0b88513ac61d"
+        }
+      }
+    },
+    "additional_oracle_compiler_sha256": "6da131141e98fefc480112d5728447319208a2537d937181dbf2340290795617"
+  }
+}

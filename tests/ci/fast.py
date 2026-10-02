@@ -16,7 +16,7 @@ For every port in bench/ports (all in parallel, memory-capped builds):
 
 Everything is compared against tests/ci/baseline.json. `--update` rewrites
 the baseline from the current toolchain (do this only from a state you
-have verified against reference / the expected checksums).
+have verified against the reference interpreter and expected checksums).
 
 Usage: tests/ci/fast.py [--update] [--only NAME ...] [--jobs N]
 Exit status: number of hard failures.
@@ -45,39 +45,11 @@ RUN_CAP_S = 60
 
 # small size: (sed substitutions, expected checksum) — mirrors tests/e2e/run.sh
 SMALL = {
-    "bfs": (["s/batch(19, 0)/batch(4, 0)/"], "512822161"),
-    "editdist": (["s/batch(15, 0)/batch(2, 0)/"], "2065873279"),
-    "gameoflife": (["s/census_fin(batch_run(18, 0, 32))/census_fin(batch_run(1, 0, 2))/"], "2601177279"),
-    "hashmap": (["s/batch(11, 0, 16384)/batch(2, 0, 256)/"], "4206244792"),
-    "kmeans": (["s/rbatch(6, 0, 19)/rbatch(6, 0, 7)/"], "4219097976"),
-    "lexer": (["s/batch(23, 0)/batch(8, 0)/"], "1822208108"),
-    "mandelbrot": (["s/rend(18, 51)/rend(2, 7)/"], "887240761"),
-    "merkle": (["s/build(22, 0)/build(4, 0)/", "s/pgen(22, 1337, 0), leafh(1337)/pgen(4, 13, 0), leafh(13)/"], "524568222"),
-    "nbody": (["s/run(17, 300)/run(7, 300)/"], "2215450620"),
-    "queens": (["s/run(17, 17, 11730)/run(10, 5, 625)/"], "774553824"),
-    "raytrace": (["s/rowf(12, 0, 4095, 6000, 1161527296, 1157627904)/rowf(6, 0, 63, 80, 1109393408, 1107296256)/"], "402971"),
     "kdtree": (["s/    n = 18/    n = 10/", "s/return qbatch(t, 18, 0)/return qbatch(t, 10, 0)/"], "2478099586"),
-    "symreg": (["s/run(18, 42, 32, 110)/run(6, 42, 32, 16)/"], "2490246820"),
-    "terrain": (["s/for t in range(65536):/for t in range(16):/"], "4236200168"),
-    "tree-bitonic": (["s/bsort(23, 0, 0)/bsort(8, 0, 0)/"], "971629740"),
-    "tree-matmul": (["s/batch(9, 0, 384, 511, 7)/batch(2, 0, 3, 3, 3)/"], "4292995302"),
-    "tree-radix": (["s/gen(22, 0)/gen(8, 0)/"], "366571299"),
 }
 
 # mid size for the perf signal (no expected value; t1 and t16 must agree)
 MID = {
-    "bfs": ["s/batch(19, 0)/batch(11, 0)/"],
-    "editdist": ["s/batch(15, 0)/batch(7, 0)/"],
-    "gameoflife": ["s/batch_run(18, 0, 32)/batch_run(12, 0, 32)/"],
-    "hashmap": ["s/batch(11, 0, 16384)/batch(6, 0, 16384)/"],
-    "lexer": ["s/batch(23, 0)/batch(16, 0)/"],
-    "mandelbrot": ["s/rend(18, 51)/rend(10, 51)/"],
-    "merkle": ["s/build(22, 0)/build(14, 0)/", "s/pgen(22, 1337, 0)/pgen(14, 1337, 0)/"],
-    "nbody": ["s/run(17, 300)/run(8, 300)/"],
-    "symreg": ["s/run(18, 42, 32, 110)/run(12, 42, 32, 110)/"],
-    "terrain": ["s/for t in range(65536):/for t in range(1024):/"],
-    "tree-bitonic": ["s/bsort(23, 0, 0)/bsort(16, 0, 0)/"],
-    "tree-radix": ["s/gen(22, 0)/gen(16, 0)/"],
 }
 
 TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.5}

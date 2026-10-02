@@ -92,83 +92,41 @@ fn wrap(lets: Vec<(u32, Core)>, tail: Core) -> Core {
 /// wrap the let-RHS shape of the body.
 pub(crate) fn normalize(e: &Core, c: &mut u32) -> Core {
     let mut lets = Vec::new();
-    let t = norm_bind(e, c, &mut lets);
+    let t = norm(e, c, &mut lets, false);
     wrap(lets, t)
 }
 
-/// Normalize into a let-RHS shape: pure | Call | If | Match; prerequisite
-/// bindings are pushed onto `lets`.
-fn norm_bind(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
+/// Normalize a let RHS (`pure = false`) or a call-free value position.
+/// Hoisting, branch tails, and lambda scope boundaries share one traversal.
+fn norm(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>, pure: bool) -> Core {
     if !has_call(e) {
         return e.clone();
     }
-    match e {
-        Core::Call(f, args) => {
-            Core::Call(*f, args.iter().map(|a| norm_pure(a, c, lets)).collect())
-        }
-        Core::App(f, a) => Core::App(Box::new(norm_pure(f, c, lets)), Box::new(norm_pure(a, c, lets))),
-        Core::If(cd, t, f) => {
-            let c2 = norm_pure(cd, c, lets);
-            Core::If(Box::new(c2), Box::new(normalize(t, c)), Box::new(normalize(f, c)))
-        }
-        Core::Match(s, arms) => {
-            let s2 = norm_pure(s, c, lets);
-            Core::Match(
-                Box::new(s2),
-                arms.iter().map(|(k, bs, b)| (*k, bs.clone(), normalize(b, c))).collect(),
-            )
-        }
-        Core::Let(x, r, bo) => {
-            let r2 = norm_bind(r, c, lets);
-            lets.push((*x, r2));
-            norm_bind(bo, c, lets)
-        }
-        _ => norm_pure(e, c, lets),
-    }
-}
-
-/// Normalize into a call-free (pure) expression, hoisting any embedded
-/// calls / call-carrying Ifs and Matches into `lets`.
-fn norm_pure(e: &Core, c: &mut u32, lets: &mut Vec<(u32, Core)>) -> Core {
-    if !has_call(e) {
-        return e.clone();
+    if pure && matches!(e, Core::Call(..) | Core::If(..) | Core::Match(..) | Core::App(..)) {
+        let rhs = norm(e, c, lets, false);
+        let x = fresh(c);
+        lets.push((x, rhs));
+        return Core::Var(x);
     }
     match e {
-        Core::Call(..) | Core::If(..) | Core::Match(..) | Core::App(..) => {
-            let r = norm_bind(e, c, lets);
-            let x = fresh(c);
-            lets.push((x, r));
-            Core::Var(x)
+        Core::Let(x, rhs, body) => {
+            let rhs = norm(rhs, c, lets, false);
+            lets.push((*x, rhs));
+            norm(body, c, lets, pure)
         }
-        Core::Let(x, r, bo) => {
-            let r2 = norm_bind(r, c, lets);
-            lets.push((*x, r2));
-            norm_pure(bo, c, lets)
+        Core::If(..) | Core::Match(..) => {
+            // Condition first, followed by independently normalized tail bodies.
+            let mut first = true;
+            crate::rewrite::map_children(e, &mut |child| {
+                if std::mem::replace(&mut first, false) {
+                    norm(child, c, lets, true)
+                } else {
+                    normalize(child, c)
+                }
+            })
         }
-        Core::Op2(op, a, b) => Core::Op2(
-            *op,
-            Box::new(norm_pure(a, c, lets)),
-            Box::new(norm_pure(b, c, lets)),
-        ),
-        Core::Cmp(op, a, b) => Core::Cmp(
-            *op,
-            Box::new(norm_pure(a, c, lets)),
-            Box::new(norm_pure(b, c, lets)),
-        ),
-        Core::Reuse(v, k, args) => {
-            Core::Reuse(*v, *k, args.iter().map(|a| norm_pure(a, c, lets)).collect())
-        }
-        Core::Ctor(k, args) => {
-            Core::Ctor(*k, args.iter().map(|a| norm_pure(a, c, lets)).collect())
-        }
-        Core::Prim(p, items) => Core::Prim(*p, items.iter().map(|a| norm_pure(a, c, lets)).collect()),
-        Core::Tuple(items) => {
-            Core::Tuple(items.iter().map(|a| norm_pure(a, c, lets)).collect())
-        }
-        Core::Proj(a, i) => Core::Proj(Box::new(norm_pure(a, c, lets)), *i),
-        // a closure's body is not compiled here: it is built as a net
-        Core::Lam(x, b) => Core::Lam(*x, b.clone()),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
+        Core::Lam(x, body) => Core::Lam(*x, body.clone()),
+        _ => crate::rewrite::map_children(e, &mut |child| norm(child, c, lets, true)),
     }
 }
 
@@ -290,7 +248,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
         Core::Match(s, arms) => ex.match_arms(e, s, arms, cnt_rule, |ex, body, ab| rtail(ex, body, par, ab, sq), b),
         Core::Call(g, args) => {
             // a tail call delivering to `par`: in the parallel world the
-            // device runtime spawns it as a task (a marked call, as in reference);
+            // device runtime spawns it as a task (a marked call);
             // otherwise it dives here
             let mut es: Vec<E> = args.iter().map(|a| ex.val(a, true, b)).collect();
             es.insert(0, par.clone());
@@ -346,3 +304,7 @@ pub(crate) fn segment_fn(seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &st
     rtail(&mut ex, &seg.body, &v("parent"), &mut s, sq);
     FnDef { name: format!("sg_{}", seg.id), ctx: true, params: rule_params(), ret: Ty::Unit, body: s, inline: Inline::Default, cold: false }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/normalization.rs"]
+mod normalization_tests;

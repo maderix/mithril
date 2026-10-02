@@ -469,7 +469,7 @@ def main():
                           flush=True)
             if gpu_enabled:
                 # the device lane times a built artefact (`build --gpu`
-                # once, `exec` per run), as the CPU lanes and reference do
+                # once, `exec` per run), as the CPU lanes do
                 port = os.path.join(PORTS_DIR, name + ".py")
                 art = os.path.join(tmpdir, name + ".gpu")
                 b = subprocess.run([MITHRIL_BIN, "build", port, "--gpu", "-o", art], capture_output=True, text=True, timeout=args.timeout)

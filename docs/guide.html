@@ -1,534 +1,317 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
-<title>Mithril Field Guide</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Programming with Mithril · Field guide</title>
+<meta name="description" content="What Mithril offers, which programs benefit, how it compares with C, Rust, CUDA and functional languages, and how interaction nets and native code work together.">
 <style>
-/* Layout: one long guide, sticky chapter bar; each chapter = one lead diagram, then three lenses (net / compiler / reference) and a code+test strip */
-:root {
-  --paper: #f4f6f7; --panel: #ffffff; --ink: #162129; --muted: #5a6872; --rule: #d5dde1;
-  --agent: #0f7c86; --agent-soft: #dff1f2; --port: #b4541e; --port-soft: #f8e6db;
-  --wire: #6b7c86; --ok: #2f7d4e; --ok-soft: #e1f2e7; --reference: #7a4fb3; --reference-soft: #efe7f8;
-  --f-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
-  --f-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
-  --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
-}
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
-  --paper: #0f1519; --panel: #161e24; --ink: #e3e9ec; --muted: #97a6af; --rule: #28343c;
-  --agent: #4fc3cc; --agent-soft: #12303a; --port: #f08a55; --port-soft: #3a2418;
-  --wire: #8a9ba5; --ok: #6cc793; --ok-soft: #173024; --reference: #b797ef; --reference-soft: #2a2140; color-scheme: dark } }
-:root[data-theme="dark"] {
-  --paper: #0f1519; --panel: #161e24; --ink: #e3e9ec; --muted: #97a6af; --rule: #28343c;
-  --agent: #4fc3cc; --agent-soft: #12303a; --port: #f08a55; --port-soft: #3a2418;
-  --wire: #8a9ba5; --ok: #6cc793; --ok-soft: #173024; --reference: #b797ef; --reference-soft: #2a2140; color-scheme: dark }
-* { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
-@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
-body { background: var(--paper); color: var(--ink); font: 16px/1.62 var(--f-body); }
-.wrap { max-width: 1060px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 80px; }
-nav.chapters { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--paper); border-bottom: 1px solid var(--rule); }
-nav.chapters .in { max-width: 1060px; margin: 0 auto; padding-inline: 16px; padding-block: 8px; display: flex; gap: 6px; overflow-x: auto; }
-nav.chapters a { flex: none; font: 600 12.5px var(--f-mono); color: var(--muted); text-decoration: none; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--rule); }
-nav.chapters a:hover, nav.chapters a:focus-visible { color: var(--agent); border-color: var(--agent); outline: none; }
-h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.15; }
-h1 { font-size: clamp(30px, 5vw, 46px); font-weight: 800; margin: 18px 0 8px; letter-spacing: -0.015em; }
-h2 { font-size: clamp(22px, 3vw, 28px); font-weight: 800; margin: 0 0 6px; }
-h3 { font-size: 16px; font-weight: 600; margin: 0 0 6px; }
-p { margin: 6px 0 10px; max-width: 68ch; }
-.lede { font-size: 17.5px; color: var(--muted); max-width: 70ch; }
-code, .mono { font-family: var(--f-mono); font-size: 13px; }
-section.ch { padding-top: 56px; scroll-margin-top: 52px; }
-.chno { font: 600 12px var(--f-mono); color: var(--port); letter-spacing: .08em; text-transform: uppercase; }
-.fig { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; margin: 14px 0; overflow-x: auto; }
-svg { display: block; width: 100%; height: auto; }
-svg text { font-family: var(--f-body); fill: var(--ink); font-size: 13px; }
-svg .m { font-family: var(--f-mono); font-size: 11.5px; fill: var(--muted); }
-svg .t { font-family: var(--f-mono); font-size: 12px; fill: var(--ink); }
-svg .b { font-weight: 700; }
-.agent { fill: var(--agent-soft); stroke: var(--agent); stroke-width: 1.5; }
-.pp { fill: var(--port); }
-.wire { stroke: var(--wire); stroke-width: 1.6; fill: none; }
-.active { stroke: var(--port); stroke-width: 3; }
-.lenses { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 12px 0; }
-.lens { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; min-width: 0; }
-.lens .k { font: 600 11px var(--f-mono); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
-.lens.net .k { color: var(--agent); } .lens.cc .k { color: var(--port); } .lens.reference .k { color: var(--reference); }
-.lens p { font-size: 15px; margin: 0; }
-.strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0; border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; background: var(--panel); }
-.strip > div { padding: 10px 14px; min-width: 0; font-size: 14px; }
-.strip > div + div { border-left: 1px solid var(--rule); }
-@media (max-width: 640px) { .strip > div + div { border-left: 0; border-top: 1px solid var(--rule); } }
-.strip .k { font: 600 11px var(--f-mono); color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
-.strip code { word-break: break-word; }
-pre.code { margin: 0; padding: 12px 14px; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; overflow-x: auto; font: 12.5px/1.5 var(--f-mono); color: var(--ink); }
-pre.code .c { color: var(--muted); }
-pre.code .h { background: var(--port-soft); color: var(--ink); }
-.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
-.two > * { min-width: 0; }
-/* stepper */
-.stepper { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; margin: 14px 0; }
-.stepper .expr { font: 600 clamp(15px, 2.2vw, 20px)/1.4 var(--f-mono); padding: 14px; border-radius: 8px; background: var(--paper); border: 1px solid var(--rule); overflow-x: auto; white-space: nowrap; }
-.stepper .expr mark { background: var(--port-soft); color: var(--ink); border-radius: 4px; padding: 0 3px; }
-.stepper .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; font-size: 14.5px; }
-.stepper .meta div { min-width: 0; }
-.stepper .meta .k { font: 600 11px var(--f-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
-.stepper .ctrl { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
-.stepper button { font: 600 13px var(--f-mono); color: var(--ink); background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
-.stepper button:hover, .stepper button:focus-visible { border-color: var(--agent); color: var(--agent); outline: none; }
-.stepper button:disabled { opacity: .45; cursor: default; }
-.stepper .count { font: 12px var(--f-mono); color: var(--muted); }
-.dots { display: flex; gap: 4px; }
-.dots span { width: 8px; height: 8px; border-radius: 99px; background: var(--rule); }
-.dots span.on { background: var(--port); }
-table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--panel); }
-th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--rule); }
-th { font: 600 11px var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
-td code { font-size: 12.5px; word-break: break-word; }
-.tbl { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; margin: 12px 0; }
-.note { font-size: 13.5px; color: var(--muted); }
-.key { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 6px; }
-.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 5px; }
-.readorder { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 14px 0; }
-.readorder a { display: block; text-decoration: none; color: var(--ink); background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-size: 14px; }
-.readorder a b { display: block; font: 600 11px var(--f-mono); color: var(--port); }
-.readorder a:hover, .readorder a:focus-visible { border-color: var(--agent); outline: none; }
-.open li { margin: 4px 0; }
-footer { margin-top: 56px; font-size: 13px; color: var(--muted); }
+:root{--paper:#f5f7fa;--panel:#fff;--ink:#202a3a;--muted:#526276;--line:#cbd3df;--blue:#285bbb;--copper:#8b461b;--wash:#e9eef6;--code:#edf1f7;--c:#6a7687;color-scheme:light}
+:root[data-theme=dark]{--paper:#151b24;--panel:#1c2531;--ink:#e4eaf2;--muted:#adbace;--line:#46556a;--blue:#83b7ff;--copper:#e5b482;--wash:#273448;--code:#202d3d;--c:#a3afc0;color-scheme:dark}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:5rem}body{margin:0;background:var(--paper);color:var(--ink);font:18px/1.65 Georgia,serif}
+a{color:var(--blue);text-underline-offset:.2em}a:hover{text-decoration-thickness:2px}button,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:.5rem .8rem}button{cursor:pointer}button:hover{border-color:var(--blue)}button:disabled{opacity:.5;cursor:default}button[aria-pressed=true]{border-color:var(--blue);background:var(--wash)}:focus-visible{outline:3px solid var(--blue);outline-offset:4px}
+h1,h2,h3,nav,button,.caption,th,summary{font-family:system-ui,sans-serif}h1{font-size:clamp(2.6rem,5vw,4.5rem);line-height:1.08;letter-spacing:-.045em;font-weight:650;margin:0 0 1.5rem}h2{font-size:clamp(1.65rem,3vw,2.3rem);line-height:1.2;letter-spacing:-.025em;margin:0 0 1.4rem}h3{font-size:1.08rem;margin:1.7rem 0 .6rem}p{max-width:70ch;margin:.8rem 0 1.2rem}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em}code{overflow-wrap:anywhere}pre{background:var(--code);border:1px solid var(--line);padding:1.15rem;overflow:auto;line-height:1.6;margin:1rem 0;tab-size:4}pre code{font-size:inherit;overflow-wrap:normal}figure{margin:1.5rem 0}.caption,figcaption{font:.85rem/1.6 system-ui,sans-serif;color:var(--muted)}figcaption{margin-top:.8rem}.blue{color:var(--blue)}.copper{color:var(--copper)}
+header{position:sticky;top:0;z-index:5;background:var(--paper);border-bottom:1px solid var(--line)}.top{max-width:1240px;margin:auto;padding:.7rem 2rem;display:flex;align-items:center;gap:1.4rem;font:.9rem system-ui,sans-serif}.brand{font-weight:700;color:var(--ink);text-decoration:none}.top .back{margin-left:auto}.top button{font-size:.85rem}.layout{max-width:1240px;margin:auto;display:grid;grid-template-columns:175px minmax(0,1fr);gap:3rem;padding:3.5rem 2rem}nav{position:sticky;top:6rem;align-self:start;font-size:.84rem;line-height:1.4}nav a{display:block;padding:.6rem 0;color:var(--muted);text-decoration:none}nav a:hover{color:var(--blue)}nav strong{display:block;margin-bottom:.6rem}main{min-width:0}section{padding:3rem 0;border-top:1px solid var(--line)}section:first-child{border-top:0;padding-top:0}.lead{font-size:1.25rem}.hero{display:block}.render-demos{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.5rem}.render-demos figure{margin:0}.render-demos h3{margin:0 0 .7rem}.render-demos img{display:block;width:100%;max-width:360px;height:auto;border:1px solid var(--line)}.render-demos strong{color:var(--ink)}.split{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}.note{border-left:3px solid var(--line);padding:.1rem 0 .1rem 1.2rem;margin:1.5rem 0}.sources{font:.82rem/1.7 system-ui,sans-serif;color:var(--muted);margin-top:1.4rem}.diagram{background:var(--panel);border:1px solid var(--line);padding:1.4rem}.node{border:1px solid var(--line);padding:1rem;background:var(--paper);text-align:center;font:.95rem/1.5 system-ui,sans-serif}.node small{display:block;margin-top:.3rem;color:var(--muted);font-size:.82rem}.flow{display:grid;gap:.75rem}.branches{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}.branches .node:first-child{border-color:var(--blue)}.branches .node:last-child{border-color:var(--copper)}.arrows{display:grid;grid-template-columns:1fr 1fr;text-align:center;color:var(--muted);font:1.2rem system-ui,sans-serif}.arrow{text-align:center;color:var(--muted);font:1.2rem system-ui,sans-serif}.controls{display:flex;gap:.65rem;flex-wrap:wrap;align-items:center;margin:1rem 0;font:.85rem system-ui,sans-serif}.status{font:.95rem/1.6 system-ui,sans-serif;min-height:3rem}.done{background:var(--wash)}svg{width:100%;height:auto;color:var(--ink)}svg text{fill:currentColor;font-family:system-ui,sans-serif;font-size:17px}.shape-svg{max-height:245px}.shape-description{min-height:4.5rem}
+.table-wrap{overflow:auto}.diagram:has(svg){overflow:auto}.diagram svg:not(.shape-svg){min-width:540px}table{border-collapse:collapse;font-size:.94rem;width:100%;min-width:560px}th,td{text-align:left;vertical-align:top;padding:.95rem .7rem;border-bottom:1px solid var(--line)}th{font-size:.8rem;color:var(--muted)}.numbers td:not(:first-child),.numbers th:not(:first-child){text-align:right;white-space:nowrap}.numbers td:first-child{width:55%}.numbers.compact{min-width:0}.chart{font:.9rem/1.5 system-ui,sans-serif}.legend{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;color:var(--muted);font-size:.82rem}.key::before{content:'';display:inline-block;width:.8rem;height:.8rem;background:var(--c);margin-right:.4rem}.key.t1::before{background:var(--copper)}.key.t16::before{background:var(--blue)}.chart-group{margin:1.6rem 0}.chart-group h3{margin:0 0 .6rem}.bar-row{display:grid;grid-template-columns:90px minmax(0,1fr) 72px;gap:.7rem;align-items:center;margin:.4rem 0}.bar-row span:last-child{text-align:right;font-variant-numeric:tabular-nums}.bar-track{height:16px;background:var(--wash)}.bar{height:100%;width:var(--w);background:var(--c)}.bar.t1{background:var(--copper)}.bar.t16{background:var(--blue)}.architecture{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.wide{grid-column:1/-1}details{margin:1rem 0}summary{cursor:pointer;font-size:.9rem}footer{border-top:1px solid var(--line);padding:2rem 0;font:.85rem system-ui,sans-serif;color:var(--muted)}[hidden]{display:none!important}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+@media(max-width:1000px){.layout{grid-template-columns:145px minmax(0,1fr);gap:1.5rem}.split{grid-template-columns:1fr}}
+@media(max-width:720px){body{font-size:17px}.top{padding:.65rem 1rem;gap:.7rem}.top>span{display:none}.top .back{font-size:.8rem;white-space:nowrap}.top button{white-space:nowrap}.layout{display:block;padding:2rem 1rem}nav{position:static;border-bottom:1px solid var(--line);padding-bottom:1rem;margin-bottom:2rem;display:flex;flex-wrap:wrap;gap:.2rem 1rem}nav strong{width:100%}nav a{padding:.25rem 0}section{padding:2.2rem 0}.diagram{padding:.85rem}.branches{gap:.65rem}.node{padding:.7rem .5rem}pre{padding:.9rem;font-size:.74em}.architecture,.render-demos{grid-template-columns:1fr}.render-demos{gap:1.5rem}.wide{grid-column:auto}.bar-row{grid-template-columns:68px minmax(0,1fr) 64px;gap:.4rem;font-size:.8rem}.shape-description{min-height:7rem}}
 </style>
-
-<nav class="chapters" aria-label="Chapters"><div class="in">
-  <a href="#map">0 Map</a><a href="#nets">1 Nets</a><a href="#order">2 Any order</a><a href="#compile">3 Compile time</a><a href="#lower">4 To machine code</a><a href="#run">5 Running</a><a href="#reference">6 reference</a><a href="#code">7 Design ↔ code</a><a href="#open">8 Open</a>
-</div></nav>
-
-<div class="wrap">
-<h1>Mithril Field Guide</h1>
-<p class="lede">What Mithril is, built up from pictures. No type theory required. Every chapter follows one real program through the real compiler and says where the idea lives in <code>docs/design.md</code>, in the code, and in the tests.</p>
-
-<div class="lenses" style="margin-top:18px">
-  <div class="lens net"><div class="k">Net lens</div><p>What the interaction net does: agents, wires, one rule firing.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>The same idea in the words you already use: SSA, inlining, constant folding, continuations.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>What we measured against, what we took from reference and what is our own.</p></div>
+</head>
+<body>
+<header><div class="top"><a class="brand" href="../README.md">Mithril</a><span>Field guide</span><a class="back" href="#try">Try a program</a><button id="theme" hidden type="button">Dark mode</button></div></header>
+<div class="layout">
+<nav aria-label="Chapters"><strong>Programming with Mithril</strong><a href="#program">What you write</a><a href="#choice">Compared with other tools</a><a href="#fit">Which programs benefit</a><a href="#limits">Where it is a poor fit</a><a href="#nets">How order stays safe</a><a href="#compile">The hybrid model</a><a href="#sharing">Sharing computation</a><a href="#evidence">Proofs and checks</a><a href="#try">Try it yourself</a></nav>
+<main>
+<section id="program">
+<h1>Programming<br>with Mithril</h1>
+<div class="hero"><p class="lead">Write plain scalar code. Mithril finds independent work in the program and runs it across CPU cores or on a GPU.</p><p>Its syntax is a Python subset, with functions, loops and values. The compiler and runtime handle task splitting, shared computation and result collection, so you can compose the algorithm in one source program.</p></div>
+<p>The camera stays fixed while the spheres move in depth and height. Their apparent sizes, shadows, reflections and refraction change with each pose.</p>
+<div class="render-demos" id="animated-tracers">
+<figure><h3>Whitted ray tracing</h3><img src="img/cornell_whitted_animated.gif" width="512" height="512" alt="Mirror and glass spheres moving in three dimensions inside a fixed Cornell box, rendered by the Whitted tracer"><figcaption><strong>CPU 16 threads: 12.6 FPS · GPU: 1.4 FPS</strong><br>512×512 · 4 samples per pixel. Direct lighting, reflections and refraction. <a href="../demos/cornell_whitted.py">Tracer source</a>.</figcaption></figure>
+<figure><h3>Path tracing</h3><img src="img/cornell_path_animated.gif" width="256" height="256" alt="The same moving spheres with sampled indirect lighting, rendered by the path tracer"><figcaption><strong>CPU 16 threads: 3.2 FPS · GPU: 2.3 FPS</strong><br>256×256 · 64 samples per pixel, up to 6 surface hits per path. <a href="../demos/cornell_path.py">Tracer source</a>.</figcaption></figure>
 </div>
-
-<div class="readorder">
-  <a href="#map"><b>0</b>The whole system in one picture</a>
-  <a href="#nets"><b>1</b>Four rules you already know</a>
-  <a href="#order"><b>2</b>Why order never matters</a>
-  <a href="#compile"><b>3</b>The optimizer is the rules</a>
-  <a href="#lower"><b>4</b>How nets become fast code</a>
-  <a href="#run"><b>5</b>Where parallelism comes from</a>
-  <a href="#reference"><b>6</b>reference, and how we differ</a>
-  <a href="#code"><b>7</b>Every idea, its file, its test</a>
-</div>
-
-<!-- ============================================================ 0 MAP -->
-<section class="ch" id="map">
-<div class="chno">Chapter 0</div>
-<h2>The whole system in one picture</h2>
-<p>A program's meaning is a set of rewrite rules on a graph. The compiler runs those rules early on whatever does not depend on input, then turns what is left into native code for the CPU and the GPU. The runtime runs the same rules on the rest.</p>
-<div class="fig">
-<svg viewBox="0 0 1000 300" role="img" aria-label="Pipeline from source through net reduction to CPU and GPU">
-  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--wire)"/></marker></defs>
-  <g>
-    <rect x="10" y="40" width="130" height="70" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="22" y="64" class="b">Source</text><text x="22" y="84" class="m">Python subset</text><text x="22" y="100" class="m">mithril-front</text>
-    <rect x="165" y="40" width="130" height="70" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="177" y="64" class="b">Core IR</text><text x="177" y="84" class="m">desugared terms</text><text x="177" y="100" class="m">eval_core = oracle</text>
-    <rect x="320" y="30" width="190" height="90" rx="8" class="agent"/>
-    <text x="334" y="56" class="b">Net + rules</text><text x="334" y="76" class="m">compile-time reduction</text><text x="334" y="92" class="m">mithril-net · mithril-core</text><text x="334" y="108" class="m">same rule table</text>
-    <rect x="535" y="40" width="130" height="70" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="547" y="64" class="b">Residual</text><text x="547" y="84" class="m">read back as Core</text><text x="547" y="100" class="m">what input needs</text>
-    <rect x="690" y="40" width="130" height="70" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="702" y="64" class="b">LirProgram</text><text x="702" y="84" class="m">forms + rule table</text><text x="702" y="100" class="m">mithril-codegen</text>
-    <path class="wire" d="M140 75 H163" marker-end="url(#ar)"/><path class="wire" d="M295 75 H318" marker-end="url(#ar)"/>
-    <path class="wire" d="M510 75 H533" marker-end="url(#ar)"/><path class="wire" d="M665 75 H688" marker-end="url(#ar)"/>
-    <path class="wire" d="M820 60 H850 V30 H870" marker-end="url(#ar)"/><path class="wire" d="M820 90 H850 V130 H870" marker-end="url(#ar)"/>
-    <rect x="872" y="6" width="120" height="50" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="882" y="28" class="b">CPU</text><text x="882" y="46" class="m">Rust + mithril-rt</text>
-    <rect x="872" y="106" width="120" height="50" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="882" y="128" class="b">GPU</text><text x="882" y="146" class="m">CUDA + engine.cu</text>
-  </g>
-  <rect x="320" y="190" width="672" height="46" rx="8" fill="var(--agent-soft)" stroke="var(--agent)" stroke-dasharray="5 4"/>
-  <text x="336" y="212" class="b">One rule table, two times</text>
-  <text x="336" y="229" class="m">compile time: mithril_core::rules on the net · CPU runtime: the same Rust code · GPU runtime: a hand-written copy in engine.cu, held to it by tests</text>
-  <path class="wire" d="M415 120 V188" stroke-dasharray="3 3"/><path class="wire" d="M932 56 V188" stroke-dasharray="3 3"/><path class="wire" d="M952 156 V188" stroke-dasharray="3 3"/>
-  <text x="10" y="270" class="m">Sizes (lines): front 2,817 · core 1,261 · net 1,848 · reassoc 689 · codegen 7,391 · cli 577 = 14,583 language (budget 15,000) · runtime: rt 2,514 · gpu host 1,723 · engine.cu 2,159</text>
-</svg>
-</div>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>A program is a graph of small agents. Computation is rewriting pairs of agents. The compiler and the runtime do the same thing, at different times.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>A conventional pipeline (parse, IR, optimize, lower, codegen), with one change: the optimizer is not a list of passes, it is the language's own evaluation rules run early (partial evaluation).</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>reference takes a Python-like program to C with a parallel runtime and was our performance baseline. Mithril keeps the rules as the definition of meaning and uses them as the optimizer too.</p></div>
-</div>
+<p class="caption">Ryzen 7 7800X3D and RTX 4090, 2 October 2026. FPS is 24-frame batch throughput, median of three runs after a warmup. Compilation excluded; returned pixels, GPU context setup and readback included. All frame pixels match across CPU and GPU. The GIFs autoplay at 12.5 FPS. <a href="img/raytracer-animation.md">Measurements and reproduction</a>.</p>
+<pre><code>def main():
+    n = size()
+    img = array_new(n * n, 0)
+    for y in range(n):
+        for x in range(n):
+            img = array_set(img, y * n + x, pixel(x, y))
+    return (n, n, img)</code></pre>
+<p>The loop computes the image one pixel at a time in source. You select a device and thread count when running it; the <a href="#fit">workload examples</a> show how those calculations can overlap.</p>
+<p>Arrays are values: <code>array_set</code> returns an updated array while existing readers of the previous version retain its contents. That gives parallel execution a precise result to preserve.</p>
+<div class="sources">Program: <a href="../demos/cornell_whitted.py">Whitted tracer</a> · <a href="../demos/cornell_path.py">path tracer</a></div>
 </section>
-
-<!-- ============================================================ 1 NETS -->
-<section class="ch" id="nets">
-<div class="chno">Chapter 1</div>
-<h2>Four rules you already know</h2>
-<p>An <b>agent</b> is a small node with ports. One port is its <b>principal port</b> (orange dot); the others are auxiliary. A <b>wire</b> connects two ports. When two agents touch principal port to principal port, they form an <b>active pair</b>, and exactly one rule says what they become. That is the whole machine.</p>
-<div class="fig">
-<svg viewBox="0 0 1000 250" role="img" aria-label="Four rules: arithmetic, copy, erase, call">
-  <!-- OP -->
-  <g transform="translate(10,20)">
-    <text x="0" y="0" class="b">OP · arithmetic</text>
-    <circle cx="40" cy="60" r="18" class="agent"/><text x="31" y="65" class="t">3</text><circle cx="40" cy="78" r="4" class="pp"/>
-    <circle cx="40" cy="130" r="20" class="agent"/><text x="33" y="135" class="t">+4</text><circle cx="40" cy="110" r="4" class="pp"/>
-    <line x1="40" y1="82" x2="40" y2="106" class="active"/>
-    <line x1="40" y1="150" x2="40" y2="180" class="wire"/>
-    <text x="80" y="115" class="m">⇒</text>
-    <circle cx="140" cy="110" r="18" class="agent"/><text x="133" y="115" class="t">7</text>
-    <line x1="140" y1="128" x2="140" y2="180" class="wire"/>
-    <text x="0" y="210" class="m">two numbers meet: result</text>
-  </g>
-  <!-- DUP -->
-  <g transform="translate(260,20)">
-    <text x="0" y="0" class="b">DUP · sharing</text>
-    <circle cx="40" cy="60" r="18" class="agent"/><text x="33" y="65" class="t">5</text><circle cx="40" cy="78" r="4" class="pp"/>
-    <polygon points="40,108 18,150 62,150" class="agent"/><circle cx="40" cy="108" r="4" class="pp"/><text x="30" y="142" class="t">δ</text>
-    <line x1="40" y1="82" x2="40" y2="104" class="active"/>
-    <line x1="26" y1="150" x2="18" y2="180" class="wire"/><line x1="54" y1="150" x2="62" y2="180" class="wire"/>
-    <text x="90" y="115" class="m">⇒</text>
-    <circle cx="140" cy="130" r="16" class="agent"/><text x="133" y="135" class="t">5</text>
-    <circle cx="190" cy="130" r="16" class="agent"/><text x="183" y="135" class="t">5</text>
-    <line x1="140" y1="146" x2="140" y2="180" class="wire"/><line x1="190" y1="146" x2="190" y2="180" class="wire"/>
-    <text x="0" y="210" class="m">a value used twice is copied,</text>
-    <text x="0" y="226" class="m">one layer at a time, only if needed</text>
-  </g>
-  <!-- ERA -->
-  <g transform="translate(520,20)">
-    <text x="0" y="0" class="b">ERA · erase</text>
-    <rect x="18" y="44" width="44" height="34" rx="6" class="agent"/><text x="26" y="66" class="t">f(x)</text><circle cx="40" cy="78" r="4" class="pp"/>
-    <circle cx="40" cy="120" r="14" class="agent"/><text x="35" y="125" class="t">ε</text><circle cx="40" cy="106" r="4" class="pp"/>
-    <line x1="40" y1="82" x2="40" y2="102" class="active"/>
-    <text x="90" y="100" class="m">⇒</text>
-    <text x="130" y="104" class="m">(nothing)</text>
-    <text x="0" y="210" class="m">an unused value vanishes; its</text>
-    <text x="0" y="226" class="m">work is never done</text>
-  </g>
-  <!-- REF -->
-  <g transform="translate(760,20)">
-    <text x="0" y="0" class="b">REF · call</text>
-    <rect x="12" y="44" width="56" height="34" rx="6" class="agent"/><text x="22" y="66" class="t">@sq</text><circle cx="40" cy="78" r="4" class="pp"/>
-    <circle cx="40" cy="120" r="16" class="agent"/><text x="33" y="125" class="t">3</text><circle cx="40" cy="104" r="4" class="pp"/>
-    <line x1="40" y1="82" x2="40" y2="100" class="active"/>
-    <text x="84" y="100" class="m">⇒</text>
-    <rect x="118" y="80" width="100" height="40" rx="6" class="agent"/><text x="128" y="105" class="t">3 × 3</text>
-    <text x="0" y="210" class="m">a named function unfolds</text>
-    <text x="0" y="226" class="m">into its body (inlining)</text>
-  </g>
-</svg>
-<div class="key"><span><span class="sw" style="background:var(--port)"></span>principal port</span><span><span class="sw" style="background:var(--port-soft);border:2px solid var(--port)"></span>active pair (the wire that fires)</span><span><span class="sw" style="background:var(--agent-soft);border:1px solid var(--agent)"></span>agent</span></div>
-</div>
-<p>Mithril's full table has these agent kinds (<code>crates/mithril-core/src/port.rs</code>, <code>Tag</code>): numbers and floats, constructors (<code>Con</code>, for tuples and data), <code>Dup</code>, <code>Era</code>, <code>Lam</code>/<code>App</code> (closures), <code>Op</code>, <code>Swi</code> (if on a number), <code>Mat</code> (match on a constructor), <code>Ref</code> (a named function) and <code>Ext</code>. The runtime adds <code>Kont</code> (a hand-off to compiled code) and <code>Arr</code> (an array block).</p>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>Each rule looks at exactly two agents and replaces them locally. No rule ever needs to see the rest of the graph.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>Think of an SSA dataflow graph where every value is used exactly once. Using a value twice needs an explicit copy node (DUP); dropping one needs a drop node (ERA). Evaluation is local rewriting of that graph.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>This is the same family of model reference's lineage (HVM, interaction combinators) is built on. Mithril's table is its own, sized for a compiled language: numbers, tuples, matches and named functions are first-class agents.</p></div>
-</div>
-<div class="strip">
-  <div><div class="k">Design</div><code>design.md §3.1</code> The rule table</div>
-  <div><div class="k">Code</div><code>mithril-core/src/rules.rs</code> (541 lines), <code>agents.rs</code>, <code>port.rs</code></div>
-  <div><div class="k">Checked by</div><code>reduce_test::*_matches_oracle</code>: net result = reference interpreter</div>
-</div>
+<section id="choice">
+<h2>What changes from C or Rust?</h2>
+<p>C and Rust give you control over memory, execution and the libraries used to build a parallel program. Mithril places more of those decisions in its compiler and runtime. The practical difference is how much machinery you write around the computation.</p>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Programming model comparison"><table><thead><tr><th>Decision</th><th>In a C or Rust implementation</th><th>In Mithril</th></tr></thead><tbody>
+<tr><td>Splitting independent work</td><td>Choose a threading library, task API or GPU kernel structure.</td><td>Write the dependencies; generated code and the scheduler expose eligible work.</td></tr>
+<tr><td>Reading shared data</td><td>Choose ownership, lifetimes and synchronization appropriate to the implementation.</td><td>Values can be shared; the runtime tracks their storage and consumers.</td></tr>
+<tr><td>Updating a value</td><td>Choose mutation, copying or a persistent data structure.</td><td>The update produces a new value. Uniquely owned storage can be reused.</td></tr>
+<tr><td>CPU and GPU execution</td><td>Choose portable libraries or maintain device implementations.</td><td>Compile the same supported source to the CPU or NVIDIA GPU backend.</td></tr>
+<tr><td>Low-level control</td><td>Direct access to layout, SIMD, device APIs and a large systems ecosystem.</td><td>Work within the language’s value model and the execution forms its compiler supports.</td></tr>
+</tbody></table></div>
+<p>C and Rust can express these algorithms too. Mithril derives more of their execution structure; the <a href="#fit">measurements below</a> show what that costs and saves on specific workloads.</p>
+<h3>Compared with writing CUDA</h3>
+<p>With CUDA, you decide how a computation maps to GPU threads and blocks—groups of threads that can cooperate. You can choose memory spaces and synchronization around that mapping. For a pixel batch, the mapping can be straightforward:</p>
+<pre><code>// CUDA work-mapping sketch; device pixel() and host setup omitted.
+__global__ void render(uint32_t *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n * n)
+        out[i] = pixel(i % n, i / n);
+}</code></pre>
+<p>Mithril takes the render loop shown above and chooses its execution structure. A CUDA implementation gives you direct control over that structure and can use hardware-specific instructions. When the algorithm reveals uneven or recursive work, CUDA may require additional task management; Mithril supplies a general scheduler. That convenience carries runtime costs which an optimized kernel can sometimes avoid.</p>
+<p>The pixel kernel illustrates the authoring model. The measured tracer demos show the cost of the generated CPU and GPU paths.</p>
+<div class="sources">CUDA model: <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html">NVIDIA’s thread, block and memory documentation</a></div>
+<h3>Compared with functional languages</h3>
+<p>Immutable values and shared computation are familiar ideas in functional programming. Haskell can defer evaluation until a value is demanded; OCaml supports functional data structures alongside mutation. The distinguishing questions are how parallel execution is requested, how sharing is represented, and which guarantees are checked.</p>
+<p>Mithril represents computation as an <em>interaction net</em> (IN): connected nodes transformed by local rules. The <a href="#nets">rule diagram</a> shows how those local steps permit different execution orders.</p>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Functional programming model comparisons"><table><thead><tr><th>Language</th><th>Relevant model</th><th>How Mithril differs</th></tr></thead><tbody>
+<tr><td>Haskell / GHC</td><td>Non-strict evaluation; <a href="https://hackage-content.haskell.org/package/parallel-3.3.0.0/docs/Control-Parallel-Strategies.html">parallel strategies</a> specify how pure values should be evaluated in parallel.</td><td>Mithril derives eligible tasks from program dependencies and represents shared computation with net rules. Lazy evaluation and deterministic parallelism also exist in Haskell.</td></tr>
+<tr><td>OCaml 5</td><td><a href="https://ocaml.org/manual/5.5/parallelism.html">Domains and task libraries</a> let the programmer create parallel work and await results.</td><td>Mithril generates the task structure from supported computations. OCaml gives the author task APIs alongside its wider language and runtime facilities.</td></tr>
+</tbody></table></div>
+<div class="sources">Language references: <a href="https://www.haskell.org/onlinereport/haskell2010/haskellch3.html">Haskell evaluation semantics</a> · <a href="https://ocaml.org/manual/5.5/parallelism.html">OCaml parallel programming</a>. Comparison refreshed 2 October 2026.</div>
 </section>
-
-<!-- ============================================================ 2 ORDER -->
-<section class="ch" id="order">
-<div class="chno">Chapter 2</div>
-<h2>Why order never matters</h2>
-<p>Every agent has exactly one principal port, so an agent can be in at most one active pair. Two active pairs therefore never share an agent, and firing one cannot disturb the other. Any order of firing, including all at once, reaches the same result. This property is called <b>confluence</b>, and it is where Mithril's parallelism comes from.</p>
-<div class="fig">
-<svg viewBox="0 0 1000 250" role="img" aria-label="Two independent active pairs fired in either order reach the same net">
-  <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--wire)"/></marker></defs>
-  <g transform="translate(20,90)">
-    <rect x="0" y="0" width="170" height="70" rx="8" fill="var(--panel)" stroke="var(--rule)"/>
-    <text x="12" y="26" class="t">(2+3) × (4+1)</text>
-    <text x="12" y="50" class="m">two active pairs:</text>
-    <text x="12" y="64" class="m">2+3 and 4+1</text>
-  </g>
-  <path class="wire" d="M190 110 L330 50" marker-end="url(#ar2)"/><text x="215" y="66" class="m">fire 2+3 first</text>
-  <path class="wire" d="M190 140 L330 200" marker-end="url(#ar2)"/><text x="215" y="196" class="m">fire 4+1 first</text>
-  <g transform="translate(335,15)"><rect x="0" y="0" width="160" height="60" rx="8" fill="var(--panel)" stroke="var(--rule)"/><text x="14" y="36" class="t">5 × (4+1)</text></g>
-  <g transform="translate(335,170)"><rect x="0" y="0" width="160" height="60" rx="8" fill="var(--panel)" stroke="var(--rule)"/><text x="14" y="36" class="t">(2+3) × 5</text></g>
-  <path class="wire" d="M495 45 L640 110" marker-end="url(#ar2)"/>
-  <path class="wire" d="M495 200 L640 140" marker-end="url(#ar2)"/>
-  <g transform="translate(645,95)"><rect x="0" y="0" width="120" height="60" rx="8" fill="var(--panel)" stroke="var(--rule)"/><text x="14" y="36" class="t">5 × 5</text></g>
-  <path class="wire" d="M765 125 H830" marker-end="url(#ar2)"/>
-  <g transform="translate(835,95)"><rect x="0" y="0" width="120" height="60" rx="8" fill="var(--ok-soft)" stroke="var(--ok)"/><text x="40" y="36" class="t b">25</text></g>
-  <text x="560" y="240" class="m">or fire both at once, on two cores: same 25, no locks</text>
-</svg>
-</div>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>Locality plus one principal port per agent means active pairs never overlap. That single structural fact is the guarantee.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>Like a pure dataflow graph with no shared mutable state: independent nodes can run in any order and on any thread with no data races. The difference is that here it holds for the whole language, including calls, branches and sharing, not only for arithmetic.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>The same property is what lets reference promise parallelism without annotations. Mithril uses it twice: to parallelize at runtime, and to justify running the rules early in the compiler, since early firing cannot change the answer.</p></div>
-</div>
-<div class="strip">
-  <div><div class="k">Design</div><code>design.md §1</code> Thesis; <code>CLAUDE.md</code> rule 4</div>
-  <div><div class="k">Code</div>confluence is structural, so there is no code for it; the scheduler may pick any redex</div>
-  <div><div class="k">Checked by</div>every fixture at 1, 4 and 16 threads and on the device gives the same answer; a Lean proof of the table is <b>not started</b> (§12)</div>
-</div>
+<section id="fit">
+<h2>Which programs benefit?</h2>
+<p>Follow the work through a few familiar algorithms. Which calculations can start together? Which need an earlier answer? What data do they share?</p>
+<h3>Rendering: each pixel has its own calculation</h3>
+<p>In the tracer above, the colour of pixel (0, 0) depends on rays through that pixel and the scene. Pixel (1, 0) traces different rays through the same scene. Neither calculation needs the other pixel’s colour:</p>
+<pre><code>a = pixel(0, 0)
+b = pixel(1, 0)
+c = pixel(2, 0)
+return (a, b, c)</code></pre>
+<p>All three calls can proceed together. Only the returned tuple needs their completed results. The full image repeats this pattern across thousands of pixels, giving workers a supply of independent jobs. A pixel containing glass may take longer than one looking at a plain wall; workers can take more available work as they finish.</p>
+<p>This is an <em>independent batch</em>. Ray tracing gives each job enough calculation to make distributing it worthwhile. If each job were just one addition, managing the jobs could cost more than running those additions locally.</p>
+<h3 id="sort-shape">Merge sort: split, solve, combine</h3>
+<p>To sort a large list, merge sort divides it into two smaller lists and sorts each one. Both sorting calls have their own input, so they can proceed together. They keep splitting until the lists are small enough to sort directly.</p>
+<figure class="diagram" id="sort-diagram"><div class="flow"><div class="node"><code>[8, 3, 6, 1]</code><small>split into smaller lists</small></div><div class="arrows" aria-hidden="true"><span>↙</span><span>↘</span></div><div class="branches"><div class="node blue"><code>[8, 3] → [3, 8]</code><small>sort the left list</small></div><div class="node copper"><code>[6, 1] → [1, 6]</code><small>sort the right list</small></div></div><div class="arrows" aria-hidden="true"><span>↘</span><span>↙</span></div><div class="node"><code>[1, 3, 6, 8]</code><small>merge the sorted results</small></div></div><figcaption>One split illustrated. Larger inputs create further independent sorting calls inside each side.</figcaption></figure>
+<p>The merge waits for both sorted lists. It repeatedly takes the smaller of their next elements: 1, then 3, then 6, then 8. This creates an alternating pattern of independent work and combination steps. Each level offers a different amount of parallel work; the merging still takes time.</p>
+<p>This shape is called <em>divide and conquer</em>. Mithril’s <a href="../bench/general/sorts.py">sorting example</a> expresses the two sorting calls as arguments to a merge. Its list-based split and merge have sequential work, which limits the benefit of adding more cores.</p>
+<h3>Queen search: a choice opens separate possibilities</h3>
+<p>Suppose you want to place four queens on a 4 × 4 board so none attack each other. Put the first queen in column 0 and search for legal positions for the remaining queens. You can also start with the first queen in column 1, 2 or 3. Each starting position defines a separate search; it needs no answer from the others.</p>
+<p>Within a search, each legal placement opens further choices for the next row. An illegal placement ends that branch. The amount of remaining work becomes clear as the search proceeds, so different branches can take different amounts of time. For this small board, the four starting columns yield 0, 1, 1 and 0 solutions. Their counts combine into the final answer: 2.</p>
+<p>This is a <em>branching search</em>. Independent partial-board searches can run together; each search follows its own dependencies.</p>
+<h3 id="query-shape">Nearest-neighbour queries: many searches share one index</h3>
+<p>Imagine a collection of points on a map. For each new location, you want to find the closest stored point. A <em>k-d tree</em> organizes the points into smaller spatial regions, so a query can skip regions too far away to contain a better answer.</p>
+<p>Build the tree once. A query near one location and a query near another can then search it independently. Both read the same tree; each keeps its own closest point and distance found so far.</p>
+<figure class="diagram" id="query-diagram"><div class="flow"><div class="node">One shared spatial tree<small>stored points grouped into regions</small></div><div class="arrows" aria-hidden="true"><span>↙</span><span>↘</span></div><div class="branches"><div class="node blue">Query near location A<small>read the tree; track A’s closest point</small></div><div class="node copper">Query near location B<small>read the tree; track B’s closest point</small></div></div></div><figcaption>The tree is shared input. The queries have separate search state and can return different answers.</figcaption></figure>
+<p>Inside one query, the search visits a nearby region first. Its result determines whether a farther region is worth visiting. Those visits have a dependency. Across queries, a sparse area may need few visits while a crowded area needs many, giving the scheduler jobs of different sizes.</p>
+<p>This combines <em>shared read-only data</em> with an <em>independent batch</em>. Mithril’s <a href="../bench/ports/kdtree.py">k-d tree example</a> passes the same tree to paired batches of queries. Each query follows its own dependencies while other queries proceed. This pattern also occurs when many inputs are checked against the same rules or lookup structure.</p>
+<h3>A number sequence: each step produces the next input</h3>
+<p>For a Collatz sequence, divide an even number by two; replace an odd number with three times that number plus one. Repeat until reaching 1:</p>
+<pre><code>def steps(n):
+    count = 0
+    while n != 1:
+        if n % 2 == 0:
+            n = n // 2
+        else:
+            n = 3 * n + 1
+        count = count + 1
+    return count</code></pre>
+<p>Starting at 6 gives <code>6 → 3 → 10 → 5 → 16 → 8 → 4 → 2 → 1</code>: eight steps. To choose the operation after 3, the program first produces 10. To choose the next one, it first produces 5. Each iteration needs the preceding iteration’s output.</p>
+<p>This is a <em>serial chain</em>. Extra workers cannot run these successive iterations together. Efficient local execution matters here. Sequences starting at 6, 7 and 8 are independent of one another, however, so a batch of sequences offers parallel work between chains. Loops and recursion can contain either shape; the dependencies decide.</p>
+<figure class="diagram" id="shape-demo" tabindex="0">
+<div class="controls" id="shape-controls" hidden><button type="button" data-shape="batch" aria-pressed="true">Independent batch</button><button type="button" data-shape="tree" aria-pressed="false">Branching search</button><button type="button" data-shape="chain" aria-pressed="false">Serial chain</button></div>
+<svg class="shape-svg" id="shape-svg" viewBox="0 0 700 210" role="img" aria-labelledby="shape-title shape-desc"><title id="shape-title">Independent batch</title><desc id="shape-desc">Many pixel calculations can proceed together before their results form an image.</desc><g fill="var(--wash)" stroke="var(--blue)" stroke-width="2"><rect x="35" y="70" width="90" height="70"/><rect x="170" y="70" width="90" height="70"/><rect x="305" y="70" width="90" height="70"/><rect x="440" y="70" width="90" height="70"/><rect x="575" y="70" width="90" height="70"/></g><g text-anchor="middle"><text x="80" y="112">pixel 1</text><text x="215" y="112">pixel 2</text><text x="350" y="112">pixel 3</text><text x="485" y="112">pixel 4</text><text x="620" y="112">pixel 5</text></g></svg>
+<p class="status shape-description" id="shape-status" aria-live="polite">A batch offers many independent jobs at once. Larger jobs spread scheduling costs over more useful work; the final result collects their outputs.</p>
+<figcaption>Explore the dependency shapes from the examples. Available work and job size determine how much the scheduler can use.</figcaption>
+</figure>
+<h3>What the spatial-tree C comparison shows</h3>
+<p>For the shared spatial index described above, the single-thread C implementation takes 0.333 seconds, Mithril at one thread takes 0.406 seconds, and Mithril at sixteen threads takes 0.090 seconds. Distributing the queries produces the multicore gain; one-thread Mithril has overhead.</p>
+<p class="caption">Ryzen 7 7800X3D, gcc -O2, minimum of three wall-clock runs on 29 September 2026, builds excluded and outputs checked. The C implementation uses one thread. <a href="../bench/results.md">Methods and recorded samples</a>. A parallel C implementation has not been measured.</p>
+<h3>Where Mithril gains over these Rust programs</h3>
+<p>Mithril can distribute independent recursive work across cores and share retained computations across closure calls. You write the ordinary calls; the compiler and runtime supply that execution structure. In Rust, you can build the same behavior with a task library and explicit shared values. The advantage is less execution machinery to write, with performance depending on the program’s shape.</p>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Rust corpus timings"><table class="numbers"><thead><tr><th>Program shape</th><th>Rust · 1 thread</th><th>Mithril 1</th><th>Mithril 16</th></tr></thead><tbody>
+<tr><td><a href="../bench/general/dag_share.py">Shared graph traversals</a></td><td>1.67 s</td><td>1.91 s</td><td>0.27 s</td></tr>
+<tr><td><a href="../bench/general/collatz_mutual.py">Serial mutual recursion</a></td><td>0.29 s</td><td>0.41 s</td><td>0.41 s</td></tr>
+<tr><td><a href="../bench/general/persist_map.py">Map updates retaining old versions</a></td><td>1.47 s</td><td>1.55 s</td><td>1.56 s</td></tr>
+<tr><td><a href="../bench/general/pipeline_cfg.py">Closures with shared setup</a></td><td>0.29 s</td><td>0.01 s</td><td>0.01 s</td></tr>
+<tr><td><a href="../bench/general/interp_closure.py">Closures depending on every new input</a></td><td>0.01 s</td><td>3.77 s</td><td>3.83 s</td></tr>
+</tbody></table></div>
+<p class="caption">Exploratory corpus at <code>ce63d1e</code>, one wall-clock sample per lane, rounded to two decimals. Results checked against a small Python oracle and source-shaped Rust twins. Conditions and complete table: <a href="design.md#111-generality-corpus">design §11.1</a>; harness: <a href="../bench/general/run.py">run.py</a>.</p>
+<p>The shared-graph program takes 0.27 seconds on sixteen Mithril threads versus 1.67 seconds in the single-thread Rust twin: about 6.2× faster through automatic task distribution. Mithril at one thread takes 1.91 seconds, so the gain comes from using more cores. A parallel Rust implementation has not been measured here.</p>
+<p>The pipeline benefits from sharing each stage’s configuration-dependent setup across calls. Its Rust twin repeats that work inside boxed closures; Rust can recover the same saving by computing and capturing the setup explicitly. The <a href="#sharing">closure example</a> shows how this happens.</p>
+<p>Rust wins on the serial recurrence, and the persistent map has similar timings without a multicore gain. The closure interpreter is a large Mithril loss: each call needs new work, while closure copying and reduction add overhead. Choose Mithril when distributing recursive work or sharing closure setup simplifies your computation; these results establish no general speed advantage over Rust.</p>
+<h3 id="gpu-checkpoint">GPU execution of the same render program</h3>
+<p>The tracers at the beginning of this guide run through the normal CPU and GPU compiler paths. Their sources, image settings, raw timing samples and output checks are included in the <a href="img/raytracer-animation.md">reproduction notes</a>. For these scenes, sixteen CPU threads are faster than the GPU path. Writing one program for both devices is the measured convenience; these renders establish no speed advantage over an optimized CUDA tracer.</p>
 </section>
-
-<!-- ============================================================ 3 COMPILE -->
-<section class="ch" id="compile">
-<div class="chno">Chapter 3</div>
-<h2>The optimizer is the rules</h2>
-<p>At compile time each function body becomes a net whose inputs are unknown wires. Every rule that does not need an unknown fires. What remains, the <b>residual</b>, is read back as code. Step through a real run on this program:</p>
-<div class="two">
-<pre class="code"><span class="c"># learn.py</span>
-def sq(x):
+<section id="limits">
+<h2>Where it is a poor fit</h2>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Workload limitations"><table><thead><tr><th>Your requirement</th><th>Current constraint</th><th>What to choose or check</th></tr></thead><tbody>
+<tr><td>Dense matrix multiplication or attention</td><td>Generic scalar execution without lowering for specialized matrix hardware or tensor layouts.</td><td>Use a kernel compiler or optimized numerical library for the dense math.</td></tr>
+<tr><td>Long serial dependency chains</td><td>Few opportunities to spread work, while runtime overhead can remain.</td><td>Compare one-thread performance with a direct C or Rust implementation.</td></tr>
+<tr><td>Tiny repeated closure applications</td><td>Copying and reducing a closure can cost more than its arithmetic, especially when every part depends on the new input.</td><td>Inspect the closure corpus; benchmark the actual shape you intend to use.</td></tr>
+<tr><td>Shared mutable state, external I/O or systems integration</td><td>Values rather than shared mutation; the current language is a compute surface without general I/O or cross-device execution.</td><td>C or Rust provide the APIs and control needed for the surrounding system.</td></tr>
+<tr><td>Explicit SIMD or broad device portability</td><td>SIMD applies one instruction to several values. Mithril’s CPU output is mostly scalar; GPU execution targets a single NVIDIA device.</td><td>Choose tools that expose the required instruction sets and devices.</td></tr>
+</tbody></table></div>
+<p>Arrays may reuse storage when ownership permits it, but preserving old values can also require copying. Task records, net nodes and queues consume memory. Changing reduction order can change peak live state even when the answer stays the same.</p>
+<div class="sources">Scope and open work: <a href="design.md#11-use-cases-and-scope">design §11</a> · <a href="../README.md#limitations">current limitations</a></div>
+</section>
+<section id="nets"><span id="dependencies"></span><span id="order"></span>
+<h2>How can execution order change safely?</h2>
+<p>The glass shader gives a useful example. It traces a reflected ray and a transmitted ray, then combines their colours. Each ray calculation can finish independently; the combination waits for both.</p>
+<pre><code># From glass(); surface geometry and the total-reflection branch omitted.
+<span class="blue">mirror = trace(add(p, scale(n, eps())), reflect(d, n), depth - 1)</span>
+<span class="copper">through = trace(sub(p, scale(n, eps())), rd, depth - 1)</span>
+return add(scale(mirror, f), scale(through, 1.0 - f))</code></pre>
+<figure class="diagram" id="join-demo"><div class="flow"><div class="branches"><div class="node blue" id="reflection">Reflection result<small>slot empty</small></div><div class="node copper" id="transmission">Transmission result<small>slot empty</small></div></div><div class="arrows" aria-hidden="true"><span>↓</span><span>↓</span></div><div class="node" id="join">Combine the colours<small>2 results pending</small></div></div><div class="controls" id="join-controls" hidden><label for="arrival">First arrival</label><select id="arrival"><option value="reflection">Reflection</option><option value="transmission">Transmission</option></select><button id="step" type="button">Deliver result</button><button id="reset" type="button">Reset</button></div><p class="status" id="join-status" aria-live="polite">The colour calculation needs both arguments. Either result may arrive first.</p><figcaption>Illustrative join using sample colours. The runtime stores each result, counts arrivals and schedules the combination when both are ready.</figcaption></figure>
+<p>In the interaction net, nodes connect through points called <em>ports</em>, including one principal port. Two principal ports joined together form an <em>active pair</em>. A rewrite rule replaces that pair and reconnects its surrounding wires. One such replacement is a reduction step.</p>
+<figure class="diagram"><svg viewBox="0 0 640 150" role="img" aria-labelledby="rule-title rule-desc"><title id="rule-title">A local interaction replaces an active pair</title><desc id="rule-desc">Two nodes joined at their principal ports are replaced with a local net that reconnects the outside wires.</desc><g fill="none" stroke="currentColor" stroke-width="2"><path d="M20 40H85 M20 110H85 M225 40H275 M225 110H275 M155 66V85"/><rect x="85" y="15" width="140" height="51"/><rect x="85" y="85" width="140" height="51"/><path d="M300 75H353 M343 66L353 75L343 84 M385 40H435 M385 110H435 M575 40H625 M575 110H625"/><rect x="435" y="20" width="140" height="110"/></g><g text-anchor="middle"><text x="155" y="47">node A</text><text x="155" y="117">node B</text><text x="505" y="70">replacement</text><text x="505" y="94">net</text></g></svg><figcaption>The short wire between A and B joins their principal ports. The outside connections are preserved by the local rule.</figcaption></figure>
+<p>For example, an erasure node connected to a number means the number has no consumer. The rule removes the pair. Other rules apply a function, compute an operation, select a branch or distribute a shared value.</p>
+<figure class="diagram"><div class="flow"><div class="node"><code>(2 × 3) + (4 × 5)</code><small>two independent multiplications</small></div><div class="arrows" aria-hidden="true"><span>left first ↙</span><span>↘ right first</span></div><div class="branches"><div class="node blue"><code>6 + (4 × 5)</code></div><div class="node copper"><code>(2 × 3) + 20</code></div></div><div class="arrows" aria-hidden="true"><span>↘</span><span>↙</span></div><div class="node"><code>6 + 20 → 26</code><small>both orders meet at the same result</small></div></div><figcaption>Arithmetic illustration of the diamond property: independent steps can be taken in either order and still meet. This picture simplifies the full net encoding.</figcaption></figure>
+<p>In the modeled core rules, different active pairs occupy separate nodes and their reductions commute. This local <em>diamond property</em> gives <em>confluence</em>: terminating reduction paths agree on a final net. The scheduler can choose between independent reductions while preserving that result.</p>
+<p>The grouping of the expression remains fixed. Splitting a fold, such as summing an array in chunks, changes grouping and needs an additional proof: the operation must be associative and have an identity such as zero for addition, under its actual numeric representation.</p>
+<p>The <a href="#evidence">proof and test table</a> identifies the modeled rules and production checks. A program must still reach a final value.</p>
+</section>
+<section id="compile"><span id="lower"></span><span id="run"></span><span id="map"></span>
+<h2>How the hybrid model executes the program</h2>
+<p>Mithril uses the rule model at two times. During compilation, it reduces everything it can with the known inputs. The remaining computation is the <em>residual program</em>. During execution, native code performs suitable parts of that residual, while net and task machinery handle sharing and independent work.</p>
+<div class="split"><div><h3>Before specialization</h3><pre><code>def square(x):
     return x * x
 
 def pick(c, a, b):
-    if c &gt; 0:
+    if c > 0:
         return a
     return b
 
-def main():
-    n = array_len(array_new(5, 0))   <span class="c"># unknown at compile time</span>
-    return sq(n) + pick(1, sq(3), n)</pre>
-<pre class="code"><span class="c">$ mithril net learn.py</span>
-function  rewrites  calls  ops  before  after
-sq               0      0    0       3      3
-pick             0      0    0       6      6
-main            10      0    1      13     12
+def shade(n):
+    return square(n) + pick(1, square(3), n)</code></pre></div><div><h3>Remaining computation</h3><pre><code>def shade(n):
+    return n * n + 9</code></pre><p>The known condition selects the first argument. The constant multiplication produces 9. The multiplication using <code>n</code> waits for the caller’s value.</p></div></div>
+<p>This is <em>specialization</em>: evaluating a program with partial knowledge of its inputs. Removing the known work reduces what every later invocation must execute. Mithril prefers to do this through its interaction rules, so constant evaluation, branch selection and call unfolding compose as steps of the same computation. Compilation budgets keep reduction bounded and retain unfinished work in the residual.</p>
+<p><em>Lowering</em> then turns the residual into efficient execution forms. Short arithmetic sequences benefit from machine instructions and registers. Allocating net nodes, dispatching rules and moving data for each tiny operation would add cost to a largely fixed dependency chain.</p>
+<figure class="diagram"><div class="flow"><div class="node">Source program</div><div class="arrow" aria-hidden="true">↓</div><div class="node">Net reduction during compilation<small>evaluate known inputs; retain the residual</small></div><div class="arrow" aria-hidden="true">↓</div><div class="architecture"><div class="node">Native regions<small>arithmetic, eligible loops and linear recursion</small></div><div class="node">Runtime net regions<small>closures, shared work and values still pending</small></div><div class="node wide">Tasks, continuations and joins<small>publish independent work; resume when results are ready</small></div></div><div class="arrow" aria-hidden="true">↓</div><div class="branches"><div class="node blue">CPU workers<small>generated Rust + runtime</small></div><div class="node copper">GPU workers<small>generated CUDA + device engine</small></div></div></div><figcaption>The execution forms work together. Calls and results cross between native code and net regions through the runtime bridge.</figcaption></figure>
+<p>A native scalar function can run arithmetic directly. A function that opens independent branches receives code that can run locally on a work budget, then suspend at supported points and offer unfinished work to the scheduler. Its <em>continuation</em> stores the code and state needed after the results arrive. A join collects those results, as in the colour example.</p>
+<p>A closure or tuple produced by a net can still contain pending values. The bridge waits for required fields before compiled code consumes them, and delivers results from compiled calls back into waiting net wires. This keeps the execution forms accountable to the computation represented by the net.</p>
+<h3>Where INs help most</h3>
+<p>Nets make dependencies, sharing and unfinished work explicit. They support partial evaluation during compilation, preserve shared computation under closures, and provide state that can be inspected or saved for later reduction. Their local rules also supply independent units of work for the reducer.</p>
+<details><summary>Inspect the actual residual and generated Rust</summary><pre><code>MITHRIL_NET_CORE=1 target/release/mithril net docs/examples/specialize.py
+# shade = Op2(Add, Op2(Mul, Var(0), Var(0)), Num(9))
 
-<span class="c">$ MITHRIL_NET_CORE=1 … (residual main)</span>
-<span class="h">n = array_len(array_new(5, 0))</span>
-<span class="h">return n * n + 9</span></pre>
-</div>
-<div class="stepper" id="stepper" aria-live="polite">
-  <div class="expr" id="st-expr"></div>
-  <div class="meta">
-    <div><div class="k">Rule that fires</div><div id="st-rule"></div></div>
-    <div><div class="k">A compiler would call it</div><div id="st-cc"></div></div>
-  </div>
-  <div class="ctrl">
-    <button type="button" id="st-prev">◀ Back</button>
-    <button type="button" id="st-next">Next ▶</button>
-    <div class="dots" id="st-dots" aria-hidden="true"></div>
-    <span class="count" id="st-count"></span>
-  </div>
-</div>
-<p class="note">The steps show the kinds of rules that fire and a readable order; the reducer fires them in whatever order it finds them (chapter 2), 10 rewrites in total for <code>main</code>.</p>
-<div class="tbl"><table>
-<thead><tr><th>A classic optimization</th><th>In Mithril it is</th><th>Why it is safe</th></tr></thead>
-<tbody>
-<tr><td>constant folding</td><td>OP firing on two known numbers</td><td>the same rule the runtime would fire</td></tr>
-<tr><td>inlining</td><td>REF unfolding a small call-free function</td><td>unfolding is the call's meaning</td></tr>
-<tr><td>branch selection</td><td>SWI / MAT firing on a known value</td><td>the same rule the runtime would fire</td></tr>
-<tr><td>dead-code elimination</td><td>ERA meeting an unused value</td><td>an erased value is never evaluated, at any time</td></tr>
-<tr><td>common subexpression sharing</td><td>DUP: one value, copied lazily</td><td>work under a DUP happens once</td></tr>
-<tr><td>unrolling, partial evaluation</td><td>speculative unfolding when control is static</td><td>accepted only when nothing depends on input</td></tr>
+cargo run --release -p mithril-cli --example dump_gen -- \
+  docs/examples/specialize.py /tmp/mithril-specialize.rs</code></pre><p>Core is the compiler’s internal expression format: <code>Var(0)</code> is the argument, and <code>Op2</code> describes an operation on two inputs. The <a href="examples/specialize.py">example</a> supplies 5 at runtime and returns 34. This residual and the following generated function were checked on 2 October 2026:</p><pre><code>fn s_2(fuel: &amp;mut i64, v0: i64) -&gt; i64 {
+    let fl: i64 = 1i64;
+    let s2: i64 = v0.wrapping_mul(v0.wrapping_shr(8i64 as u32));
+    let s1: i64 = s2.wrapping_add(2304i64);
+    return s1;
+}</code></pre><p>The integer is encoded as <code>n &lt;&lt; 8</code>, so 9 becomes 2304. This function performs the multiply and add locally. Generated names and encodings can change with compiler revisions.</p></details>
+<div class="sources">Implementation: <a href="../crates/mithril-net/src">net specializer</a> · <a href="../crates/mithril-codegen/src">lowering</a> · <a href="../crates/mithril-rt/src/engine.rs">CPU engine</a> · <a href="../crates/mithril-gpu/cuda/engine.cu">GPU engine</a> · <a href="design.md">full design</a></div>
+</section>
+<section id="sharing">
+<h2>Sharing can change how much work gets done</h2>
+<p>A closure is a function that retains values from where it was created. In this pipeline example, <code>stage(c)</code> returns a function that uses configuration <code>c</code> for every later input <code>x</code>.</p>
+<pre><code>def stage(c):
+    return lambda x: (x * 3 + setup(c)) &amp; 1048575</code></pre>
+<p><code>setup(c)</code> depends on the retained configuration, while the multiplication depends on each new input. Mithril’s sharing rules let the setup work run once and remain shared across applications of the same stage.</p>
+<figure class="diagram"><div class="flow"><div class="node">Configuration c</div><div class="arrow" aria-hidden="true">↓</div><div class="node">setup(c)<small>one shared computation for this stage</small></div><div class="arrows" aria-hidden="true"><span>↙</span><span>↘</span></div><div class="branches"><div class="node blue">Input x₁<small>compute x₁ × 3 + shared setup</small></div><div class="node copper">Input x₂<small>compute x₂ × 3 + shared setup</small></div></div></div><figcaption>Repeated applications share the configuration-dependent work. This is sharing within the retained computation, rather than a cache keyed by arbitrary expression equality.</figcaption></figure>
+<p>That explains the pipeline result in the Rust table. Its <a href="../bench/general/rust/pipeline_cfg.rs">Rust twin</a> keeps the setup call inside boxed stage closures. A Rust implementation can explicitly compute and capture the setup value; the comparison measures the source-shaped program, rather than the fastest implementation of the idea.</p>
+<p>The closure interpreter has the opposite shape. Almost all its work depends on the new environment passed to each call. Copying and reducing that closure tree gains little reusable work, while the runtime cost remains. That explains its large loss in the Rust table.</p>
+<div class="sources">Evidence: <a href="../bench/general/pipeline_cfg.py">pipeline</a> · <a href="../bench/general/interp_closure.py">closure interpreter</a> · <a href="design.md#111-generality-corpus">corpus measurements</a></div>
+</section>
+<section id="evidence"><span id="code"></span><span id="open"></span>
+<h2>What has been proved, and what is checked?</h2>
+<p>The evidence follows the computation from its modeled rules through the generated programs and runtime configurations.</p>
+<figure class="diagram"><div class="flow"><div class="node">Modeled local rules<small>Lean proof: independent reductions commute</small></div><div class="arrow" aria-hidden="true">↓</div><div class="node">Specialized and generated programs<small>compare results with the reference interpreter</small></div><div class="arrow" aria-hidden="true">↓</div><div class="node">Thread counts, budgets and devices<small>compare outputs across execution configurations</small></div></div><figcaption>A proof of rule behavior and tests of implementation agreement provide different kinds of evidence.</figcaption></figure>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Proof and test scope"><table><thead><tr><th>Property</th><th>Evidence</th><th>Scope</th></tr></thead><tbody>
+<tr><td>Core reduction order preserves the final net</td><td><a href="../proofs/confluence/README.md">Lean confluence proof</a>, checked by a proof assistant.</td><td>The modeled pure rule table. Production extensions and native lowering have additional obligations.</td></tr>
+<tr><td>Splitting a justified fold preserves its result</td><td><a href="../crates/mithril-reassoc/src">Associativity and identity proofs</a> with a chunked-fold lemma.</td><td>The specific operation and numeric representation accepted by the proof.</td></tr>
+<tr><td>Specialization and generated code compute the expected answer</td><td><a href="../crates/mithril-net/tests/specialize_test.rs">Specializer tests</a>, <a href="../tests/parity/check.py">parity checks</a> and CPU/GPU oracle tests.</td><td>Programs and configurations exercised by each run. The interpreter supplies an independent expected result, called an oracle.</td></tr>
+<tr><td>Production reduction orders agree on the value</td><td><a href="../crates/mithril-net/tests/schedule_test.rs">10,000 generated programs across five sampled orders</a>.</td><td>Tested samples. Extended rules can take different rewrite counts, and schedules can use different peak memory.</td></tr>
+<tr><td>CPU join and ownership protocols are safe under concurrency</td><td><a href="../crates/mithril-rt/src/sync.rs">Runtime protocol functions</a> checked with loom, which explores thread interleavings.</td><td>The modeled atomic protocols and interleavings; a separate obligation from proving the whole runtime.</td></tr>
 </tbody></table></div>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>The compiler reduces the net until only redexes that wait on input remain, then reads the net back as Core. No pass knows what "inlining" is.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>Partial evaluation by the language's own semantics. A striking check: a small interpreter applied to a constant program specializes to that program's arithmetic (the first Futamura projection), with nothing in the compiler knowing it is an interpreter.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>Our reading of reference is that its compile-time optimizations are conventional compiler work before a parallel runtime. Here the net is the optimizer of record: a Core-level rewrite that duplicates what a rule does is not allowed (CLAUDE.md).</p></div>
-</div>
-<div class="strip">
-  <div><div class="k">Design</div><code>design.md §3.2</code> Specialization, <code>§3.3</code> Readback</div>
-  <div><div class="k">Code</div><code>mithril-net/src/reduce.rs</code>, <code>residual.rs</code>, <code>lib.rs</code>; CLI <code>mithril net</code></div>
-  <div><div class="k">Checked by</div><code>specialize_test::every_fixture_specializes_to_the_same_value</code>, <code>constants_fold_and_known_branches_select</code>, <code>interpreter_over_a_static_program_…</code></div>
-</div>
+<p>The current CUDA engine implements its rules separately from the CPU rule source. Oracle comparisons check their agreement. The <a href="design.md#8-verification">verification notes</a> identify the remaining proof and implementation gaps. This page describes the evidence; current test status comes from running the relevant gates.</p>
+<details><summary>Explore a saved computation and its actual reduction traces</summary><p>The <a href="../demos/compiler_planning/README.md">compiler-planning demo</a> expresses choices about fusion, vector width, tile size and placement as a Mithril program. It saves an unfinished net, then resumes it with different orders of ready work. The viewer shows actual traces, final plans and occupied net slots. An independent exhaustive solver checks each answer.</p><pre><code>python3 demos/compiler_planning/demo.py --out target/compiler-planning/demo
+# Open target/compiler-planning/demo/demo.html</code></pre><p>Fusion chooses which operations run together; vector width chooses values per instruction; tiling divides work into blocks; placement chooses where work and temporary data live. Costs are a synthetic contract, not device timings. The demo establishes that the planning computation can be expressed, saved and resumed with checked results.</p></details>
 </section>
+<section id="try">
+<h2>Try a program whose shape you understand</h2>
+<p>Start with a computation you can check independently. Compare one-thread and many-thread output first, then measure execution separately from compilation. The tracer is an approachable example because you can also inspect the image.</p>
+<pre><code># Build from the repository root.
+cargo build --release -p mithril-cli
 
-<!-- ============================================================ 4 LOWER -->
-<section class="ch" id="lower">
-<div class="chno">Chapter 4</div>
-<h2>How nets become fast code</h2>
-<p>The residual is not interpreted. Each function is emitted in the <b>forms</b> its callers need. The fastest form is plain native code; the others let work suspend, split across workers, or cross back into the net. Below is the real output for <code>learn.py</code> (CPU, Rust).</p>
-<div class="two">
-<div>
-<h3>Native form <code>s_</code>: plain machine code</h3>
-<pre class="code"><span class="c">// main: n*n + 9, ints pre-shifted by 8 bits</span>
-fn s_2(ctx, fuel) -&gt; i64 {
-  let v0 = arr_new_raw(5, 0) as i64;
-  let v1 = arr_len_of(v0 as u64).wrapping_shl(8);
-  let s3 = v1.wrapping_mul(v1.wrapping_shr(8));
-  let s2 = s3.wrapping_add(<span class="h">2304</span>);  <span class="c">// 9 &lt;&lt; 8</span>
-  free_val(ctx, v0 as u64);
-  return s2;
-}</pre>
-</div>
-<div>
-<h3>Other forms of the same function</h3>
-<pre class="code"><span class="c">// d_: dive form, runs natively under a budget</span>
-fn d_2(ctx, fuel) -&gt; R { *fuel -= 1; Ok(retag(s_2(ctx, fuel))) }
-<span class="c">// x_: rule form on boxed values, delivers to a record</span>
-fn x_2(ctx, parent) { …; deliver(ctx, parent, t4); }
-<span class="c">// fc_: the CALL rule's entry, when a call is a task</span>
-fn fc_2(ctx, a, b, aux) { dive_to(ctx, 2, &amp;[aux]); }</pre>
-</div>
-</div>
-<div class="fig">
-<svg viewBox="0 0 1000 200" role="img" aria-label="Fork site split into P, D and J records">
-  <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--wire)"/></marker></defs>
-  <text x="10" y="22" class="b">A fork site: <tspan class="t">sum(l) + sum(r)</tspan> when the budget runs out</text>
-  <rect x="10" y="40" width="200" height="60" rx="8" class="agent"/><text x="22" y="64" class="t">x = sum(l)</text><text x="22" y="84" class="m">re-spawned as a task</text>
-  <rect x="250" y="40" width="200" height="60" rx="8" fill="var(--panel)" stroke="var(--rule)"/><text x="262" y="64" class="t">P: y = sum(r)</text><text x="262" y="84" class="m">independent of x: runs now</text>
-  <rect x="490" y="40" width="200" height="60" rx="8" fill="var(--port-soft)" stroke="var(--port)"/><text x="502" y="64" class="t">J: x + y</text><text x="502" y="84" class="m">record, waits for 2 values</text>
-  <path class="wire" d="M210 70 C 350 140, 470 140, 560 102" marker-end="url(#ar3)"/>
-  <path class="wire" d="M450 70 H488" marker-end="url(#ar3)"/>
-  <text x="730" y="58" class="m">a record = a continuation frame</text>
-  <text x="730" y="76" class="m">with a counter of missing inputs;</text>
-  <text x="730" y="94" class="m">the last delivery fires it</text>
-  <text x="10" y="140" class="m">Native code never suspends, so a function that forks runs in dive form; its leaves still call native code.</text>
-  <text x="10" y="160" class="m">"Forks" means one activation can make two or more self calls (calls in different branch arms are alternatives: fixed today, 2164e74).</text>
-  <text x="10" y="180" class="m">Suspension exists to expose work to idle workers; the budget decides when.</text>
-</svg>
-</div>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>Lowering is a faster way to reduce a region of the net. It must compute exactly what reducing that region computes, bit for bit, and any region can fall back to the rules.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>ANF, type inference, unboxing and native scalar forms, then two printers (Rust, CUDA) from one LIR. A suspended call is a CPS continuation made explicit as a record with a pending count; a dive is a direct-style call with a budget.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>Fork sites derived from the net, suspension on an empty budget as the fork mechanism, borrowing and reuse: these are Mithril's own (§14 review). The ports we measure against are reference's benchmark programs.</p></div>
-</div>
-<div class="strip">
-  <div><div class="k">Design</div><code>design.md §4</code> Types, <code>§5.2</code> Forms, <code>§5.3</code> Fork sites, <code>§5.5</code> Budgets</div>
-  <div><div class="k">Code</div><code>mithril-codegen/src/scalar.rs</code> (native), <code>seq.rs</code> (dive, rule forms, fork split), <code>ty.rs</code>, <code>lir.rs</code>; <code>mithril-gpu/src/cuda.rs</code></div>
-  <div><div class="k">Checked by</div><code>codegen_test</code>: every fixture = oracle at 1/4/16 threads and starved budgets (fuel 1, 2, 7, 64); <code>fold_sum_parallel_equals_sequential</code></div>
-</div>
+target/release/mithril run demos/cornell_whitted.py --threads 1 --image one.ppm
+target/release/mithril run demos/cornell_whitted.py --threads 16 --image many.ppm
+cmp one.ppm many.ppm
+
+# With a GPU-enabled build and the documented CUDA setup:
+target/release/mithril run demos/cornell_whitted.py --gpu --image gpu.ppm
+cmp one.ppm gpu.ppm</code></pre>
+<p>Mithril supports functions, branches, loops, tuples, user-defined data types, closures and arrays. Integers are signed 56-bit values with wraparound; floats default to f64, with f32 elaboration for supported operations. The syntax resembles Python, and the numeric and value semantics are Mithril’s.</p>
+<p>The <a href="../README.md#build">build instructions</a> include the GPU requirements. <a href="../bench/general">The generality corpus</a> provides shared graphs, persistent maps and closures to inspect. <a href="design.md">The design notes</a> are the reference for implementation details and open work.</p>
 </section>
-
-<!-- ============================================================ 5 RUN -->
-<section class="ch" id="run">
-<div class="chno">Chapter 5</div>
-<h2>Where parallelism comes from</h2>
-<p>One runtime model on both devices: <b>tasks</b> are pending rule firings, <b>records</b> are continuations waiting for values, <b>dives</b> run native code under a budget. The CPU and GPU differ only in how they pick what to run next.</p>
-<div class="fig">
-<svg viewBox="0 0 1000 250" role="img" aria-label="CPU waves over per-rule buckets and GPU grow/work rounds">
-  <text x="10" y="22" class="b">CPU · waves</text>
-  <g transform="translate(10,36)">
-    <rect x="0" y="0" width="120" height="34" rx="6" fill="var(--panel)" stroke="var(--rule)"/><text x="10" y="22" class="m">bucket: CALL f</text>
-    <rect x="0" y="42" width="120" height="34" rx="6" fill="var(--panel)" stroke="var(--rule)"/><text x="10" y="64" class="m">bucket: JOIN</text>
-    <rect x="0" y="84" width="120" height="34" rx="6" fill="var(--panel)" stroke="var(--rule)"/><text x="10" y="106" class="m">bucket: NET</text>
-    <path class="wire" d="M120 59 H170"/>
-    <g transform="translate(175,0)">
-      <rect x="0" y="0" width="90" height="118" rx="6" class="agent"/><text x="12" y="24" class="m">16 workers</text><text x="12" y="44" class="m">drain the</text><text x="12" y="60" class="m">biggest</text><text x="12" y="76" class="m">bucket</text>
-    </g>
-    <text x="0" y="146" class="m">each wave: merge spawns, pick the bucket with the most work, drain it in parallel</text>
-    <text x="0" y="164" class="m">a record fires the moment its last input arrives</text>
-  </g>
-  <text x="520" y="22" class="b">GPU · one kernel, rounds</text>
-  <g transform="translate(520,36)">
-    <rect x="0" y="0" width="200" height="50" rx="6" fill="var(--reference-soft)" stroke="var(--reference)"/><text x="10" y="22" class="m">GROW: forkable tasks fire,</text><text x="10" y="38" class="m">frontier widens a level</text>
-    <rect x="0" y="62" width="200" height="50" rx="6" class="agent"/><text x="10" y="84" class="m">WORK: each lane drains its</text><text x="10" y="100" class="m">tasks depth-first</text>
-    <path class="wire" d="M200 25 C 250 25, 250 87, 200 87"/><text x="236" y="60" class="m">grid barrier between phases</text>
-    <text x="0" y="146" class="m">up to 65,536 lanes, one cooperative launch; the grow/work policy is reference's</text>
-    <text x="0" y="164" class="m">design (attributed, §14), to be replaced by demand-driven sharing</text>
-  </g>
-  <text x="10" y="228" class="m">Closures: a closure built at runtime lives in a net region; applying it runs the same rules at runtime, and work under the closure that does not need its argument runs once (W2: 5 rewrites per application).</text>
-</svg>
-</div>
-<div class="lenses">
-  <div class="lens net"><div class="k">Net lens</div><p>Parallel work is simply several redexes fired at once. Confluence says it cannot change the result, so the scheduler is free to choose.</p></div>
-  <div class="lens cc"><div class="k">Compiler lens</div><p>A work-queue runtime with explicit continuations. Buckets are per-rule work queues; a record is a join counter plus its frame. Determinism comes from the model, not from locks.</p></div>
-  <div class="lens reference"><div class="k">reference lens</div><p>The device scheduling policy (grow/work rounds, the parallel and sequential worlds) was adopted from the reference paper and is marked for replacement. The CPU wave scheduler, records and dives are Mithril's own.</p></div>
-</div>
-<div class="strip">
-  <div><div class="k">Design</div><code>design.md §6</code> CPU runtime, <code>§7</code> Device, <code>§3.4</code> Closures</div>
-  <div><div class="k">Code</div><code>mithril-rt/src/engine.rs</code>, <code>worker.rs</code>, <code>alloc.rs</code>, <code>template.rs</code>; <code>mithril-gpu/cuda/engine.cu</code>, <code>src/runner.rs</code></div>
-  <div><div class="k">Checked by</div><code>engine_test</code>; <code>gpu_fixtures_match_the_oracle</code>; <code>gpu_closure_corpus_matches_the_cpu</code>; <code>shared_closure_computes_its_free_work_once</code></div>
-</div>
-</section>
-
-<!-- ============================================================ 6 reference -->
-<section class="ch" id="reference">
-<div class="chno">Chapter 6</div>
-<h2>reference, and how we differ</h2>
-<p>reference (reference, version 2.0.31 as measured here) compiles a Python-like language to C with a parallel runtime, on the CPU and on CUDA. Mithril was built with reference as the performance baseline. The rule is: reference is measured, its runtime source is not read to design Mithril's.</p>
-<div class="tbl"><table>
-<thead><tr><th>Question</th><th>reference (as measured and documented)</th><th>Mithril</th></tr></thead>
-<tbody>
-<tr><td>What defines a program's meaning?</td><td>its language semantics, run by a parallel runtime</td><td>the interaction rules, with an oracle interpreter checking them</td></tr>
-<tr><td>What does the optimizer do?</td><td>conventional compilation to C</td><td>the rules run early (chapter 3); no pass duplicates a rule</td></tr>
-<tr><td>How is code executed?</td><td>generated C plus its runtime (reference), tasks in grow/work rounds</td><td>native forms from one LIR, records and dives, Rust and CUDA printers</td></tr>
-<tr><td>Where does parallelism come from?</td><td>forks in the program, scheduled by its runtime</td><td>fork sites derived from the net's dependencies, split on an empty budget</td></tr>
-<tr><td>Sharing and closures</td><td>not the focus of the benchmarked subset</td><td>DUP sharing at compile time and runtime; closure work done once</td></tr>
-<tr><td>What we took</td><td colspan="2">benchmark programs and C twins (licensed, to be replaced by our own set); the device grow/work policy (attributed, to be replaced); standard CUDA setup practices</td></tr>
-</tbody></table></div>
-<div class="fig">
-<svg viewBox="0 0 1000 170" role="img" aria-label="How many of 16 ports Mithril is at or under reference">
-  <text x="10" y="22" class="b">Standings: ports where Mithril is at or under reference (design.md §10 and today's remeasure)</text>
-  <g font-family="var(--f-mono)">
-    <text x="10" y="58" class="m">1 CPU thread</text><rect x="170" y="44" width="700" height="18" rx="4" fill="var(--rule)"/><rect x="170" y="44" width="481" height="18" rx="4" fill="var(--agent)"/><text x="660" y="58" class="t">11 of 16</text>
-    <text x="10" y="92" class="m">16 CPU threads</text><rect x="170" y="78" width="700" height="18" rx="4" fill="var(--rule)"/><rect x="170" y="78" width="263" height="18" rx="4" fill="var(--agent)"/><text x="442" y="92" class="t">6 of 16</text>
-    <text x="10" y="126" class="m">GPU (wall)</text><rect x="170" y="112" width="700" height="18" rx="4" fill="var(--rule)"/><rect x="170" y="112" width="47" height="18" rx="4" fill="var(--port)"/><text x="226" y="126" class="t">1 of 15 (raytrace)</text>
-  </g>
-  <text x="10" y="158" class="m">Every result checksum-equal. The GPU lane is the open front: investigation running on branch codex/gpu-root-cause.</text>
-</svg>
-</div>
-</section>
-
-<!-- ============================================================ 7 CODE -->
-<section class="ch" id="code">
-<div class="chno">Chapter 7</div>
-<h2>Every idea, its file, its test</h2>
-<p>The design, the code and the tests describe the same system. If one of them disagrees with the others, that is a bug in one of them.</p>
-<div class="tbl"><table>
-<thead><tr><th>Idea</th><th>design.md</th><th>Code</th><th>Checked by</th></tr></thead>
-<tbody>
-<tr><td>Oracle (what "correct" means)</td><td>§2, §8</td><td><code>mithril-front/src/core.rs</code> <code>eval_core</code></td><td>every test compares against it</td></tr>
-<tr><td>Rule table</td><td>§3.1</td><td><code>mithril-core/src/rules.rs</code>; device copy <code>mithril-gpu/cuda/engine.cu</code></td><td><code>reduce_test</code>; <code>gpu_fixtures_match_the_oracle</code></td></tr>
-<tr><td>Compile-time reduction</td><td>§3.2</td><td><code>mithril-net/src/reduce.rs</code>, <code>lib.rs</code></td><td><code>specialize_test</code></td></tr>
-<tr><td>Readback (net to Core)</td><td>§3.3</td><td><code>mithril-net/src/residual.rs</code></td><td><code>specialize_test::every_fixture_specializes_to_the_same_value</code></td></tr>
-<tr><td>Sharing and closures</td><td>§3.4</td><td><code>rules.rs</code> DUP rules; <code>mithril-rt/src/template.rs</code> net region</td><td><code>reduce_test::shared_subexpression_reduces_once</code>; <code>w2_runtime</code> fixture</td></tr>
-<tr><td>Types and native layouts</td><td>§4</td><td><code>mithril-codegen/src/ty.rs</code>, <code>scalar.rs</code>; f32 in <code>mithril-front/src/infer.rs</code></td><td><code>infer_test</code>; tuple and f32 fixtures in <code>codegen_test</code></td></tr>
-<tr><td>Forms and lowering</td><td>§5.1–5.2</td><td><code>lir.rs</code>, <code>scalar.rs</code>, <code>seq.rs</code>, <code>fast.rs</code></td><td><code>codegen_test</code> (1/4/16 threads, starved budgets)</td></tr>
-<tr><td>Fork sites and splits</td><td>§5.3</td><td><code>seq.rs</code> <code>split_chain</code>; <code>lib.rs</code> <code>fork_recursive</code></td><td><code>fib_naive_parallel_equals_sequential</code>; <code>self_calls_in_different_arms_are_not_a_fork</code></td></tr>
-<tr><td>Proven folds</td><td>§5.6</td><td><code>mithril-reassoc</code>, <code>codegen/src/fold.rs</code></td><td><code>reassoc_test</code>; <code>fold_sum_parallel_equals_sequential</code>; Lean via <code>mithril prove</code></td></tr>
-<tr><td>CPU runtime</td><td>§6</td><td><code>mithril-rt/src/engine.rs</code>, <code>worker.rs</code>, <code>alloc.rs</code></td><td><code>engine_test</code></td></tr>
-<tr><td>Device runtime</td><td>§7</td><td><code>engine.cu</code>, <code>runner.rs</code>, <code>cuda.rs</code></td><td><code>gpu_test</code> (13 device tests)</td></tr>
-</tbody></table></div>
-<p class="note">Rules that keep code and design equal (CLAUDE.md): one rule table; optimizations are rule firings; lowering never changes meaning; parallelism is the net's own; every semantic change comes with an oracle-equality test.</p>
-</section>
-
-<!-- ============================================================ 8 OPEN -->
-<section class="ch" id="open">
-<div class="chno">Chapter 8</div>
-<h2>What is not done yet</h2>
-<ul class="open">
-  <li><b>The GPU lane.</b> Faster than 16 CPU threads on 8 of 17 programs by wall clock, behind reference's GPU on most. Root-cause investigation in progress.</li>
-  <li><b>One rule-table source.</b> The device carries a hand-written copy of the rules, held equal by tests only.</li>
-  <li><b>Proof.</b> Confluence of the rule table is argued, not machine-checked (Lean: not started). Folds are Lean-checked.</li>
-  <li><b>Two optimizations outside the rules.</b> <code>tail_inline</code> and <code>if_convert</code> are Core rewrites with thresholds: a drift from "optimizations are rule firings", listed for fixing.</li>
-  <li><b>Known bug.</b> An array of tuples built inside a closure is read wrongly by compiled code (pinned by an ignored test).</li>
-</ul>
-</section>
-
-<footer>Built from HEAD 023fe2e: <code>docs/design.md</code>, <code>CLAUDE.md</code>, the crates under <code>crates/</code>, and real compiler output for <code>learn.py</code> (<code>mithril net</code>, the emitted Rust). Lines counted from the sources on 2026-09-30.</footer>
-</div>
-
+<footer><a href="../README.md">README</a> · <a href="design.md">Design notes</a> · <a href="../tests/ci/run.sh">Test gates</a><p>Documentation refreshed 2 October 2026. Measurements retain the dates and revisions of their source reports.</p></footer>
+</main></div>
 <script>
-(function () {
-  var steps = [
-    { e: 'sq(n) + pick(1, <mark>sq(3)</mark>, n)', r: 'start: n is an unknown wire; everything else is known', c: 'the function before optimization' },
-    { e: '<mark>n·n</mark> + pick(1, sq(3), n)', r: 'REF sq meets n: the body unfolds; n is used twice, so a DUP shares it', c: 'inlining (the parameter is shared, not recomputed)' },
-    { e: 'n·n + <mark>(if 1 &gt; 0 then sq(3) else n)</mark>', r: 'REF pick unfolds', c: 'inlining' },
-    { e: 'n·n + (if <mark>1</mark> then sq(3) else n)', r: 'OP fires on 1 and 0', c: 'constant folding' },
-    { e: 'n·n + <mark>sq(3)</mark>', r: 'SWI fires on the known 1: the then-branch stays; the else-branch meets ERA', c: 'branch selection, and dead code (the unused n) removed' },
-    { e: 'n·n + <mark>3·3</mark>', r: 'REF sq meets 3: unfolds; DUP copies the number 3', c: 'inlining of a known call' },
-    { e: 'n·n + <mark>9</mark>', r: 'OP fires on 3 and 3', c: 'constant folding' },
-    { e: '<mark>n·n + 9</mark>', r: 'no rule can fire without n: the net is quiescent', c: 'the residual program, read back as Core' }
-  ];
-  var i = 0, ex = document.getElementById('st-expr'), ru = document.getElementById('st-rule'), cc = document.getElementById('st-cc'),
-      pv = document.getElementById('st-prev'), nx = document.getElementById('st-next'), dots = document.getElementById('st-dots'), ct = document.getElementById('st-count');
-  steps.forEach(function () { dots.appendChild(document.createElement('span')); });
-  function show() {
-    var s = steps[i];
-    ex.innerHTML = s.e; ru.textContent = s.r; cc.textContent = s.c;
-    pv.disabled = i === 0; nx.disabled = i === steps.length - 1;
-    Array.prototype.forEach.call(dots.children, function (d, k) { d.className = k <= i ? 'on' : ''; });
-    ct.textContent = 'step ' + (i + 1) + ' of ' + steps.length;
+(() => {
+  const root = document.documentElement, theme = document.getElementById('theme');
+  let saved; try { saved = localStorage.getItem('mithril-guide-theme'); } catch (_) {}
+  let dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  function paint() { root.dataset.theme = dark ? 'dark' : 'light'; theme.textContent = dark ? 'Light mode' : 'Dark mode'; }
+  paint(); theme.hidden = false;
+  theme.addEventListener('click', () => { dark = !dark; paint(); try { localStorage.setItem('mithril-guide-theme', root.dataset.theme); } catch (_) {} });
+  const arrival = document.getElementById('arrival'), step = document.getElementById('step');
+  const state = document.getElementById('join-status'), join = document.getElementById('join');
+  const names = {reflection:'Reflection', transmission:'Transmission'};
+  const colours = {reflection:'(0.6, 0.4, 0.2)', transmission:'(0.2, 0.6, 0.8)'};
+  let count = 0;
+  function reset() {
+    count = 0; step.disabled = false; arrival.disabled = false;
+    for (const key of Object.keys(names)) { const node = document.getElementById(key); node.classList.remove('done'); node.querySelector('small').textContent = 'slot empty'; }
+    join.classList.remove('done'); join.querySelector('small').textContent = '2 results pending';
+    state.textContent = 'The colour calculation needs both arguments. Either result may arrive first.';
   }
-  pv.addEventListener('click', function () { if (i > 0) { i--; show(); } });
-  nx.addEventListener('click', function () { if (i < steps.length - 1) { i++; show(); } });
-  document.getElementById('stepper').addEventListener('keydown', function (e) {
-    if (e.key === 'ArrowRight') nx.click(); if (e.key === 'ArrowLeft') pv.click();
+  step.addEventListener('click', () => {
+    if (count >= 2) return;
+    const key = count === 0 ? arrival.value : (arrival.value === 'reflection' ? 'transmission' : 'reflection');
+    const node = document.getElementById(key); node.classList.add('done'); node.querySelector('small').textContent = colours[key];
+    count++; arrival.disabled = true;
+    join.querySelector('small').textContent = count === 1 ? '1 result pending' : '0 pending · ready to run';
+    state.textContent = count === 1 ? names[key] + ' has arrived. The combination waits for the other colour.' : 'Both colours are ready. With sample weights ¼ and ¾, either arrival order produces (0.3, 0.55, 0.65).';
+    if (count === 2) { join.classList.add('done'); step.disabled = true; }
   });
-  show();
+  document.getElementById('reset').addEventListener('click', reset);
+  arrival.addEventListener('change', reset);
+  document.getElementById('join-controls').hidden = false;
+  const svg = document.getElementById('shape-svg'), status = document.getElementById('shape-status');
+  const shapes = {
+    batch: {title:'Independent batch', description:'Many pixel calculations proceed independently before their results form an image.', text:'A batch offers many independent jobs at once. Larger jobs spread scheduling costs over more useful work; the final result collects their outputs.', nodes:[[80,95,'pixel 1'],[215,95,'pixel 2'],[350,95,'pixel 3'],[485,95,'pixel 4'],[620,95,'pixel 5']], edges:[]},
+    tree: {title:'Branching search', description:'One search opens two branches, which open more branches as their inputs become available.', text:'A search reveals independent branches as it runs. The work in each branch can differ, so task distribution matters. Useful parallelism depends on how much branching the input actually produces.', nodes:[[350,30,'search'],[190,100,'branch'],[510,100,'branch'],[100,175,'leaf'],[280,175,'leaf'],[420,175,'leaf'],[600,175,'leaf']], edges:[[0,1],[0,2],[1,3],[1,4],[2,5],[2,6]]},
+    chain: {title:'Serial chain', description:'Every step waits for the output of the previous step.', text:'Every step needs the previous result. Extra workers cannot shorten this dependency chain by changing the schedule; efficient local execution is the main opportunity.', nodes:[[80,95,'step 1'],[215,95,'step 2'],[350,95,'step 3'],[485,95,'step 4'],[620,95,'step 5']], edges:[[0,1],[1,2],[2,3],[3,4]]}
+  };
+  const ns = 'http://www.w3.org/2000/svg';
+  function element(tag, attrs, parent, text) {
+    const el = document.createElementNS(ns, tag);
+    for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+    if (text !== undefined) el.textContent = text;
+    parent.appendChild(el); return el;
+  }
+  function draw(key) {
+    const s = shapes[key], mobile = innerWidth < 620;
+    let nodes = s.nodes;
+    if (mobile) {
+      const positions = key === 'batch' ? [[95,35],[265,35],[95,115],[265,115],[180,195]] : key === 'chain' ? [[180,30],[180,90],[180,150],[180,210],[180,270]] : [[180,30],[90,105],[270,105],[45,185],[135,185],[225,185],[315,185]];
+      nodes = s.nodes.map((n,i)=>[...positions[i],n[2]]);
+    }
+    svg.setAttribute('viewBox',mobile ? (key === 'chain' ? '0 0 360 300' : '0 0 360 230') : '0 0 700 210');
+    svg.style.maxHeight=mobile ? '320px' : '245px'; svg.style.minWidth='0'; svg.replaceChildren();
+    element('title',{id:'shape-title'},svg,s.title); element('desc',{id:'shape-desc'},svg,s.description);
+    const lines = element('g',{fill:'none',stroke:'currentColor','stroke-width':2},svg);
+    for (const [a,b] of s.edges) { const p=nodes[a],q=nodes[b]; element('line',{x1:p[0],y1:p[1],x2:q[0],y2:q[1]},lines); }
+    for (const [x,y,label] of nodes) {
+      const width=mobile && key === 'tree' ? 76 : 96;
+      element('rect',{x:x-width/2,y:y-22,width,height:44,fill:'var(--wash)',stroke:'var(--blue)','stroke-width':2},svg);
+      element('text',{x,y:y+6,'text-anchor':'middle'},svg,label);
+    }
+    status.textContent=s.text;
+    document.querySelectorAll('[data-shape]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.shape===key)));
+  }
+  document.querySelectorAll('[data-shape]').forEach(b=>b.addEventListener('click',()=>draw(b.dataset.shape)));
+  addEventListener('resize',()=>draw(document.querySelector('[data-shape][aria-pressed=true]').dataset.shape));
+  draw('batch'); document.getElementById('shape-controls').hidden=false;
 })();
 </script>
-
-</body></html>
+</body>
+</html>

@@ -23,3 +23,11 @@ obligations.lean
 .idea/
 *.swp
 .DS_Store
+
+# Local contributor instructions and assistant tooling
+/CLAUDE.md
+/AGENTS.md
+/AGENT.md
+/agent.md
+/claude.md
+/tools/codex/

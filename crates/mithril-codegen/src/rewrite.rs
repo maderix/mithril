@@ -114,7 +114,7 @@ pub(crate) fn mark_reuse(body: &Core, m: &CoreModule, unbox: &HashMap<u32, u8>) 
     count_uses(body, &mut uses);
     let cx = ReuseCtx { m, unbox, uses };
     let mut avail: Vec<(u32, usize)> = Vec::new();
-    tail(body, &cx, &mut avail)
+    reuse(body, &cx, &mut avail, true)
 }
 
 fn take_token(avail: &mut Vec<(u32, usize)>, arity: usize) -> Option<u32> {
@@ -122,102 +122,64 @@ fn take_token(avail: &mut Vec<(u32, usize)>, arity: usize) -> Option<u32> {
     Some(avail.remove(pos).0)
 }
 
-/// Value position: a construct may take a token; calls and branches end
-/// the straight-line span (branches evaluate with no tokens inside).
-fn val(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
+/// Rebuild immediate children in Core evaluation order. Binder metadata is
+/// untouched; the caller chooses which scopes and branches to recurse into.
+pub(crate) fn map_children(e: &Core, f: &mut dyn FnMut(&Core) -> Core) -> Core {
+    let mut out = e.clone();
+    match &mut out {
+        Core::Op2(_, a, b) | Core::Cmp(_, a, b) | Core::Let(_, a, b) | Core::App(a, b) => { **a = f(a); **b = f(b); }
+        Core::If(a, b, c) => { **a = f(a); **b = f(b); **c = f(c); }
+        Core::Call(_, xs) | Core::Ctor(_, xs) | Core::Reuse(_, _, xs) | Core::Tuple(xs) | Core::Prim(_, xs) => for x in xs { *x = f(x); },
+        Core::Match(s, arms) => { **s = f(s); for (_, _, b) in arms { *b = f(b); } }
+        Core::Proj(a, _) | Core::Lam(_, a) => **a = f(a),
+        Core::Num(_) | Core::Flo(_) | Core::Var(_) => {}
+    }
+    out
+}
+
+/// One reuse walk. Tail branches inherit tokens; value branches start empty.
+/// Calls clear the span, and lambda bodies always start in their own scope.
+fn reuse(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>, tail: bool) -> Core {
     match e {
         Core::Ctor(c, xs) => {
-            let xs2: Vec<Core> = xs.iter().map(|x| val(x, cx, avail)).collect();
-            let ar = cx.m.ctors[*c as usize].1;
-            if ar == 2 && !cx.unbox.contains_key(c) {
-                if let Some(v) = take_token(avail, 2) {
-                    return Core::Reuse(v, *c, xs2);
-                }
+            let xs: Vec<Core> = xs.iter().map(|x| reuse(x, cx, avail, false)).collect();
+            if cx.m.ctors[*c as usize].1 == 2 && !cx.unbox.contains_key(c) {
+                if let Some(v) = take_token(avail, 2) { return Core::Reuse(v, *c, xs); }
             }
-            Core::Ctor(*c, xs2)
+            Core::Ctor(*c, xs)
         }
-        Core::Call(g, xs) => {
-            let xs2 = xs.iter().map(|x| val(x, cx, avail)).collect();
+        Core::Call(..) => {
+            let call = map_children(e, &mut |x| reuse(x, cx, avail, false));
             avail.clear();
-            Core::Call(*g, xs2)
+            call
         }
+        Core::Let(x, r, b) => Core::Let(*x, Box::new(reuse(r, cx, avail, false)), Box::new(reuse(b, cx, avail, tail))),
         Core::If(c, t, f) => {
-            let c2 = val(c, cx, avail);
-            let mut none = Vec::new();
-            let t2 = val(t, cx, &mut none);
-            none.clear();
-            let f2 = val(f, cx, &mut none);
+            let c = reuse(c, cx, avail, false);
+            let seed = if tail { avail.clone() } else { Vec::new() };
+            let t = reuse(t, cx, &mut seed.clone(), tail);
+            let f = reuse(f, cx, &mut seed.clone(), tail);
             avail.clear();
-            Core::If(Box::new(c2), Box::new(t2), Box::new(f2))
+            Core::If(Box::new(c), Box::new(t), Box::new(f))
         }
         Core::Match(s, arms) => {
-            let s2 = val(s, cx, avail);
-            let mut none = Vec::new();
-            let arms2 = arms
-                .iter()
-                .map(|(c, bs, b)| {
-                    none.clear();
-                    (*c, bs.clone(), val(b, cx, &mut none))
-                })
-                .collect();
+            let s2 = reuse(s, cx, avail, false);
+            // Only a tail match can lend its consumed spine to an arm.
+            let tok = match &**s { Core::Var(v) if tail && cx.uses.get(v) == Some(&1) => Some(*v), _ => None };
+            let seed = if tail { avail.clone() } else { Vec::new() };
+            let arms = arms.iter().map(|(c, bs, b)| {
+                let mut a = seed.clone();
+                if let Some(v) = tok.filter(|_| *c != UNREACHABLE_CTOR && !cx.unbox.contains_key(c) && cx.m.ctors[*c as usize].1 == 2) { a.push((v, 2)); }
+                (*c, bs.clone(), reuse(b, cx, &mut a, tail))
+            }).collect();
             avail.clear();
-            Core::Match(Box::new(s2), arms2)
+            Core::Match(Box::new(s2), arms)
         }
-        Core::Let(x, r, b) => {
-            let r2 = val(r, cx, avail);
-            let b2 = val(b, cx, avail);
-            Core::Let(*x, Box::new(r2), Box::new(b2))
-        }
-        Core::Op2(o, a, b) => Core::Op2(o.clone(), Box::new(val(a, cx, avail)), Box::new(val(b, cx, avail))),
-        Core::Cmp(o, a, b) => Core::Cmp(o.clone(), Box::new(val(a, cx, avail)), Box::new(val(b, cx, avail))),
-        Core::Tuple(xs) => Core::Tuple(xs.iter().map(|x| val(x, cx, avail)).collect()),
-        Core::Prim(p, xs) => Core::Prim(*p, xs.iter().map(|x| val(x, cx, avail)).collect()),
-        Core::Proj(b, i) => Core::Proj(Box::new(val(b, cx, avail)), *i),
-        // a closure body is another scope: no reuse token crosses into it
-        Core::Lam(x, b) => Core::Lam(*x, Box::new(val(b, cx, &mut Vec::new()))),
-        Core::App(f, a) => Core::App(Box::new(val(f, cx, avail)), Box::new(val(a, cx, avail))),
-        Core::Reuse(v, c, xs) => Core::Reuse(*v, *c, xs.iter().map(|x| val(x, cx, avail)).collect()),
-        Core::Num(_) | Core::Flo(_) | Core::Var(_) => e.clone(),
+        Core::Lam(x, b) => Core::Lam(*x, Box::new(reuse(b, cx, &mut Vec::new(), false))),
+        _ => map_children(e, &mut |x| reuse(x, cx, avail, false)),
     }
 }
 
-/// Tail position: branches inherit the tokens (each path independently).
-fn tail(e: &Core, cx: &ReuseCtx, avail: &mut Vec<(u32, usize)>) -> Core {
-    match e {
-        Core::Let(x, r, b) => {
-            let r2 = val(r, cx, avail);
-            let b2 = tail(b, cx, avail);
-            Core::Let(*x, Box::new(r2), Box::new(b2))
-        }
-        Core::If(c, t, f) => {
-            let c2 = val(c, cx, avail);
-            let mut a1 = avail.clone();
-            let t2 = tail(t, cx, &mut a1);
-            let mut a2 = avail.clone();
-            let f2 = tail(f, cx, &mut a2);
-            avail.clear();
-            Core::If(Box::new(c2), Box::new(t2), Box::new(f2))
-        }
-        Core::Match(s, arms) => {
-            let s2 = val(s, cx, avail);
-            // a consumed boxed scrutinee cell becomes a token for each arm
-            let tok = match &**s {
-                Core::Var(v) if cx.uses.get(v) == Some(&1) => Some(*v),
-                _ => None,
-            };
-            let arms2 = arms
-                .iter()
-                .map(|(c, bs, b)| {
-                    let mut a = avail.clone();
-                    if let Some(v) = tok.filter(|_| *c != UNREACHABLE_CTOR && !cx.unbox.contains_key(c) && cx.m.ctors[*c as usize].1 == 2) {
-                        a.push((v, 2));
-                    }
-                    (*c, bs.clone(), tail(b, cx, &mut a))
-                })
-                .collect();
-            avail.clear();
-            Core::Match(Box::new(s2), arms2)
-        }
-        other => val(other, cx, avail),
-    }
-}
+#[cfg(test)]
+#[path = "../tests/support/core_rebuild.rs"]
+mod rebuild_tests;

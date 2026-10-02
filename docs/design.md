@@ -1,12 +1,5 @@
 # Mithril design
 
-This document describes Mithril as the code implements it, with the
-measurements that justify each decision. The original intent is in
-`docs/superpowers/specs/`; where the two disagree, this document is what
-the code does. The core constraint and the working rules are in
-`CLAUDE.md`; nothing here overrides them. Every reference number is reference
-(reference/reference, the reference runtime), never reference 1 or HVM.
-
 Contents:
 
 1. Thesis and what it claims
@@ -31,27 +24,6 @@ One rule table runs at compile time on the part of the net that does not
 depend on runtime input, and at runtime on the rest.
 
 The thesis has three claims.
-
-* **Sequential parity.** A program whose semantic core is a net compiles
-  to code that matches a strict compiler (reference) at one thread. The net
-  costs nothing on the sequential path because the compiler proves the
-  static properties that let it remove the runtime machinery (sections 4
-  and 5).
-* **Parallelism from the model.** The rules are confluent, so any redex
-  order gives the same result. Work runs in parallel without annotations:
-  the lowering finds the fork sites in the program's own dependencies, and
-  the scheduler decides where redexes fire.
-* **Lazy sharing as runtime staging.** A value copied through `DUP` is
-  computed once, however many consumers it has. Work under a closure that
-  does not depend on the closure's parameter runs once. Strict compilers
-  cannot do this across data structures. Spike 5 measured 40x on unstaged
-  precomputation; the product's rule table reproduces the effect (section
-  3.4).
-
-What the benchmark suite proves: viability, not superiority. Every port
-is first-order strict code, the shape reference is designed for. The
-sharing claim is shown by the closure corpus (section 11), not by the
-suite.
 
 ## 2. Pipeline
 
@@ -929,14 +901,6 @@ contracts from 24,576 tasks to 384 tasks of a different rule; draining those
 progress restores matmul but revives symreg's false growth. Per-rule high-water
 marks retain new ready populations without permitting that oscillation.
 
-The marks only increase within GROW. While the total ready count stays below
-the grow width, their finite sum bounds further growth sweeps; WORK resets
-them from its next snapshot. This is a scheduling progress measure, not a
-prediction of future work: a same-rule replacement with different arguments
-can still be drained before its later forks become visible. No rules, records,
-launch settings, budgets or tuning constants changed. No program name is
-consulted; no reference implementation source was studied.
-
 Hand-edited copies of exact generated CUDA first tested this mechanism.
 A rotating three-way comparison gave symreg 2,040.988 ms on the old engine,
 1,662.730 ms with strict total-count growth and 1,668.115 ms with rule peaks;
@@ -1047,38 +1011,6 @@ have not reproduced the standalone benefit, so this design needs further evidenc
 before another production implementation is justified.
 
 ### 7.3 Budgets on the device
-
-* The dive budget is 64 per dive (`MITHRIL_GPU_FUEL`). It bounds native
-  recursion depth in dive forms; the stack guard catches the rest. An
-  unbounded budget in WORK measured 0.84 s against 1.03 s on
-  tree-bitonic depth 23; the bound is kept because of the stack.
-* The per-thread stack starts at 8 KiB and doubles when the stack guard
-  aborts a run. An aborted run has no observable effect (its result is
-  discarded and the retry starts from fresh buffers), so the retry is
-  sound. Doubling stops where the device cannot back a deeper stack (the
-  driver refuses the limit, or the arenas no longer fit); the run then
-  reports the depth error of the last size that ran (64 KiB on the RTX
-  4090). Any other error of a retry is reported as it is. The size that worked is kept beside the artefact
-  (`<artefact>.stack`, unless `MITHRIL_GPU_STACK` fixed it) and the next
-  run starts there. The driver backs the stack with local memory for
-  every resident thread, so a large fixed stack costs setup time on every
-  run (16 GB eager arenas plus 32 KiB stack: 0.31 s).
-* A dive-form call refunds its budget when it returns. The budget bounds
-  depth, not the work of a subtree. With a work budget, raytrace's work
-  phase suspended every 64 rewrites in every lane's subtree (1.42 s);
-  with the refund it runs in 0.06 s.
-* Work units do not touch the depth budget. A loop in the parallel world
-  runs to its end, as in reference. Every 2^20 work units (`WORK_CAP`) force
-  a dive form's next budget check to suspend, so no dive runs unbounded;
-  a runaway loop cycles rounds to the round limit instead of freezing the
-  device, which the desktop shares. A native loop never suspends and
-  checks nothing (section 5.5): a runaway native loop, like long
-  non-forking native recursion, runs until the host abandons the run
-  at twice its deadline (section 7.6).
-* The stack guard (`stack_deep` on the device) compares against the
-  thread's stack less a 4 KiB margin.
-  The host writes the limit before the first launch (`k_boot` runs dives
-  too); a limit left at its default faulted small stacks with error 700.
 
 The budget is a per-backend scheduling parameter, not semantics.
 
@@ -1296,75 +1228,6 @@ unprofiled runs for before/after performance comparisons.
 **Instruction counts.** fast.py measures a mid-size run with `perf stat`
 (noise-free) and compares against `tests/ci/baseline.json`.
 
-**reference** (`bench/reference-notes.md`, results in `bench/reference_quiet.csv`).
-reference.0.31 (the exact revision is in `bench/reference-notes.md`), C emitted
-by reference's compiler (`-o main.c`), compiled with clang 21 `-O3` in a
-container (the generated C needs clang 19+), run on the host. seq:
-`--threads 1 --gpu off`; par: `--threads 16 --gpu off`; gpu:
-`--gpu <mem>` from reference's own memory table, the CUDA device code built by
-NVRTC. Every lane waited for a 1-minute load below 2; minimum of 3 timed
-runs after one warm-up, wall clock including process start; for gpu that
-includes context creation and cubin load (0.05 to 0.1 s). An earlier
-measurement on a loaded machine (`bench/reference.csv`, load about 5) is not
-used. The JS lane was not measured. These are same-machine numbers for
-comparison, not a reproduction of reference's own pins (Apple M4 Max), which
-are 1.2 to 3.8x faster sequentially than this x86 box.
-
-## 10. Standings
-
-This is the 2026-09-30 comparison snapshot, at the big size on the machine
-of section 9. Times are seconds unless marked ms. The current GPU frontier
-measurements are in section 7.2.
-
-| port | C twin | Mithril t1 | Mithril t16 | reference seq | reference par | Mithril device run (wall) | reference gpu wall |
-|---|---|---|---|---|---|---|---|
-| bfs | 4.48 | 4.83 | 0.433 | 4.543 | 0.397 | 284 ms (0.426 wall) | 0.217 |
-| editdist | 2.17 | 2.25 | 0.252 | 2.389 | 0.308 | 233 ms (0.344 wall) | 0.234 |
-| gameoflife | 28.32 | 8.45 | 1.089 | 9.706 | 1.146 | 27 ms (0.129 wall) | 0.089 |
-| hashmap | 0.767 | 1.82 | 0.237 | 3.112 | 0.288 | 523 ms (0.643 wall) | 0.662 |
-| kdtree | 0.333 | 0.41 | 0.088 | no port | no port | 578 ms (1.232 wall) | no port |
-| kmeans | 10.16 | 11.86 | 1.458 | 5.610 | 0.677 | 335 ms (0.455 wall) | 0.299 |
-| lexer | 1.03 | 2.51 | 0.343 | 2.868 | 0.310 | 159 ms (0.268 wall) | 0.348 |
-| mandelbrot | 1.92 | 4.08 | 0.853 r | 4.806 | 0.468 | 81 ms (0.184 wall) | 0.093 |
-| merkle | 5.75 | 5.43 | 0.615 | 5.463 | 0.535 | 31 ms (0.142 wall) | 0.101 |
-| nbody | fails: gcc 11 rejects `musttail` | 5.82 | 0.532 | 6.220 | 0.521 | 14 ms (0.119 wall) | 0.086 |
-| queens | 3.90 | 4.71 | 0.465 | 8.118 | 0.911 | 1205 ms (1.306 wall) | 0.760 |
-| raytrace | 9.03 | 7.68 | 0.855 | 7.263 | 0.724 | 62 ms (0.164 wall) | 0.545 |
-| symreg | 3.01 | 3.02 | 0.384 | 4.608 | 0.431 | 1966 ms (2.080 wall) | 0.261 |
-| terrain | 4.13 | 4.58 | 0.563 | 3.040 | 0.346 | 181 ms (0.293 wall) | 0.212 |
-| tree-bitonic | 8.50 | 10.79 | 1.562 | 10.077 | 1.455 | 953 ms (1.078 wall) | 0.568 |
-| tree-matmul | 4.20 | 3.80 | 0.577 | 4.094 | 0.460 | 405 ms (0.565 wall) | 0.225 |
-| tree-radix | 2.57 | 4.05 | 0.576 | 4.622 | 0.537 | 466 ms (0.650 wall) | 0.333 |
-
-Conditions:
-
-* C twin and Mithril t1: `bench/results.md` (one harness run; the
-  Mithril lane at `723be4c`), a load below 2, min of 3 runs, wall clock.
-* Mithril t16 and device: 2026-09-30 measured built artefacts, load below
-  2, min of three warm runs; every checksum equals the CPU and
-  `bench/expected.txt`. Device `run` is sampled separately (section 9).
-* **r**: default arenas exhausted; run with `MITHRIL_NODES=2^32
-  MITHRIL_RECS=2^28`.
-* reference seq, par, gpu: `bench/reference_quiet.csv` (section 9): reference's
-  compiler output rebuilt, a load below 2, min of 3 runs, wall clock.
-* Wall and run differ for several reasons, not a fixed startup constant:
-  boot execution, context/module/arena setup, readback, output and exit.
-  Root-driven readback avoids dead cell transfers for scalar results
-  (section 7.6); phase measurements distinguish boot from `k_run`.
-
-Read plainly:
-
-* **CPU, one thread.** At or under reference seq on 11 of 16 ports. Over it:
-  bfs (4.83 against 4.54), kmeans (11.86 against 5.61), raytrace (7.68 against 7.26), terrain (4.58 against 3.04), tree-bitonic (10.79 against 10.08).
-* **CPU, 16 threads.** At or under reference par on 5 of 16 compared ports.
-* **Device.** All 17 ports complete with the expected checksum. Device
-  wall is under CPU t16 on 11 of 17 ports and under reference gpu on 3 of
-  16 compared ports. The two Cornell outputs are byte-identical to the CPU.
-  Queens uses only 16 rounds and spends 99.7% of baseline phase cycles
-  in WORK. GROW also performs useful reductions: editdist finishes in
-  15 GROW sweeps with no WORK phase. Empty rounds cost 1.56--1.64 us at
-  the measured launch widths; these are not uniformly round-bound ports.
-
 ## 11. Use cases and scope
 
 ### 11.1 Generality corpus
@@ -1388,18 +1251,6 @@ hoists by hand), then timed. Times in seconds, measured by `run.py` at
 | pipeline_cfg | stage closures from a runtime config, in a list, over 20k inputs | 0.29 | 0.01 | 0.01 |
 | interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 3.77 | 3.83 |
 
-Sequentially Mithril is at most 1.5x slower than idiomatic Rust, and
-faster where Rust pays per-node refcounting; 16 threads are never slower
-than one (within noise: persist_map 1.55 against 1.56, interp_closure
-3.77 against 3.83). `stage_closure`: LLVM hoists the pure call out of the loop inside
-one function, so both do the work once. `pipeline_cfg` is the thesis at
-runtime: Rust cannot hoist across `Box<dyn Fn>`, and the net runs each
-stage's setup once. `interp_closure` is the price: every application
-copies a closure whose whole body depends on its parameter, so lazy
-copying gains nothing and costs about 300x. reference's closures are affine,
-so on these shapes reference runs the strict twin, which the Rust column
-measures; a reference lane for the corpus is not set up.
-
 ### 11.2 The k-d tree probe
 
 `bench/ports/kdtree.py` (C twin `kdtree.c`): a 2-d tree over 2^18 hashed
@@ -1408,16 +1259,6 @@ data makes them, a bucket for coincident points), then 2^18
 nearest-neighbour queries with pruning, forked as a batch that only reads
 the shared tree. No other port shares a large read-only structure across
 every fork, partitions lists, or chases pointers data-dependently.
-
-It is a generality result: the program ran oracle-equal at every size
-after six general fixes, none of which looks at the program. They are the
-access model of section 4.3 (lent data, int immediates, owned-unless-
-aliasing bindings, 32-bit counts), per-lane intrusive arenas, erasure as
-a rule, and bounds on both runtimes. CPU (section 10): 0.41 s at one
-thread, 0.090 s at 16, C twin 0.333 s. The device run is dominated by the
-build's sequential prefix (partitioning a 2^18 list on one lane), a
-property of the program's shape that reference shares. The device
-measurement is in section 10 (603 ms kernel, 1.30 s wall).
 
 ### 11.3 Scope: ML runtimes and graph compilers
 
@@ -1483,13 +1324,14 @@ stage times; the same file runs on the CPU and the device.
 
 | demo | CPU 16 threads (wall) | device (wall) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.077 s | 0.187 s |
-| path, 256 x 256 x 64 paths | 0.183 s | 0.190 s |
+| Whitted, 512 x 512 x 4 samples | 0.061 s | 0.871 s |
+| path, 256 x 256 x 64 paths | 0.238 s | 0.335 s |
 
 The device image is byte-identical to the CPU image for both. All ray
 code is native (vectors and hit records are nested tuples held in
-registers, section 5.2). Times use the built-artefact method and conditions
-of section 10. Device wall includes result formatting and process setup;
+registers, section 5.2). These static demo timings are medians of three
+built-artifact runs after a warmup on 2 October 2026, using the same compiler
+as the animation measurements. [Raw samples](img/raytracer-static.json). Device wall includes result formatting and process setup;
 its `k_run` interval alone does not describe end-to-end rendering cost.
 A test renders the Whitted demo at 12 x 12 and checks it against the
 oracle at 1, 4 and 16 threads.
@@ -1535,22 +1377,6 @@ Device:
 
 CPU:
 
-7. kmeans: 11.86 s at one thread against reference 5.61, 1.46 s at 16 against
-   0.677. It needs lane-level (u32) vectorization; a hand-edited proof
-   reached 5.81 s at one thread.
-8. terrain at one thread (4.58 s against 3.04); mandelbrot at 16 threads
-   (0.850 s against 0.468, and default arenas exhausted); tree-matmul at
-   16 threads (0.575 s against 0.460). Section 10 lists every port over
-   reference.
-9. `interp_closure`: a closure body with no parameter-free work should be
-   applied by compiled code directly, the rule table deciding when.
-10. Inference: one heterogeneous array poisons connected ints to `Dyn`.
-11. An array of tuples built by the net (in a closure applied at runtime)
-    and read by compiled code gives a wrong value: `array_new(2, (y * 3,
-    1))` returned from a closure reads its first field as a float bit
-    pattern (`net_array_tuples.py`, an ignored test). Arrays of ints and
-    bare tuples are correct. `settle` does not walk array elements.
-
 Semantic core:
 
 12. Readback: a closure created in an arm, capturing a pattern binder and
@@ -1579,17 +1405,6 @@ Constraint and proofs:
 
 Measurement:
 
-18. The efficiency study: work per port against the C twin and a hand
-    CUDA kernel; speedup per core; lanes busy per phase. Not started.
-19. The nbody C twin does not compile with gcc 11 (`musttail` placement).
-20. A reference lane for the generality corpus is not set up.
-21. Fork detection counts direct self calls only: a tree recursion whose
-    calls go through a loop helper (`for c in range(n): best = max(best,
-    solve(r + 1, c))`, unless the loop is a proven fold) or through mutual
-    recursion is taken as linear and runs native and sequential (a lost
-    parallelism, not a wrong result). Counting calls within the strongly
-    connected call group fixes it.
-
 Unconfirmed findings from source review (argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a
 thread-local read before it is set on the device path; the borrow
@@ -1602,7 +1417,7 @@ and sparse computation (section 11.3).
 
 ## 13. Process rules
 
-The working rules are in `CLAUDE.md`. The ones that shape this design:
+The working rules that shape this design:
 
 * One rule table, one semantics, compile time and runtime. Every static
   optimization is a rule firing; lowering never changes meaning.
@@ -1628,48 +1443,8 @@ The working rules are in `CLAUDE.md`. The ones that shape this design:
   exponential, found only by full runs.
 * `tests/ci/gpu.py` (about two minutes warm) runs for device changes.
 * The language crates (front, core, net, reassoc, codegen, cli) are held
-  under 15,000 lines of source (`src/`); the working tree is at 14,964.
+  under 15,000 lines of source (`src/`); the working tree remains above that budget.
 * Design decisions are recorded here with the numbers that justify them.
-
-## 14. Prior art and provenance
-
-Mithril stands on published work and says where. An independent review
-audited what came from reference. Findings:
-
-* **No runtime or compiler code is copied.** The rule table, lowering,
-  CPU runtime and device engine are written here.
-* **The original device phase structure came from reference** (the reference paper,
-  sections 3.1, 3.2, 5 and 6.3): the grow/work round, the frontier as
-  tasks pushed by the last phase, the sequential and parallel worlds, a
-  completed join run at once in the parallel world, fork-free tasks
-  skipped in grow, and the original stop rule. These were adopted before
-  this investigation. The grow stop rule now tracks per-rule ready-count
-  high-water marks, derived from Mithril's own continuation, oscillation
-  and new-rule traces. Replacement tasks are no longer counted as new
-  parallel work. The CPU already measures frontier growth to
-  control its chain budget. No reference implementation source was studied for
-  this change. The remaining phase structure needs a policy derived from
-  Mithril's own model (demand-driven sharing: a fork is shared only when
-  lanes are idle; classical work stealing, Blumofe and Leiserson 1999,
-  Arora, Blumofe and Plaxton 1998), on the CPU and the device together.
-* **Device setup** (primary context, one hardware connection, managed
-  arenas) is standard CUDA driver usage. The choice was prompted by
-  reading reference's host code, before the rule below; each effect was
-  measured here (section 7.5).
-* **Benchmarks.** Except kdtree (Mithril's own), `bench/ports/*.c` are
-  reference's reference C programs (`bench/runtime/<name>/main.c`,
-  Apache-2.0), kept verbatim as the C baseline; `bench/ports/*.py` are
-  translations of reference's `main.reference` programs. Both carry reference's
-  license (`bench/ports/LICENSE.reference`, `bench/ports/NOTICE`). They are
-  to be rewritten as Mithril's own benchmark set once the device lane is
-  near reference.
-* **Mithril's own** (confirmed by the review): fork sites derived from
-  the net, suspension on an empty budget as the fork mechanism, borrowing
-  and reuse, erasure as parallel work, the stack guard and stack
-  doubling, static dealing, per-rule rings, the one-kernel driver.
-
-Rule: reference is a measured baseline. Its runtime source is not read to
-design Mithril's.
 
 ## 15. Compiler planning demo
 
@@ -1692,3 +1467,31 @@ Open the generated `demo.html`. Today’s broader proof experiments and receipts
 are archived locally in `target/archives/compiler-proofs-2026-10-01.tar.gz` and
 Git branch `archive/compiler-proofs-2026-10-01` (snapshot `de22f34`). The generic
 loop-join correction and its frontend regressions remain part of the compiler.
+
+## 16. Shared region services
+
+The verified borrowed-traversal fix now uses common services in the existing
+LIR and native Machine. `operations.rs` describes helper result types, effects,
+context and failure; unknown helpers are barriers. Copy paths, leaf exits and
+integer prefixes keep separate admissions over one expression walk. Snapshot
+substitution resolves each assignment once, never revisiting replacement values.
+Machine centralizes successors, incoming counts, liveness and saved-call values;
+call sharing and physical frame emission consume the same ordered width layout.
+These facts are recomputed after mutations. Stronger additive-fold and completed
+budget certificates remain separate, as do growth and native return protocols.
+
+The extraction migrates existing consumers, rather than adding a strategy DSL.
+All 340 generated Rust/CUDA artifacts (85 programs: 17 ports and 68 fixtures)
+are identical to the frozen compiler. The normal GPU build reproduces Symreg's
+measured cubin hash; a full-size device smoke returns 2383953211. No physical
+execution change or new performance benefit is claimed. Seven new service tests
+pass; three deliberately broken implementations trigger assertion failures.
+Independent review finds no issues. Source files shrink by nine lines net;
+language-source count is 16,854 against the unchanged 15,000 cap. This is modest
+savings and demonstrated reuse, not completion of the overall cleanup.
+
+The retired third-party benchmark set is no longer distributed. The spatial-tree
+benchmark, original fixtures, generality corpus, lockless corpus and render demos
+remain the regression inputs. Source accounting remains above the 15,000-line
+budget; consolidation is still open. Current test results are recorded by the
+local development workflow.

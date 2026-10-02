@@ -80,14 +80,10 @@ fn self_calls(body: &[Stmt], name: &str) -> usize {
 }
 
 fn count_calls(e: &Expr, name: &str) -> usize {
-    let own = matches!(e, Expr::Call(f, _) if f == name) as usize;
-    own + match e {
-        Expr::Call(_, xs) | Expr::Tuple(xs) => xs.iter().map(|x| count_calls(x, name)).sum(),
-        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => count_calls(a, name) + count_calls(b, name),
-        Expr::Not(a) | Expr::Neg(a) | Expr::Lambda(_, a) => count_calls(a, name),
-        Expr::IfExp(a, b, c) => count_calls(a, name) + count_calls(b, name).max(count_calls(c, name)),
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => 0,
-    }
+    e.fold(&mut |e, counts| {
+        let nested = if matches!(e, Expr::IfExp(..)) { counts[0] + counts[1].max(counts[2]) } else { counts.iter().sum() };
+        nested + matches!(e, Expr::Call(f, _) if f == name) as usize
+    })
 }
 
 /// Calls made in the bodies of proven fold loops.
@@ -102,40 +98,11 @@ fn fold_calls(st: &Stmt, out: &mut BTreeSet<String>) {
 }
 
 fn stmt_calls(st: &Stmt, out: &mut BTreeSet<String>) {
-    let body = |b: &[Stmt], out: &mut BTreeSet<String>| b.iter().for_each(|st| stmt_calls(st, out));
-    match st {
-        Stmt::Assign(_, e) | Stmt::Return(e) | Stmt::ExprStmt(e) => expr_calls(e, out),
-        Stmt::If(c, a, b) => {
-            expr_calls(c, out);
-            body(a, out);
-            body(b, out);
-        }
-        Stmt::While(c, b) | Stmt::For(_, c, b, _) => {
-            expr_calls(c, out);
-            body(b, out);
-        }
-        Stmt::Match(e, arms) => {
-            expr_calls(e, out);
-            arms.iter().for_each(|(_, b)| body(b, out));
-        }
-    }
-}
-
-fn expr_calls(e: &Expr, out: &mut BTreeSet<String>) {
-    match e {
-        Expr::Call(f, xs) => {
-            out.insert(f.clone());
-            xs.iter().for_each(|x| expr_calls(x, out));
-        }
-        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => {
-            expr_calls(a, out);
-            expr_calls(b, out);
-        }
-        Expr::Not(a) | Expr::Neg(a) | Expr::Lambda(_, a) => expr_calls(a, out),
-        Expr::IfExp(a, b, c) => [a, b, c].iter().for_each(|x| expr_calls(x, out)),
-        Expr::Tuple(xs) => xs.iter().for_each(|x| expr_calls(x, out)),
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => {}
-    }
+    let (head, blocks) = st.parts();
+    head.fold(&mut |e, _: Vec<()>| {
+        if let Expr::Call(name, _) = e { out.insert(name.clone()); }
+    });
+    for block in blocks { for st in block { stmt_calls(st, out); } }
 }
 
 fn rewrite(stmts: Vec<Stmt>, vars: &BTreeSet<String>, user: &BTreeSet<String>, helpers: &mut Module) -> Vec<Stmt> {
@@ -168,13 +135,13 @@ fn split(v: &str, n: &Expr, body: &[Stmt], rest: &[Stmt], vars: &BTreeSet<String
     }
     let mut later = BTreeSet::new();
     free_reads_stmts(rest, &mut later);
-    if !reads(upd).contains(s) || s == v || local.iter().any(|x| later.contains(x)) || any(upd, &|e| matches!(e, Expr::IfExp(..) | Expr::Bool2(..) | Expr::Not(_))) {
+    if !reads(upd).contains(s) || s == v || local.iter().any(|x| later.contains(x)) || upd.any(&|e| matches!(e, Expr::IfExp(..) | Expr::Bool2(..) | Expr::Not(_))) {
         return None;
     }
 
     // calls in the update that do not read `s` become work too
     let k = helpers.fns.len();
-    let calls = |e: &Expr| any(e, &|x| matches!(x, Expr::Call(f, _) if user.contains(f) || helpers.fns.iter().any(|h| &h.name == f)));
+    let calls = |e: &Expr| e.any(&|x| matches!(x, Expr::Call(f, _) if user.contains(f) || helpers.fns.iter().any(|h| &h.name == f)));
     let upd = hoist(upd, s, &calls, &format!("__w{k}_"), &mut work);
     if !work.iter().any(|st| matches!(st, Stmt::Assign(_, e) if calls(e))) {
         return None; // plain arithmetic stays a native loop
@@ -242,14 +209,4 @@ fn reads(e: &Expr) -> BTreeSet<String> {
     let mut r = BTreeSet::new();
     free_reads_expr(e, &mut r);
     r
-}
-
-fn any(e: &Expr, p: &dyn Fn(&Expr) -> bool) -> bool {
-    p(e) || match e {
-        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => any(a, p) || any(b, p),
-        Expr::Not(a) | Expr::Neg(a) | Expr::Lambda(_, a) => any(a, p),
-        Expr::IfExp(a, b, c) => any(a, p) || any(b, p) || any(c, p),
-        Expr::Call(_, xs) | Expr::Tuple(xs) => xs.iter().any(|x| any(x, p)),
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => false,
-    }
 }

@@ -27,6 +27,7 @@ pub struct Wctx<'e> {
     ar: &'e Arena,
     prog: &'e dyn Program,
     fuel: i64,
+    pub(crate) native_ready: bool,
     /// Intrusive free list threaded through cell word 0 (NIL = u32::MAX).
     cfree_head: u32,
     /// Current bump chunk `[lo, hi)` (u64: `hi` may be 2^32).
@@ -95,6 +96,7 @@ impl<'e> Wctx<'e> {
             ar,
             prog,
             fuel,
+            native_ready: false,
             cfree_head: u32::MAX,
             cchunk: (0, 0),
             rfree: Vec::new(),
@@ -350,6 +352,14 @@ impl<'e> Wctx<'e> {
         let rule = self.ar.recs[ri as usize].rule.load(Ordering::Relaxed) as u16;
         self.mark(rule);
         self.out_recs[rule as usize].push(ri);
+    }
+
+    /// Complete a record in the next wave, after its caller attaches it.
+    pub fn deliver_deferred(&mut self, parent: u64, val: u64) {
+        let old = self.inline_depth;
+        self.inline_depth = MAX_INLINE;
+        self.deliver(parent, val);
+        self.inline_depth = old;
     }
 
     // ---- redexes ----

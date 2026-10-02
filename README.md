@@ -7,9 +7,19 @@ No threads, no locks, no annotations. Independent work in your program runs at
 the same time on its own, and the answer is identical at 1 thread, 16 threads
 or on the GPU.
 
-![Cornell box, path traced by Mithril](docs/img/cornell_path.png)
+| Whitted ray tracing | Path tracing |
+|---|---|
+| <img src="docs/img/cornell_whitted_animated.gif" width="320" alt="Moving mirror and glass spheres in the Whitted Cornell scene"> | <img src="docs/img/cornell_path_animated.gif" width="320" alt="Moving mirror and glass spheres in the path-traced Cornell scene"> |
+| **CPU 16 threads: 12.6 FPS · GPU: 1.4 FPS** | **CPU 16 threads: 3.2 FPS · GPU: 2.3 FPS** |
+| 512×512 · 4 samples per pixel | 256×256 · 64 samples per pixel |
 
-This is `demos/cornell_path.py`, an ordinary recursive path tracer:
+Ryzen 7 7800X3D and RTX 4090; 24-frame batch throughput, median of three runs
+with compilation excluded and image return included. Both backends produce
+identical pixels. GIF playback is 12.5 FPS. [Measurements and reproduction](docs/img/raytracer-animation.md).
+
+The camera stays fixed while the spheres move in depth and height. Each frame
+recomputes their shadows, reflections and refraction. This is
+`demos/cornell_path.py`, an ordinary recursive path tracer:
 
 ```python
 def path(o, d, depth, h, seen):
@@ -31,13 +41,17 @@ def main():
 ```
 
 ```
-mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 1.60 s
-mithril run --image cornell.ppm demos/cornell_path.py                # 0.17 s, 16 threads
-mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.27 s, RTX 4090
+mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 2.149 s
+mithril run --image cornell.ppm demos/cornell_path.py                # 0.238 s, 16 threads
+mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.335 s, RTX 4090
 ```
 
 All three write the same image, bit for bit (times are run time, excluding
 compilation).
+
+[The Mithril Field Guide](docs/guide.html) explains which programs benefit,
+the tradeoffs compared with C, Rust, CUDA and functional languages, and how it
+works, with diagrams, measurements and links to the proofs and tests.
 
 ## How it works
 
@@ -65,8 +79,7 @@ mithril-front            oracle    compile-time     what input           GPU: CU
   records wait for their inputs, dives run native code on a budget
   (`mithril-rt` on the CPU, `engine.cu` on the GPU).
 
-`docs/guide.html` walks through this with pictures; `docs/design.md` is the
-full design.
+[design.md](docs/design.md) records the full design and its open obligations.
 
 ## Build
 
@@ -112,9 +125,8 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 - `demos/cornell_whitted.py`, `demos/cornell_path.py`: a Whitted ray tracer
   and a path tracer of the Cornell box. Write the image with
   `mithril run --image cornell.ppm demos/cornell_path.py`.
-- `bench/ports/*.py`: 17 benchmark programs (tree recursion, graph search,
-  k-means, n-body, Mandelbrot, sorting networks, a lexer, a hash map, ...).
-  Their expected checksums are in `bench/expected.txt`.
+- `bench/ports/kdtree.py`: nearest-neighbour queries over a shared spatial tree,
+  with an independent C implementation and a recorded checksum.
 - `bench/general/*.py`: interpreters, persistent maps, pipelines and
   closures, the shapes a general-purpose language has to handle.
 - `bench/lockless/`: five programs that need locks or atomics in C and Rust,
@@ -132,11 +144,11 @@ It runs, in order:
 - `cargo test --release --workspace`: unit tests, and every program under
   `crates/*/tests/fixtures` compiled and checked against the reference
   interpreter at 1, 4 and 16 threads and under starved budgets.
-- `tests/ci/fast.py`: every benchmark port at a small size (exact checksum
+- `tests/ci/fast.py`: the spatial-tree benchmark at a small size (exact checksum
   at 1 and 16 threads) plus regression checks on generated-code size and
   instruction counts.
-- `tests/parity/check.py`: 596 programs (fixtures, ports, demos and 500
-  generated programs) run through the reference interpreter, 1/4/16
+- `tests/parity/check.py`: fixtures, original benchmarks, demos and 500
+  generated programs run through the reference interpreter, 1/4/16
   threads, four starved budgets and the GPU, each compared with a pinned
   reference build (`tests/parity/build_ref.py`); `tests/parity/KNOWN.md`
   lists the reference's own known bugs.
@@ -149,36 +161,20 @@ Useful switches: `MITHRIL_STATS=1` (scheduler statistics of a CPU run),
 
 ## Benchmarks
 
-Big sizes of the benchmark ports and demos, wall-clock seconds, minimum of
-3 runs after a warm-up. AMD Ryzen 7 7800X3D (8 cores, 16 threads), RTX 4090;
-Mithril at commit `21e18d8` (`tests/parity/perf_baseline.json`), C twins
-from `bench/results.md`. GPU times include CUDA context creation and
-teardown (about 0.1 s). Every run prints the same checksum.
+Recorded wall-clock seconds, compilation excluded. Ryzen 7 7800X3D
+(8 cores, 16 threads), RTX 4090. Static render timings are medians of three
+runs on 2 October 2026; GPU wall includes context creation and readback.
+The spatial-tree CPU measurements are from 29 September and its GPU
+measurement from 2 October. All completed lanes agree on their output.
 
-| program | C twin (gcc -O2, 1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
+| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
 |---|---:|---:|---:|---:|
-| bfs | 4.48 s | 4.87 s | 0.44 s | 0.43 s |
-| cornell_path | - | 1.60 s | 0.17 s | 0.27 s |
-| cornell_whitted | - | 0.22 s | 0.05 s | 0.52 s |
-| editdist | 2.17 s | 2.26 s | 0.25 s | 0.35 s |
-| gameoflife | 28.32 s | 8.59 s | 1.09 s | 0.13 s |
-| hashmap | 0.77 s | 1.87 s | 0.23 s | 0.65 s |
-| kdtree | 0.33 s | 0.41 s | 0.09 s | 1.34 s |
-| kmeans | 10.16 s | 11.78 s | 1.48 s | 0.46 s |
-| lexer | 1.03 s | 2.51 s | 0.34 s | 0.27 s |
-| mandelbrot | 1.92 s | 3.95 s | 0.83 s | 0.19 s |
-| merkle | 5.75 s | 5.39 s | 0.61 s | 0.15 s |
-| nbody | - | 5.82 s | 0.51 s | 0.12 s |
-| queens | 3.90 s | 4.81 s | 0.47 s | 1.33 s |
-| raytrace | 9.03 s | 7.71 s | 0.85 s | 0.16 s |
-| symreg | 3.01 s | 3.04 s | 0.40 s | 2.10 s |
-| terrain | 4.12 s | 4.78 s | 0.56 s | 0.30 s |
-| tree-bitonic | 8.50 s | 10.72 s | 1.57 s | 1.09 s |
-| tree-matmul | 4.20 s | 4.04 s | 0.59 s | 0.57 s |
-| tree-radix | 2.57 s | 4.20 s | 0.58 s | 0.66 s |
+| cornell_path | - | 2.149 s | 0.238 s | 0.335 s |
+| cornell_whitted | - | 0.264 s | 0.061 s | 0.871 s |
+| kdtree | 0.333 s | 0.406 s | 0.090 s | 1.280 s |
 
-`bench/results.md` has the CPU table with C ratios, and `docs/design.md`
-section 10 the comparison with reference.
+[Spatial-tree CPU methods](bench/results.md) ·
+[Render measurements](docs/img/raytracer-static.json).
 
 ## Limitations
 
@@ -202,5 +198,4 @@ FMA), and independent calls such as pixels are not vectorized together.
 
 ## License
 
-Apache License 2.0, see `LICENSE`. Parts of `bench/` are derived from
-reference's benchmarks (Apache-2.0); see `NOTICE`.
+Apache License 2.0, see `LICENSE`.

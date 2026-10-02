@@ -26,7 +26,7 @@
 //! pre-lowering behavior of `bin`'s unchecked int path, and pinned by the
 //! checksum oracles in every test lane.
 
-use crate::lir::{do_, as_i, bin, burn_fuel, c, cast, free, i64_, let_, num, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
+use crate::lir::{do_, bin, burn_fuel, c, cast, free, i64_, let_, ok, p, ret, set, u16_, usize_, v, Bop, FnDef, Inline, Pat, Ty, E, S};
 use crate::seq::{arith, bin_code, cmp_code, compare, vn, vparams};
 use mithril_front::core::{Core, CoreModule, Prim, UNREACHABLE_CTOR};
 use crate::ty::Shape;
@@ -64,21 +64,6 @@ pub(crate) struct Sig {
     pub ra: Vec<bool>,
 }
 
-/// An owned array slot: a variable, or component `i` of a destructured
-/// tuple variable `t`.
-fn slot_key(e: &Core, tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>) -> Option<u64> {
-    match e {
-        Core::Var(v) if arrs.contains_key(v) => Some(*v as u64),
-        Core::Proj(b, i) => match &**b {
-            Core::Var(t) if tarr.get(t).is_some_and(|m| m.get(*i).copied().unwrap_or(false)) => {
-                Some((1u64 << 40) | ((*t as u64) << 8) | *i as u64)
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn slot_name(key: u64) -> String {
     if key >> 40 != 0 {
         format!("q{}_{}", (key >> 8) & 0xFFFF_FFFF, key & 0xFF)
@@ -87,39 +72,123 @@ fn slot_name(key: u64) -> String {
     }
 }
 
-/// Whether `e` is array-valued (under the current bindings).
-fn akind(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core) -> bool {
-    match e {
-        Core::Var(v) => arrs.contains_key(v),
-        Core::Proj(..) => slot_key(e, tarr, arrs).is_some(),
-        Core::Prim(Prim::ArrNew | Prim::ArrSet, _) => true,
-        Core::Call(g, _) => matches!(&sigs[*g as usize], Some(s) if s.ret == Kind::S1 && s.ra.first() == Some(&true)),
-        Core::If(_, x, _) => akind(sigs, tarr, arrs, x),
-        Core::Let(_, _, b) => akind(sigs, tarr, arrs, b),
-        _ => false,
-    }
-}
-
-/// Array mask of a tuple-valued expression of `k` components.
-fn tmask(sigs: &[Option<Sig>], tarr: &HashMap<u32, Vec<bool>>, arrs: &HashMap<u32, bool>, e: &Core, k: usize) -> Vec<bool> {
-    match e {
-        Core::Tuple(items) if items.len() == k => items.iter().map(|it| akind(sigs, tarr, arrs, it)).collect(),
-        // a nested tuple holds no arrays (the checker enforces it)
-        Core::Tuple(_) => vec![false; k],
-        Core::If(_, x, _) => tmask(sigs, tarr, arrs, x, k),
-        Core::Let(_, _, b) => tmask(sigs, tarr, arrs, b, k),
-        Core::Call(g, _) => sigs[*g as usize].as_ref().map(|s| s.ra.clone()).unwrap_or_else(|| vec![false; k]),
-        _ => vec![false; k],
-    }
-}
-
 /// What a let binds (see `Chk::bind`).
 enum Bound {
     Tup(Shape, Vec<bool>),
-    /// an alias of a borrowed array: the parameter it names
+    /// an alias of a borrowed array: the RHS variable
     Lent(u32),
     Owned,
     Scalar,
+}
+
+/// Value bindings shared by classification and emission. Tuple variables
+/// hold their leaves as q<var>_<i>; array variables record borrowing.
+#[derive(Clone, Default)]
+struct Scope {
+    tvars: HashMap<u32, Shape>,
+    arrs: HashMap<u32, bool>,
+    tarr: HashMap<u32, Vec<bool>>,
+}
+
+impl Scope {
+    /// An owned array slot: a variable, or component `i` of a destructured
+    /// tuple variable `t`.
+    fn slot(&self, e: &Core) -> Option<u64> {
+        match e {
+            Core::Var(v) if self.arrs.contains_key(v) => Some(*v as u64),
+            Core::Proj(b, i) => match &**b {
+                Core::Var(t) if self.tarr.get(t).is_some_and(|m| m.get(*i).copied().unwrap_or(false)) => {
+                    Some((1u64 << 40) | ((*t as u64) << 8) | *i as u64)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether `e` is array-valued (under the current bindings).
+    fn array(&self, sigs: &[Option<Sig>], e: &Core) -> bool {
+        match e {
+            Core::Var(v) => self.arrs.contains_key(v),
+            Core::Proj(..) => self.slot(e).is_some(),
+            Core::Prim(Prim::ArrNew | Prim::ArrSet, _) => true,
+            Core::Call(g, _) => matches!(&sigs[*g as usize], Some(s) if s.ret == Kind::S1 && s.ra.first() == Some(&true)),
+            Core::If(_, x, _) => self.array(sigs, x),
+            Core::Let(_, _, b) => self.array(sigs, b),
+            _ => false,
+        }
+    }
+
+    /// Array mask of a tuple-valued expression of `k` components.
+    fn mask(&self, sigs: &[Option<Sig>], e: &Core, k: usize) -> Vec<bool> {
+        match e {
+            Core::Tuple(items) if items.len() == k => items.iter().map(|it| self.array(sigs, it)).collect(),
+            // a nested tuple holds no arrays (the checker enforces it)
+            Core::Tuple(_) => vec![false; k],
+            Core::If(_, x, _) => self.mask(sigs, x, k),
+            Core::Let(_, _, b) => self.mask(sigs, b, k),
+            Core::Call(g, _) => sigs[*g as usize].as_ref().map(|s| s.ra.clone()).unwrap_or_else(|| vec![false; k]),
+            _ => vec![false; k],
+        }
+    }
+
+    fn bound(&self, sigs: &[Option<Sig>], r: &Core) -> Bound {
+        if let Some(sh) = tuple_kind(sigs, &self.tvars, r) {
+            let mask = self.mask(sigs, r, sh.width());
+            Bound::Tup(sh, mask)
+        } else if self.array(sigs, r) {
+            match r {
+                Core::Var(v) if self.arrs.get(v) == Some(&true) => Bound::Lent(*v),
+                _ => Bound::Owned,
+            }
+        } else {
+            Bound::Scalar
+        }
+    }
+
+    /// Install after the RHS is checked/emitted and its local scope ends.
+    fn bind(&mut self, x: u32, bound: Bound, live: &mut std::collections::BTreeSet<u64>) {
+        self.tvars.remove(&x);
+        self.tarr.remove(&x);
+        self.arrs.remove(&x);
+        match bound {
+            Bound::Tup(sh, mask) => {
+                for (i, a) in mask.iter().enumerate() {
+                    if *a {
+                        live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
+                    }
+                }
+                self.tvars.insert(x, sh);
+                self.tarr.insert(x, mask);
+            }
+            Bound::Lent(_) | Bound::Owned => {
+                let borrowed = matches!(bound, Bound::Lent(_));
+                self.arrs.insert(x, borrowed);
+                if !borrowed {
+                    live.insert(x as u64);
+                }
+            }
+            Bound::Scalar => {}
+        }
+    }
+}
+
+/// The same native parameter bindings seed both the checker and emitter.
+fn param_bindings(fid: u32, params: &[PTy]) -> (Scope, std::collections::BTreeSet<u64>, HashMap<u32, bool>) {
+    let (mut scope, mut live, mut handles) = (Scope::default(), std::collections::BTreeSet::new(), HashMap::new());
+    for (p, pt) in params.iter().enumerate() {
+        match pt {
+            PTy::T(k) => {
+                scope.tvars.insert(p as u32, pshape(fid, p, *k));
+            }
+            PTy::A | PTy::B => scope.bind(p as u32, if *pt == PTy::B { Bound::Lent(p as u32) } else { Bound::Owned }, &mut live),
+            PTy::H | PTy::O => {
+                handles.insert(p as u32, *pt == PTy::O);
+            }
+            PTy::I => {}
+        }
+    }
+    (scope, live, handles)
 }
 
 /// `e` binds variables of its own.
@@ -127,17 +196,19 @@ fn has_let(e: &Core) -> bool {
     e.any(&mut |e| if matches!(e, Core::Let(..)) { Some(true) } else { None })
 }
 
+/// Required value form; tuple leaves may contain moved array slots.
+#[derive(Clone, Copy)]
+enum Expected<'a> {
+    Int,
+    Array,
+    Tuple(&'a Shape),
+}
+
 struct Chk<'m> {
     why: Option<String>,
     sigs: &'m [Option<Sig>],
-    /// tuple vars (SK-destructured lets and T params) -> layout; held as
-    /// their leaves
-    tvars: HashMap<u32, Shape>,
+    scope: Scope,
     ok: bool,
-    /// array vars -> borrowed (true) or owned
-    arrs: HashMap<u32, bool>,
-    /// tuple vars -> which components are arrays
-    tarr: HashMap<u32, Vec<bool>>,
     /// owned array slots alive on the current path
     live: std::collections::BTreeSet<u64>,
     /// borrowed params this body consumes (they must become owned)
@@ -167,7 +238,7 @@ impl<'m> Chk<'m> {
     /// A tuple variable used whole (returned, aliased, joined): its
     /// components are copied, which ownership allows for ints only.
     fn whole(&mut self, e: &Core, t: u32) {
-        if self.tarr.get(&t).is_some_and(|m| m.iter().any(|a| *a)) {
+        if self.scope.tarr.get(&t).is_some_and(|m| m.iter().any(|a| *a)) {
             self.fail(e);
         }
     }
@@ -179,22 +250,14 @@ impl<'m> Chk<'m> {
         self.ok = false;
     }
 
-    fn akind(&self, e: &Core) -> bool {
-        akind(self.sigs, &self.tarr, &self.arrs, e)
-    }
-
-    fn slot(&self, e: &Core) -> Option<u64> {
-        slot_key(e, &self.tarr, &self.arrs)
-    }
-
     /// An array read in place: must name a live slot or a borrowed var.
     /// (Every array in native code holds ints: parameters are typed
     /// `Arr(true)` at the boundary, and inside, arrays are only built and
     /// written with int-checked values.)
     fn read(&mut self, e: &Core) {
         match e {
-            Core::Var(v) if self.arrs.get(v) == Some(&true) => {}
-            _ => match self.slot(e) {
+            Core::Var(v) if self.scope.arrs.get(v) == Some(&true) => {}
+            _ => match self.scope.slot(e) {
                 Some(k) if self.live.contains(&k) => {}
                 _ => self.fail(e),
             },
@@ -204,7 +267,7 @@ impl<'m> Chk<'m> {
     /// Consume slot `k` (an owned array moves on).
     fn consume(&mut self, e: &Core, k: u64) {
         if let Core::Var(v) = e {
-            if self.arrs.get(v) == Some(&true) {
+            if self.scope.arrs.get(v) == Some(&true) {
                 // a borrowed param handed on as owned: it must be owned
                 self.demote.push(self.root.get(v).copied().unwrap_or(*v));
                 return self.fail(e);
@@ -219,46 +282,7 @@ impl<'m> Chk<'m> {
     /// is returned for deferred consumption (it moves when the enclosing
     /// operation runs, after its other operands are evaluated).
     fn aexpr(&mut self, e: &Core) -> Option<u64> {
-        if !self.ok {
-            return None;
-        }
-        if let Some(k) = self.slot(e) {
-            return Some(k);
-        }
-        match e {
-            Core::Var(v) if self.arrs.get(v) == Some(&true) => {
-                self.demote.push(self.root.get(v).copied().unwrap_or(*v));
-                self.fail(e);
-            }
-            Core::Prim(Prim::ArrNew, xs) => {
-                self.expr(&xs[0]);
-                self.expr(&xs[1]);
-            }
-            Core::Prim(Prim::ArrSet, xs) => {
-                let d = self.aexpr(&xs[0]);
-                self.expr(&xs[1]);
-                self.expr(&xs[2]);
-                if let Some(k) = d {
-                    self.consume(&xs[0], k);
-                }
-            }
-            Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() == Some(&true) => self.args(*g, args),
-                _ => self.fail(e),
-            },
-            Core::If(c, x, y) => {
-                if !self.arms(c, x, y, |s, e| { let d = s.aexpr(e); s.settle(e, d) }).2 {
-                    self.fail(e);
-                }
-            }
-            Core::Let(x, r, b) => {
-                self.bind(*x, r);
-                let d = self.aexpr(b);
-                self.settle(b, d);
-            }
-            _ => self.fail(e),
-        }
-        None
+        self.check(e, Expected::Array)
     }
 
     /// Check both arms of an `if` from the same live set; true when both
@@ -266,13 +290,13 @@ impl<'m> Chk<'m> {
     fn arms<R>(&mut self, c: &Core, x: &Core, y: &Core, mut f: impl FnMut(&mut Self, &Core) -> R) -> (R, R, bool) {
         self.expr(c);
         // each arm's bindings end with it
-        let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone());
+        let scope = (self.scope.clone(), self.root.clone());
         let before = self.live.clone();
         let a = f(self, x);
-        (self.tvars, self.tarr, self.arrs, self.root) = scope.clone();
+        (self.scope, self.root) = scope.clone();
         let after = std::mem::replace(&mut self.live, before);
         let b = f(self, y);
-        (self.tvars, self.tarr, self.arrs, self.root) = scope;
+        (self.scope, self.root) = scope;
         let same = self.live == after;
         (a, b, same)
     }
@@ -287,7 +311,7 @@ impl<'m> Chk<'m> {
     /// A value in a consuming position that may be an int or an array:
     /// returns the deferred slot, if any.
     fn any(&mut self, e: &Core) -> Option<u64> {
-        if self.akind(e) {
+        if self.scope.array(self.sigs, e) {
             self.aexpr(e)
         } else {
             self.expr(e);
@@ -297,41 +321,91 @@ impl<'m> Chk<'m> {
 
     /// `e` is a plain i64-valued expression.
     fn expr(&mut self, e: &Core) {
+        self.check(e, Expected::Int);
+    }
+
+    /// All native value forms share call, branch and let scoping. Array
+    /// slots move only after the enclosing operation evaluates its inputs.
+    fn check(&mut self, e: &Core, expected: Expected<'_>) -> Option<u64> {
         if !self.ok {
-            return;
+            return None;
         }
-        match e {
-            Core::Num(_) => {}
-            Core::Prim(Prim::ArrGet, xs) => {
-                self.read(&xs[0]);
-                self.expr(&xs[1]);
+        if matches!(expected, Expected::Array) {
+            if let Some(k) = self.scope.slot(e) {
+                return Some(k);
             }
-            Core::Prim(Prim::ArrLen, xs) => self.read(&xs[0]),
-            Core::Prim(p, xs) if p.is_f32() => xs.iter().for_each(|x| self.expr(x)),
-            // an array, or a tuple var escaping without Proj
-            Core::Var(i) if self.arrs.contains_key(i) || self.tvars.contains_key(i) || self.hvars.contains_key(i) => self.fail(e),
-            Core::Var(_) => {}
-            Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-                self.expr(a);
-                self.expr(b);
-            }
-            Core::If(c, x, y) => {
-                if !self.arms(c, x, y, |s, e| s.expr(e)).2 {
+        }
+        match (e, expected) {
+            (Core::If(c, x, y), _) => {
+                let same = self.arms(c, x, y, |s, arm| {
+                    let d = s.check(arm, expected);
+                    s.settle(arm, d);
+                }).2;
+                let masks_agree = match expected {
+                    Expected::Tuple(sh) => self.scope.mask(self.sigs, x, sh.width())
+                        == self.scope.mask(self.sigs, y, sh.width()),
+                    _ => true,
+                };
+                if !same || !masks_agree {
                     self.fail(e);
                 }
             }
-            Core::Let(x, r, b) => {
+            (Core::Let(x, r, b), _) => {
                 self.bind(*x, r);
+                let d = self.check(b, expected);
+                self.settle(b, d);
+            }
+            (Core::Call(g, args), _) => {
+                let accepts = self.sigs[*g as usize].as_ref().is_some_and(|sig| match expected {
+                    Expected::Int => sig.ret == Kind::S1 && sig.ra.first() != Some(&true),
+                    Expected::Array => sig.ret == Kind::S1 && sig.ra.first() == Some(&true),
+                    Expected::Tuple(sh) => sig.ret == Kind::SK(sh.width()) && rshape(*g, sh.width()) == *sh,
+                });
+                if accepts {
+                    self.args(*g, args);
+                } else {
+                    self.fail(e);
+                }
+            }
+            (Core::Prim(Prim::ArrNew, xs), Expected::Array) => {
+                self.expr(&xs[0]);
+                self.expr(&xs[1]);
+            }
+            (Core::Prim(Prim::ArrSet, xs), Expected::Array) => {
+                let d = self.aexpr(&xs[0]);
+                self.expr(&xs[1]);
+                self.expr(&xs[2]);
+                self.settle(&xs[0], d);
+            }
+            (Core::Num(_), Expected::Int) => {}
+            (Core::Prim(Prim::ArrGet, xs), Expected::Int) => {
+                self.read(&xs[0]);
+                self.expr(&xs[1]);
+            }
+            (Core::Prim(Prim::ArrLen, xs), Expected::Int) => self.read(&xs[0]),
+            (Core::Prim(p, xs), Expected::Int) if p.is_f32() => xs.iter().for_each(|x| self.expr(x)),
+            (Core::Var(i), Expected::Int) if self.scope.arrs.contains_key(i) || self.scope.tvars.contains_key(i) || self.hvars.contains_key(i) => self.fail(e),
+            (Core::Var(_), Expected::Int) => {}
+            (Core::Op2(_, a, b) | Core::Cmp(_, a, b), Expected::Int) => {
+                self.expr(a);
                 self.expr(b);
             }
-            Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::S1 && sig.ra.first() != Some(&true) => self.args(*g, args),
-                _ => self.fail(e),
-            },
-            Core::Proj(..) if self.slot(e).is_some() => self.fail(e), // an array component
-            // a scalar component (a nested one is tuple-valued)
-            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).is_some_and(|s| s.0.get(*i) == Some(&None))) => {}
+            (Core::Proj(..), Expected::Int) if self.scope.slot(e).is_some() => self.fail(e),
+            (Core::Proj(b, i), Expected::Int) if matches!(&**b, Core::Var(t) if self.scope.tvars.get(t).is_some_and(|s| s.0.get(*i) == Some(&None))) => {}
+            (Core::Var(t), Expected::Tuple(sh)) if self.scope.tvars.get(t) == Some(sh) => self.whole(e, *t),
+            (Core::Proj(..), Expected::Tuple(sh)) => self.targ(e, sh),
+            (Core::Tuple(items), Expected::Tuple(sh)) if sh.is_flat() && items.len() == sh.width() => self.items(items),
+            (Core::Tuple(_), Expected::Tuple(sh)) => self.targ(e, sh),
             _ => self.fail(e),
+        }
+        None
+    }
+
+    /// Evaluate tuple leaves before any of their owned slots move.
+    fn items(&mut self, items: &[Core]) {
+        let moved: Vec<(usize, u64)> = items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
+        for (j, d) in moved {
+            self.consume(&items[j], d);
         }
     }
 
@@ -349,12 +423,12 @@ impl<'m> Chk<'m> {
                 }
                 PTy::B => {
                     self.read(a);
-                    lent.extend(self.slot(a));
+                    lent.extend(self.scope.slot(a));
                 }
                 PTy::H if matches!(a, Core::Var(x) if self.hvars.get(x) == Some(&false)) => {}
                 PTy::O if matches!(a, Core::Var(x) if self.hvars.get(x) == Some(&true) && self.once(*x)) => {}
                 PTy::H | PTy::O => self.fail(a),
-                PTy::I if self.akind(a) => self.fail(a),
+                PTy::I if self.scope.array(self.sigs, a) => self.fail(a),
                 PTy::I => self.expr(a),
                 PTy::T(k) => self.targ(a, &pshape(g, j, *k)),
             }
@@ -372,8 +446,8 @@ impl<'m> Chk<'m> {
     /// A tuple argument of layout `sh` (no arrays: its leaves are ints).
     fn targ(&mut self, a: &Core, sh: &Shape) {
         match a {
-            Core::Var(t) if self.tvars.get(t) == Some(sh) => self.whole(a, *t),
-            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.tvars.get(t).and_then(|s| s.0.get(*i)) == Some(&Some(sh.clone()))) => {
+            Core::Var(t) if self.scope.tvars.get(t) == Some(sh) => self.whole(a, *t),
+            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if self.scope.tvars.get(t).and_then(|s| s.0.get(*i)) == Some(&Some(sh.clone()))) => {
                 if let Core::Var(t) = &**b {
                     self.whole(a, *t);
                 }
@@ -394,90 +468,32 @@ impl<'m> Chk<'m> {
     /// tuple-valued expression (a join point: `if`/`match` arms that each
     /// yield a tuple of the variables they assign) bound as components.
     fn bind(&mut self, x: u32, r: &Core) {
-        // `r` is checked in the outer scope; its own bindings end with it,
-        // and `x` then shadows any outer binding of the same variable
-        let outer = has_let(r).then(|| (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone()));
-        let bound = if let Some(sh) = tuple_kind(self.sigs, &self.tvars, r) {
-            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, sh.width());
-            self.tuple_expr(r, &sh);
-            Bound::Tup(sh, mask)
-        } else if self.akind(r) {
-            match r {
-                Core::Var(v) if self.arrs.get(v) == Some(&true) => Bound::Lent(self.root.get(v).copied().unwrap_or(*v)),
-                _ => {
-                    let d = self.aexpr(r);
-                    self.settle(r, d);
-                    Bound::Owned
-                }
-            }
-        } else {
-            self.expr(r);
-            Bound::Scalar
-        };
-        if let Some((tv, ta, ar, ro)) = outer {
-            (self.tvars, self.tarr, self.arrs, self.root) = (tv, ta, ar, ro);
-        }
-        self.tvars.remove(&x);
-        self.tarr.remove(&x);
-        self.arrs.remove(&x);
-        self.hvars.remove(&x);
-        match bound {
-            Bound::Tup(sh, mask) => {
-                for (i, a) in mask.iter().enumerate() {
-                    if *a {
-                        self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
-                    }
-                }
-                self.tvars.insert(x, sh);
-                self.tarr.insert(x, mask);
-            }
-            Bound::Lent(root) => {
-                self.arrs.insert(x, true); // alias of a borrowed array
-                self.root.insert(x, root);
-            }
+        // The RHS is checked in the outer scope; its own bindings end
+        // with it, and x then shadows the outer binding.
+        let outer = has_let(r).then(|| (self.scope.clone(), self.root.clone()));
+        let bound = self.scope.bound(self.sigs, r);
+        match &bound {
+            Bound::Tup(sh, _) => self.tuple_expr(r, sh),
             Bound::Owned => {
-                self.arrs.insert(x, false);
-                self.live.insert(x as u64);
+                let d = self.aexpr(r);
+                self.settle(r, d);
             }
-            Bound::Scalar => {}
+            Bound::Lent(_) => {}
+            Bound::Scalar => self.expr(r),
         }
+        if let Some((scope, root)) = outer {
+            (self.scope, self.root) = (scope, root);
+        }
+        self.hvars.remove(&x);
+        if let Bound::Lent(y) = &bound {
+            self.root.insert(x, self.root.get(y).copied().unwrap_or(*y));
+        }
+        self.scope.bind(x, bound, &mut self.live);
     }
 
     /// A tuple-valued expression of layout `sh`.
     fn tuple_expr(&mut self, e: &Core, sh: &Shape) {
-        if !self.ok {
-            return;
-        }
-        let k = sh.width();
-        match e {
-            Core::Var(t) if self.tvars.get(t) == Some(sh) => self.whole(e, *t),
-            Core::Proj(..) => self.targ(e, sh),
-            // flat: components may be arrays (moved in)
-            Core::Tuple(items) if sh.is_flat() && items.len() == k => {
-                let moved: Vec<(usize, u64)> =
-                    items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
-                for (j, d) in moved {
-                    self.consume(&items[j], d);
-                }
-            }
-            // nested: ints only
-            Core::Tuple(_) => self.targ(e, sh),
-            Core::If(c, x, y) => {
-                let same = self.arms(c, x, y, |s, e| s.tuple_expr(e, sh)).2;
-                if !same || tmask(self.sigs, &self.tarr, &self.arrs, x, k) != tmask(self.sigs, &self.tarr, &self.arrs, y, k) {
-                    self.fail(e);
-                }
-            }
-            Core::Let(x, r, b) => {
-                self.bind(*x, r);
-                self.tuple_expr(b, sh);
-            }
-            Core::Call(g, args) => match &self.sigs[*g as usize] {
-                Some(sig) if sig.ret == Kind::SK(k) && rshape(*g, k) == *sh => self.args(*g, args),
-                _ => self.fail(e),
-            },
-            _ => self.fail(e),
-        }
+        self.check(e, Expected::Tuple(sh));
     }
 
     /// Tail position; returns the tail kind (S1 / SK(k)) with its array
@@ -488,18 +504,12 @@ impl<'m> Chk<'m> {
             return (Kind::No, vec![]);
         }
         match e {
-            Core::Var(t) if self.tvars.contains_key(t) => {
-                let sh = self.tvars[t].clone();
-                self.whole(e, *t);
+            Core::Tuple(_) | Core::Var(_) | Core::Proj(..) if tuple_kind(self.sigs, &self.scope.tvars, e).is_some() => {
+                let sh = tuple_kind(self.sigs, &self.scope.tvars, e).unwrap();
                 self.ret_shape(e, fid, &sh);
-                (Kind::SK(sh.width()), vec![false; sh.width()])
-            }
-            Core::Proj(b, i) if matches!(&**b, Core::Var(t) if matches!(self.tvars.get(t).and_then(|s| s.0.get(*i)), Some(Some(_)))) => {
-                let Core::Var(t) = &**b else { unreachable!() };
-                let sh = self.tvars[t].0[*i].clone().unwrap_or_else(|| Shape::flat(0));
-                self.targ(e, &sh);
-                self.ret_shape(e, fid, &sh);
-                (Kind::SK(sh.width()), vec![false; sh.width()])
+                let mask = self.scope.mask(self.sigs, e, sh.width());
+                self.tuple_expr(e, &sh);
+                (Kind::SK(sh.width()), mask)
             }
             Core::Let(x, r, b) => {
                 self.bind(*x, r);
@@ -519,10 +529,10 @@ impl<'m> Chk<'m> {
                         return (Kind::No, vec![]);
                     }
                 };
-                let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.root.clone(), self.live.clone());
+                let scope = (self.scope.clone(), self.root.clone(), self.live.clone(), self.hvars.clone());
                 let mut kind: Option<(Kind, Vec<bool>)> = None;
                 for (ctor, binders, body) in arms.iter().filter(|a| a.0 != UNREACHABLE_CTOR) {
-                    (self.tvars, self.tarr, self.arrs, self.root, self.live) = scope.clone();
+                    (self.scope, self.root, self.live, self.hvars) = scope.clone();
                     for (j, x) in binders.iter().enumerate() {
                         match field_ty(*ctor, j) {
                             crate::ty::Ty::Int => {}
@@ -543,6 +553,7 @@ impl<'m> Chk<'m> {
                         }
                     };
                 }
+                self.hvars = scope.3;
                 kind.unwrap_or((Kind::No, vec![]))
             }
             Core::If(c, x, y) => {
@@ -555,21 +566,6 @@ impl<'m> Chk<'m> {
                     self.fail(e);
                     (Kind::No, vec![])
                 }
-            }
-            Core::Tuple(items) => {
-                let sh = tuple_kind(self.sigs, &self.tvars, e).unwrap_or_else(|| Shape::flat(items.len()));
-                self.ret_shape(e, fid, &sh);
-                if !sh.is_flat() {
-                    self.targ(e, &sh);
-                    return (Kind::SK(sh.width()), vec![false; sh.width()]);
-                }
-                let mask: Vec<bool> = items.iter().map(|it| self.akind(it)).collect();
-                let moved: Vec<(usize, u64)> =
-                    items.iter().enumerate().filter_map(|(j, it)| self.any(it).map(|d| (j, d))).collect();
-                for (j, d) in moved {
-                    self.consume(&items[j], d);
-                }
-                (Kind::SK(items.len()), mask)
             }
             Core::Call(g, args) => {
                 match &self.sigs[*g as usize] {
@@ -592,7 +588,7 @@ impl<'m> Chk<'m> {
                 }
             }
             other => {
-                if self.akind(other) {
+                if self.scope.array(self.sigs, other) {
                     let d = self.aexpr(other);
                     self.settle(other, d);
                     (Kind::S1, vec![true])
@@ -700,31 +696,8 @@ fn proj_shape(e: &Core, p: u32, bare: &mut bool, max: &mut i64) {
             Core::Var(t) if *t == p => *max = (*max).max(*i as i64),
             other => proj_shape(other, p, bare, max),
         },
-        Core::Op2(_, a, b) | Core::Cmp(_, a, b) => {
-            proj_shape(a, p, bare, max);
-            proj_shape(b, p, bare, max);
-        }
-        Core::If(c, x, y) => {
-            proj_shape(c, p, bare, max);
-            proj_shape(x, p, bare, max);
-            proj_shape(y, p, bare, max);
-        }
-        Core::Let(_, r, b) => {
-            proj_shape(r, p, bare, max);
-            proj_shape(b, p, bare, max);
-        }
-        Core::Call(_, a) | Core::Ctor(_, a) | Core::Tuple(a) | Core::Reuse(_, _, a) | Core::Prim(_, a) => {
-            for x in a {
-                proj_shape(x, p, bare, max);
-            }
-        }
-        Core::Match(s, arms) => {
-            proj_shape(s, p, bare, max);
-            for (_, _, b) in arms {
-                proj_shape(b, p, bare, max);
-            }
-        }
-        _ => {}
+        Core::Lam(..) | Core::App(..) => {}
+        _ => e.kids().into_iter().for_each(|k| proj_shape(k, p, bare, max)),
     }
 }
 
@@ -776,21 +749,18 @@ pub(crate) fn ctx_arg(g: u32) -> &'static str {
 /// Which native functions need the context: array prims or array params
 /// or results, or a call to one that does (fixpoint).
 pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
-    fn prims(e: &Core, out: &mut bool, calls: &mut Vec<u32>) {
-        e.walk(&mut |e| match e {
-            Core::Prim(p, _) if !p.is_f32() => *out = true,
-            Core::Match(..) => *out = true,
-            Core::Call(g, _) => calls.push(*g),
-            _ => {}
-        });
-    }
     let n = m.fns.len();
     let mut calls = vec![Vec::new(); n];
     let need: Vec<bool> = (0..n)
         .map(|f| {
             let Some(sig) = &sigs[f] else { return true };
             let mut p = false;
-            prims(&m.fns[f].body, &mut p, &mut calls[f]);
+            m.fns[f].body.walk(&mut |e| match e {
+                Core::Prim(pr, _) if !pr.is_f32() => p = true,
+                Core::Match(..) => p = true,
+                Core::Call(g, _) => calls[f].push(*g),
+                _ => {}
+            });
             p || sig.params.iter().any(|t| matches!(t, PTy::A | PTy::B | PTy::H | PTy::O)) || sig.ra.iter().any(|a| *a)
         })
         .collect();
@@ -1050,41 +1020,22 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types, bor: &[Vec<bool>]
     let mut param_seed: Vec<Vec<PTy>> =
         sigs.iter().enumerate().map(|(fi, s)| s.as_ref().map(|s| s.params.clone()).unwrap_or_else(|| vec![PTy::I; m.fns[fi].arity])).collect();
     fn run<'a>(m: &CoreModule, sigs: &'a [Option<Sig>], fid: usize, params: &[PTy]) -> (Chk<'a>, (Kind, Vec<bool>)) {
+        let (scope, live, hvars) = param_bindings(fid as u32, params);
         let mut c = Chk {
             why: None,
             sigs,
-            tvars: HashMap::new(),
+            scope,
             ok: true,
-            arrs: HashMap::new(),
-            tarr: HashMap::new(),
-            live: Default::default(),
+            live,
             demote: Vec::new(),
             root: HashMap::new(),
-            hvars: HashMap::new(),
+            hvars,
             uses: {
                 let mut u = crate::Cnt::new();
                 crate::cnt_expr(&m.fns[fid].body, &mut u);
                 u
             },
         };
-        for (p, pt) in params.iter().enumerate() {
-            match pt {
-                PTy::T(k) => {
-                    c.tvars.insert(p as u32, pshape(fid as u32, p, *k));
-                }
-                PTy::A => {
-                    c.arrs.insert(p as u32, false);
-                    c.live.insert(p as u64);
-                }
-                PTy::B => {
-                    c.arrs.insert(p as u32, true);
-                }
-                PTy::H | PTy::O => {
-                    c.hvars.insert(p as u32, *pt == PTy::O);
-                }
-                PTy::I => {}
-            }
-        }
         let tk = c.tail(&m.fns[fid].body, fid as u32);
         (c, tk)
     }
@@ -1157,13 +1108,8 @@ struct Sem<'m> {
     /// ... only its low 32 bits
     low32: bool,
     tmp: u32,
-    /// component vars (SK-destructured lets and T(k) params): var -> arity;
-    /// components live as q<var>_<i>
-    tvars: HashMap<u32, Shape>,
-    /// array vars -> borrowed; tuple vars -> array components; owned array
-    /// slots alive on the current path (mirrors the classifier's `Chk`)
-    arrs: HashMap<u32, bool>,
-    tarr: HashMap<u32, Vec<bool>>,
+    scope: Scope,
+    /// owned array slots alive on the current path (as in `Chk`)
     live: std::collections::BTreeSet<u64>,
     /// the function counts fuel (it loops or calls); a call-free, loop-free
     /// body does bounded work and settles none
@@ -1202,12 +1148,8 @@ impl<'m> Sem<'m> {
         format!("s{}", self.tmp)
     }
 
-    fn akind(&self, e: &Core) -> bool {
-        akind(self.sigs, &self.tarr, &self.arrs, e)
-    }
-
-    fn slot(&self, e: &Core) -> Option<u64> {
-        slot_key(e, &self.tarr, &self.arrs)
+    fn temp(&mut self, ty: Ty, e: E, b: &mut Vec<S>) -> E {
+        crate::value::bind(self.fresh(), ty, e, b)
     }
 
     /// An int operand as a plain (unshifted) i64: a constant as is,
@@ -1255,14 +1197,14 @@ impl<'m> Sem<'m> {
     fn rd(&self, e: &Core) -> String {
         match e {
             Core::Var(x) => vn(*x),
-            _ => slot_name(self.slot(e).expect("array read of a non-slot in scalar emission")),
+            _ => slot_name(self.scope.slot(e).expect("array read of a non-slot in scalar emission")),
         }
     }
 
     /// An array-valued expression in a consuming position; a slot operand
     /// is returned by name with its key for deferred consumption.
     fn aval(&mut self, e: &Core, b: &mut Vec<S>) -> (E, Option<u64>) {
-        if let Some(k) = self.slot(e) {
+        if let Some(k) = self.scope.slot(e) {
             return (v(slot_name(k)), Some(k));
         }
         let t = self.fresh();
@@ -1316,20 +1258,20 @@ impl<'m> Sem<'m> {
         let names = names(self);
         let (live0, lens0) = (self.live.clone(), self.lens.clone());
         // each arm's bindings end with it
-        let scope = (self.tvars.clone(), self.tarr.clone(), self.arrs.clone());
+        let scope = self.scope.clone();
         let mut bx = Vec::new();
         for (n, e) in names.iter().zip(arm(self, x, &mut bx)) {
             bx.push(set(n, e));
         }
         let after = std::mem::replace(&mut self.live, live0);
         self.lens = lens0.clone();
-        (self.tvars, self.tarr, self.arrs) = scope.clone();
+        self.scope = scope.clone();
         let mut by = Vec::new();
         for (n, e) in names.iter().zip(arm(self, y, &mut by)) {
             by.push(set(n, e));
         }
         (self.live, self.lens) = (after, lens0);
-        (self.tvars, self.tarr, self.arrs) = scope;
+        self.scope = scope;
         b.extend(names.iter().map(|n| S::Decl(n.clone(), Ty::I64)));
         b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
         names
@@ -1346,7 +1288,7 @@ impl<'m> Sem<'m> {
 
     /// Any value in a consuming position (int or array).
     fn anyval(&mut self, e: &Core, b: &mut Vec<S>) -> (E, Option<u64>) {
-        if self.akind(e) {
+        if self.scope.array(self.sigs, e) {
             self.aval(e, b)
         } else {
             (self.val(e, b), None)
@@ -1427,65 +1369,33 @@ impl<'m> Sem<'m> {
     }
 
     fn bind(&mut self, x: u32, r: &Core, b: &mut Vec<S>) {
-        // as `Chk::bind`: `r`'s own bindings end with it, then `x` shadows
-        let outer = has_let(r).then(|| (self.tvars.clone(), self.tarr.clone(), self.arrs.clone(), self.lens.clone()));
-        let unscope = |s: &mut Self| {
-            if let Some((tv, ta, ar, le)) = outer.clone() {
-                (s.tvars, s.tarr, s.arrs, s.lens) = (tv, ta, ar, le);
+        let outer = has_let(r).then(|| (self.scope.clone(), self.lens.clone()));
+        let bound = self.scope.bound(self.sigs, r);
+        let es = match &bound {
+            Bound::Tup(_, _) => self.tval(r, b),
+            Bound::Lent(y) => vec![v(vn(*y))],
+            Bound::Owned => vec![self.aval_now(r, b)],
+            Bound::Scalar => {
+                self.low = self.ranges.masked(x);
+                self.low32 = self.ranges.masked32(x);
+                vec![self.val(r, b)]
             }
-            s.tvars.remove(&x);
-            s.tarr.remove(&x);
-            s.arrs.remove(&x);
         };
-        if let Some(sh) = tuple_kind(self.sigs, &self.tvars, r) {
-            let mask = tmask(self.sigs, &self.tarr, &self.arrs, r, sh.width());
-            let comps = self.tval(r, b);
-            unscope(self);
-            for (i, e) in comps.into_iter().enumerate() {
-                b.push(let_(format!("q{x}_{i}"), Ty::I64, e));
-            }
-            self.tvars.insert(x, sh);
-            for (i, a) in mask.iter().enumerate() {
-                if *a {
-                    self.live.insert((1u64 << 40) | ((x as u64) << 8) | i as u64);
-                }
-            }
-            self.tarr.insert(x, mask);
-            return;
+        // Carry an array's cached length across its move or borrowed alias.
+        let len = matches!(bound, Bound::Lent(_) | Bound::Owned).then(|| self.acc(&name_of(&es[0]))).flatten();
+        if let Some((scope, lens)) = outer {
+            (self.scope, self.lens) = (scope, lens);
         }
-        if self.akind(r) {
-            if let Core::Var(y) = r {
-                if self.arrs.get(y) == Some(&true) {
-                    let l = self.lens.get(&vn(*y)).cloned();
-                    unscope(self);
-                    self.arrs.insert(x, true);
-                    b.push(let_(vn(x), Ty::I64, v(vn(*y))));
-                    if let Some(l) = l {
-                        self.lens.insert(vn(x), l);
-                    }
-                    return;
-                }
-            }
-            let er = self.aval_now(r, b);
-            let en = name_of(&er);
-            let l = self.lens.get(&en).cloned();
-            unscope(self);
-            b.push(let_(vn(x), Ty::I64, er));
-            if let Some(l) = l {
-                self.lens.insert(vn(x), l);
-            }
-            self.arrs.insert(x, false);
-            self.live.insert(x as u64);
-            return;
+        let tuple = matches!(bound, Bound::Tup(..));
+        self.scope.bind(x, bound, &mut self.live);
+        for (i, e) in es.into_iter().enumerate() {
+            b.push(let_(if tuple { format!("q{x}_{i}") } else { vn(x) }, Ty::I64, e));
         }
-        self.low = self.ranges.masked(x);
-        self.low32 = self.ranges.masked32(x);
-        let er = self.val(r, b);
-        unscope(self);
-        b.push(let_(vn(x), Ty::I64, er));
+        if let Some(l) = len {
+            self.lens.insert(vn(x), l);
+        }
     }
 
-    /// A tuple-valued expression as its native components.
     /// A tuple-valued expression as its leaves, in order.
     fn tval(&mut self, e: &Core, b: &mut Vec<S>) -> Vec<E> {
         match e {
@@ -1493,7 +1403,7 @@ impl<'m> Sem<'m> {
                 let mut moved = Vec::new();
                 let mut es: Vec<E> = Vec::new();
                 for it in items {
-                    if tuple_kind(self.sigs, &self.tvars, it).is_some() {
+                    if tuple_kind(self.sigs, &self.scope.tvars, it).is_some() {
                         es.extend(self.tval(it, b));
                     } else {
                         let (x, d) = self.anyval(it, b);
@@ -1507,7 +1417,7 @@ impl<'m> Sem<'m> {
                 es
             }
             Core::If(cd, x, y) => {
-                let k = tuple_kind(self.sigs, &self.tvars, e).expect("tuple if").width();
+                let k = tuple_kind(self.sigs, &self.scope.tvars, e).expect("tuple if").width();
                 let names = |s: &mut Self| {
                     let t = s.fresh();
                     (0..k).map(|i| format!("{t}_{i}")).collect()
@@ -1519,11 +1429,11 @@ impl<'m> Sem<'m> {
                 self.tval(bo, b)
             }
             Core::Call(g, args) => self.call_tuple(*g, args, b),
-            Core::Var(t) if self.tvars.contains_key(t) => (0..self.tvars[t].width()).map(|i| v(format!("q{t}_{i}"))).collect(),
+            Core::Var(t) if self.scope.tvars.contains_key(t) => (0..self.scope.tvars[t].width()).map(|i| v(format!("q{t}_{i}"))).collect(),
             // a nested component: its leaves
             Core::Proj(base, i) => match &**base {
                 Core::Var(t) => {
-                    let sh = &self.tvars[t];
+                    let sh = &self.scope.tvars[t];
                     let (off, w) = (sh.offset(*i), sh.0[*i].as_ref().map_or(1, Shape::width));
                     (off..off + w).map(|j| v(format!("q{t}_{j}"))).collect()
                 }
@@ -1545,17 +1455,13 @@ impl<'m> Sem<'m> {
             Core::Prim(Prim::ArrGet, xs) => {
                 let a = self.rd(&xs[0]);
                 let i = self.unshifted(&xs[1], b);
-                let t = self.fresh();
                 let get = self.arr_get(&a, i);
-                b.push(let_(&t, Ty::I64, conv(cast(get, Ty::I64), true, sh))); // stored pre-shifted
-                v(t)
+                self.temp(Ty::I64, conv(cast(get, Ty::I64), true, sh), b) // stored pre-shifted
             }
             Core::Prim(pr, xs) if pr.is_f32() => {
                 // the bit patterns go through plain
                 let es: Vec<E> = xs.iter().map(|x| self.unshifted(x, b)).collect();
-                let t = self.fresh();
-                b.push(let_(&t, Ty::I64, conv(p(f32_fn(*pr), es), false, sh)));
-                v(t)
+                self.temp(Ty::I64, conv(p(f32_fn(*pr), es), false, sh), b)
             }
             Core::Prim(Prim::ArrLen, xs) => {
                 let a = self.rd(&xs[0]);
@@ -1564,7 +1470,7 @@ impl<'m> Sem<'m> {
             }
             Core::Var(i) => v(vn(*i)),
             Core::Proj(base, i) => match &**base {
-                Core::Var(t) if self.tvars.contains_key(t) => v(format!("q{t}_{}", self.tvars[t].offset(*i))),
+                Core::Var(t) if self.scope.tvars.contains_key(t) => v(format!("q{t}_{}", self.scope.tvars[t].offset(*i))),
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
             Core::Op2(op, x, y) => {
@@ -1600,8 +1506,7 @@ impl<'m> Sem<'m> {
                         bin(Bop::Shl, arith(c, ex, ey), i64_(8))
                     }
                 };
-                b.push(let_(&t, Ty::I64, body));
-                v(t)
+                crate::value::bind(t, Ty::I64, body, b)
             }
             Core::Cmp(op, x, y) => {
                 let (ex, ey) = (self.val(x, b), self.val(y, b));
@@ -1616,8 +1521,8 @@ impl<'m> Sem<'m> {
                 let t = self.fresh();
                 let m = format!("{t}m");
                 b.push(let_(&m, Ty::I64, E::Neg(Box::new(cast(bin(Bop::Ne, ec, i64_(0)), Ty::I64)))));
-                b.push(let_(&t, Ty::I64, bin(Bop::Or, bin(Bop::And, vx, v(&m)), bin(Bop::And, vy, bin(Bop::Xor, v(&m), i64_(-1))))));
-                v(t)
+                let selected = bin(Bop::Or, bin(Bop::And, vx, v(&m)), bin(Bop::And, vy, bin(Bop::Xor, v(&m), i64_(-1))));
+                crate::value::bind(t, Ty::I64, selected, b)
             }
             Core::If(cd, x, y) => v(self.join(cd, x, y, b, |s| vec![s.fresh()], |s, e, bb| vec![s.val(e, bb)]).remove(0)),
             Core::Let(x, r, bo) => {
@@ -1626,9 +1531,7 @@ impl<'m> Sem<'m> {
             }
             Core::Call(g, args) => {
                 let call = self.call(*g, args, b);
-                let t = self.fresh();
-                b.push(let_(&t, Ty::I64, call));
-                v(t)
+                self.temp(Ty::I64, call, b)
             }
             _ => unreachable!("non-scalar Core in scalar emission"),
         }
@@ -1647,21 +1550,17 @@ impl<'m> Sem<'m> {
                 self.low32 = *op != mithril_front::ast::BinOp::Shl;
                 self.low = *op != mithril_front::ast::BinOp::Shl;
                 let ey = self.val(y, b);
-                let t = self.fresh();
                 let body = arith(bin_code(op), cast(ex, Ty::U32), cast(ey, Ty::U32));
-                b.push(let_(&t, Ty::I64, cast(body, Ty::I64)));
-                v(t)
+                self.temp(Ty::I64, cast(body, Ty::I64), b)
             }
             Core::Op2(op, x, y) => {
                 self.low = crate::range::feeds_mask(op, y);
                 self.low32 = crate::range::feeds_mask32(op, y);
                 let ex = self.val(x, b);
                 let ey = self.val(y, b);
-                let t = self.fresh();
                 let wrap = self.ranges.wrap(op, x, y, low);
                 let body = arith(bin_code(op), ex, ey);
-                b.push(let_(&t, Ty::I64, if wrap { p("wrap56", vec![body]) } else { body }));
-                v(t)
+                self.temp(Ty::I64, if wrap { p("wrap56", vec![body]) } else { body }, b)
             }
             Core::Cmp(op, x, y) => {
                 let (ex, ey) = (self.val(x, b), self.val(y, b));
@@ -1674,47 +1573,45 @@ impl<'m> Sem<'m> {
     /// Tail position: self tail calls become loop iterations; everything
     /// else returns (a bare i64 for S1, a native tuple for SK).
     fn tail(&mut self, e: &Core, fid: u32, lp: bool, b: &mut Vec<S>) {
-        match e {
+        let result = match e {
             Core::Let(x, r, bo) => {
                 self.bind(*x, r, b);
-                self.tail(bo, fid, lp, b);
+                return self.tail(bo, fid, lp, b);
             }
-            Core::If(..) if join_arm(e) && !self.akind(e) && tuple_kind(self.sigs, &self.tvars, e).is_none_or(|sh| {
-                tmask(self.sigs, &self.tarr, &self.arrs, e, sh.width()).iter().all(|a| !a)
+            Core::If(..) if join_arm(e) && !self.scope.array(self.sigs, e) && tuple_kind(self.sigs, &self.scope.tvars, e).is_none_or(|sh| {
+                self.scope.mask(self.sigs, e, sh.width()).iter().all(|a| !a)
             }) =>
             {
                 // call-free, array-free arms: one value join and a single
                 // return (per-arm returns each settle fuel, which keeps the
                 // backend from turning a cheap unpredictable branch into a
                 // select)
-                let x = match tuple_kind(self.sigs, &self.tvars, e) {
+                match tuple_kind(self.sigs, &self.scope.tvars, e) {
                     Some(_) => E::Tup(self.tval(e, b)),
                     None => self.val(e, b),
-                };
-                self.drop_live(b);
-                self.settle_fuel(b);
-                b.push(ret(x));
+                }
             }
             Core::If(cd, x, y) => {
                 let ec = self.val(cd, b);
-                let (live, arrs, tarr, lens, tvars) = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone(), self.tvars.clone());
+                let (live, scope, lens) = (self.live.clone(), self.scope.clone(), self.lens.clone());
                 let mut bx = Vec::new();
                 self.tail(x, fid, lp, &mut bx);
-                (self.live, self.arrs, self.tarr, self.lens, self.tvars) = (live, arrs.clone(), tarr.clone(), lens.clone(), tvars.clone());
+                (self.live, self.scope, self.lens) = (live, scope.clone(), lens.clone());
                 let mut by = Vec::new();
                 self.tail(y, fid, lp, &mut by);
-                (self.arrs, self.tarr, self.lens, self.tvars) = (arrs, tarr, lens, tvars);
+                (self.scope, self.lens) = (scope, lens);
                 b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bx, by));
+                return;
             }
             Core::Match(sc, arms) => {
                 let Core::Var(h) = &**sc else { unreachable!("native match on a non-handle") };
                 let hv = as_u(v(vn(*h)));
                 let owned = self.hvars.get(h) == Some(&true);
                 let unbox = UNBOX.with(|u| u.borrow().clone());
-                let saved = (self.live.clone(), self.arrs.clone(), self.tarr.clone(), self.lens.clone(), self.tvars.clone());
+                let saved = (self.live.clone(), self.scope.clone(), self.lens.clone(), self.hvars.clone());
                 let mut bodies = Vec::new();
                 for (ctor, binders, body) in arms {
-                    (self.live, self.arrs, self.tarr, self.lens, self.tvars) = saved.clone();
+                    (self.live, self.scope, self.lens, self.hvars) = saved.clone();
                     let mut ab = Vec::new();
                     if *ctor != UNREACHABLE_CTOR {
                         let used = crate::free_vars(body);
@@ -1722,21 +1619,9 @@ impl<'m> Sem<'m> {
                         let n = binders.len();
                         let ports: Vec<E> = if unbox.contains_key(ctor) {
                             binders.iter().map(|_| hv.clone()).collect()
-                        } else if !owned {
-                            (0..n).map(|j| c("field", vec![hv.clone(), usize_(j)])).collect()
                         } else {
                             let names: Vec<String> = (0..n).map(|j| format!("f{h}_{j}")).collect();
-                            let k = u16_(*ctor as u64);
-                            match n {
-                                0 => {}
-                                1 => {
-                                    ab.push(S::Let(Pat::Tup(vec![names[0].clone(), "m_unused".into()]), Ty::Infer, c("consume2k", vec![hv.clone(), k])));
-                                    ab.push(free(v("m_unused")));
-                                }
-                                2 => ab.push(S::Let(Pat::Tup(names.clone()), Ty::Infer, c("consume2k", vec![hv.clone(), k]))),
-                                _ => ab.push(S::Let(Pat::Arr(names.clone()), Ty::Infer, c(&format!("consume_chain::<{n}>"), vec![hv.clone(), k]))),
-                            }
-                            names.into_iter().map(v).collect()
+                            crate::value::fields(hv.clone(), *ctor, names, owned && n > 0, None, &mut ab)
                         };
                         for ((j, x), f) in binders.iter().enumerate().zip(ports) {
                             if !used.contains(x) {
@@ -1750,8 +1635,7 @@ impl<'m> Sem<'m> {
                                     self.hvars.insert(*x, owned);
                                     cast(f, Ty::I64)
                                 }
-                                _ if self.shifted => p("sh", vec![f]),
-                                _ => as_i(f),
+                                _ => crate::value::native_int(f, self.shifted),
                             };
                             ab.push(let_(vn(*x), Ty::I64, val));
                         }
@@ -1759,8 +1643,9 @@ impl<'m> Sem<'m> {
                     }
                     bodies.push(ab);
                 }
-                (self.arrs, self.tarr, self.lens, self.tvars) = (saved.1, saved.2, saved.3, saved.4);
+                (self.scope, self.lens, self.hvars) = (saved.1, saved.2, saved.3);
                 b.push(crate::seq::plan_arms(&hv, arms, &unbox, |i| bodies[i].clone()));
+                return;
             }
             Core::Call(g, args) if *g == fid && lp => {
                 let es = self.call_args(*g, args, b);
@@ -1786,6 +1671,7 @@ impl<'m> Sem<'m> {
                     b.push(set(format!("l_v{pp}"), v(l)));
                 }
                 b.push(S::Continue);
+                return;
             }
             Core::Call(g, args) => {
                 let call = match self.sigs[*g as usize].as_ref().map(|s| s.ret) {
@@ -1796,26 +1682,18 @@ impl<'m> Sem<'m> {
                     _ => self.call(*g, args, b),
                 };
                 // the call reads arrays lent to it: run it before they are freed
-                let t = self.fresh();
-                b.push(let_(&t, Ty::Infer, call));
-                let call = v(t);
-                self.drop_live(b);
-                self.settle_fuel(b);
-                b.push(ret(call));
+                self.temp(Ty::Infer, call, b)
             }
-            Core::Tuple(_) | Core::Var(_) | Core::Proj(..) if tuple_kind(self.sigs, &self.tvars, e).is_some() => {
-                let x = E::Tup(self.tval(e, b));
-                self.drop_live(b);
-                self.settle_fuel(b);
-                b.push(ret(x));
+            Core::Tuple(_) | Core::Var(_) | Core::Proj(..) if tuple_kind(self.sigs, &self.scope.tvars, e).is_some() => {
+                E::Tup(self.tval(e, b))
             }
             other => {
-                let x = if self.akind(other) { self.aval_now(other, b) } else { self.val(other, b) };
-                self.drop_live(b);
-                self.settle_fuel(b);
-                b.push(ret(x));
+                if self.scope.array(self.sigs, other) { self.aval_now(other, b) } else { self.val(other, b) }
             }
-        }
+        };
+        self.drop_live(b);
+        self.settle_fuel(b);
+        b.push(ret(result));
     }
 }
 
@@ -1827,6 +1705,106 @@ fn flat_names(sig: &Sig) -> Vec<String> {
         _ => vec![vn(pp as u32)],
     };
     sig.params.iter().enumerate().flat_map(comps).collect()
+}
+
+/// Port/native boundary shared by the scalar dive and local region entries.
+/// The signature owns conversion and borrowing; the result form chooses only
+/// whether a tuple crosses the boundary as cells or as an aggregate.
+pub(crate) fn port_bridge(fid: u32, sig: &Sig, bor: &[bool], ret_ty: Ty) -> Vec<S> {
+    // bridge: unpack ports per param type, call, repack per return kind
+    let mut unpack = Vec::new();
+    let mut bargs: Vec<E> = vec![v("fuel")];
+    let mut after = Vec::new();
+    let conv = |e: E| crate::value::native_int(e, shifted(fid));
+    for (pp, pt) in sig.params.iter().enumerate() {
+        let pv = v(vn(pp as u32));
+        match pt {
+            PTy::I => bargs.push(conv(pv)),
+            // array ports pass as their bits; the dive side's borrow mode
+            // for this param may differ from the native one
+            PTy::A => {
+                if bor[pp] {
+                    unpack.push(let_(vn(pp as u32), Ty::U64, c("dup_val", vec![pv.clone()])));
+                }
+                // native code writes owned arrays without refcount checks
+                unpack.push(let_(vn(pp as u32), Ty::U64, c("arr_own", vec![pv.clone()])));
+                bargs.push(cast(pv, Ty::I64));
+            }
+            PTy::B | PTy::H => {
+                if !bor[pp] {
+                    after.push(free(pv.clone()));
+                }
+                bargs.push(cast(pv, Ty::I64));
+            }
+            PTy::O => bargs.push(cast(pv, Ty::I64)),
+            PTy::T(k) => {
+                // the port's leaves, nested tuples read through
+                fn leaves(src: E, sh: &Shape, name: &str, conv: &dyn Fn(E) -> E, out: &mut Vec<S>, args: &mut Vec<E>) {
+                    for (i, comp) in sh.0.iter().enumerate() {
+                        let (n, f) = (format!("{name}_{i}"), c("field", vec![src.clone(), usize_(i)]));
+                        match comp {
+                            None => {
+                                out.push(let_(&n, Ty::I64, conv(f)));
+                                args.push(v(n));
+                            }
+                            Some(sub) => {
+                                out.push(let_(&n, Ty::U64, f));
+                                leaves(v(&n), sub, &n, conv, out, args);
+                            }
+                        }
+                    }
+                }
+                leaves(pv.clone(), &pshape(fid, pp, *k), &format!("a{pp}"), &conv, &mut unpack, &mut bargs);
+                if !bor[pp] {
+                    unpack.push(free(pv));
+                }
+            }
+        }
+    }
+    let pack = |i: usize, r: E| if sig.ra.get(i).copied().unwrap_or(false) { as_u(r) } else { crate::value::int_port(r, shifted(fid)) };
+    let call = E::Call { f: format!("s_{fid}"), ctx: !ctx_arg(fid).is_empty(), args: bargs };
+    let mut bridge_body = unpack;
+    if is_leaf(fid) {
+        bridge_body.push(burn_fuel());
+    }
+    match sig.ret {
+        Kind::S1 => {
+            bridge_body.push(let_("r", Ty::I64, call));
+            bridge_body.extend(after);
+            bridge_body.push(ret(ok(pack(0, v("r")))));
+        }
+        Kind::SK(k) => {
+            let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
+            bridge_body.push(S::Let(Pat::Tup(comps.clone()), Ty::Infer, call));
+            bridge_body.extend(after);
+            // one tuple cell per level of the result's layout, inner ones
+            // first (each allocation takes the context)
+            fn cells(sh: &Shape, next: &mut usize, leaf: &dyn Fn(usize) -> E, out: &mut Vec<S>) -> E {
+                let mut fs = Vec::new();
+                for comp in &sh.0 {
+                    match comp {
+                        None => {
+                            *next += 1;
+                            fs.push(leaf(*next - 1));
+                        }
+                        Some(sub) => {
+                            let inner = cells(sub, next, leaf, out);
+                            let n = format!("rc{}", out.len());
+                            out.push(let_(&n, Ty::U64, inner));
+                            fs.push(v(n));
+                        }
+                    }
+                }
+                c("mk_con", vec![u16_(0xFFF), E::Slice(fs)])
+            }
+            let outer = if matches!(ret_ty, Ty::ResArr(_)) { E::Arr(comps.iter().enumerate().map(|(i, n)| pack(i, v(n))).collect()) } else {
+                cells(&rshape(fid, k), &mut 0, &|i| pack(i, v(&comps[i])), &mut bridge_body)
+            };
+            bridge_body.push(ret(ok(outer)));
+        }
+        Kind::No => unreachable!(),
+    }
+    bridge_body
 }
 
 /// The native form `s_<fid>` plus the bridging dive form `d_<fid>`.
@@ -1847,40 +1825,21 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         Kind::SK(k) => Ty::Tup(k),
         Kind::No => unreachable!(),
     };
+    let (scope, live, hvars) = param_bindings(fid, &sig.params);
     let mut sem = Sem {
         sigs,
         ranges: crate::range::Ranges::of(&f.body),
         low: false,
         low32: false,
         tmp: 0,
-        tvars: HashMap::new(),
-        arrs: HashMap::new(),
-        tarr: HashMap::new(),
-        live: Default::default(),
+        scope,
+        live,
         fuel: !is_leaf(fid),
         shifted: shifted(fid),
         lens: HashMap::new(),
         use_lens: false,
-        hvars: HashMap::new(),
+        hvars,
     };
-    for (pp, pt) in sig.params.iter().enumerate() {
-        match pt {
-            PTy::T(k) => {
-                sem.tvars.insert(pp as u32, pshape(fid, pp, *k));
-            }
-            PTy::A => {
-                sem.arrs.insert(pp as u32, false);
-                sem.live.insert(pp as u64);
-            }
-            PTy::B => {
-                sem.arrs.insert(pp as u32, true);
-            }
-            PTy::H | PTy::O => {
-                sem.hvars.insert(pp as u32, *pt == PTy::O);
-            }
-            PTy::I => {}
-        }
-    }
     // loop-carried array params keep their length in a loop variable;
     // elsewhere a length is read at its first use
     // Length locals pay where the backend cannot keep a length itself: a
@@ -1931,97 +1890,7 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
         return vec![native];
     }
 
-    // bridge: unpack ports per param type, call, repack per return kind
-    let mut unpack = Vec::new();
-    let mut bargs: Vec<E> = vec![v("fuel")];
-    let mut after = Vec::new();
-    let conv = |e: E| if shifted(fid) { p("sh", vec![e]) } else { as_i(e) };
-    for (pp, pt) in sig.params.iter().enumerate() {
-        let pv = v(vn(pp as u32));
-        match pt {
-            PTy::I => bargs.push(conv(pv)),
-            // array ports pass as their bits; the dive side's borrow mode
-            // for this param may differ from the native one
-            PTy::A => {
-                if bor[fid as usize][pp] {
-                    unpack.push(let_(vn(pp as u32), Ty::U64, c("dup_val", vec![pv.clone()])));
-                }
-                // native code writes owned arrays without refcount checks
-                unpack.push(let_(vn(pp as u32), Ty::U64, c("arr_own", vec![pv.clone()])));
-                bargs.push(cast(pv, Ty::I64));
-            }
-            PTy::B | PTy::H => {
-                if !bor[fid as usize][pp] {
-                    after.push(free(pv.clone()));
-                }
-                bargs.push(cast(pv, Ty::I64));
-            }
-            PTy::O => bargs.push(cast(pv, Ty::I64)),
-            PTy::T(k) => {
-                // the port's leaves, nested tuples read through
-                fn leaves(src: E, sh: &Shape, name: &str, conv: &dyn Fn(E) -> E, out: &mut Vec<S>, args: &mut Vec<E>) {
-                    for (i, comp) in sh.0.iter().enumerate() {
-                        let (n, f) = (format!("{name}_{i}"), c("field", vec![src.clone(), usize_(i)]));
-                        match comp {
-                            None => {
-                                out.push(let_(&n, Ty::I64, conv(f)));
-                                args.push(v(n));
-                            }
-                            Some(sub) => {
-                                out.push(let_(&n, Ty::U64, f));
-                                leaves(v(&n), sub, &n, conv, out, args);
-                            }
-                        }
-                    }
-                }
-                leaves(pv.clone(), &pshape(fid, pp, *k), &format!("a{pp}"), &conv, &mut unpack, &mut bargs);
-                if !bor[fid as usize][pp] {
-                    unpack.push(free(pv));
-                }
-            }
-        }
-    }
-    let pack = |i: usize, r: E| if sig.ra.get(i).copied().unwrap_or(false) { as_u(r) } else if shifted(fid) { p("retag", vec![r]) } else { num(r) };
-    let call = E::Call { f: format!("s_{fid}"), ctx: !ctx_arg(fid).is_empty(), args: bargs };
-    let mut bridge_body = unpack;
-    if is_leaf(fid) {
-        bridge_body.push(burn_fuel());
-    }
-    match sig.ret {
-        Kind::S1 => {
-            bridge_body.push(let_("r", Ty::I64, call));
-            bridge_body.extend(after);
-            bridge_body.push(ret(ok(pack(0, v("r")))));
-        }
-        Kind::SK(k) => {
-            let comps: Vec<String> = (0..k).map(|i| format!("r{i}")).collect();
-            bridge_body.push(S::Let(Pat::Tup(comps.clone()), Ty::Infer, call));
-            bridge_body.extend(after);
-            // one tuple cell per level of the result's layout, inner ones
-            // first (each allocation takes the context)
-            fn cells(sh: &Shape, next: &mut usize, leaf: &dyn Fn(usize) -> E, out: &mut Vec<S>) -> E {
-                let mut fs = Vec::new();
-                for comp in &sh.0 {
-                    match comp {
-                        None => {
-                            *next += 1;
-                            fs.push(leaf(*next - 1));
-                        }
-                        Some(sub) => {
-                            let inner = cells(sub, next, leaf, out);
-                            let n = format!("rc{}", out.len());
-                            out.push(let_(&n, Ty::U64, inner));
-                            fs.push(v(n));
-                        }
-                    }
-                }
-                c("mk_con", vec![u16_(0xFFF), E::Slice(fs)])
-            }
-            let outer = cells(&rshape(fid, k), &mut 0, &|i| pack(i, v(&comps[i])), &mut bridge_body);
-            bridge_body.push(ret(ok(outer)));
-        }
-        Kind::No => unreachable!(),
-    }
+    let mut bridge_body = port_bridge(fid, &sig, &bor[fid as usize], Ty::Res);
     // Every caller native: nothing dives this function, so the bridge
     // has no caller and must not look like one (a live bridge call site
     // with unknown arguments blocks the backend's interprocedural

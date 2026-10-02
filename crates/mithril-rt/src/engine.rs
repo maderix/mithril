@@ -117,6 +117,7 @@ impl Engine {
                 // a single entry cannot use the pool: run it here (waking the
                 // pool would just move the work, and its caches, to another core)
                 if threads == 1 || work < PAR_WORK || n < 2 {
+                    ctx0.native_ready = threads == 1 || n >= 4 * threads;
                     ctx0.set_fuel(fuel.saturating_mul(boost));
                     // single-threaded drain on the coordinator; buffers keep capacity
                     let mut rx = mem::take(&mut buckets[k]);
@@ -157,9 +158,12 @@ impl Engine {
                     // growing (every split costs a record and locality); a
                     // thin frontier keeps the base budget and splits often.
                     let f = wave_fuel(fuel, n, threads).saturating_mul(boost);
+                    ctx0.native_ready = n >= 4 * threads;
                     ctx0.set_fuel(f);
                     for w in &workers {
-                        lock(w).set_fuel(f);
+                        let mut w = lock(w);
+                        w.native_ready = n >= 4 * threads;
+                        w.set_fuel(f);
                     }
                 }
                 {

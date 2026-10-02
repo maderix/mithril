@@ -63,6 +63,27 @@ pub enum Expr {
     Lambda(Vec<String>, Box<Expr>),
 }
 
+impl Expr {
+    pub fn kids(&self) -> Vec<&Expr> {
+        match self {
+            Self::Bin(_, a, b) | Self::Cmp(_, a, b) | Self::Bool2(_, a, b) | Self::Index(a, b) => vec![a, b],
+            Self::Not(a) | Self::Neg(a) | Self::Lambda(_, a) => vec![a],
+            Self::IfExp(c, a, b) => vec![c, a, b],
+            Self::Call(_, xs) | Self::Tuple(xs) => xs.iter().collect(),
+            Self::Int(_) | Self::Float(_) | Self::Bool(_) | Self::Var(_) => Vec::new(),
+        }
+    }
+
+    pub fn any(&self, p: &dyn Fn(&Expr) -> bool) -> bool {
+        p(self) || self.kids().into_iter().any(|e| e.any(p))
+    }
+
+    pub fn fold<T>(&self, f: &mut dyn FnMut(&Expr, Vec<T>) -> T) -> T {
+        let children = self.kids().into_iter().map(|e| e.fold(f)).collect();
+        f(self, children)
+    }
+}
+
 /// A proven fold: carried by `Stmt::For` (`None` out of the parser; reassoc
 /// sets it) and copied by desugar onto the loop helper's `CoreFn.fold`.
 #[derive(Clone, PartialEq, Debug)]
@@ -91,6 +112,18 @@ pub enum Stmt {
     /// `for v in range(e): body` — `fold` is always `None` from the parser.
     For(String, Expr, Vec<Stmt>, Option<FoldInfo>),
     Match(Expr, Vec<(Pat, Vec<Stmt>)>),
+}
+
+impl Stmt {
+    /// Head expression and nested blocks, in source order. Binders stay on the statement.
+    pub fn parts(&self) -> (&Expr, Vec<&[Stmt]>) {
+        match self {
+            Self::Assign(_, e) | Self::Return(e) | Self::ExprStmt(e) => (e, Vec::new()),
+            Self::If(e, a, b) => (e, vec![a, b]),
+            Self::While(e, b) | Self::For(_, e, b, _) => (e, vec![b]),
+            Self::Match(e, arms) => (e, arms.iter().map(|(_, b)| b.as_slice()).collect()),
+        }
+    }
 }
 
 /// A `match` case pattern: `Ctor(a, b)` (ctor pattern, `binds` are the

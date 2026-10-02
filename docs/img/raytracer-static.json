@@ -1,0 +1,81 @@
+{
+  "compiler_sha256": "6da131141e98fefc480112d5728447319208a2537d937181dbf2340290795617",
+  "results": {
+    "whitted": {
+      "samples_s": {
+        "cpu1": [
+          0.2638078429736197,
+          0.2597879450186156,
+          0.267011056013871
+        ],
+        "cpu16": [
+          0.059126608015503734,
+          0.06076103902887553,
+          0.0672795029822737
+        ],
+        "gpu": [
+          0.8309450339875184,
+          0.8713831139612012,
+          0.8852229479816742
+        ]
+      },
+      "median_s": {
+        "cpu1": 0.2638078429736197,
+        "cpu16": 0.06076103902887553,
+        "gpu": 0.8713831139612012
+      },
+      "min_s": {
+        "cpu1": 0.2597879450186156,
+        "cpu16": 0.059126608015503734,
+        "gpu": 0.8309450339875184
+      },
+      "pixels_sha256": "0b938c156359d3b21878ddc8f61015cd117e006d2284fe00361e17749fdc1c30",
+      "diagnostic": "mithril-gpu: context 36 ms\nmithril-gpu: native cache 45 words/lane, 92160 bytes/block, 1 blocks/SM\nmithril-gpu: device events: boot 4.769 ms, run 704.390 ms\nmithril-gpu: setup 30 ms, run 706 ms on 32768 lanes: 16 rounds (14 grow sweeps 2 M cycles, 1 work phases 1907 M cycles, widest frontier 32768), 2228481 cells and 115199 records issued\nmithril-gpu: phases: module load 11 ms, arenas 19 ms, to readback 710 ms\nmithril-gpu: detail: boot launch 4.282 ms, prepare run 0.003 ms, readback + format 32.196 ms (35655696 cell bytes), stack 8192\nmithril-gpu: context create + run + destroy 819 ms\n",
+      "source_sha256": "cd54e5d3485aeb2cc863fb97343e5dbd347ea5d4150f1af82fdad2c9e46d5d38",
+      "fps": {
+        "cpu1": 3.7906378700803,
+        "cpu16": 16.457914742451475,
+        "gpu": 1.1476008474092667
+      }
+    },
+    "path": {
+      "samples_s": {
+        "cpu1": [
+          2.7117504400084727,
+          2.1494650979875587,
+          1.9188421159633435
+        ],
+        "cpu16": [
+          0.2724273350322619,
+          0.23792504100129008,
+          0.234272851026617
+        ],
+        "gpu": [
+          0.3773684490006417,
+          0.3352530780248344,
+          0.3255441940273158
+        ]
+      },
+      "median_s": {
+        "cpu1": 2.1494650979875587,
+        "cpu16": 0.23792504100129008,
+        "gpu": 0.3352530780248344
+      },
+      "min_s": {
+        "cpu1": 1.9188421159633435,
+        "cpu16": 0.234272851026617,
+        "gpu": 0.3255441940273158
+      },
+      "pixels_sha256": "29b6713d59766ca03b9cca0ebd92c01eb8b0f076c632fe3419038b4c724d4983",
+      "diagnostic": "mithril-gpu: context 61 ms\nmithril-gpu: native cache 45 words/lane, 92160 bytes/block, 1 blocks/SM\nmithril-gpu: device events: boot 3.516 ms, run 193.591 ms\nmithril-gpu: setup 30 ms, run 194 ms on 32768 lanes: 16 rounds (14 grow sweeps 1 M cycles, 1 work phases 523 M cycles, widest frontier 32768), 1180033 cells and 114943 records issued\nmithril-gpu: phases: module load 11 ms, arenas 19 ms, to readback 198 ms\nmithril-gpu: detail: boot launch 4.275 ms, prepare run 0.002 ms, readback + format 11.625 ms (18880528 cell bytes), stack 8192\nmithril-gpu: context create + run + destroy 310 ms\n",
+      "source_sha256": "19c4001517681ba85b41e02ea8bfa5f2cdffe49be6b28555fff13d9a8825c862",
+      "fps": {
+        "cpu1": 0.4652320249052902,
+        "cpu16": 4.203004424383299,
+        "gpu": 2.9828212343092146
+      }
+    }
+  },
+  "date": "2026-10-02",
+  "method": "unchanged static demo; median process wall of three after warmup; compilation excluded; image return included; pixels checked across CPU1, CPU16 and GPU"
+}

@@ -6,7 +6,7 @@ each other on the parity corpus: today's bugs. `check.py --divergences`
 prints them from `reference.json`.
 
 The correct answer is the oracle's (`mithril oracle`, `eval_core`), except
-where the net's lazy semantics decides (CLAUDE.md: an unused binding is never
+where the net's lazy semantics decides (an unused binding is never
 evaluated) or the oracle cannot run the program (`known.json` then states the
 answer and why). Every answer below was also checked by hand or against the
 program's documented value.

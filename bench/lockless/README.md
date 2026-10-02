@@ -22,8 +22,7 @@ checksum line (fsum's idiomatic reductions excepted, see below):
   thread-local structures, `reduce` to merge them.
   `rust/src/bin/fsum_tree.rs`: a fixed-shape tree sum.
 
-These are Mithril's own benchmarks (spec: `docs/superpowers/specs/
-2026-09-30-lockless-proof-evidence-design.md`, section 6), not reference ports.
+These programs and their C and Rust twins form Mithril's shared-state benchmark set.
 
 | program | big size | C / Rust, shared structure or idiomatic reduction (`main.c`, `<name>.rs`) | C / Rust, fold/merge or tree (`main_fold.c`/`main_tree.c`, `<name>_fold.rs`/`fsum_tree.rs`) | Mithril uses |
 |---|---|---|---|---|

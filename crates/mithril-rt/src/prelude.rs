@@ -51,6 +51,13 @@ pub fn field(ctx: &Wctx, p: u64, i: usize) -> u64 {
     }
 }
 
+/// Borrow the first two fields, sharing the common two-field cell read.
+#[inline]
+pub fn read_pair(ctx: &Wctx, p: u64) -> [u64; 2] {
+    if con_ar(p) > 2 { [field(ctx,p,0), field(ctx,p,1)] }
+    else { ctx.cell(con_addr(p)) }
+}
+
 #[inline]
 pub fn floor_div(a: i64, b: i64) -> i64 {
     let q = a.wrapping_div(b);
@@ -373,6 +380,7 @@ pub fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
 #[inline] pub fn set_parent(ctx: &mut Wctx, rec: u32, parent: u64) { ctx.set_parent(rec, parent) }
 #[inline] pub fn ready_rec(ctx: &mut Wctx, rec: u32) { ctx.ready_rec(rec) }
 #[inline] pub fn deliver(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver(parent, v) }
+#[inline] pub fn deliver_deferred(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver_deferred(parent, v) }
 #[inline] pub fn rec_parent(ctx: &Wctx, rec: u32) -> u64 { ctx.rec(rec).parent }
 #[inline] pub fn rec_d(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).d }
 #[inline] pub fn rec_s(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).s }
@@ -413,6 +421,12 @@ pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
 #[inline] pub fn stack_guard() {}
 /// `n` units of work charged to the budget (the device charges none: see lir::work_fuel)
 #[inline] pub fn work_fuel(fuel: &mut i64, n: i64) { *fuel -= n; }
+/// Uninterrupted native regions settle all work once, modulo the fuel word.
+#[inline] pub fn native_work_fuel(fuel: &mut i64, n: i64) { *fuel = fuel.wrapping_sub(n); }
+/// The scheduler chooses a native subtree only after exposing enough work.
+#[inline] pub fn native_ready(ctx: &Wctx, _: &[u64]) -> bool { ctx.native_ready }
+#[inline] pub fn native_enter(_: &mut Wctx) -> bool { false }
+#[inline] pub fn native_leave(_: &mut Wctx, _: bool) {}
 /// A fork site's call in the rule form: the same on the CPU.
 #[inline]
 pub fn dive_res_fork(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
@@ -943,3 +957,40 @@ pub fn show<T: Tables>(eng: &Engine, p: u64) -> String {
     }
 }
 
+
+/// Lane-owned native continuation words; they never cross a suspension boundary.
+#[derive(Default)]
+pub struct NativeFrames(Vec<u32>);
+#[inline] pub fn native_frames(_: u32) -> NativeFrames { NativeFrames::default() }
+#[inline] pub fn native_push32(s: &mut NativeFrames, v: u32) { s.0.push(v); }
+#[inline] pub fn native_pop32(s: &mut NativeFrames) -> u32 { s.0.pop().expect("empty native continuation") }
+#[inline] pub fn native_push(s: &mut NativeFrames, v: u64) { native_push32(s,v as u32); native_push32(s,(v >> 32) as u32); }
+#[inline] pub fn native_pop(s: &mut NativeFrames) -> u64 { let hi=native_pop32(s) as u64; (hi << 32) | native_pop32(s) as u64 }
+#[inline] pub fn native_empty(s: &NativeFrames) -> bool { s.0.is_empty() }
+#[inline] pub fn native_ok() -> bool { true }
+#[inline] pub fn native_done(s: &mut NativeFrames) { debug_assert!(s.0.is_empty()); }
+#[inline] pub fn native_reserve(s: &mut NativeFrames, width: u32) -> u64 { let pos=s.0.len(); s.0.resize(pos + width as usize,0); pos as u64 }
+#[inline] pub fn native_take(s: &mut NativeFrames, width: u32) -> u64 { s.0.len().checked_sub(width as usize).expect("incomplete native frame") as u64 }
+#[inline] pub fn native_release(s: &mut NativeFrames, slot: u64) { s.0.truncate(slot as usize); }
+#[inline] pub fn native_set32(s: &mut NativeFrames, slot: u64, field: u32, v: u32) { s.0[slot as usize + field as usize]=v; }
+#[inline] pub fn native_get32(s: &mut NativeFrames, slot: u64, field: u32) -> u32 { s.0[slot as usize + field as usize] }
+#[inline] pub fn native_set64(s: &mut NativeFrames, slot: u64, field: u32, v: u64) { native_set32(s,slot,field,v as u32); native_set32(s,slot,field+1,(v >> 32) as u32); }
+#[inline] pub fn native_get64(s: &mut NativeFrames, slot: u64, field: u32) -> u64 { let hi=native_get32(s,slot,field+1) as u64; (hi << 32) | native_get32(s,slot,field) as u64 }
+
+#[inline] pub fn native_check(_: u64) -> bool { true }
+
+#[inline] pub fn native_cached(_: &NativeFrames, _: u64) -> bool { true }
+#[inline] pub fn native_set_fixed32(s: &mut NativeFrames, slot: u64, field: u32, v: u32) { native_set32(s,slot,field,v) }
+#[inline] pub fn native_get_fixed32(s: &mut NativeFrames, slot: u64, field: u32) -> u32 { native_get32(s,slot,field) }
+#[inline] pub fn native_set_fixed64(s: &mut NativeFrames, slot: u64, field: u32, v: u64) { native_set64(s,slot,field,v) }
+#[inline] pub fn native_get_fixed64(s: &mut NativeFrames, slot: u64, field: u32) -> u64 { native_get64(s,slot,field) }
+
+/// A native continuation owns a complete record until its region returns.
+pub struct NativeRecords<const K: usize>(Vec<[u64; K]>);
+#[inline] pub fn native_records<const K: usize>(_: [u64; K]) -> NativeRecords<K> { NativeRecords(Vec::new()) }
+#[inline] pub fn native_record_empty<const K: usize>(s: &NativeRecords<K>) -> bool { s.0.is_empty() }
+#[inline] pub fn native_record_done<const K: usize>(s: &mut NativeRecords<K>) { debug_assert!(s.0.is_empty()); }
+#[inline] pub fn native_record_push<const K: usize>(s: &mut NativeRecords<K>, fields: [u64; K]) { s.0.push(fields); }
+#[inline] pub fn native_record_read<const K: usize>(s: &NativeRecords<K>, _: [u64; K]) -> [u64; K] { *s.0.last().expect("empty native continuation") }
+#[inline] pub fn native_record_replace<const K: usize>(s: &mut NativeRecords<K>, fields: [u64; K]) { *s.0.last_mut().expect("empty native continuation") = fields; }
+#[inline] pub fn native_record_pop<const K: usize>(s: &mut NativeRecords<K>, _: [u64; K]) { s.0.pop().expect("empty native continuation"); }

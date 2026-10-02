@@ -56,6 +56,12 @@
    "timeout": 120
   },
   {
+   "name": "fixture/mithril-codegen/borrowed_tree",
+   "path": "crates/mithril-codegen/tests/fixtures/borrowed_tree.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
    "name": "fixture/mithril-codegen/branch_recursion",
    "path": "crates/mithril-codegen/tests/fixtures/branch_recursion.py",
    "sed": [],
@@ -64,6 +70,12 @@
   {
    "name": "fixture/mithril-codegen/chain_boxed",
    "path": "crates/mithril-codegen/tests/fixtures/chain_boxed.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/chain_walk",
+   "path": "crates/mithril-codegen/tests/fixtures/chain_walk.py",
    "sed": [],
    "timeout": 120
   },
@@ -82,6 +94,24 @@
   {
    "name": "fixture/mithril-codegen/closures",
    "path": "crates/mithril-codegen/tests/fixtures/closures.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/con_share",
+   "path": "crates/mithril-codegen/tests/fixtures/con_share.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/dead_binding",
+   "path": "crates/mithril-codegen/tests/fixtures/dead_binding.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/dead_division",
+   "path": "crates/mithril-codegen/tests/fixtures/dead_division.py",
    "sed": [],
    "timeout": 120
   },
@@ -118,6 +148,18 @@
   {
    "name": "fixture/mithril-codegen/fib_naive",
    "path": "crates/mithril-codegen/tests/fixtures/fib_naive.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/flo_share",
+   "path": "crates/mithril-codegen/tests/fixtures/flo_share.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/flo_share_ops",
+   "path": "crates/mithril-codegen/tests/fixtures/flo_share_ops.py",
    "sed": [],
    "timeout": 120
   },
@@ -188,8 +230,50 @@
    "timeout": 120
   },
   {
+   "name": "fixture/mithril-codegen/join_blowup",
+   "path": "crates/mithril-codegen/tests/fixtures/join_blowup.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/join_returns",
+   "path": "crates/mithril-codegen/tests/fixtures/join_returns.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
    "name": "fixture/mithril-codegen/lent_pick",
    "path": "crates/mithril-codegen/tests/fixtures/lent_pick.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/lent_tail_call",
+   "path": "crates/mithril-codegen/tests/fixtures/lent_tail_call.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/lent_tail_read",
+   "path": "crates/mithril-codegen/tests/fixtures/lent_tail_read.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/loop_image",
+   "path": "crates/mithril-codegen/tests/fixtures/loop_image.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/loop_split_kept",
+   "path": "crates/mithril-codegen/tests/fixtures/loop_split_kept.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/loop_split_shapes",
+   "path": "crates/mithril-codegen/tests/fixtures/loop_split_shapes.py",
    "sed": [],
    "timeout": 120
   },
@@ -214,6 +298,12 @@
   {
    "name": "fixture/mithril-codegen/native_arrays",
    "path": "crates/mithril-codegen/tests/fixtures/native_arrays.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/native_match",
+   "path": "crates/mithril-codegen/tests/fixtures/native_match.py",
    "sed": [],
    "timeout": 120
   },
@@ -244,6 +334,18 @@
   {
    "name": "fixture/mithril-codegen/readback_values",
    "path": "crates/mithril-codegen/tests/fixtures/readback_values.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/recursive_counts",
+   "path": "crates/mithril-codegen/tests/fixtures/recursive_counts.py",
+   "sed": [],
+   "timeout": 120
+  },
+  {
+   "name": "fixture/mithril-codegen/recursive_expr",
+   "path": "crates/mithril-codegen/tests/fixtures/recursive_expr.py",
    "sed": [],
    "timeout": 120
   },

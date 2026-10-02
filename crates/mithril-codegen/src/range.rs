@@ -118,7 +118,7 @@ pub(crate) fn low32_closed(op: &BinOp) -> bool {
     matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
 }
 
-fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
+pub(crate) fn op_iv(op: &BinOp, x: Iv, y: Iv, yexpr: &Core) -> Iv {
     let k = match yexpr {
         Core::Num(n) => Some(*n as i128),
         _ => None,

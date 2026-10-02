@@ -42,6 +42,8 @@
 
 mod fast;
 mod fold;
+mod native;
+mod bounds;
 pub mod lir;
 mod range;
 mod rewrite;
@@ -49,6 +51,7 @@ mod rules;
 mod scalar;
 mod seq;
 mod ty;
+mod value;
 
 use mithril_front::core::{Core, CoreModule, Val};
 use std::collections::BTreeSet;
@@ -170,6 +173,8 @@ pub enum Rule {
 /// prints it.
 pub struct LirProgram {
     pub fns: Vec<lir::FnDef>,
+    /// Pure integer calls with a fully defunctionalized native entry.
+    pub native_entries: Vec<u32>,
     /// rule id -> what it fires (dense: every id below `rules.len()`)
     pub rules: Vec<Rule>,
     /// rules whose firing may run a dive (charged a whole budget)
@@ -204,78 +209,86 @@ pub struct LirProgram {
 /// Lower a specialized module (see `emit_rust`); `rust_program` prints the
 /// result for the CPU. The returned module is the one the functions were
 /// lowered from (after codegen's own Core shapes).
+struct Lowering {
+    module: CoreModule,
+    bodies: Vec<Core>,
+    tys: ty::Types,
+    unbox: std::collections::HashMap<u32, u8>,
+    bor: Vec<Vec<bool>>,
+    bsets: Vec<std::collections::HashSet<u32>>,
+    folds: Vec<Option<fold::ParFold>>,
+    native_sigs: Vec<Option<scalar::Sig>>,
+    calls: Vec<std::collections::HashSet<u32>>,
+}
+impl Lowering {
+    fn new(m: &CoreModule) -> Self {
+        BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m));
+        let module = rewrite::tail_inline(m);
+        BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(&module));
+        let m = &module;
+        let bodies: Vec<_> = m.fns.iter().map(|f| {
+            let mut fresh = f.body.max_var().max(f.arity as u32) + 1;
+            rules::normalize(&f.body, &mut fresh)
+        }).collect();
+        let mut normalized = m.clone();
+        for (f, body) in normalized.fns.iter_mut().zip(&bodies) { f.body = body.clone(); }
+        let tys = ty::infer(&normalized);
+        let unbox = unboxed_ctors(m, &tys);
+        scalar::UNBOX.with(|u| *u.borrow_mut() = unbox.clone());
+        let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
+        let native_sigs = scalar::classify(m, &tys, &bor);
+        let folds = (0..m.fns.len()).map(|f| fold::par_fold(m, f as u32)).collect();
+        let calls = m.fns.iter().map(|f| callees(&f.body)).collect();
+        let bodies = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
+        Self { module, bodies, tys, unbox, bor, bsets, folds, native_sigs, calls }
+    }
+    fn native_bodies(&self) -> Vec<lir::FnDef> {
+        let scal = self.configure(&Default::default());
+        (0..scal.len()).filter(|f| scal[*f].is_some())
+            .flat_map(|f| scalar::scalar_fn(&self.module, f as u32, &scal, &self.bor, false)).collect()
+    }
+    fn configure(&self, plans: &std::collections::BTreeMap<u32, native::FoldPlan>) -> Vec<Option<scalar::Sig>> {
+        let m = &self.module;
+        let mut scal = self.native_sigs.clone();
+        let seed = (0..m.fns.len()).map(|f| scal[f].is_some() &&
+            (fork_recursive(f as u32, &m.fns[f]) || self.folds[f].is_some() || plans.contains_key(&(f as u32)))).collect();
+        for (f, parallel) in fixpoint(seed, |f, set| self.calls[f].iter().any(|g| set[*g as usize])).into_iter().enumerate() {
+            if parallel { scal[f] = None; }
+        }
+        scalar::SHIFTED.with(|s| *s.borrow_mut() = scalar::choose_reps(m, &scal));
+        scalar::CTX.with(|s| *s.borrow_mut() = scalar::needs_ctx(m, &scal));
+        scalar::LEAF.with(|s| *s.borrow_mut() = (0..m.fns.len()).map(|f| scal[f].is_some() && !any_call(&m.fns[f].body)).collect());
+        BOUNDED.with(|s| *s.borrow_mut() = bounded_fns(m).iter().zip(&scal).map(|(b, sig)| *b || sig.is_some()).collect());
+        scalar::SIGS.with(|s| *s.borrow_mut() = scal.clone());
+        scal
+    }
+}
 pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
-    // Constant folding, inlining, branch selection and static evaluation
-    // happened in the net (specialize); what remains here are the shapes
-    // codegen itself owns: mutual tail recursion into loops.
-    let m_u = rewrite::tail_inline(m);
+    if let Some(value) = core_value(&m.fns[m.main as usize].body) {
+        let empty = |constant: Option<Val>| LirProgram { native_entries: Vec::new(), fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
+        return (empty(Some(value)), m.clone());
+    }
+    let analysis = Lowering::new(m);
+    // Discovery consumes only native bodies, without emitting growth, rules,
+    // segments or bridges. Final emission uses the same module facts.
+    let native = analysis.native_bodies();
+    let plans = native::discover(&analysis.module, &native);
+    lower_inner(analysis, &plans)
+}
+fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, native::FoldPlan>) -> (LirProgram, CoreModule) {
+    let scal = analysis.configure(plans);
+    let Lowering { module: m_u, bodies, tys, unbox, bor, bsets, folds, native_sigs, calls } = analysis;
     let m = &m_u;
-    let empty = |constant: Option<Val>| LirProgram { fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
-    // Const path: the whole program reduced to its value at compile time.
-    if let Some(v) = core_value(&m.fns[m.main as usize].body) {
-        return (empty(Some(v)), m_u.clone());
-    }
-
     let nf = m.fns.len();
-    let folds: Vec<Option<fold::ParFold>> = (0..nf).map(|f| fold::par_fold(m, f as u32)).collect();
-    let mut join_rule: Vec<u16> = vec![0; nf];
-    let mut next: u16 = (1 + nf) as u16;
+    let mut join_rule = vec![0; nf];
+    let mut next = (1 + nf) as u16;
     for f in 0..nf {
-        if folds[f].is_some() {
-            join_rule[f] = next;
-            next += 1;
-        }
+        if folds[f].is_some() || plans.contains_key(&(f as u32)) { join_rule[f] = next; next += 1; }
     }
-    let mut sq = rules::SegQ { next, q: Vec::new(), memo: Default::default(), holes: Vec::new() };
-    // forwarding segment: fuel-out at a dive entry spawns the pending call
-    // against a record of this rule, which just passes the value upward
+    let mut sq = rules::SegQ { next, q: vec![], memo: Default::default(), holes: vec![] };
     let fwd = sq.add(u32::MAX, vec![0], vec![], Core::Var(0));
-
-    // Normalize every body first, then infer per-parameter borrow modes
-    // (read-only params are lent, not consumed; see `borrows`).
-    let bodies: Vec<Core> = m
-        .fns
-        .iter()
-        .map(|f| {
-            let mut c = f.body.max_var().max(f.arity as u32) + 1;
-            rules::normalize(&f.body, &mut c)
-        })
-        .collect();
-
-    // types of the bodies the emitters see: ANF introduces fresh vars (call
-    // results, intermediate values) that must carry types too
-    let tys = {
-        let mut mn = m.clone();
-        for (f, b) in mn.fns.iter_mut().zip(&bodies) {
-            f.body = b.clone();
-        }
-        ty::infer(&mn)
-    };
-    let unbox = unboxed_ctors(m, &tys);
-    scalar::UNBOX.with(|u| *u.borrow_mut() = unbox.clone());
-    let (bor, bsets) = borrows(m, &bodies, &tys, &unbox);
-    let mut scal = scalar::classify(m, &tys, &bor);
-    // Native scalar code never suspends, so it cannot split work: a
-    // function that forks, and every function that (transitively) calls
-    // one, runs in dive form instead (its leaves still call native code).
-    let calls: Vec<std::collections::HashSet<u32>> = m.fns.iter().map(|f| callees(&f.body)).collect();
-    // parallel sources: forking recursion and proven folds (split across
-    // workers by their CALL rule)
-    let seed = (0..nf).map(|f| scal[f].is_some() && (fork_recursive(f as u32, &m.fns[f]) || folds[f].is_some())).collect();
-    for (f, r) in fixpoint(seed, |f, s| calls[f].iter().any(|g| s[*g as usize])).into_iter().enumerate() {
-        if r {
-            scal[f] = None;
-        }
-    }
-    scalar::SHIFTED.with(|l| *l.borrow_mut() = scalar::choose_reps(m, &scal));
-    scalar::CTX.with(|c| *c.borrow_mut() = scalar::needs_ctx(m, &scal));
-    scalar::LEAF.with(|l| *l.borrow_mut() = (0..nf).map(|f| scal[f].is_some() && !any_call(&m.fns[f].body)).collect());
-    BOUNDED.with(|b| *b.borrow_mut() = bounded_fns(m).iter().zip(&scal).map(|(x, s)| *x || s.is_some()).collect());
     CLOSURES.with(|c| *c.borrow_mut() = Some(mithril_net::NetProg::new(m)));
-    scalar::SIGS.with(|s| *s.borrow_mut() = scal.clone());
-    let iret: Vec<bool> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
-    // static reuse rewrite: consumed same-arity cells are rebuilt in place
-    let bodies: Vec<Core> = bodies.iter().map(|b| rewrite::mark_reuse(b, m, &unbox)).collect();
+    let iret: Vec<_> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
     let shared = std::cell::RefCell::new(seq::Shared::default());
     // fold splits deep-share the fold's extra args (see fold.rs)
     for (fid, pf) in folds.iter().enumerate() {
@@ -367,6 +380,8 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
         emit(vec![call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid])]);
         if let Some(pf) = &folds[fid] {
             emit(vec![fold::join_fn(fid as u32, pf)]);
+        } else if let Some(plan) = plans.get(&(fid as u32)) {
+            emit(vec![fold::join_fn(fid as u32, &fold::ParFold { acc: 0, mask32: true, tuple: (plan.seeds.len() > 1).then_some(plan.seeds.len()) })]);
         }
     }
     // Segments may enqueue further segments while being emitted.
@@ -386,7 +401,7 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     rules[0] = Rule::Boot(m.main);
     for fid in 0..nf {
         rules[1 + fid] = Rule::Call(fid as u32);
-        if folds[fid].is_some() {
+        if folds[fid].is_some() || plans.contains_key(&(fid as u32)) {
             rules[join_rule[fid] as usize] = Rule::Join(fid as u32);
         }
     }
@@ -435,12 +450,15 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     };
     let net = CLOSURES.with(|c| c.borrow_mut().take()).expect("closure registry");
     let net_live = net_live_entries(&net, nf);
+    native::regions(m, &native_sigs, &scal, &bor, &tys, plans, &mut fns);
+    let native_entries = native::lower(m, &mut fns, plans, &join_rule, fwd);
     let prog = LirProgram {
+        native_entries,
         fns,
         rules,
         diving,
         dives: (0..nf).map(|fid| (m.fns[fid].arity, bor[fid].clone())).collect(),
-        folds: (0..nf as u32).filter(|f| folds[*f as usize].is_some()).collect(),
+        folds: (0..nf as u32).filter(|f| folds[*f as usize].is_some() || plans.contains_key(f)).collect(),
         lin,
         lin_tup,
         unbox_cid,
@@ -814,13 +832,40 @@ pub(crate) fn callees(e: &Core) -> std::collections::HashSet<u32> {
 /// (a fork through a helper or mutual recursion is not seen). A closure
 /// body is counted as if it ran once (no native form admits one).
 fn fork_recursive(fid: u32, f: &mithril_front::core::CoreFn) -> bool {
-    // the most self calls any single execution of `e` makes
-    let per_run = f.body.fold(&mut |e, ks: Vec<usize>| match e {
-        Core::If(..) => ks[0] + ks[1].max(ks[2]),
-        Core::Match(..) => ks[0] + ks[1..].iter().copied().max().unwrap_or(0),
-        _ => matches!(e, Core::Call(g, _) if *g == fid) as usize + ks.iter().sum::<usize>(),
-    });
-    !f.self_tail_rec && per_run >= 2
+    // the most self calls one execution starts independently: a call whose arguments
+    // need another self call's result waits for it (a chain), so it cannot run beside it
+    fn needs(e: &Core, fid: u32, dep: &std::collections::HashSet<u32>) -> bool {
+        e.any(&mut |e| match e {
+            Core::Call(g, _) if *g == fid => Some(true),
+            Core::Var(x) if dep.contains(x) => Some(true),
+            _ => None,
+        })
+    }
+    fn starts(e: &Core, fid: u32, dep: &mut std::collections::HashSet<u32>) -> usize {
+        match e {
+            Core::Call(g, args) if *g == fid => {
+                let own = !args.iter().any(|a| needs(a, fid, dep)) as usize;
+                own + args.iter().map(|a| starts(a, fid, dep)).sum::<usize>()
+            }
+            Core::Let(x, r, b) => {
+                let n = starts(r, fid, dep);
+                if needs(r, fid, dep) {
+                    dep.insert(*x);
+                }
+                n + starts(b, fid, dep)
+            }
+            Core::If(c, x, y) => starts(c, fid, dep) + starts(x, fid, dep).max(starts(y, fid, dep)),
+            Core::Match(sc, arms) => {
+                let n = starts(sc, fid, dep);
+                if needs(sc, fid, dep) {
+                    dep.extend(arms.iter().flat_map(|(_, bs, _)| bs.iter().copied()));
+                }
+                n + arms.iter().map(|(_, _, b)| starts(b, fid, dep)).max().unwrap_or(0)
+            }
+            _ => e.kids().into_iter().map(|k| starts(k, fid, dep)).sum(),
+        }
+    }
+    !f.self_tail_rec && starts(&f.body, fid, &mut std::collections::HashSet::new()) >= 2
 }
 
 /// Whether evaluating `e` may run a suspendable call (calls to bounded
@@ -987,108 +1032,78 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
     let bsets = (0..nf).map(|f| derive_set(&bodies[f], &bor[f])).collect();
     (bor, bsets)
 }
-/// The lent parameters whose value escapes (stored, returned, passed to an
-/// owning parameter); an integer field is an immediate and never does.
+/// Follow aliases and match fields from a set of parameter origins. Both
+/// borrow analyses use the same propagation; integer fields stop escape
+/// provenance, while the emitted raw-read set retains them and unions
+/// membership across arms that bind the same variable.
+fn borrow_origins(body: &Core, origins: &mut std::collections::HashMap<u32, u64>, sticky: bool, field: &dyn Fn(u32) -> bool, visit: &mut dyn FnMut(&Core, &std::collections::HashMap<u32, u64>)) {
+    let inherit = |x, source, origins: &mut std::collections::HashMap<u32, u64>| {
+        origins.insert(x, source | if sticky { origins.get(&x).copied().unwrap_or(0) } else { 0 });
+    };
+    visit(body, origins);
+    match body {
+        Core::Let(x, r, b) => {
+            if let Core::Var(y) = r.as_ref() {
+                inherit(*x, origins.get(y).copied().unwrap_or(0), origins);
+            }
+            borrow_origins(r, origins, sticky, field, visit);
+            borrow_origins(b, origins, sticky, field, visit);
+        }
+        Core::Match(s, arms) => {
+            let source = origin_of(s, origins);
+            borrow_origins(s, origins, sticky, field, visit);
+            for (_, binders, b) in arms {
+                for x in binders {
+                    inherit(*x, if field(*x) { source } else { 0 }, origins);
+                }
+                borrow_origins(b, origins, sticky, field, visit);
+            }
+        }
+        _ => body.kids().into_iter().for_each(|e| borrow_origins(e, origins, sticky, field, visit)),
+    }
+}
+
+fn origin_of(e: &Core, origins: &std::collections::HashMap<u32, u64>) -> u64 {
+    match e {
+        Core::Var(x) => origins.get(x).copied().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Lent parameters stored in a constructor, tuple or owning call argument;
+/// array reads lend their first argument and integer fields never escape.
 fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) -> u64 {
-    use std::collections::HashMap;
     if arity > 60 {
         return u64::MAX;
     }
-    let mut mask: HashMap<u32, u64> = HashMap::new();
-    for (i, b) in own_bor.iter().enumerate() {
-        if *b {
-            mask.insert(i as u32, 1u64 << i);
+    let mut origins = own_bor.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| (i as u32, 1u64 << i)).collect();
+    let mut esc = 0;
+    borrow_origins(body, &mut origins, false, &|x| !is_int(x), &mut |e, origins| {
+        let args = match e {
+            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) | Core::Call(_, xs) => xs,
+            _ => return,
+        };
+        for (j, x) in args.iter().enumerate() {
+            let escapes = match e {
+                Core::Prim(mithril_front::core::Prim::ArrGet | mithril_front::core::Prim::ArrLen, _) => j > 0,
+                Core::Call(g, _) => !bor.get(*g as usize).and_then(|ps| ps.get(j)).copied().unwrap_or(false),
+                _ => true,
+            };
+            if escapes {
+                esc |= origin_of(x, origins);
+            }
         }
-    }
-    let mut esc = 0u64;
-    fn var_mask(e: &Core, mask: &HashMap<u32, u64>) -> u64 {
-        match e {
-            Core::Var(i) => mask.get(i).copied().unwrap_or(0),
-            _ => 0,
-        }
-    }
-    fn walk(e: &Core, mask: &mut HashMap<u32, u64>, esc: &mut u64, bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) {
-        match e {
-            Core::Let(x, r, b) => {
-                if let Core::Var(y) = r.as_ref() {
-                    let v = mask.get(y).copied().unwrap_or(0);
-                    mask.insert(*x, v);
-                }
-                walk(r, mask, esc, bor, is_int);
-                walk(b, mask, esc, bor, is_int);
-            }
-            // an array read only looks at its array: not an escape
-            Core::Prim(mithril_front::core::Prim::ArrGet | mithril_front::core::Prim::ArrLen, xs) => {
-                for (j, x) in xs.iter().enumerate() {
-                    if j > 0 {
-                        *esc |= var_mask(x, mask);
-                    }
-                    walk(x, mask, esc, bor, is_int);
-                }
-            }
-            Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) => {
-                for x in xs {
-                    *esc |= var_mask(x, mask);
-                    walk(x, mask, esc, bor, is_int);
-                }
-            }
-            Core::Call(g, xs) => {
-                for (j, x) in xs.iter().enumerate() {
-                    let owned_param =
-                        bor.get(*g as usize).map(|ps| !ps.get(j).copied().unwrap_or(false)).unwrap_or(true);
-                    if owned_param {
-                        *esc |= var_mask(x, mask);
-                    }
-                    walk(x, mask, esc, bor, is_int);
-                }
-            }
-            Core::Match(s, arms) => {
-                let sm = var_mask(s, mask);
-                walk(s, mask, esc, bor, is_int);
-                for (_, binders, b) in arms {
-                    for bv in binders {
-                        mask.insert(*bv, if is_int(*bv) { 0 } else { sm });
-                    }
-                    walk(b, mask, esc, bor, is_int);
-                }
-            }
-            _ => e.kids().into_iter().for_each(|k| walk(k, mask, esc, bor, is_int)),
-        }
-    }
-    walk(body, &mut mask, &mut esc, bor, is_int);
+    });
     esc
 }
 
 /// Variables derived from borrowed parameters (raw reads, owner upstream).
 fn derive_set(body: &Core, own_bor: &[bool]) -> std::collections::HashSet<u32> {
-    let mut s: std::collections::HashSet<u32> =
-        own_bor.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i as u32).collect();
-    fn walk(e: &Core, s: &mut std::collections::HashSet<u32>) {
-        match e {
-            Core::Let(x, r, b) => {
-                if let Core::Var(y) = r.as_ref() {
-                    if s.contains(y) {
-                        s.insert(*x);
-                    }
-                }
-                walk(r, s);
-                walk(b, s);
-            }
-            Core::Match(sc, arms) => {
-                let inb = matches!(sc.as_ref(), Core::Var(y) if s.contains(y));
-                walk(sc, s);
-                for (_, binders, b) in arms {
-                    if inb {
-                        for bv in binders {
-                            s.insert(*bv);
-                        }
-                    }
-                    walk(b, s);
-                }
-            }
-            _ => e.kids().into_iter().for_each(|k| walk(k, s)),
-        }
-    }
-    walk(body, &mut s);
-    s
+    let mut origins = own_bor.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| (i as u32, 1)).collect();
+    borrow_origins(body, &mut origins, true, &|_| true, &mut |_, _| {});
+    origins.into_iter().filter_map(|(x, origin)| (origin != 0).then_some(x)).collect()
 }
+
+#[cfg(test)]
+#[path = "../tests/support/borrow_analysis.rs"]
+mod borrow_analysis_tests;

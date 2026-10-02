@@ -10,7 +10,7 @@
 use mithril_codegen::lir::{Bop, FnDef, Pat, Ty, E, S};
 use mithril_codegen::{LirProgram, Rule};
 use mithril_net::{count_uses, ClosureSpec, Entry, MatchMeta, NExpr, ARR_PAIR};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 struct P<'a> {
@@ -26,6 +26,8 @@ struct P<'a> {
     /// the enclosing function's return type
     ret: Ty,
     out: String,
+    direct_machine: bool,
+    loop_exits: Vec<u32>,
 }
 
 fn ty(t: Ty) -> String {
@@ -45,19 +47,23 @@ fn ty(t: Ty) -> String {
         Ty::RefU32 => "u32*".into(),
         Ty::RefI64 => "i64*".into(),
         Ty::Infer => "auto".into(),
+        Ty::Frames | Ty::FrameRecords(_) => "NativeFrames".into(),
         Ty::Unit => "void".into(),
     }
 }
 
 /// Return type of a helper of the device runtime (see engine.cu).
 fn helper_ret(f: &str) -> Ty {
+    if let Some(h) = mithril_codegen::lir::operations::helper(f) {
+        use mithril_codegen::lir::operations::Effect;
+        if matches!(h.effect, Effect::Value | Effect::Borrow | Effect::Allocate) { return h.result; }
+    }
     match f {
-        "as_i" | "sat_mul" | "imax" | "fuel_of" | "wrap56" | "floor_div" | "py_mod" | "sh" | "atomic_load" => Ty::I64,
-        "con_tag" => Ty::U16,
+        "sat_mul" | "imax" | "fuel_of" | "atomic_load" => Ty::I64,
         "con_ar" => Ty::U8,
-        "con_addr" | "alloc2" | "alloc_rec" | "rec_d" | "rec_s" => Ty::U32,
+        "con_addr" | "rec_d" | "rec_s" => Ty::U32,
         "arr_len_of" => Ty::Usize,
-        "flag_load" | "is_err" => Ty::Bool,
+        "flag_load" | "is_err" | "native_empty" | "native_ok" => Ty::Bool,
         "apply" | "dive_res" | "dive_res_fork" => Ty::Res,
         "fork_fuel" => Ty::RefI64,
         _ if f.starts_with("f32_") => Ty::I64,
@@ -337,8 +343,8 @@ impl<'a> P<'a> {
             S::Switch(e, arms, d) => {
                 let v = self.ex(e);
                 self.line(format!("switch ({v}) {{"));
-                for (k, body) in arms {
-                    self.out.push_str(&format!("case {k}: "));
+                for (keys, body) in mithril_codegen::lir::grouped_arms(arms) {
+                    for k in keys { self.out.push_str(&format!("case {k}: ")); }
                     self.block(body);
                     self.out.push_str("break;\n");
                 }
@@ -353,10 +359,42 @@ impl<'a> P<'a> {
                 self.out.push_str("break;\n}\n");
             }
             S::Loop(body) => {
+                let exit=self.tmp;self.tmp+=1;self.loop_exits.push(exit);
                 self.out.push_str("for (;;) ");
                 self.block(body);
+                self.loop_exits.pop();
+                self.line(format!("loop_exit_{exit}:;"));
+            }
+            S::Machine(arms) => {
+                fn dynamic(body: &[S]) -> bool {
+                    body.iter().any(|s| match s {
+                        S::Jump(e) => !matches!(e, E::Int(_, _)),
+                        S::Set(n, _) if n == "pc" => true,
+                        S::If(_, a, b) => dynamic(a) || dynamic(b),
+                        S::Switch(_, arms, d) => arms.iter().any(|(_, b)| dynamic(b)) || d.as_ref().is_some_and(|b| dynamic(b)),
+                        S::Loop(b) => dynamic(b),
+                        _ => false,
+                    })
+                }
+                self.direct_machine = arms.iter().all(|(_, b)| !dynamic(b));
+                if self.direct_machine {
+                    self.stmt(&S::Switch(E::V("pc".into()), arms.iter().map(|(id, _)| (*id, vec![S::Jump(E::Int(*id as i64, Ty::U64))])).collect(), None));
+                    for (id, body) in arms { self.line(format!("native_case_{id}:")); self.block(body); self.line(format!("goto native_case_{id};")); }
+                } else {
+                    self.out.push_str("native_dispatch: for (;;) {\n");
+                    self.stmt(&S::Switch(E::V("pc".into()), arms.clone(), None));
+                    self.out.push_str("}\n");
+                }
+                self.direct_machine = false;
+            }
+            S::Jump(e) => {
+                if self.direct_machine {
+                    let E::Int(id, _) = e else { unreachable!() };
+                    self.line(format!("goto native_case_{id};"));
+                } else { let value = self.ex(e); self.line(format!("pc = {value}; goto native_dispatch;")); }
             }
             S::Continue => self.out.push_str("continue;\n"),
+            S::Break => self.line(format!("goto loop_exit_{};",self.loop_exits.last().expect("break outside loop"))),
             S::Ret(e) => {
                 if matches!(e, E::Tup(xs) if xs.is_empty()) {
                     self.out.push_str("return;\n");
@@ -466,7 +504,7 @@ fn tuple_widths(body: &[S], out: &mut Vec<usize>) {
                 ex(e, out);
             }
             S::Decl(_, Ty::Tup(k)) => out.push(*k),
-            S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) => ex(e, out),
+            S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) | S::Jump(e) => ex(e, out),
             S::If(e, a, b) => {
                 ex(e, out);
                 tuple_widths(a, out);
@@ -478,6 +516,7 @@ fn tuple_widths(body: &[S], out: &mut Vec<usize>) {
                 d.iter().for_each(|b| tuple_widths(b, out));
             }
             S::Loop(b) => tuple_widths(b, out),
+            S::Machine(arms) => { for (_, b) in arms { tuple_widths(b, out); } }
             S::Try(_, e, _, h) => {
                 ex(e, out);
                 tuple_widths(h, out);
@@ -505,7 +544,11 @@ fn signature(d: &FnDef) -> String {
 
 /// Print `program.cu` for a lowered program.
 pub fn print(prog: &LirProgram) -> String {
-    let fnret: HashMap<String, Ty> = prog.fns.iter().map(|d| (d.name.clone(), d.ret)).collect();
+    let roots = prog.native_entries.iter().map(|fid| format!("s_{fid}")).collect::<Vec<_>>();
+    let (value_entries, values) = mithril_codegen::lir::completed::entries(&prog.fns, &roots);
+    let fns: Vec<_> = prog.fns.iter().chain(&values).collect();
+    let functions: HashMap<_, _> = fns.iter().map(|f| (f.name.as_str(), *f)).collect();
+    let fnret: HashMap<String, Ty> = fns.iter().map(|d| (d.name.clone(), d.ret)).collect();
     let mut out = String::new();
     let _ = writeln!(out, "// program.cu generated by mithril-gpu; do not edit.");
     let _ = writeln!(out, "#define PROG_NRULES {}", prog.rules.len());
@@ -514,6 +557,8 @@ pub fn print(prog: &LirProgram) -> String {
     let _ = writeln!(out, "#define FILL_RULE {}", prog.fill_rule);
     let _ = writeln!(out, "#define FWD_RULE {}", prog.fwd);
     let _ = writeln!(out, "#define FIELD_RULE {}\n#define WHOLE_RULE {}\n#define RELINK_RULE {}", prog.settle_rules[0], prog.settle_rules[1], prog.settle_rules[2]);
+    let _ = writeln!(out, "#define NATIVE_FRAMES {}", u8::from(prog.fns.iter().any(|f| f.name.starts_with("native_s_"))));
+    let _ = writeln!(out, "#define NATIVE_ENTRIES {}", prog.native_entries.len());
     let _ = writeln!(out, "#include \"engine.cu\"\n");
     // tables
     let lin: Vec<&str> = prog.lin.iter().map(|b| if *b { "true" } else { "false" }).collect();
@@ -533,7 +578,7 @@ pub fn print(prog: &LirProgram) -> String {
     }
     // native int tuples of every width the program uses
     let mut widths: Vec<usize> = Vec::new();
-    for d in &prog.fns {
+    for d in &fns {
         if let Ty::Tup(k) = d.ret {
             widths.push(k);
         }
@@ -546,12 +591,12 @@ pub fn print(prog: &LirProgram) -> String {
         let _ = writeln!(out, "struct T{k} {{ i64 {}; }};", if fs.is_empty() { "_z".to_string() } else { fs.join(", ") });
     }
     out.push('\n');
-    for d in &prog.fns {
+    for d in &fns {
         let _ = writeln!(out, "{};", signature(d));
     }
     out.push('\n');
-    for d in &prog.fns {
-        let mut p = P { fnret: &fnret, locals: d.params.iter().cloned().collect(), scopes: Vec::new(), pre: String::new(), tmp: 0, ret: d.ret, out: String::new() };
+    for d in &fns {
+        let mut p = P { fnret: &fnret, locals: d.params.iter().cloned().collect(), scopes: Vec::new(), pre: String::new(), tmp: 0, ret: d.ret, out: String::new(), direct_machine: false, loop_exits: Vec::new() };
         p.out.push_str(&signature(d));
         p.out.push(' ');
         p.block_with(&d.body, d.params.iter().map(|(x, _)| x.clone()).collect());
@@ -585,8 +630,70 @@ pub fn print(prog: &LirProgram) -> String {
         let _ = writeln!(out, "  case {id}u: {call}; return;");
     }
     let _ = writeln!(out, "  default: g_abort(AB_UNREACHABLE); return;\n  }}\n}}");
+    native_kernels(prog, &value_entries, &functions, &mut out);
     net_region(prog, &mut out);
     out
+}
+
+// Separate launches execute the same native entry selected by a populated
+// work frontier. Each launch needs only its reachable runtime state.
+fn native_kernels(prog: &LirProgram, value_entries: &BTreeMap<String, String>, functions: &HashMap<&str, &FnDef>, out: &mut String) {
+    if prog.native_entries.is_empty() { return; }
+    let entries: Vec<String> = prog.native_entries.iter().map(|f| (1+f).to_string()).collect();
+    let _=writeln!(out,"__device__ bool prog_native_rule(u32 r) {{ switch(r) {{");
+    for r in &entries { let _=writeln!(out,"case {r}: return true;"); }
+    let _=writeln!(out,"default: return false; }} }}");
+    fn guarded(name: &str, functions: &HashMap<&str,&FnDef>, seen: &mut HashSet<String>) -> bool {
+        if name=="stack_guard" { return true; }
+        if !seen.insert(name.to_string()) { return false; }
+        let Some(f)=functions.get(name) else { return false };
+        fn calls(body: &[S], names: &mut Vec<String>) {
+            for s in body {
+                match s {
+                    S::Fn(f) => calls(&f.body,names),
+                    _ => {
+                        let (e,bs)=s.parts();
+                        if let Some(e)=e { e.walk(&mut |e| if let E::Call { f,.. }=e { names.push(f.clone()); }); }
+                        for b in bs { calls(b,names); }
+                    }
+                }
+            }
+        }
+        let mut names=Vec::new(); calls(&f.body,&mut names);
+        names.iter().any(|n| guarded(n,functions,seen))
+    }
+    for fid in &prog.native_entries {
+        let rule=1+fid;
+        let original = format!("s_{fid}");
+        let entry = value_entries.get(&original).unwrap_or(&original);
+        let f = functions[entry.as_str()];
+        let n=prog.dives[*fid as usize].0;
+        let _=writeln!(out,"extern \"C\" __global__ void k_native_{rule}() {{");
+        if !value_entries.contains_key(&original) { let _=writeln!(out,"s_work[threadIdx.x]=0;"); }
+        let _=writeln!(out,"s_native_top[threadIdx.x]=0; s_mode[threadIdx.x]=0;");
+        if guarded(&f.name,&functions,&mut HashSet::new()) { let _=writeln!(out,"s_sp0[threadIdx.x]=sp_now();"); }
+        let _=writeln!(out,"const u32 begin=G.bdone[{rule}], count=g_snap[{rule}]-begin;\nfor(;;) {{\nu64 offset=native_task();\nif(offset>=count) break;\nu32 i=begin+(u32)offset;\nif (*(volatile u32*)G.abortf) break;\nconst u64 *e=&G.ebuf[((u64){rule}*G.bcap+(i&(G.bcap-1)))*3];\nu64 parent=e[2];");
+        if n>2 { let _=writeln!(out,"u64 ch=e[1];"); }
+        for i in 0..n {
+            let value=match i { 0=>"e[0]", 1 if n==2=>"e[1]", _=>"pop_chain(&ch)" };
+            let _=writeln!(out,"i64 a{i}=as_i({value});");
+        }
+        let args=(0..n).map(|i| format!(",a{i}")).collect::<String>();
+        if value_entries.contains_key(&original) {
+            let _=writeln!(out,"auto value={entry}({});", args.strip_prefix(',').unwrap_or(&args));
+        } else {
+            let _=writeln!(out,"i64 fuel=G.fuel;\nauto value={entry}(&fuel{args});");
+        }
+        match f.ret {
+            Ty::I64 => { let _=writeln!(out,"deliver(parent,num(value));"); }
+            Ty::Tup(k) => {
+                let ports=(0..k).map(|i| format!("num(value.f{i})")).collect::<Vec<_>>().join(",");
+                let _=writeln!(out,"u64 ports[{k}]={{{ports}}}; deliver(parent,mk_con(4095,ports,{k}));");
+            }
+            _=>unreachable!("native entry must return integers"),
+        }
+        let _=writeln!(out,"publish_local();\n}}\n}}");
+    }
 }
 
 // ---- the net region: entries as net builders, the match tables ----

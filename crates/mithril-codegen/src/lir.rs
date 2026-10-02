@@ -14,6 +14,10 @@
 //! match handles both outcomes in place.
 
 use std::fmt::Write;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[path = "operations.rs"]
+pub mod operations;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ty {
@@ -38,6 +42,8 @@ pub enum Ty {
     RefI64,
     /// the type the initializer has (destructuring lets)
     Infer,
+    Frames,
+    FrameRecords(usize),
     Unit,
 }
 
@@ -133,7 +139,11 @@ pub enum S {
     /// integer switch with a default (`unreachable` when `None`)
     Switch(E, Vec<(u64, Vec<S>)>, Option<Vec<S>>),
     Loop(Vec<S>),
+    /// Native return dispatch. Jump leaves any nested ordinary loops.
+    Machine(Vec<(u64, Vec<S>)>),
+    Jump(E),
     Continue,
+    Break,
     Ret(E),
     /// `let pat = match e { Ok(v) => v, Err(r) => { handler } }`; the
     /// handler leaves the function
@@ -266,6 +276,37 @@ pub fn pat_names(p: &Pat) -> Vec<String> {
 }
 
 impl E {
+    pub fn all(&self, predicate: &dyn Fn(&E) -> bool) -> bool {
+        let mut yes = true;
+        self.walk(&mut |e| yes &= predicate(e));
+        yes
+    }
+    pub fn reads(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        self.walk(&mut |e| if let E::V(n) | E::Ref(n) | E::Addr(n) | E::Deref(n) = e { names.insert(n.clone()); });
+        names
+    }
+    /// Substitute snapshots once: references inside a replacement belong to
+    /// its earlier assignment, and must not be looked up in the current env.
+    pub fn substitute(&self, env: &BTreeMap<String, E>, require_all: bool) -> Option<E> {
+        let mut e = self.clone();
+        let mut complete = true;
+        e.rewrite(&mut |e| if let E::V(n) = e {
+            if let Some(value) = env.get(n) { *e = value.clone(); }
+            else { complete = false; }
+        });
+        (!require_all || complete).then_some(e)
+    }
+    /// Post-order rewrite, left to right. Replacements are not revisited.
+    pub fn rewrite(&mut self, f: &mut dyn FnMut(&mut E)) {
+        match self {
+            E::Call { args, .. } | E::Tup(args) | E::Arr(args) | E::Slice(args) => for e in args { e.rewrite(f); },
+            E::Bin(_, a, b) => { a.rewrite(f); b.rewrite(f); }
+            E::Not(a) | E::Neg(a) | E::Cast(a, _) | E::Idx(a, _) | E::Ok(a) | E::Err(a) => a.rewrite(f),
+            E::Int(..) | E::Bool(_) | E::Flo(_) | E::V(_) | E::Deref(_) | E::Ref(_) | E::Addr(_) | E::Const(_) => {}
+        }
+        f(self);
+    }
     /// Pre-order visit of every sub-expression.
     pub fn walk(&self, f: &mut dyn FnMut(&E)) {
         f(self);
@@ -282,17 +323,53 @@ impl E {
 }
 
 impl S {
+    /// Mutable execution-order parts. Nested functions have a separate scope.
+    pub fn parts_mut(&mut self) -> (Option<&mut E>, Vec<&mut Vec<S>>) {
+        match self {
+            S::Let(_, _, e) | S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) | S::Jump(e) => (Some(e), vec![]),
+            S::If(e, a, b) | S::Res(e, _, a, _, b) => (Some(e), vec![a, b]),
+            S::Switch(e, arms, d) => (Some(e), arms.iter_mut().map(|(_, b)| b).chain(d.iter_mut()).collect()),
+            S::Try(_, e, _, h) => (Some(e), vec![h]),
+            S::Loop(b) => (None, vec![b]),
+            S::Machine(arms) => (None, arms.iter_mut().map(|(_, b)| b).collect()),
+            S::Decl(..) | S::Continue | S::Break | S::Fn(_) | S::Unreachable | S::Comment(_) => (None, vec![]),
+        }
+    }
     /// A statement's own expression and its nested blocks, in execution
     /// order (a nested `Fn` is neither).
-    fn parts(&self) -> (Option<&E>, Vec<&[S]>) {
+    pub fn parts(&self) -> (Option<&E>, Vec<&[S]>) {
         match self {
-            S::Let(_, _, e) | S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) => (Some(e), vec![]),
+            S::Let(_, _, e) | S::Set(_, e) | S::Store(_, e) | S::Do(e) | S::Ret(e) | S::Jump(e) => (Some(e), vec![]),
             S::If(e, a, b) | S::Res(e, _, a, _, b) => (Some(e), vec![&a[..], &b[..]]),
             S::Switch(e, arms, d) => (Some(e), arms.iter().map(|(_, b)| &b[..]).chain(d.as_deref()).collect()),
             S::Try(_, e, _, h) => (Some(e), vec![&h[..]]),
             S::Loop(b) => (None, vec![&b[..]]),
-            S::Decl(..) | S::Continue | S::Fn(_) | S::Unreachable | S::Comment(_) => (None, vec![]),
+            S::Machine(arms) => (None, arms.iter().map(|(_, b)| &b[..]).collect()),
+            S::Decl(..) | S::Continue | S::Break | S::Fn(_) | S::Unreachable | S::Comment(_) => (None, vec![]),
         }
+    }
+}
+
+/// Pre-order statement visit within one function scope.
+pub fn walk_stmts(body: &[S], f: &mut dyn FnMut(&S)) {
+    for s in body { f(s); for b in s.parts().1 { walk_stmts(b, f); } }
+}
+/// Pre-order expressions within one function scope, in statement order.
+pub fn walk_exprs(body: &[S], f: &mut dyn FnMut(&E)) {
+    walk_stmts(body, &mut |s| if let Some(e) = s.parts().0 { e.walk(f); });
+}
+/// Pre-order mutation; returning false makes this statement a CFG barrier.
+pub fn mutate_stmts(body: &mut [S], f: &mut dyn FnMut(&mut S) -> bool) {
+    for s in body { if f(s) { for b in s.parts_mut().1 { mutate_stmts(b, f); } } }
+}
+/// Filter each whole block before visiting retained expressions and children.
+/// Removed statements and nested functions are never traversed.
+pub fn retain_rewrite(body: &mut Vec<S>, keep: &mut dyn FnMut(&S) -> bool, f: &mut dyn FnMut(&mut E)) {
+    body.retain(&mut *keep);
+    for s in body {
+        let (e, children) = s.parts_mut();
+        if let Some(e) = e { e.rewrite(f); }
+        for b in children { retain_rewrite(b, keep, f); }
     }
 }
 
@@ -341,20 +418,112 @@ pub fn free_locals(body: &[S], f: &dyn Fn(&str) -> bool) -> Vec<String> {
 
 /// Locals assigned or mutably borrowed after their binding.
 fn assigned(body: &[S], out: &mut std::collections::HashSet<String>) {
-    for s in body {
+    walk_stmts(body, &mut |s| {
+        if matches!(s, S::Jump(_)) { out.insert("pc".into()); }
         if let S::Set(x, _) = s {
             out.insert(x.clone());
         }
-        let (e, bs) = s.parts();
-        if let Some(e) = e {
-            e.walk(&mut |e| {
-                if let E::Ref(x) = e {
-                    out.insert(x.clone());
+    });
+    walk_exprs(body, &mut |e| if let E::Ref(x) = e { out.insert(x.clone()); });
+}
+
+/// Adjacent reads of an immutable constructor share its checked cell access.
+/// Conversions execute in their original order, after the borrowed load.
+pub fn borrowed_cells(body: &mut Vec<S>) {
+    fn read(e: &E) -> Option<(E, usize)> {
+        match e {
+            E::Call { f, ctx: true, args } if f == "field" && args.len() == 2 => {
+                if let E::Int(i, Ty::Usize) = args[1] {
+                    return Some((args[0].clone(), i as usize));
                 }
-            });
+                None
+            }
+            E::Cast(e, _) => read(e),
+            E::Call {
+                f,
+                ctx: false,
+                args,
+            } if matches!(f.as_str(), "as_i" | "sh") && args.len() == 1 => read(&args[0]),
+            _ => None,
         }
-        bs.into_iter().for_each(|b| assigned(b, out));
     }
+    fn replace(mut e: E, name: &str) -> E {
+        e.rewrite(&mut |e| {
+            if matches!(e,E::Call {f,..} if f=="field") {
+                *e = v(name);
+            }
+        });
+        e
+    }
+    fn visit(body: &mut Vec<S>, serial: &mut usize, used: &mut std::collections::BTreeSet<String>) {
+        for s in body.iter_mut() {
+            for b in s.parts_mut().1 {
+                visit(b, serial, used);
+            }
+        }
+        let mut i = 0;
+        while i + 1 < body.len() {
+            let (S::Set(a, x), S::Set(b, y)) = (&body[i], &body[i + 1]) else {
+                i += 1;
+                continue;
+            };
+            let (Some((node, 0)), Some((other, 1))) = (read(x), read(y)) else {
+                i += 1;
+                continue;
+            };
+            if node != other || node.reads().contains(a)
+                || !node.all(&|e| matches!(e, E::V(_) | E::Int(..) | E::Cast(..))) {
+                i += 1;
+                continue;
+            }
+            let names = loop {
+                let names = vec![
+                    format!("borrow_{}_0", *serial),
+                    format!("borrow_{}_1", *serial),
+                ];
+                *serial += 1;
+                if names.iter().all(|n| !used.contains(n)) {
+                    used.extend(names.clone());
+                    break names;
+                }
+            };
+            let replacement = vec![
+                S::Let(
+                    Pat::Arr(names.clone()),
+                    Ty::Infer,
+                    c("read_pair", vec![node]),
+                ),
+                set(a, replace(x.clone(), &names[0])),
+                set(b, replace(y.clone(), &names[1])),
+            ];
+            body.splice(i..i + 2, replacement);
+            i += 3;
+        }
+    }
+    let mut used = std::collections::BTreeSet::new();
+    walk_stmts(body, &mut |s| match s {
+        S::Let(p, ..) | S::Try(p, ..) => used.extend(pat_names(p)),
+        S::Set(n, _) | S::Store(n, _) | S::Decl(n, _) => {
+            used.insert(n.clone());
+        }
+        _ => {}
+    });
+    walk_exprs(body, &mut |e| {
+        if let E::V(n) | E::Ref(n) | E::Deref(n) | E::Addr(n) | E::Const(n) = e {
+            used.insert(n.clone());
+        }
+    });
+    visit(body, &mut 0, &mut used);
+}
+
+/// Identical switch bodies share one branch in every printer.
+pub fn grouped_arms(arms: &[(u64, Vec<S>)]) -> Vec<(Vec<u64>, &[S])> {
+    let mut groups: Vec<(Vec<u64>, &[S])> = Vec::new();
+    for (key, body) in arms {
+        if let Some((keys, _)) = groups.iter_mut().find(|(_, b)| *b == body.as_slice()) { keys.push(*key); }
+        else { groups.push((vec![*key], body)); }
+    }
+    groups
 }
 
 // ---- the Rust printer ----
@@ -379,6 +548,8 @@ pub mod rust {
             Ty::RefU32 => "&mut u32".into(),
             Ty::RefI64 => "&mut i64".into(),
             Ty::Infer => "_".into(),
+            Ty::Frames => "NativeFrames".into(),
+            Ty::FrameRecords(k) => format!("NativeRecords<{k}>"),
             Ty::Unit => "()".into(),
         }
     }
@@ -387,7 +558,7 @@ pub mod rust {
         match e {
             E::Int(n, t) => match t {
                 Ty::U64 => format!("{}u64", *n as u64),
-                Ty::I64 | Ty::U32 | Ty::U16 | Ty::U8 | Ty::Usize => format!("{n}{}", ty(*t)),
+                Ty::I64 | Ty::U32 | Ty::U16 | Ty::U8 | Ty::Usize => if *n < 0 { format!("({n}{})", ty(*t)) } else { format!("{n}{}", ty(*t)) },
                 _ => format!("{n}"),
             },
             E::Bool(b) => b.to_string(),
@@ -468,8 +639,9 @@ pub mod rust {
                 }
                 S::Switch(e, arms, d) => {
                     let _ = writeln!(out, "match {} {{", ex(e));
-                    for (k, b) in arms {
-                        let _ = writeln!(out, "{k} => {{");
+                    for (keys, b) in grouped_arms(arms) {
+                        let pattern = keys.iter().map(u64::to_string).collect::<Vec<_>>().join(" | ");
+                        let _ = writeln!(out, "{pattern} => {{");
                         stmts(b, muts, out);
                         out.push_str("}\n");
                     }
@@ -481,11 +653,18 @@ pub mod rust {
                     out.push_str("}\n}\n");
                 }
                 S::Loop(b) => {
-                    out.push_str("'l: loop {\n");
+                    out.push_str("loop {\n");
                     stmts(b, muts, out);
                     out.push_str("}\n");
                 }
-                S::Continue => out.push_str("continue 'l;\n"),
+                S::Machine(arms) => {
+                    out.push_str("'native: loop {\n");
+                    stmts(&[S::Switch(v("pc"), arms.clone(), None)], muts, out);
+                    out.push_str("}\n");
+                }
+                S::Jump(e) => { let _ = writeln!(out, "pc = {}; continue 'native;", ex(e)); }
+                S::Continue => out.push_str("continue;\n"),
+                S::Break => out.push_str("break;\n"),
                 S::Ret(e) => {
                     let _ = writeln!(out, "return {};", ex(e));
                 }
@@ -543,3 +722,6 @@ pub mod rust {
         out.push_str("}\n\n");
     }
 }
+
+#[path = "completed.rs"]
+pub mod completed;

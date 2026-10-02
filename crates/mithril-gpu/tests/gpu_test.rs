@@ -160,8 +160,11 @@ fn engine_source_is_program_independent() {
 // ---------------- GPU-gated tests (MITHRIL_GPU=1) ----------------
 
 fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
+    eprintln!("{name}: lowering");
     let (cm, cu) = pipeline(name);
+    eprintln!("{name}: interpreter oracle");
     let want = oracle(&cm);
+    eprintln!("{name}: CUDA compile and execution");
     match cu {
         Ok(cu) => (want.clone(), compile_and_run(&cu, BOOT, &cache_dir())),
         // nothing to run: the constant is the result
@@ -177,6 +180,7 @@ fn gpu_fixtures_match_the_oracle() {
     }
     let mut failed = Vec::new();
     for name in FIXTURES {
+        eprintln!("GPU oracle fixture: {name}");
         let (want, got) = run_fixture(name);
         match got {
             Ok(r) if r.text == want => {}
@@ -185,6 +189,14 @@ fn gpu_fixtures_match_the_oracle() {
         }
     }
     assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_frame_split_shared_environments_match_oracle() {
+    if !gpu_on() { return; }
+    let (want, got) = run_fixture("fork_split_shapes.py");
+    assert_eq!(got.map(|r| r.text), Ok(want));
 }
 
 /// The closure corpus (bench/general), at the sizes run.py uses for its
@@ -221,26 +233,15 @@ fn gpu_closure_corpus_matches_the_cpu() {
     assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
 }
 
-/// The device driver's schedule is bounded by the program's fork levels,
-/// not its size: tree-bitonic at depth 8 (256 leaves) is ~200 rounds (one
-/// per call level of the merge network; the host wave loop it replaced
-/// took thousands, one per rewrite level of a lane's chain).
+/// A recursive tree exposes work through fork levels, with oracle-equal results.
 #[test]
 #[ignore = "requires MITHRIL_GPU=1"]
 fn gpu_schedule_is_bounded_by_fork_levels() {
-    if !gpu_on() {
-        return;
-    }
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ports/tree-bitonic.py");
-    let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
-    assert!(text.contains("bsort(23, 0, 0)"), "the port's main changed");
-    let src = text.replace("bsort(23, 0, 0)", "bsort(8, 0, 0)");
-    let (cm, cu) = pipeline_src(&src);
-    let want = oracle(&cm);
-    let cu = cu.expect("bitonic is not a compile-time constant");
-    let r = compile_and_run(&cu, BOOT, &cache_dir()).expect("device run");
-    assert_eq!(r.text, want, "tree-bitonic depth 8 on the device");
-    assert!(r.rounds < 400, "the schedule took {} rounds for 8 fork levels", r.rounds);
+    if !gpu_on() { return; }
+    let (want, got) = run_fixture("recursive_counts.py");
+    let r = got.expect("device run");
+    assert_eq!(r.text, want);
+    assert!(r.rounds < 400, "the schedule took {} rounds", r.rounds);
 }
 
 /// A sequential chain costs the device a round per budget of steps, not
@@ -259,26 +260,30 @@ fn gpu_chain_costs_a_round_per_budget_not_per_step() {
     assert!(r.rounds < 2000, "the chain took {} rounds", r.rounds);
 }
 
-/// A native (scalar) non-tail recursion has no budget; past the thread's
-/// stack the guard aborts with a named error instead of a driver fault.
+/// Defunctionalized native recursion spills into the cell arena while the
+/// hardware stack stays fixed. The independent iterative oracle avoids
+/// depending on the reference interpreter's own recursion limit.
 #[test]
 #[ignore = "requires MITHRIL_GPU=1"]
-fn gpu_deep_native_recursion_is_a_clean_error() {
-    if !gpu_on() {
-        return;
-    }
+fn gpu_deep_native_frames_spill_with_a_fixed_hardware_stack() {
+    if !gpu_on() { return; }
     let src = "def count(n):\n    if n == 0:\n        return 0\n    return (count(n - 1) * 3 + 1) & 4294967295\n\ndef main():\n    return count(array_len(array_new(100000, 0)))\n";
     let (_, cu) = pipeline_src(src);
-    let err = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir()).expect_err("100,000 native frames cannot fit the device stack");
-    assert!(err.contains("recursion too deep"), "wrong error: {err}");
-    // the stack doubled past its 8 KiB start before the device refused
-    let bytes: usize = err.split('(').nth(1).and_then(|t| t.split(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
-    assert!(bytes > 8192, "no doubling before the depth error: {err}");
+    let cu = cu.expect("not a constant");
+    let want = (0..100000).fold(0u32, |n, _| n.wrapping_mul(3).wrapping_add(1)).to_string();
+    std::env::set_var("MITHRIL_GPU_STACK", "8192");
+    for cache in ["0", "auto"] {
+        std::env::set_var("MITHRIL_GPU_NATIVE_WORDS", cache);
+        let got = compile_and_run(&cu, BOOT, &cache_dir());
+        assert_eq!(got.map(|r| r.text), Ok(want.clone()), "cache={cache}");
+    }
+    std::env::remove_var("MITHRIL_GPU_NATIVE_WORDS");
+    std::env::remove_var("MITHRIL_GPU_STACK");
 }
 
-/// A recursion 600 deep under a dive budget of 1000 needs more than the
-/// 8 KiB starting stack.
-const DEEP600: &str = "def count(n):\n    if n == 0:\n        return 0\n    return (count(n - 1) * 3 + 1) & 4294967295\n\ndef main():\n    return count(array_len(array_new(600, 0)))\n";
+/// A boxed recursion remains in the rule engine. Under a dive budget of
+/// 1000 its 600 calls still exercise hardware-stack growth and the guard.
+const DEEP600: &str = "@data\nclass Chain:\n    End: ()\n    Node: (tail,)\n\ndef count(n):\n    if n == 0:\n        return End()\n    return Node(count(n - 1))\n\ndef depth(x):\n    match x:\n        case End():\n            return 0\n        case Node(t):\n            return depth(t) + 1\n\ndef main():\n    return depth(count(array_len(array_new(600, 0))))\n";
 
 fn cubin_of(src: &str) -> (String, PathBuf) {
     let (cm, cu) = pipeline_src(src);

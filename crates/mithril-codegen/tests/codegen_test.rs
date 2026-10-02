@@ -501,7 +501,7 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     let s = &rs[rs.find(&format!("fn s_{bins}(")).expect("loop is scalar")..];
     let s = &s[..s.find("\nfn ").unwrap_or(s.len())];
     // the if/elif accumulator update became selects: one back-edge
-    assert_eq!(s.matches("continue 'l").count(), 1, "if/elif in the loop was not if-converted");
+    assert_eq!(s.matches("continue;").count(), 1, "if/elif in the loop was not if-converted");
     // masked arithmetic is computed in 32 bits
     assert!(s.contains("as u32).wrapping_mul("), "masked products are not narrowed");
     // the dive-form caller destructures the native tuple (no heap tuple)
@@ -513,7 +513,7 @@ fn ifconv_native_calls_and_narrowing_match_oracle() {
     let pid = cm.fns.iter().position(|f| f.name == "pick").unwrap();
     let pick = &rs[rs.find(&format!("fn s_{pid}(")).expect("pick is native")..];
     let pick = &pick[..pick[1..].find("\nfn ").map_or(pick.len(), |e| e + 1)];
-    assert_eq!(pick.matches("continue 'l").count(), 2, "pick's subtree choice became a select");
+    assert_eq!(pick.matches("continue;").count(), 2, "pick's subtree choice became a select");
 }
 
 #[test]
@@ -533,12 +533,13 @@ fn self_calls_in_different_arms_are_not_a_fork() {
     let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
     // one self call per execution whichever arm runs: linear, native
     assert!(rs.contains(&format!("fn s_{}(", id("walk"))), "walk (one self call per arm) is not native");
-    // two self calls in one arm: a fork, kept splittable
-    assert!(!rs.contains(&format!("fn s_{}(", id("tree"))), "tree has a native form");
-    assert!(!rs.contains(&format!("fn s_{}(", id("choose"))), "choose (a fork in one arm) has a native form");
-    // a self call in a condition or before a branch adds to the arm's
-    assert!(!rs.contains(&format!("fn s_{}(", id("cond_fork"))), "cond_fork has a native form");
-    assert!(!rs.contains(&format!("fn s_{}(", id("seq_fork"))), "seq_fork has a native form");
+    // Forks retain a suspendable form even when a native region is available.
+    // trmc_golden executes this fixture against the oracle at multiple widths.
+    let (lir, lowered) = mithril_codegen::lower(&cm);
+    for name in ["tree", "choose", "cond_fork", "seq_fork"] {
+        let fid = lowered.fns.iter().position(|f| f.name == name).unwrap();
+        assert!(lir.diving.contains(&((fid + 1) as u16)), "{name} lost its splittable call rule");
+    }
     // calling linear recursion does not demote the caller
     assert!(rs.contains(&format!("fn s_{}(", id("via_walk"))), "via_walk (calls walk) is not native");
 }
@@ -621,7 +622,7 @@ fn native_arrays_match_oracle_under_suspension() {
     assert!(!step.contains("*fuel"), "leaf settles fuel through the pointer");
     assert!(w.contains("fl = fl.wrapping_add(1i64);"), "caller does not count the leaf's fuel unit");
     // the if/else accumulator became mask selects
-    assert!(rs.contains("m) | (") && rs.contains("m ^ -1i64)"), "if-converted selects are not mask arithmetic");
+    assert!(rs.contains("m) | (") && rs.contains("m ^ (-1i64))"), "if-converted selects are not mask arithmetic");
     // one array lent and moved into the same call: the net inlines the
     // callee, and the native body must read the array before writing it
     // in place (value semantics: the read sees the old element)
@@ -705,7 +706,7 @@ fn mutual_tail_recursion_becomes_a_loop() {
     let (cm, rs) = trmc_golden("mutual_tail.py");
     let ev = native_form(&cm, &rs, "ev");
     let id = cm.fns.iter().position(|f| f.name == "od").unwrap();
-    assert!(ev.contains("continue 'l"), "ev is not a loop");
+    assert!(ev.contains("continue;"), "ev is not a loop");
     assert!(!ev.contains(&format!("s_{id}(")), "ev still calls od");
 }
 
@@ -1063,4 +1064,83 @@ fn constructor_matches_in_native_code_match_oracle() {
     let total = cm.fns.iter().position(|f| f.name == "total").unwrap();
     assert!(rs.contains(&format!("fn s_{total}(")), "total has no native form");
     golden("native_match.py", 0, &["1", "4", "16"]);
+}
+
+/// Two self calls where one needs the other's result are a chain, not a fork:
+/// the function stays native and the result equals the oracle.
+#[test]
+fn dependent_self_calls_are_a_chain_not_a_fork() {
+    let (cm, rs) = pipeline(&fixture("chain_walk.py"), 0);
+    let walk = cm.fns.iter().position(|f| f.name == "walk").unwrap();
+    assert!(rs.contains(&format!("fn s_{walk}(")), "walk has no native form");
+    golden("chain_walk.py", 0, &["1", "4", "16"]);
+}
+
+#[test]
+fn native_port_boundaries_preserve_layout_ownership_and_work() {
+    for name in ["tuple_nested.py", "native_arrays.py", "native_match.py", "tuple_fork.py"] {
+        let (cm, _) = pipeline(&fixture(name), 1 << 20);
+        let want = oracle(&cm);
+        let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
+        for rep in [Some(false), Some(true)] {
+            let code = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
+            let binary = compile(&code, &format!("boundary-{}-{rep:?}", name.trim_end_matches(".py")));
+            for threads in ["1", "4", "16"] {
+                for fuel in ["1", "64", "4096"] {
+                    assert_eq!(run(&binary, &[threads, fuel]), want, "{name} rep={rep:?} threads={threads} fuel={fuel}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn local_tuple_entries_pack_outer_fields_and_execute_the_ready_path() {
+    for (case, leaf, first, merge, total) in [
+        ("flat", "(v + x, 1)", "l[0] + r[0]", "(s, l[1] + r[1])", "a[0] + a[1] + b[0] + b[1]"),
+        ("singleton", "((v + x,), 1)", "l[0][0] + r[0][0]", "((s,), l[1] + r[1])", "a[0][0] + a[1] + b[0][0] + b[1]"),
+        ("both", "((v + x,), (1,))", "l[0][0] + r[0][0]", "((s,), (l[1][0] + r[1][0],))", "a[0][0] + a[1][0] + b[0][0] + b[1][0]"),
+        ("empty", "((), (v + x, 1))", "l[1][0] + r[1][0]", "((), (s, l[1][1] + r[1][1]))", "a[1][0] + a[1][1] + b[1][0] + b[1][1]"),
+    ] {
+        let src = format!("@data\nclass Tree:\n    Leaf: (v,)\n    Pair: (a, b)\ndef build(n, x):\n    if n == 0:\n        return Leaf(x)\n    return Pair(build(n - 1, x - 7), build(n - 1, x + 11))\ndef walk(t, x):\n    match t:\n        case Leaf(v):\n            return {leaf}\n        case Pair(a, b):\n            l = walk(a, x)\n            r = walk(b, x)\n            s = {first}\n            return {merge}\ndef main():\n    t = build(array_len(array_new(3, 0)), -1099511627776)\n    a = walk(t, -17)\n    b = walk(t, 4294967295)\n    return {total}\n");
+        let cm = desugar(&mithril_front::parse(&src).unwrap()).unwrap();
+        let want = oracle(&cm);
+        let net_cm = desugar(&mithril_front::parse(&src.replace("array_len(array_new(3, 0))", "3")).unwrap()).unwrap();
+        let mut net = mithril_net::build(&net_cm);
+        mithril_net::reduce(&mut net, &net_cm, 1 << 20);
+        assert_eq!(fmt_val(&mithril_net::readback(&net, mithril_net::root_port()).unwrap()), want);
+        for rep in [Some(false), Some(true)] {
+            let (program, lowered) = mithril_codegen::lower(&cm);
+            let fid = lowered.fns.iter().position(|f| f.name == "walk").unwrap();
+            let entry = program.fns.iter().find(|f| f.name == format!("n_{fid}")).expect("tuple walk needs an aggregate entry");
+            assert!(matches!(entry.ret, mithril_codegen::lir::Ty::ResArr(_)));
+            // Direct calls exercise the scalar or local-region aggregate
+            // bridge selected for this layout; closure bodies reduce as nets.
+            let mut code = mithril_codegen::emit_rust_opts(&cm, mithril_codegen::EmitOpts { int_rep: rep });
+            let boxed = code.find(&format!("fn d_{fid}(")).unwrap();
+            let begin = boxed + code[boxed..].find("{\n").unwrap() + 2;
+            let mut depth = 1;
+            let finish = code[begin..].char_indices().find_map(|(at, c)| {
+                if c == '{' { depth += 1; }
+                if c == '}' { depth -= 1; }
+                (depth == 0).then_some(begin + at)
+            }).unwrap();
+            code.replace_range(begin..finish, &format!("return n_{fid}(ctx, fuel, v0, v1).map(|a| mk_con(ctx, 4095u16, &a));\n"));
+            let start = code.find(&format!("fn n_{fid}(")).unwrap();
+            let enter = start + code[start..].find("{\n").unwrap() + 2;
+            code.insert_str(enter, "BOUNDARY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);\n");
+            let end = code.rfind("\n}").unwrap();
+            code.insert_str(end, "\neprintln!(\"boundary_hits={}\", BOUNDARY_HITS.load(std::sync::atomic::Ordering::Relaxed));");
+            code.push_str("\nstatic BOUNDARY_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);\n");
+            let binary = compile(&code, &format!("local-boundary-{case}-{rep:?}"));
+            for threads in ["1", "4", "16"] {
+                for fuel in ["1", "64", "4096"] {
+                    let (got, stderr) = run_env(&binary, &[threads, fuel], &[]);
+                    assert_eq!(got, want, "{case} rep={rep:?} threads={threads} fuel={fuel}");
+                    let hits: usize = stderr.lines().find_map(|s| s.strip_prefix("boundary_hits=")).unwrap().parse().unwrap();
+                    if threads == "1" && fuel == "4096" { assert!(hits > 0, "aggregate adapter must actually execute"); }
+                }
+            }
+        }
+    }
 }

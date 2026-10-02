@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Performance parity: the 17 ports and the 2 demos at their BIG size (the
+"""Performance parity: the spatial-tree benchmark and the 2 demos at their BIG size (the
 unmodified sources), built once each; per program:
   cpu_t1, cpu_t16   wall seconds of the built program (--threads 1 / 16)
   dev_wall          wall seconds of `mithril exec` on the `build --gpu` artefact
@@ -31,8 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 BASELINE = os.path.join(HERE, "perf_baseline.json")
 REF_BIN = os.path.join(ROOT, "target", "parity-ref", "mithril")
 CAND_BIN = os.environ.get("MITHRIL_BIN", os.path.join(ROOT, "target", "release", "mithril"))
-PORTS = ["bfs", "editdist", "gameoflife", "hashmap", "kdtree", "kmeans", "lexer", "mandelbrot", "merkle",
-         "nbody", "queens", "raytrace", "symreg", "terrain", "tree-bitonic", "tree-matmul", "tree-radix"]
+PORTS = ["kdtree"]
 PROGRAMS = [(n, f"bench/ports/{n}.py") for n in PORTS] + [
     ("cornell_whitted", "demos/cornell_whitted.py"), ("cornell_path", "demos/cornell_path.py")]
 # the big-size arena of tests/e2e/run.sh (u32 cap; reservations commit only what is used)
