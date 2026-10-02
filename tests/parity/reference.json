@@ -1,4 +1,27 @@
 {
+ "_added_oracles": {
+  "interpreter_sha256": "ff9deaff3fc30d6c9265a3db2aad0e4cf5d635ebed6c8e4dd8b5465fad02a1d0",
+  "programs": [
+   "fixture/mithril-codegen/borrowed_tree",
+   "fixture/mithril-codegen/chain_walk",
+   "fixture/mithril-codegen/con_share",
+   "fixture/mithril-codegen/dead_binding",
+   "fixture/mithril-codegen/dead_division",
+   "fixture/mithril-codegen/flo_share",
+   "fixture/mithril-codegen/flo_share_ops",
+   "fixture/mithril-codegen/join_blowup",
+   "fixture/mithril-codegen/join_returns",
+   "fixture/mithril-codegen/lent_tail_call",
+   "fixture/mithril-codegen/lent_tail_read",
+   "fixture/mithril-codegen/loop_image",
+   "fixture/mithril-codegen/loop_split_kept",
+   "fixture/mithril-codegen/loop_split_shapes",
+   "fixture/mithril-codegen/native_match",
+   "fixture/mithril-codegen/recursive_counts",
+   "fixture/mithril-codegen/recursive_expr"
+  ],
+  "source": "Current Core interpreter; added fixture answers only, compiled lanes must match these answers."
+ },
  "_comment": "Reference outputs (stdout, exit status) per program per lane; recorded by check.py --record from target/parity-ref/mithril (build_ref.py).",
  "results": {
   "demos/cornell_path": {
@@ -437,6 +460,12 @@
     "rc": 0
    }
   },
+  "fixture/mithril-codegen/borrowed_tree": {
+   "oracle": {
+    "out": "-285314677470366\n",
+    "rc": 0
+   }
+  },
   "fixture/mithril-codegen/branch_recursion": {
    "device": {
     "out": "((702, 6), 6765, 524288, 2, 1024, 772)\n",
@@ -510,6 +539,12 @@
    },
    "run_t4": {
     "out": "1715910720\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/chain_walk": {
+   "oracle": {
+    "out": "4219080707\n",
     "rc": 0
    }
   },
@@ -624,6 +659,24 @@
    },
    "run_t4": {
     "out": "17049\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/con_share": {
+   "oracle": {
+    "out": "(31, 60, 150)\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/dead_binding": {
+   "oracle": {
+    "out": "5\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/dead_division": {
+   "oracle": {
+    "out": "5\n",
     "rc": 0
    }
   },
@@ -852,6 +905,18 @@
    },
    "run_t4": {
     "out": "75025\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/flo_share": {
+   "oracle": {
+    "out": "(4.75, 3.75)\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/flo_share_ops": {
+   "oracle": {
+    "out": "(4.75, 9.5, 4.0)\n",
     "rc": 0
    }
   },
@@ -1273,6 +1338,18 @@
     "rc": 0
    }
   },
+  "fixture/mithril-codegen/join_blowup": {
+   "oracle": {
+    "out": "0\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/join_returns": {
+   "oracle": {
+    "out": "(3, 36, 85, 5, 0)\n",
+    "rc": 0
+   }
+  },
   "fixture/mithril-codegen/lent_pick": {
    "device": {
     "out": "216513\n",
@@ -1308,6 +1385,36 @@
    },
    "run_t4": {
     "out": "216513\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/lent_tail_call": {
+   "oracle": {
+    "out": "2788163683\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/lent_tail_read": {
+   "oracle": {
+    "out": "70548\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/loop_image": {
+   "oracle": {
+    "out": "2536644096\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/loop_split_kept": {
+   "oracle": {
+    "out": "1252894\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/loop_split_shapes": {
+   "oracle": {
+    "out": "5875464361\n",
     "rc": 0
    }
   },
@@ -1460,6 +1567,12 @@
    },
    "run_t4": {
     "out": "409208\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/native_match": {
+   "oracle": {
+    "out": "772739644\n",
     "rc": 0
    }
   },
@@ -1650,6 +1763,18 @@
    },
    "run_t4": {
     "out": "(C2(3, [2.5, 2.5, 2.5], [C1(3, C0()), C1(3, C0()), C1(3, C0())], [[-7, 3, -7], [-7, 3, -7], [-7, 3, -7]], C0()), C2(3, [2.5, 2.5, 2.5], [C1(3, C0()), C1(3, C0()), C1(3, C0())], [[-7, 3, -7], [-7, 3, -7], [-7, 3, -7]], C0()), [-7, 3, -7], -3.5)\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/recursive_counts": {
+   "oracle": {
+    "out": "(128, 254)\n",
+    "rc": 0
+   }
+  },
+  "fixture/mithril-codegen/recursive_expr": {
+   "oracle": {
+    "out": "-30540309850686064\n",
     "rc": 0
    }
   },

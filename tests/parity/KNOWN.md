@@ -1,6 +1,6 @@
 # Known divergences of the reference
 
-The reference is commit 21e18d8 plus the `mithril oracle` hook
+The reference is commit 87e015b3e24e04cb0ccc1ee77b3f7cc7e5fe2579 plus the `mithril oracle` hook
 (`build_ref.py`). These are the lanes of the reference that disagree with
 each other on the parity corpus: today's bugs. `check.py --divergences`
 prints them from `reference.json`.

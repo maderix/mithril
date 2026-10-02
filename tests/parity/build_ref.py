@@ -19,7 +19,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-REF_COMMIT = "21e18d8"
+REF_COMMIT = "87e015b3e24e04cb0ccc1ee77b3f7cc7e5fe2579"
 REF_DIR = os.path.join(ROOT, "target", "parity-ref")
 SRC = os.path.join(REF_DIR, "src")
 BIN = os.path.join(REF_DIR, "mithril")

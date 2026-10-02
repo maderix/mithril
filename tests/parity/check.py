@@ -166,7 +166,7 @@ def matches_ref(cand, refl):
     """Equal to the reference, or to one of the other outcomes the
     reference showed on repeated runs (`alts`: a lane of the reference
     that is not deterministic, e.g. a crash that depends on the schedule)."""
-    return same(cand, refl) or any(same(cand, x) for x in refl.get("alts", []))
+    return refl is not None and (same(cand, refl) or any(same(cand, x) for x in refl.get("alts", [])))
 
 
 def correct(name, ref, known):
@@ -282,9 +282,6 @@ def main():
         corr = correct(name, ref, known)
         for lane in lanes:
             refl = ref.get(name, {}).get(lane)
-            if refl is None:
-                notes.append(("NOREF", name, lane, results[name][lane], None))
-                continue
             v = verdict(results[name][lane], refl, corr)
             counts[lane][v] += 1
             if v != "EQUAL":

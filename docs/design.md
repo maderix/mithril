@@ -953,7 +953,7 @@ rejected variants are retained there, outside the source tree.
 
 #### Standalone continuation-storage probe (2026-10-01)
 
-`examples/gpu_roofline/queens` preserves the port's selected prefix space and
+A locally archived standalone probe preserved the selected prefix space and
 checks 863,992,044 visited candidate nodes, 6,899,189 solutions and checksum
 2063750025 against a recursive CPU oracle. Three rotating rounds give a
 6.736 ms minimum work interval with shared-memory continuations and an
@@ -988,7 +988,8 @@ Existing proven range-fold splitting does not by itself prove this candidate-set
 recursion can split. First validate native frame lowering with unchanged source
 and decomposition, including forced spills, one-lane execution, both integer
 representations and oracle equality; then treat deeper splitting as its own case.
-The example README records exact commands, measurements and the current limits.
+The probe and its measurement receipts are retained locally; they are not part
+of the published examples.
 
 The first integration attempt was rejected before promotion. It implemented a
 common native continuation machine, live-value captures, structured loop backedges
@@ -1463,10 +1464,9 @@ runs, with modeled accelerator decisions. Arena counts exclude vector capacity,
 queue and process overhead; no device kernel or speedup is claimed.
 
 Run `python3 demos/compiler_planning/demo.py --out target/compiler-planning/demo`.
-Open the generated `demo.html`. Today’s broader proof experiments and receipts
-are archived locally in `target/archives/compiler-proofs-2026-10-01.tar.gz` and
-Git branch `archive/compiler-proofs-2026-10-01` (snapshot `de22f34`). The generic
-loop-join correction and its frontend regressions remain part of the compiler.
+Open the generated `demo.html`. Broader exploratory receipts are archived
+locally. The generic loop-join correction and its frontend regressions remain
+part of the compiler.
 
 ## 16. Shared region services
 
