@@ -1,36 +1,26 @@
 # Mithril
 
-**Write plain scalar code. Mithril runs it in parallel on every CPU core and on
-the GPU, and the result is the same no matter what order the work runs in.**
+**A programming language for deterministic parallelism, built on interaction nets.**
 
-No threads, no locks, no annotations. Independent work in your program runs at
-the same time on its own, and the answer is identical at 1 thread, 16 threads
-or on the GPU.
+Write ordinary step-by-step code. Mithril runs it on every core of a CPU or
+across a GPU, and the answer is the same whichever order the work runs in. There
+are no threads, locks or parallel annotations in the source.
+
+**Read the introduction:
+[Mithril: a programming language for deterministic parallelism](https://maderix.github.io/articles/mithril/)**,
+an illustrated article covering where the language comes from, how it works,
+animated examples, where it fits and where it does not.
 
 | Whitted ray tracing | Path tracing |
 |---|---|
 | <img src="docs/img/cornell_whitted_animated.gif" width="320" alt="Moving mirror and glass spheres in the Whitted Cornell scene"> | <img src="docs/img/cornell_path_animated.gif" width="320" alt="Moving mirror and glass spheres in the path-traced Cornell scene"> |
-| **CPU 16 threads: 12.6 FPS · GPU: 1.4 FPS** | **CPU 16 threads: 3.2 FPS · GPU: 2.3 FPS** |
 | 512×512 · 4 samples per pixel | 256×256 · 64 samples per pixel |
 
-Ryzen 7 7800X3D and RTX 4090; 24-frame batch throughput, median of three runs
-with compilation excluded and image return included. Both backends produce
-identical pixels. GIF playback is 12.5 FPS. [Measurements and reproduction](docs/img/raytracer-animation.md).
-
-The camera stays fixed while the spheres move in depth and height. Each frame
-recomputes their shadows, reflections and refraction. This is
-`demos/cornell_path.py`, an ordinary recursive path tracer:
+Both scenes are plain Mithril programs. The same source runs on 1 thread, 16
+threads and an NVIDIA GPU, and all three write identical pixels.
+[Measurements and reproduction](docs/img/raytracer-animation.md).
 
 ```python
-def path(o, d, depth, h, seen):
-    x = scene(o, d)
-    if x[0] >= far() or depth == 0:
-        return (0.0, 0.0, 0.0)
-    ...
-    direct = next_event(p, n, h)
-    more = path(add(p, scale(n, eps())), bounce(n, hash(h + 4)), depth - 1, hash(h + 5), 0)
-    return mul(albedo(m), add((direct, direct, direct), more))
-
 def main():
     n = size()
     img = array_new(n * n, 0)
@@ -41,45 +31,57 @@ def main():
 ```
 
 ```
-mithril run --image cornell.ppm demos/cornell_path.py --threads 1    # 2.149 s
-mithril run --image cornell.ppm demos/cornell_path.py                # 0.238 s, 16 threads
-mithril run --image cornell.ppm demos/cornell_path.py --gpu          # 0.335 s, RTX 4090
+mithril run --image cornell.ppm demos/cornell_path.py --threads 1
+mithril run --image cornell.ppm demos/cornell_path.py --threads 16
+mithril run --image cornell.ppm demos/cornell_path.py --gpu
 ```
-
-All three write the same image, bit for bit (times are run time, excluding
-compilation).
-
-[The Mithril Field Guide](docs/guide.html) explains which programs benefit,
-the tradeoffs compared with C, Rust, CUDA and functional languages, and how it
-works, with diagrams, measurements and links to the proofs and tests.
 
 ## How it works
 
-A Mithril program means a set of interaction-net rewrite rules. A rule only
-ever touches two nodes, and two rules never touch the same node, so the rules
-give the same result in any order: the runtime is free to run them in
-parallel, and the compiler is free to run them early.
+A Mithril program means what a set of interaction-net rewrite rules says it
+means. Each rule replaces one pair of connected nodes and touches no other node,
+so any two rule firings can happen in either order and the result is the same.
+The runtime can therefore run them in parallel, and the compiler can run them
+early.
 
 ```
 source (Python subset)  ->  Core  ->  net + rules  ->  residual  ->  LIR  ->  CPU: Rust + mithril-rt
-mithril-front            oracle    compile-time     what input           GPU: CUDA + engine.cu
-                                   reduction        still needs
+mithril-front            oracle    compile-time     the program          GPU: CUDA + engine.cu
+                                   reduction        that runs
 ```
 
-- **The optimizer is the rules.** At compile time every rule that does not
-  wait on input fires: constant folding, inlining, branch selection and dead
-  code removal are rule firings, not separate passes (`mithril-net`).
-- **What remains becomes native code.** Each function is emitted as plain
-  native code where it can be, plus forms that can pause and split work
-  across workers (`mithril-codegen`).
-- **Parallel work comes from the program's shape.** Independent calls,
-  proven folds and loops whose iterations are independent run as trees of
-  tasks; the result is the sequential one.
-- **One runtime model on both devices.** Tasks are pending rule firings,
-  records wait for their inputs, dives run native code on a budget
+- **The optimizer is the rules.** While compiling, Mithril fires every rule
+  whose inputs are written in the source. Constant folding, inlining and branch
+  selection are rule firings, so they cannot change what the program means
+  (`mithril-net`).
+- **Input-dependent work becomes native code.** A function that is one sequence
+  of steps, such as the arithmetic for a pixel, is emitted as plain machine
+  code. A function that can split into independent calls also gets a form that
+  can pause and hand work to idle cores (`mithril-codegen`).
+- **Parallel work comes from the program's shape.** Independent calls, proven
+  folds and loops whose iterations do not depend on each other run as trees of
+  tasks, and the result equals the one-thread result.
+- **One runtime model on both devices.** Tasks are pending rule firings, records
+  wait for their inputs, and dives run native code under a work budget
   (`mithril-rt` on the CPU, `engine.cu` on the GPU).
 
-[design.md](docs/design.md) records the full design and its open obligations.
+[docs/design.md](docs/design.md) records the full design and its open
+obligations.
+
+## The language
+
+- Functions (`def`), `if`/`elif`/`else`, `while`, `for i in range(a, b)`,
+  `return`, assignment and tuple destructuring (`a, b = t`).
+- Integers are 56-bit signed with wrap-around; floats are f64 by default.
+  `sqrt(x)` and `f32(n)` make a value binary32, and f32 then spreads through
+  the arithmetic; `int(x)` converts back.
+- Algebraic data types with `@data`, taken apart with `match`/`case`
+  (matches must be exhaustive), tuples and `t[i]` on them.
+- Lambdas and closures (`lambda x: x + k`), passed and returned as values.
+- Arrays as values: `array_new(n, v)`, `array_get(a, i)`, `array_set(a, i, v)`
+  (returns the new array; written in place when no other variable refers to
+  the old one), `array_len(a)`.
+- No shared mutable state, no locks, no parallel annotations.
 
 ## Build
 
@@ -105,32 +107,26 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 `MITHRIL_NVCC_IMAGE` selects another image. Compiled kernels are cached under
 `target/mithril-cache/gpu`.
 
-## The language
-
-- Functions (`def`), `if`/`elif`/`else`, `while`, `for i in range(a, b)`,
-  `return`, assignment and tuple destructuring (`a, b = t`).
-- Integers are 56-bit signed with wrap-around; floats are f64 by default.
-  `sqrt(x)` and `f32(n)` make a value binary32, and f32 then spreads through
-  the arithmetic; `int(x)` converts back.
-- Algebraic data types with `@data`, taken apart with `match`/`case`
-  (matches must be exhaustive), tuples and `t[i]` on them.
-- Lambdas and closures (`lambda x: x + k`), passed and returned as values.
-- Arrays as values: `array_new(n, v)`, `array_get(a, i)`, `array_set(a, i, v)`
-  (returns the new array; updated in place when nothing else holds it),
-  `array_len(a)`.
-- No mutation of shared state, no locks, no annotations for parallelism.
-
 ## Examples
 
-- `demos/cornell_whitted.py`, `demos/cornell_path.py`: a Whitted ray tracer
-  and a path tracer of the Cornell box. Write the image with
+- `demos/cornell_whitted.py`, `demos/cornell_path.py`: a Whitted ray tracer and
+  a path tracer of the Cornell box. Write the image with
   `mithril run --image cornell.ppm demos/cornell_path.py`.
+- `docs/examples/`: the merge sort, N-queens, Collatz and specialization
+  programs used in the introduction.
 - `bench/ports/kdtree.py`: nearest-neighbour queries over a shared spatial tree,
   with an independent C implementation and a recorded checksum.
-- `bench/general/*.py`: interpreters, persistent maps, pipelines and
-  closures, the shapes a general-purpose language has to handle.
+- `bench/general/*.py`: interpreters, persistent maps, pipelines and closures.
 - `bench/lockless/`: five programs that need locks or atomics in C and Rust,
-  written in Mithril without any, each with C and Rust versions.
+  written in Mithril without either, each with C and Rust versions.
+
+Inspect what the compiler did with a program:
+
+```
+mithril net f.py      # rule firings and the residual size per function
+mithril prove f.py    # fold proofs, checked by Lean
+mithril oracle f.py   # the reference interpreter's answer
+```
 
 ## Tests
 
@@ -147,39 +143,17 @@ It runs, in order:
 - `tests/ci/fast.py`: the spatial-tree benchmark at a small size (exact checksum
   at 1 and 16 threads) plus regression checks on generated-code size and
   instruction counts.
-- `tests/parity/check.py`: fixtures, original benchmarks, demos and 500
-  generated programs run through the reference interpreter, 1/4/16
-  threads, four starved budgets and the GPU, each compared with a pinned
-  reference build (`tests/parity/build_ref.py`); `tests/parity/KNOWN.md`
-  lists the reference's own known bugs.
-- With `--gpu`: `tests/ci/gpu.py` (the ports on the device) and the device
-  test suite.
+- `tests/parity/check.py`: fixtures, benchmarks, demos and generated programs run
+  through the reference interpreter, 1/4/16 threads, starved budgets and the
+  GPU, each compared with a pinned reference build.
+- With `--gpu`: `tests/ci/gpu.py` (the ports on the device) and the device test
+  suite.
 
 Useful switches: `MITHRIL_STATS=1` (scheduler statistics of a CPU run),
 `MITHRIL_TIMING=1` (compile and run times), `MITHRIL_GPU_STATS=1` and
 `MITHRIL_GPU_TRACE=1` (per-round device statistics).
 
-## Benchmarks
-
-Recorded wall-clock seconds, compilation excluded. Ryzen 7 7800X3D
-(8 cores, 16 threads), RTX 4090. Static render timings are medians of three
-runs on 2 October 2026; GPU wall includes context creation and readback.
-The spatial-tree CPU measurements are from 29 September and its GPU
-measurement from 2 October. All completed lanes agree on their output.
-
-| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
-|---|---:|---:|---:|---:|
-| cornell_path | - | 2.149 s | 0.238 s | 0.335 s |
-| cornell_whitted | - | 0.264 s | 0.061 s | 0.871 s |
-| kdtree | 0.333 s | 0.406 s | 0.090 s | 1.280 s |
-
-[Spatial-tree CPU methods](bench/results.md) ·
-[Render measurements](docs/img/raytracer-static.json).
-
-## Limitations
-
-Generated CPU code is mostly scalar: it targets baseline x86-64 (no AVX or
-FMA), and independent calls such as pixels are not vectorized together.
+Recorded timings and methods are in [bench/results.md](bench/results.md).
 
 ## Repository layout
 
@@ -194,7 +168,7 @@ FMA), and independent calls such as pixels are not vectorized together.
 | `crates/mithril-gpu` | the CUDA printer, the device engine (`cuda/engine.cu`) and its host runner |
 | `crates/mithril-cli` | the `mithril` command |
 | `proofs/confluence` | Lean 4 proof that the core rule table is confluent |
-| `bench`, `demos`, `tests` | programs, benchmarks and gates |
+| `bench`, `demos`, `docs`, `tests` | programs, benchmarks, documentation and gates |
 
 ## License
 
