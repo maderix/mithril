@@ -133,6 +133,8 @@ fn oracle_reports_front_end_errors_like_run() {
     assert!(stderr(&out).contains("missing input file"), "stderr: {}", stderr(&out));
 }
 
+// a CLI built with the gpu feature runs the program instead
+#[cfg(not(feature = "gpu"))]
 #[test]
 fn run_gpu_without_feature_reports_and_exits_1() {
     let out = mithril(&["run", fixture("fact_while.py").to_str().unwrap(), "--gpu"]);

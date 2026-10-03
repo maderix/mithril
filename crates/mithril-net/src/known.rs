@@ -20,12 +20,9 @@
 //! clones is bounded. A parameter is fixed only where the constant changes
 //! the cost of repeated work: it is an unchanged parameter of a loop (a
 //! function that calls itself) that the loop divides by (or shifts by), or
-//! the function passes it unchanged to such a parameter of a callee. A constant used once (a sphere's radius, a wall's
-//! position) gains nothing from a clone and costs a specialization: the
-//! Whitted demo's constant arguments cloned every shape function and its
-//! code generation went from seconds to minutes. A loop's own test is not
-//! fixed either (a known bound would unroll the loop and evaluate its body
-//! at compile time in each clone).
+//! the function passes it unchanged to such a parameter of a callee. A
+//! loop's own test is not fixed (a known bound would unroll the loop and
+//! evaluate its body at compile time in each clone).
 
 use crate::reduce::{specialize_fns, specialize_some, SpecReport};
 use mithril_front::core::{Core, CoreFn, CoreModule};
@@ -42,6 +39,10 @@ const MAX_ROUNDS: usize = 8;
 /// calls pass to parameters they never change.
 pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
     let (mut out, mut reports) = specialize_fns(m, fuel);
+    // the later passes unfold the callees the first one did (a callee that
+    // calls nothing once specialized would otherwise unfold now): a clone is
+    // the original's residual under its constants, whatever the round
+    let mut inline = crate::NetProg::new(m).inline;
     // (original callee, fixed (parameter, value)s) -> clone
     let mut clones: HashMap<(u32, Vec<(usize, i64)>), u32> = HashMap::new();
     // clone -> (original, fixed): a clone's fixed parameters stay fixed, and
@@ -97,13 +98,14 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
             // from the original's specialized body; its calls to itself
             // become calls to the clone
             out.fns.push(clone_with(&out.fns[g as usize], g, c, &fixed));
+            inline.push(inline[g as usize]);
             todo.push(true);
         }
         if !changed && !todo.contains(&true) {
             break;
         }
         // only clones and functions whose calls were retargeted change
-        let (o, r) = specialize_some(&out, fuel, &todo);
+        let (o, r) = specialize_some(&out, fuel, &todo, Some(&inline));
         out = o;
         for rep in r {
             match reports.iter_mut().find(|x| x.name == rep.name) {
@@ -190,7 +192,7 @@ fn repeated(m: &CoreModule, fixable: Vec<Vec<bool>>) -> Vec<Vec<bool>> {
     // a loop's own test (the branch that decides whether it calls itself
     // again) stays: a known bound with a known start lets the per-function
     // pass unroll the loop and evaluate its body at compile time in every
-    // clone (the Whitted demo's pixel loops: 1,180 traced pixels per clone)
+    // clone
     let control = |g: usize| -> Vec<bool> {
         let mut c = vec![false; fixable[g].len()];
         if let Core::If(test, ..) = &m.fns[g].body {
@@ -204,8 +206,7 @@ fn repeated(m: &CoreModule, fixable: Vec<Vec<bool>>) -> Vec<Vec<bool>> {
         }
         c
     };
-    // a constant divisor or shift count becomes a shift, mask or multiply;
-    // other uses of a constant measured no gain (design.md)
+    // a constant divisor or shift count becomes a shift, mask or multiply
     let divisor = |g: usize| -> Vec<bool> {
         use mithril_front::ast::BinOp::*;
         let mut d = vec![false; fixable[g].len()];

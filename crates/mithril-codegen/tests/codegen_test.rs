@@ -606,7 +606,12 @@ fn native_arrays_match_oracle_under_suspension() {
     }
     // writes in native code need no refcount check: arrays there are
     // linear and made unique where they enter (the bridge)
-    let fill_loop = cm.fns.iter().position(|f| f.name.starts_with("__for")).unwrap();
+    // the live helpers: a function no call reaches keeps its id but not its
+    // code, and walk's loop runs as its clone on the constant n (walk divides
+    // by it)
+    let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
+    let live = |prefix: &str| sm.fns.iter().position(|f| f.name.starts_with(prefix) && f.body != mithril_front::core::Core::Num(0)).unwrap_or_else(|| panic!("no live {prefix}"));
+    let fill_loop = live("__for");
     assert!(rs[rs.find(&format!("fn s_{fill_loop}(")).expect("fill's loop is native")..].contains("arr_set_u("), "native write still checks the refcount");
     // fill's loop is an index fill: its bridge makes the array unique before a
     // split can lend it (fill itself has a native and a dive form)
@@ -615,7 +620,8 @@ fn native_arrays_match_oracle_under_suspension() {
     // step returns (array, array, int) as a native tuple the loop destructures
     let step = native_form(&cm, &rs, "step");
     assert!(step.contains("-> (i64, i64, i64)"), "step does not return a native tuple");
-    let wl = cm.fns.iter().position(|f| f.name.starts_with("__while")).expect("walk's loop helper");
+    let wl = live("__while");
+    assert_eq!(sm.fns[wl].name, "__while21_3k64", "walk's loop runs as its clone");
     let w = rs.find(&format!("fn s_{wl}(")).map(|s| &rs[s..]).expect("walk's loop is native");
     let w = &w[..w[1..].find("\nfn ").map(|e| e + 1).unwrap_or(w.len())];
     assert!(!w.contains("mk_con"), "walk's loop builds heap tuples");

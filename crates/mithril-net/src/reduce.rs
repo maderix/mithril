@@ -111,14 +111,18 @@ const SPEC_TOTAL_FUEL: u64 = 400_000;
 ///
 /// `MITHRIL_NET_TRACE=1` narrates the process on stderr.
 pub fn specialize_fns(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
-    specialize_some(m, fuel, &vec![true; m.fns.len()])
+    specialize_some(m, fuel, &vec![true; m.fns.len()], None)
 }
 
 /// `specialize_fns` for the functions `todo` marks; the others keep their
-/// bodies (and report nothing).
-pub(crate) fn specialize_some(m: &CoreModule, fuel: u64, todo: &[bool]) -> (CoreModule, Vec<SpecReport>) {
+/// bodies (and report nothing). `inline`, when given, replaces the module's
+/// own choice of the callees that unfold (`NetProg::inline`).
+pub(crate) fn specialize_some(m: &CoreModule, fuel: u64, todo: &[bool], inline: Option<&[bool]>) -> (CoreModule, Vec<SpecReport>) {
     let mut prog = NetProg::new(m);
     prog.mode = Mode::Specialize;
+    if let Some(inline) = inline {
+        prog.inline = inline.to_vec();
+    }
     let eval_prog = NetProg::new(m);
     let mut out = m.clone();
     let mut reports = Vec::new();

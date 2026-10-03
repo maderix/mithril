@@ -146,7 +146,9 @@ def swaps(n, k):
 
 
 def work(k):
-    g = fill(array_new(64, 0), 64, k)
+    # fill's bound is unknown at compile time, so its loop runs (a constant
+    # bound unrolls it)
+    g = fill(array_new(64, 0), array_len(array_new(64, 0)), k)
     s = walk(g, 64)
     # the same array handed to two native calls: the second must see the
     # original (the first copies before writing in place)

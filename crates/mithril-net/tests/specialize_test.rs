@@ -784,7 +784,7 @@ fn mutual_recursion_fixes_nothing() {
 
 #[test]
 fn a_proven_fold_keeps_its_counter_bound_and_accumulator() {
-    let src = "def total(n, k):\n    s = 0\n    for i in range(n):\n        s = s + i * k\n    return s\n\ndef main():\n    return total(array_len(array_new(100000, 0)), 3) + total(40, 2)\n";
+    let src = "def total(n, k):\n    s = 0\n    for i in range(n):\n        s = s + i % k\n    return s\n\ndef main():\n    return total(array_len(array_new(100000, 0)), 3) + total(40, 2)\n";
     let (_, s) = full(src);
     let mut fixed_extra = false;
     for f in s.fns.iter().filter(|f| f.fold.is_some()) {
@@ -802,9 +802,10 @@ fn a_proven_fold_keeps_its_counter_bound_and_accumulator() {
 
 #[test]
 fn clones_do_not_chain_and_originals_no_call_reaches_lose_their_code() {
-    let src = "def f(i):\n    if i < 1:\n        return 1\n    return f(i - 1) + i\n\ndef g(n, c):\n    x = f(n)\n    if c > 0:\n        return x\n    return x + 1\n\ndef main():\n    n = array_len(array_new(6, 0))\n    return g(n, 1) + g(n, 1) + g(n, 0)\n";
+    let src = "def f(i, d):\n    if i < 1:\n        return 1\n    return f(i - 1, d) + i % d\n\ndef g(n, d):\n    return f(n, d) + 1\n\ndef main():\n    n = array_len(array_new(6, 0))\n    return g(n, 4) + g(n, 4) + g(n, 3)\n";
     let (_, s) = full(src);
-    assert_eq!(named(&s, "g_1k1").len(), 1, "one clone per fixed argument, never a clone of a clone: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
-    assert!(named(&s, "g_1k1_").is_empty());
+    assert_eq!(named(&s, "g_1k4").len(), 1, "one clone per fixed argument, never a clone of a clone: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+    assert!(named(&s, "g_1k4_").is_empty());
+    assert_eq!(named(&s, "f_1k4").len(), 1, "the divisor reaches f's own clone");
     assert_eq!(body(&s, "g"), &Core::Num(0), "g is no longer called");
 }
