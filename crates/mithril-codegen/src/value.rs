@@ -1,21 +1,11 @@
 //! Value construction shared by native and port lowering. Ownership decisions
 //! stay with the caller; these builders preserve field and statement order.
-use crate::lir::{as_i, c, let_, num, p, u16_, usize_, v, Pat, Ty, E, S};
+use crate::lir::{c, let_, u16_, usize_, v, Pat, Ty, E, S};
 
 pub(crate) fn bind(name: impl Into<String>, ty: Ty, value: E, out: &mut Vec<S>) -> E {
     let name = name.into();
     out.push(let_(&name, ty, value));
     v(name)
-}
-
-/// Turn a native integer into its port representation.
-pub(crate) fn int_port(value: E, shifted: bool) -> E {
-    if shifted { p("retag", vec![value]) } else { num(value) }
-}
-
-/// Read a port integer in the native representation selected by its caller.
-pub(crate) fn native_int(value: E, shifted: bool) -> E {
-    if shifted { p("sh", vec![value]) } else { as_i(value) }
 }
 
 /// Read borrowed fields or move them out of an owned constructor. A reuse token retains the

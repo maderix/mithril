@@ -1,21 +1,15 @@
-use mithril_codegen::lir::{self, as_i, c, free, i64_, let_, num, p, u16_, usize_, v, Pat, Ty, S};
+use mithril_codegen::lir::{self, c, free, i64_, let_, p, u16_, usize_, v, Pat, Ty, S};
 
 #[path = "../src/value.rs"]
 mod value;
 
 #[test]
-fn value_bindings_and_integer_representations_preserve_exact_lir() {
+fn value_bindings_preserve_exact_lir() {
     for ty in [Ty::I64, Ty::U64, Ty::Infer] {
         let mut out = vec![S::Comment("prefix".into())];
         let expr = p("side_effect", vec![i64_(-1)]);
         assert_eq!(value::bind("chosen_name", ty, expr.clone(), &mut out), v("chosen_name"));
         assert_eq!(out, vec![S::Comment("prefix".into()), let_("chosen_name", ty, expr)]);
-    }
-    for e in [i64_(i64::MIN), i64_(i64::MAX), i64_(0), v("r"), c("caller", vec![v("arg")])] {
-        assert_eq!(value::int_port(e.clone(), false), num(e.clone()));
-        assert_eq!(value::int_port(e.clone(), true), p("retag", vec![e.clone()]));
-        assert_eq!(value::native_int(e.clone(), false), as_i(e.clone()));
-        assert_eq!(value::native_int(e.clone(), true), p("sh", vec![e]));
     }
 }
 

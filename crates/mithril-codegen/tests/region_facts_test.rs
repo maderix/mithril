@@ -30,8 +30,8 @@ fn proof_policies_distinguish_borrowed_paths_total_exits_and_prefixes() {
         (p("as_i", vec![v("x")]), [true, true, true]),
         (p("num", vec![v("x")]), [false, true, true]),
         (p("con_tag", vec![v("t")]), [true, true, false]),
-        (p("retag", vec![v("x"), i64_(0)]), [false, true, true]),
-        (p("sh", vec![v("x"), i64_(1)]), [false, true, true]),
+        // releases a boxed int: an ownership effect, admitted by no policy
+        (p("take_i", vec![v("x")]), [false, false, false]),
         (p("floor_div", vec![v("x"), v("y")]), [false, false, true]),
         (bin(Bop::Div, v("x"), v("y")), [false, false, true]),
         (E::Tup(vec![v("x")]), [false, false, true]),

@@ -51,7 +51,7 @@ fn peek(net: &Net, mut p: Port) -> Port {
 pub fn readback(net: &Net, root: Port) -> Option<Val> {
     let p = peek(net, root);
     match p.tag() {
-        Tag::Num => Some(Val::I(p.as_i64())),
+        Tag::Num | Tag::Big => Some(Val::I(p.int_value())),
         Tag::Flo => Some(Val::F(f64::from_bits(flo_bits(net.cell(p.payload() as u32))))),
         Tag::Con => read_con(net, p),
         _ => None,
@@ -93,7 +93,8 @@ const SPEC_UNFOLD_AGENTS: usize = 2000;
 /// Nesting bound of speculative unfolds (an unfolded body's own calls are
 /// unfolded in turn: a loop with a static bound unrolls as a chain).
 const SPEC_DEPTH: u32 = 256;
-/// Total speculative rewrites spent (accepted or not) per function.
+/// Total speculative rewrites spent per function: accepted or rejected unfolds,
+/// and static evaluations that did not finish.
 const SPEC_TOTAL_FUEL: u64 = 400_000;
 
 /// Specialize every function by the interaction rules. A function's body
@@ -109,13 +110,22 @@ const SPEC_TOTAL_FUEL: u64 = 400_000;
 /// residual net is read back as the function's new body.
 ///
 /// `MITHRIL_NET_TRACE=1` narrates the process on stderr.
-pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
+pub fn specialize_fns(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
+    specialize_some(m, fuel, &vec![true; m.fns.len()])
+}
+
+/// `specialize_fns` for the functions `todo` marks; the others keep their
+/// bodies (and report nothing).
+pub(crate) fn specialize_some(m: &CoreModule, fuel: u64, todo: &[bool]) -> (CoreModule, Vec<SpecReport>) {
     let mut prog = NetProg::new(m);
     prog.mode = Mode::Specialize;
     let eval_prog = NetProg::new(m);
     let mut out = m.clone();
     let mut reports = Vec::new();
     for (fid, f) in m.fns.iter().enumerate() {
+        if !todo[fid] {
+            continue;
+        }
         let mut net = Net::new();
         let params = crate::build::build_fn(&mut net, &prog, fid);
         let free: Vec<(Port, u32)> = params.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
@@ -131,6 +141,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
             let mut rd = crate::residual::Reader::new(&fx.net, &prog, &fx.free, fx.next_var, &fx.dup_frame, &fx.ref_frame, &fx.arms);
             rd.read_frame(0, crate::root_port())
         };
+        let body = crate::expose::expose_forks(body);
         reports.push(SpecReport {
             name: f.name.clone(),
             rewrites: done,
@@ -276,13 +287,16 @@ fn run(
             if a.tag() == Tag::Ref {
                 if args_known(&fx.net, crate::ref_head(a)) {
                     let key = call_key(&fx.net, a);
-                    if memo.memo.get(&key) != Some(&false) {
-                        if let Some(v) = evaluate_call(&mut fx.net, eval_prog, a) {
-                            fx.net.residual.swap_remove(i);
-                            crate::rules::link(&mut fx.net, v, b);
-                            *evaluated += 1;
-                            progress = true;
-                            continue;
+                    if memo.memo.get(&key) != Some(&false) && memo.spent < SPEC_TOTAL_FUEL {
+                        match evaluate_call(&mut fx.net, eval_prog, a) {
+                            Ok(v) => {
+                                fx.net.residual.swap_remove(i);
+                                crate::rules::link(&mut fx.net, v, b);
+                                *evaluated += 1;
+                                progress = true;
+                                continue;
+                            }
+                            Err(spent) => memo.spent += spent,
                         }
                         memo.memo.insert(key, false);
                     }
@@ -439,7 +453,7 @@ fn data_nodes(net: &Net) -> usize {
 fn args_known(net: &Net, head: Port) -> bool {
     fn known(net: &Net, p: Port) -> bool {
         match p.tag() {
-            Tag::Num | Tag::Flo => true,
+            Tag::Num | Tag::Big | Tag::Flo => true,
             Tag::Con => crate::con_fields(net, p).into_iter().all(|f| known(net, f)),
             Tag::Var => {
                 let s = Port(net.cell(p.payload() as u32)[0]);
@@ -453,8 +467,8 @@ fn args_known(net: &Net, head: Port) -> bool {
 
 /// Evaluate a fully static call in a scratch net (evaluation mode, every
 /// call unfolds) under `SPEC_CALL_FUEL`; the value, re-materialized in the
-/// main net, or `None` if it did not finish (or hit something opaque).
-fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Option<Port> {
+/// main net, or the rewrites spent if it did not finish (or hit something opaque).
+fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Result<Port, u64> {
     let args: Vec<Val> = crate::list_items(net, crate::ref_head(r)).into_iter().map(|a| readback(net, a).expect("ICE: known argument without a value")).collect();
     let mut scratch = Net::new();
     let root = scratch.alloc(EMPTY, EMPTY);
@@ -462,24 +476,25 @@ fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Option<Port> {
     let ps: Vec<Port> = args.iter().map(|v| alloc_val(&mut scratch, v)).collect();
     let head = crate::list_alloc(&mut scratch, &ps);
     scratch.redexes.push((crate::ref_port(head, crate::ref_entry(r)), crate::root_port()));
-    drain(&mut scratch, eval_prog, SPEC_CALL_FUEL, &mut 0);
+    let mut spent = 0;
+    drain(&mut scratch, eval_prog, SPEC_CALL_FUEL, &mut spent);
     if !scratch.redexes.is_empty() || !scratch.residual.is_empty() {
-        return None;
+        return Err(spent);
     }
     // a large value is not worth embedding in the program
     if scratch.cells.len() - scratch.free.len() > SPEC_VALUE_CELLS {
-        return None;
+        return Err(spent);
     }
-    let v = readback(&scratch, crate::root_port())?;
+    let v = readback(&scratch, crate::root_port()).ok_or(spent)?;
     // the call's argument list is consumed: free it
     let _ = crate::list_collect(net, crate::ref_head(r));
-    Some(alloc_val(net, &v))
+    Ok(alloc_val(net, &v))
 }
 
 /// Materialize a value as ports/cells.
 fn alloc_val(net: &mut Net, v: &Val) -> Port {
     match v {
-        Val::I(n) => Port::num(*n),
+        Val::I(n) => Port::int(*n),
         Val::F(f) => mithril_core::agents::Cells::alloc_flo(net, *f),
         Val::C(_, fields) | Val::T(fields) => {
             let ps: Vec<Port> = fields.iter().map(|f| alloc_val(net, f)).collect();

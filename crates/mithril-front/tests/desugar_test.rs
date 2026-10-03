@@ -1,5 +1,4 @@
 use mithril_front::core::{Core, CoreModule, CtorId};
-use mithril_front::lex::{I56_MAX, I56_MIN};
 use mithril_front::{desugar, eval_core, parse, Diag, Val};
 
 fn dm(src: &str) -> CoreModule {
@@ -339,14 +338,15 @@ fn ternary_ifexp_evaluates_both_arms() {
     assert_eq!(eval_core(&cm, f, &[Val::I(0), Val::I(10), Val::I(20)]), Val::I(20));
 }
 
-// ---- i56 wraparound arithmetic ----
+// ---- 64-bit wraparound arithmetic ----
 
 #[test]
-fn addition_wraps_at_i56_boundary() {
+fn addition_wraps_at_i64_boundary_not_i56() {
     let src = "def addone(x):\n    return x + 1\n";
     let cm = dm(src);
     let f = fid(&cm, "addone");
-    assert_eq!(eval_core(&cm, f, &[Val::I(I56_MAX)]), Val::I(I56_MIN));
+    assert_eq!(eval_core(&cm, f, &[Val::I((1 << 55) - 1)]), Val::I(1 << 55));
+    assert_eq!(eval_core(&cm, f, &[Val::I(i64::MAX)]), Val::I(i64::MIN));
     assert_eq!(eval_core(&cm, f, &[Val::I(0)]), Val::I(1));
 }
 

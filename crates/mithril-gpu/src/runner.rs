@@ -918,7 +918,13 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let t_prepare = t0.elapsed();
     if stats { cu(cuEventRecord(mem.events[2], std::ptr::null_mut()), "record run start")?; }
     let t_run = std::time::Instant::now();
-    let mut width: u32 = env_value("MITHRIL_GPU_GROW_WIDTH", lanes as u64).clamp(1, lanes as u64) as u32;
+    // Grow to 16 tasks per lane before the work phase or a native launch:
+    // tasks are claimed as lanes finish, and subtree sizes vary (subsetsum:
+    // the largest of 56,712 native tasks took 10x the mean, 444 ms; with 16x
+    // the lanes in tasks, 103 ms). One sweep can double the frontier, so the
+    // width stays within a quarter of a rule's ring.
+    let wide = (16 * lanes as u64).min(bcap as u64 / 4).max(lanes as u64);
+    let mut width: u32 = env_value("MITHRIL_GPU_GROW_WIDTH", wide).clamp(1, wide) as u32;
     let mut steps: u32 = env_value("MITHRIL_GPU_WORK_STEPS", 1 << 30).clamp(1, u32::MAX as u64) as u32;
     // a grow task runs its body with the dive budget; fork-site callees
     // and tail calls become tasks at once
@@ -997,7 +1003,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         }
         let rb = dtoh::<u32>(d.rbump, 1, "read rbump")?[0];
         let nb = dtoh::<u32>(d.nbump, 1, "read nbump")?[0];
-        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[3]);
+        eprintln!("mithril-gpu: setup {:.0} ms, run {:.0} ms on {lanes} lanes: {} rounds ({} grow sweeps {:.0} M cycles, {} work phases {:.0} M cycles, {} range launches, widest frontier {}), {nb} cells and {rb} records issued", t_setup.as_secs_f64() * 1e3, t_run.elapsed().as_secs_f64() * 1e3, r[0], r[1], r[4] as f64 / 1e6, r[2], r[5] as f64 / 1e6, r[6], r[3]);
         if std::env::var_os("MITHRIL_GPU_TRACE").is_some() {
             cu(cuModuleGetGlobal_v2(&mut ptr, &mut sz, module, c"g_whist".as_ptr()), "cuModuleGetGlobal(g_whist)")?;
             let h = dtoh::<u32>(ptr, 40, "read g_whist")?;
@@ -1050,6 +1056,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
 // ---- readback of a result port (mirrors mithril_rt::prelude::show) ----
 
 const T_NUM: u64 = 2;
+const T_BIG: u64 = 15;
 const T_FLO: u64 = 3;
 const T_CON: u64 = 4;
 const T_LAM: u64 = 6;
@@ -1075,6 +1082,7 @@ unsafe fn show(d: &Dev, cells: &mut Vec<u64>, unbox: &[u32], p: u64) -> Result<S
         t if t >= TU => format!("C{}({})", unbox.get((t - TU) as usize).copied().unwrap_or(0), as_i(p)),
         T_LAM => "<closure>".to_string(),
         T_NUM => as_i(p).to_string(),
+        T_BIG => dtoh::<i64>(d.heap + 8 * ((p & M56) + 2), 1, "read boxed int")?[0].to_string(),
         T_FLO => format!("{:?}", f64::from_bits(cell(d, cells, (p & M56) as u32)?[0])),
         T_CON => {
             let k = ((p >> 4) & 0xFFF) as u16;
@@ -1105,8 +1113,7 @@ unsafe fn show(d: &Dev, cells: &mut Vec<u64>, unbox: &[u32], p: u64) -> Result<S
             let elems = dtoh::<u64>(d.heap + 8 * (base + 2), n, "read array")?;
             let mut fs = Vec::new();
             for e in elems {
-                let e = if raw { (e >> 8) | (T_NUM << 56) } else { e };
-                fs.push(show(d, cells, unbox, e)?);
+                fs.push(if raw { (e as i64).to_string() } else { show(d, cells, unbox, e)? });
             }
             format!("[{}]", fs.join(", "))
         }

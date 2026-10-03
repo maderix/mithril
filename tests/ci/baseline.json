@@ -1,1 +1,99 @@
-{}
+{
+ "collatz": {
+  "build_s": 0.66,
+  "gen_lines": 660,
+  "name": "collatz",
+  "scalar": [
+   0,
+   3
+  ],
+  "segments": 1,
+  "small_ok": true,
+  "small_t1": "59431",
+  "small_t16": "59431"
+ },
+ "heat2d": {
+  "build_s": 0.92,
+  "gen_lines": 1334,
+  "name": "heat2d",
+  "scalar": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10
+  ],
+  "segments": 4,
+  "small_ok": true,
+  "small_t1": "131504068",
+  "small_t16": "131504068"
+ },
+ "histogram": {
+  "build_s": 0.68,
+  "gen_lines": 976,
+  "name": "histogram",
+  "scalar": [
+   0,
+   1,
+   2
+  ],
+  "segments": 2,
+  "small_ok": true,
+  "small_t1": "4456",
+  "small_t16": "4456"
+ },
+ "knapsack": {
+  "build_s": 1.18,
+  "gen_lines": 1004,
+  "name": "knapsack",
+  "scalar": [
+   0,
+   1,
+   2,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "segments": 3,
+  "small_ok": true,
+  "small_t1": "7590",
+  "small_t16": "7590"
+ },
+ "msort": {
+  "build_s": 0.72,
+  "gen_lines": 994,
+  "name": "msort",
+  "scalar": [
+   4
+  ],
+  "segments": 7,
+  "small_ok": true,
+  "small_t1": "873274365",
+  "small_t16": "873274365"
+ },
+ "subsetsum": {
+  "build_s": 0.52,
+  "gen_lines": 895,
+  "name": "subsetsum",
+  "scalar": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "segments": 5,
+  "small_ok": true,
+  "small_t1": "7379",
+  "small_t16": "7379"
+ }
+}

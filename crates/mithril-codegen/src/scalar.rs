@@ -1,6 +1,6 @@
 //! Native scalar lowering.
 //!
-//! A function is *scalar* when every value it computes is an i56 integer:
+//! A function is *scalar* when every value it computes is an integer:
 //! `Num / Var / Op2 / Cmp / If / Let`, calls to other scalar functions, and —
 //! because `while`/`for` desugar into helpers that tail-return a `Tuple` of
 //! the live loop variables — an all-integer `Tuple` in tail position
@@ -9,8 +9,8 @@
 //! No floats, constructors, matches, or escaping tuples.
 //!
 //! Scalar functions are emitted as plain `fn s_<fid>(v0: i64, ..) -> i64`
-//! (or `-> (i64, .., i64)` for `SK(k)`) with native wrapping arithmetic (one
-//! `wrap56` sign-fix per op, exactly matching `bin`'s int path),
+//! (or `-> (i64, .., i64)` for `SK(k)`) with native 64-bit wrapping
+//! arithmetic (exactly `bin`'s int path),
 //! self-tail-recursion as a loop, and no ctx/fuel/ownership plumbing. Their
 //! `d_<fid>` dive form becomes a thin bridge (unpack ports -> call `s_` ->
 //! repack; `SK` results build the same 0xFFF tuple cell the dive form
@@ -707,6 +707,9 @@ thread_local! {
     /// Scalar signatures of the module being emitted, for direct calls
     /// from dive code (`native_sig`).
     pub(crate) static SIGS: std::cell::RefCell<Vec<Option<Sig>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Native functions a dive caller must not call natively: proven folds (their
+    /// bridge splits the range) and functions whose calls reach one.
+    pub(crate) static DUAL: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
     /// `LEAF[g]`: native `g` is call-free and loop-free. It settles no fuel
     /// itself; its one unit is counted at the call site (a register
     /// increment in native callers), so fuel still measures work.
@@ -714,9 +717,6 @@ thread_local! {
     /// `BRIDGE_LIVE[g]`: native `g` can be reached through its dive bridge
     /// (it is the entry, a fold, or has a non-native caller).
     pub(crate) static BRIDGE_LIVE: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// `SHIFTED[g]`: native `g` holds its ints pre-shifted (`x << 8`); see
-    /// `choose_reps`.
-    pub(crate) static SHIFTED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
     /// `CTX[g]`: native `g` takes the worker context (it touches arrays,
     /// itself or through a callee); the rest keep their argument registers.
     pub(crate) static CTX: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -724,8 +724,6 @@ thread_local! {
     static FIELDS: std::cell::RefCell<Vec<Vec<crate::ty::Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Unboxed constructors (ctor -> tag slot), for native match dispatch.
     pub(crate) static UNBOX: std::cell::RefCell<HashMap<u32, u8>> = std::cell::RefCell::new(HashMap::new());
-    /// Test override of `choose_reps` (see `EmitOpts`).
-    pub(crate) static FORCE_REP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 fn field_ty(ctor: u32, j: usize) -> crate::ty::Ty {
@@ -767,156 +765,6 @@ pub(crate) fn needs_ctx(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
     crate::fixpoint(need, |f, s| calls[f].iter().any(|g| s[*g as usize]))
 }
 
-pub(crate) fn shifted(g: u32) -> bool {
-    flag(&SHIFTED, g, false)
-}
-
-/// Integer representation of each native function, chosen by a static op
-/// count over its body. *Plain* ints are canonical i56 values in an i64: an
-/// op whose range is not proven re-wraps (two shifts), and masked 32-bit
-/// arithmetic runs in u32 for free; array elements (stored pre-shifted)
-/// cost a shift per access. *Shifted* ints are held as `x << 8`: i64
-/// wrapping is i56 wrapping, so add/sub/compare/min chains need no wrap,
-/// but a var-by-var multiply, a right shift, an array index and division
-/// each cost an op. The cheaper side wins; calls convert at the boundary.
-pub(crate) fn choose_reps(m: &CoreModule, sigs: &[Option<Sig>]) -> Vec<bool> {
-    use crate::range::{feeds_mask, feeds_mask32, low32_closed};
-    use mithril_front::ast::BinOp;
-    struct C<'a> {
-        r: &'a crate::range::Ranges,
-        plain: usize,
-        shf: usize,
-    }
-    fn nonconst(e: &Core) -> bool {
-        !matches!(e, Core::Num(_))
-    }
-    fn walk(c: &mut C, e: &Core, low: bool, low32: bool) {
-        match e {
-            Core::Op2(op, x, y) if low32 && low32_closed(op) => {
-                if *op == BinOp::Mul && nonconst(x) && nonconst(y) {
-                    c.shf += 1;
-                }
-                walk(c, x, true, true);
-                walk(c, y, *op != BinOp::Shl, *op != BinOp::Shl);
-            }
-            Core::Op2(op, x, y) => {
-                if c.r.wrap(op, x, y, low) {
-                    c.plain += 2;
-                }
-                c.shf += match op {
-                    BinOp::Mul if nonconst(x) && nonconst(y) => 1,
-                    BinOp::Shr => 1 + nonconst(y) as usize,
-                    BinOp::Shl => nonconst(y) as usize,
-                    BinOp::Div | BinOp::FloorDiv | BinOp::Mod => 2,
-                    _ => 0,
-                };
-                walk(c, x, feeds_mask(op, y), feeds_mask32(op, y));
-                walk(c, y, false, false);
-            }
-            Core::Let(x, r, b) => {
-                let (lo, lo32) = (c.r.masked(*x), c.r.masked32(*x));
-                walk(c, r, lo, lo32);
-                walk(c, b, low, low32);
-            }
-            Core::Prim(p, xs) if p.is_f32() => {
-                c.shf += xs.len() + 1;
-                xs.iter().for_each(|x| walk(c, x, false, false));
-            }
-            Core::Prim(p, xs) => {
-                if matches!(p, Prim::ArrGet | Prim::ArrSet) {
-                    c.plain += 1;
-                    c.shf += nonconst(&xs[1]) as usize;
-                }
-                xs.iter().for_each(|x| walk(c, x, false, false));
-            }
-            Core::If(a, t, f) => {
-                walk(c, a, false, false);
-                walk(c, t, low, low32);
-                walk(c, f, low, low32);
-            }
-            Core::Match(sc, arms) => {
-                walk(c, sc, false, false);
-                arms.iter().for_each(|(_, _, b)| walk(c, b, low, low32));
-            }
-            _ => e.kids().into_iter().for_each(|k| walk(c, k, false, false)),
-        }
-    }
-    let n = m.fns.len();
-    if std::env::var_os("MITHRIL_PLAIN_INTS").is_some() {
-        return vec![false; n];
-    }
-    if let Some(r) = FORCE_REP.with(|f| f.get()) {
-        return (0..n).map(|f| r && sigs[f].is_some()).collect();
-    }
-    // local op counts
-    let local: Vec<(usize, usize)> = (0..n)
-        .map(|f| {
-            if sigs[f].is_none() {
-                return (0, 0);
-            }
-            let r = crate::range::Ranges::of(&m.fns[f].body);
-            let mut c = C { r: &r, plain: 0, shf: 0 };
-            walk(&mut c, &m.fns[f].body, false, false);
-            (c.plain, c.shf)
-        })
-        .collect();
-    // call edges between native functions, weighted by the int values
-    // crossing them (args and results): each converts when the two sides
-    // differ
-    let ints = |g: usize| -> usize {
-        let s = sigs[g].as_ref().unwrap();
-        let ps: usize = s.params.iter().map(|p| match p {
-            PTy::I => 1,
-            PTy::T(k) => *k,
-            _ => 0,
-        }).sum();
-        ps + s.ra.iter().filter(|a| !**a).count()
-    };
-    let mut edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-    for f in 0..n {
-        if sigs[f].is_none() {
-            continue;
-        }
-        for g in crate::call_sites(&m.fns[f].body) {
-            let g = g as usize;
-            if g != f && sigs[g].is_some() {
-                let w = ints(g);
-                edges[f].push((g, w));
-                edges[g].push((f, w));
-            }
-        }
-    }
-    let mut rep = vec![false; n];
-    for _ in 0..2 * n + 2 {
-        let mut changed = false;
-        for f in 0..n {
-            if sigs[f].is_none() {
-                continue;
-            }
-            let (p, q) = local[f];
-            let cross = |sh: bool| -> usize { edges[f].iter().filter(|(g, _)| rep[*g] != sh).map(|(_, w)| w).sum() };
-            let want = q + cross(true) < p + cross(false);
-            if want != rep[f] {
-                rep[f] = want;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    rep
-}
-
-/// Convert a native int expression between representations.
-fn conv(e: E, from_sh: bool, to_sh: bool) -> E {
-    match (from_sh, to_sh) {
-        (false, true) => bin(Bop::Shl, e, i64_(8)),
-        (true, false) => bin(Bop::Shr, e, i64_(8)),
-        _ => e,
-    }
-}
-
 pub(crate) fn is_leaf(g: u32) -> bool {
     flag(&LEAF, g, false)
 }
@@ -925,6 +773,9 @@ pub(crate) fn is_leaf(g: u32) -> bool {
 /// scalar-lowered, all-int parameters, and never suspending (a forking
 /// scalar function keeps a dive form of its own and is not included).
 pub(crate) fn native_sig(g: u32) -> Option<Sig> {
+    if flag(&DUAL, g, false) {
+        return None;
+    }
     SIGS.with(|s| s.borrow().get(g as usize).cloned().flatten())
         .filter(|s| s.params.iter().all(|p| *p == PTy::I) && s.ra.iter().all(|a| !a))
 }
@@ -1103,9 +954,7 @@ pub(crate) fn classify(m: &CoreModule, tys: &crate::ty::Types, bor: &[Vec<bool>]
 struct Sem<'m> {
     sigs: &'m [Option<Sig>],
     ranges: crate::range::Ranges,
-    /// the Op2 about to be emitted only has its low bits observed
-    low: bool,
-    /// ... only its low 32 bits
+    /// the Op2 about to be emitted only has its low 32 bits observed
     low32: bool,
     tmp: u32,
     scope: Scope,
@@ -1114,8 +963,6 @@ struct Sem<'m> {
     /// the function counts fuel (it loops or calls); a call-free, loop-free
     /// body does bounded work and settles none
     fuel: bool,
-    /// this function's ints are pre-shifted (see `choose_reps`)
-    shifted: bool,
     /// array value name -> the local holding its length (read once where
     /// the array enters; a write or a move keeps it), so bounds checks
     /// compare against a register instead of reloading the header
@@ -1124,6 +971,10 @@ struct Sem<'m> {
     use_lens: bool,
     /// constructor handles, owned: true (see `Chk::hvars`)
     hvars: HashMap<u32, bool>,
+    /// this function, and the `array_new` being bound is written in full
+    /// by a fill before any read (`uninit_lets`)
+    fid: u32,
+    uninit: bool,
 }
 
 /// The name an array value is known by (arrays are always locals).
@@ -1150,22 +1001,6 @@ impl<'m> Sem<'m> {
 
     fn temp(&mut self, ty: Ty, e: E, b: &mut Vec<S>) -> E {
         crate::value::bind(self.fresh(), ty, e, b)
-    }
-
-    /// An int operand as a plain (unshifted) i64: a constant as is,
-    /// anything else shifted down.
-    fn unshifted(&mut self, e: &Core, b: &mut Vec<S>) -> E {
-        match e {
-            Core::Num(n) => i64_(*n),
-            _ if !self.shifted => self.val(e, b),
-            _ => bin(Bop::Shr, self.val(e, b), i64_(8)),
-        }
-    }
-
-    /// An int value in the array storage form (pre-shifted).
-    fn stored(&mut self, e: &Core, b: &mut Vec<S>) -> E {
-        let x = self.val(e, b);
-        conv(x, self.shifted, true)
     }
 
     /// The length local of array value `a`, reading it now if unknown
@@ -1210,9 +1045,9 @@ impl<'m> Sem<'m> {
         let t = self.fresh();
         match e {
             Core::Prim(Prim::ArrNew, xs) => {
-                let n = self.unshifted(&xs[0], b);
-                let x = self.stored(&xs[1], b);
-                b.push(let_(&t, Ty::I64, cast(p("arr_new_raw", vec![n, x]), Ty::I64)));
+                let n = self.val(&xs[0], b);
+                let alloc = if std::mem::take(&mut self.uninit) { p("arr_new_raw_uninit", vec![n]) } else { p("arr_new_raw", vec![n, self.val(&xs[1], b)]) };
+                b.push(let_(&t, Ty::I64, cast(alloc, Ty::I64)));
                 if self.use_lens {
                     b.push(let_(format!("l_{t}"), Ty::Usize, p("arr_len_of", vec![as_u(v(&t))])));
                     self.lens.insert(t.clone(), format!("l_{t}"));
@@ -1220,8 +1055,8 @@ impl<'m> Sem<'m> {
             }
             Core::Prim(Prim::ArrSet, xs) => {
                 let (a, d) = self.aval(&xs[0], b);
-                let i = self.unshifted(&xs[1], b);
-                let x = self.stored(&xs[2], b);
+                let i = self.val(&xs[1], b);
+                let x = self.val(&xs[2], b);
                 if let Some(k) = d {
                     self.live.remove(&k);
                 }
@@ -1308,13 +1143,7 @@ impl<'m> Sem<'m> {
 
     /// A single-value call's result in this function's representation.
     fn call(&mut self, g: u32, args: &[Core], b: &mut Vec<S>) -> E {
-        let call = self.raw_call(g, args, b);
-        let sig = self.sigs[g as usize].as_ref().unwrap();
-        if shifted(g) == self.shifted || sig.ra.first() == Some(&true) {
-            call
-        } else {
-            conv(call, shifted(g), self.shifted)
-        }
+        self.raw_call(g, args, b)
     }
 
     /// A tuple-valued call: its components, converted to this function's
@@ -1326,7 +1155,7 @@ impl<'m> Sem<'m> {
         let t = self.fresh();
         let rs: Vec<String> = (0..k).map(|i| format!("{t}_{i}")).collect();
         b.push(S::Let(Pat::Tup(rs.clone()), Ty::Infer, call));
-        (0..k).map(|i| if sig.ra[i] || shifted(g) == self.shifted { v(&rs[i]) } else { conv(v(&rs[i]), shifted(g), self.shifted) }).collect()
+        rs.iter().map(v).collect()
     }
 
     /// Free the owned arrays still alive at a path's end.
@@ -1351,15 +1180,8 @@ impl<'m> Sem<'m> {
                 }
                 PTy::B => es.push(v(self.rd(a))),
                 PTy::H | PTy::O => es.push(self.val(a, b)),
-                PTy::I => {
-                    let x = self.val(a, b);
-                    es.push(conv(x, self.shifted, shifted(g)));
-                }
-                PTy::T(_) => {
-                    for x in self.tval(a, b) {
-                        es.push(conv(x, self.shifted, shifted(g)));
-                    }
-                }
+                PTy::I => es.push(self.val(a, b)),
+                PTy::T(_) => es.extend(self.tval(a, b)),
             }
         }
         for k in moved {
@@ -1374,9 +1196,13 @@ impl<'m> Sem<'m> {
         let es = match &bound {
             Bound::Tup(_, _) => self.tval(r, b),
             Bound::Lent(y) => vec![v(vn(*y))],
-            Bound::Owned => vec![self.aval_now(r, b)],
+            Bound::Owned => {
+                self.uninit = crate::uninit_let(self.fid, x);
+                let e = self.aval_now(r, b);
+                self.uninit = false;
+                vec![e]
+            }
             Bound::Scalar => {
-                self.low = self.ranges.masked(x);
                 self.low32 = self.ranges.masked32(x);
                 vec![self.val(r, b)]
             }
@@ -1444,74 +1270,31 @@ impl<'m> Sem<'m> {
     }
 
     fn val(&mut self, e: &Core, b: &mut Vec<S>) -> E {
-        let low = std::mem::take(&mut self.low);
         let low32 = std::mem::take(&mut self.low32);
-        let sh = self.shifted;
         match e {
-            Core::Op2(..) | Core::Cmp(..) if !sh => self.plain_arith(e, low, low32, b),
-            // shifted ints are `x << 8`: i64 wrapping is i56 wrapping, so no
-            // op needs a wrap fix-up
-            Core::Num(n) => i64_(if sh { (*n).wrapping_shl(8) } else { *n }),
+            Core::Op2(..) | Core::Cmp(..) => self.plain_arith(e, low32, b),
+            Core::Num(n) => i64_(*n),
             Core::Prim(Prim::ArrGet, xs) => {
                 let a = self.rd(&xs[0]);
-                let i = self.unshifted(&xs[1], b);
+                let i = self.val(&xs[1], b);
                 let get = self.arr_get(&a, i);
-                self.temp(Ty::I64, conv(cast(get, Ty::I64), true, sh), b) // stored pre-shifted
+                self.temp(Ty::I64, cast(get, Ty::I64), b)
             }
             Core::Prim(pr, xs) if pr.is_f32() => {
                 // the bit patterns go through plain
-                let es: Vec<E> = xs.iter().map(|x| self.unshifted(x, b)).collect();
-                self.temp(Ty::I64, conv(p(f32_fn(*pr), es), false, sh), b)
+                let es: Vec<E> = xs.iter().map(|x| self.val(x, b)).collect();
+                self.temp(Ty::I64, p(f32_fn(*pr), es), b)
             }
             Core::Prim(Prim::ArrLen, xs) => {
                 let a = self.rd(&xs[0]);
                 let l = self.acc(&a).map(v).unwrap_or_else(|| p("arr_len_of", vec![as_u(v(a))]));
-                conv(cast(l, Ty::I64), false, sh)
+                cast(l, Ty::I64)
             }
             Core::Var(i) => v(vn(*i)),
             Core::Proj(base, i) => match &**base {
                 Core::Var(t) if self.scope.tvars.contains_key(t) => v(format!("q{t}_{}", self.scope.tvars[t].offset(*i))),
                 _ => unreachable!("non-idiom Proj in scalar emission"),
             },
-            Core::Op2(op, x, y) => {
-                let t = self.fresh();
-                let k = |e: &Core| if let Core::Num(n) = e { Some(*n) } else { None };
-                let body = match bin_code(op) {
-                    c @ (0 | 1 | 8 | 9 | 10) => {
-                        let (ex, ey) = (self.val(x, b), self.val(y, b));
-                        arith(c, ex, ey)
-                    }
-                    2 => match (k(x), k(y)) {
-                        // one factor unshifted: a constant as is
-                        (_, Some(cst)) => bin(Bop::Mul, self.val(x, b), i64_(cst)),
-                        (Some(cst), _) => bin(Bop::Mul, self.val(y, b), i64_(cst)),
-                        _ => {
-                            let (ex, ey) = (self.val(x, b), self.val(y, b));
-                            bin(Bop::Mul, ex, bin(Bop::Shr, ey, i64_(8)))
-                        }
-                    },
-                    6 | 7 => {
-                        let ex = self.val(x, b);
-                        let sh = self.unshifted(y, b);
-                        if bin_code(op) == 6 {
-                            bin(Bop::Shl, ex, sh)
-                        } else {
-                            bin(Bop::And, bin(Bop::Shr, ex, sh), i64_(-256))
-                        }
-                    }
-                    c => {
-                        // division family: on unshifted values
-                        let ex = self.unshifted(x, b);
-                        let ey = self.unshifted(y, b);
-                        bin(Bop::Shl, arith(c, ex, ey), i64_(8))
-                    }
-                };
-                crate::value::bind(t, Ty::I64, body, b)
-            }
-            Core::Cmp(op, x, y) => {
-                let (ex, ey) = (self.val(x, b), self.val(y, b));
-                bin(Bop::Shl, cast(compare(cmp_code(op), ex, ey), Ty::I64), i64_(8))
-            }
             Core::If(cd, x, y) if matches!((&**x, &**y), (Core::Num(_) | Core::Var(_), Core::Num(_) | Core::Var(_))) => {
                 // a select of computed values (what if-conversion leaves):
                 // mask arithmetic, so the backend cannot turn it back into
@@ -1537,30 +1320,26 @@ impl<'m> Sem<'m> {
         }
     }
 
-    /// Plain-representation arithmetic: canonical i56 values, re-wrapped
-    /// where the range is not proven; masked 32-bit ops run in u32.
-    fn plain_arith(&mut self, e: &Core, low: bool, low32: bool, b: &mut Vec<S>) -> E {
+    /// Native arithmetic: 64-bit wrapping; masked 32-bit ops run in u32.
+    fn plain_arith(&mut self, e: &Core, low32: bool, b: &mut Vec<S>) -> E {
         match e {
             Core::Op2(op, x, y) if low32 && crate::range::low32_closed(op) => {
                 // only the low 32 bits are observed: compute in u32 (the
                 // port's `& 0xFFFFFFFF` masks become free)
                 self.low32 = true;
-                self.low = true;
                 let ex = self.val(x, b);
                 self.low32 = *op != mithril_front::ast::BinOp::Shl;
-                self.low = *op != mithril_front::ast::BinOp::Shl;
                 let ey = self.val(y, b);
                 let body = arith(bin_code(op), cast(ex, Ty::U32), cast(ey, Ty::U32));
                 self.temp(Ty::I64, cast(body, Ty::I64), b)
             }
             Core::Op2(op, x, y) => {
-                self.low = crate::range::feeds_mask(op, y);
                 self.low32 = crate::range::feeds_mask32(op, y);
                 let ex = self.val(x, b);
                 let ey = self.val(y, b);
-                let wrap = self.ranges.wrap(op, x, y, low);
+                // ints are 64-bit: the machine's wrapping arithmetic is the semantics
                 let body = arith(bin_code(op), ex, ey);
-                self.temp(Ty::I64, if wrap { p("wrap56", vec![body]) } else { body }, b)
+                self.temp(Ty::I64, body, b)
             }
             Core::Cmp(op, x, y) => {
                 let (ex, ey) = (self.val(x, b), self.val(y, b));
@@ -1574,6 +1353,10 @@ impl<'m> Sem<'m> {
     /// else returns (a bare i64 for S1, a native tuple for SK).
     fn tail(&mut self, e: &Core, fid: u32, lp: bool, b: &mut Vec<S>) {
         let result = match e {
+            // `let x = r in x` is `r`: a call bound only to be returned is a tail call
+            Core::Let(x, r, bo) if matches!(**bo, Core::Var(y) if y == *x) && matches!(**r, Core::Call(..)) => {
+                return self.tail(r, fid, lp, b);
+            }
             Core::Let(x, r, bo) => {
                 self.bind(*x, r, b);
                 return self.tail(bo, fid, lp, b);
@@ -1635,7 +1418,9 @@ impl<'m> Sem<'m> {
                                     self.hvars.insert(*x, owned);
                                     cast(f, Ty::I64)
                                 }
-                                _ => crate::value::native_int(f, self.shifted),
+                                // an int moved out of a consumed cell may be a box
+                                _ if owned && !unbox.contains_key(ctor) => p("take_i", vec![f]),
+                                _ => crate::lir::as_i(f),
                             };
                             ab.push(let_(vn(*x), Ty::I64, val));
                         }
@@ -1681,6 +1466,14 @@ impl<'m> Sem<'m> {
                     }
                     _ => self.call(*g, args, b),
                 };
+                // nothing left to free after it: settle this frame's work first
+                // and return the call itself, so a tail call stays a jump (the
+                // callee charges its own work; the totals are unchanged)
+                if self.live.is_empty() {
+                    self.settle_fuel(b);
+                    b.push(ret(call));
+                    return;
+                }
                 // the call reads arrays lent to it: run it before they are freed
                 self.temp(Ty::Infer, call, b)
             }
@@ -1715,10 +1508,12 @@ pub(crate) fn port_bridge(fid: u32, sig: &Sig, bor: &[bool], ret_ty: Ty) -> Vec<
     let mut unpack = Vec::new();
     let mut bargs: Vec<E> = vec![v("fuel")];
     let mut after = Vec::new();
-    let conv = |e: E| crate::value::native_int(e, shifted(fid));
+    let conv = crate::lir::as_i;
     for (pp, pt) in sig.params.iter().enumerate() {
         let pv = v(vn(pp as u32));
         match pt {
+            // an owned int port may be a box: released after the read
+            PTy::I if !bor[pp] => bargs.push(p("take_i", vec![pv])),
             PTy::I => bargs.push(conv(pv)),
             // array ports pass as their bits; the dive side's borrow mode
             // for this param may differ from the native one
@@ -1761,7 +1556,7 @@ pub(crate) fn port_bridge(fid: u32, sig: &Sig, bor: &[bool], ret_ty: Ty) -> Vec<
             }
         }
     }
-    let pack = |i: usize, r: E| if sig.ra.get(i).copied().unwrap_or(false) { as_u(r) } else { crate::value::int_port(r, shifted(fid)) };
+    let pack = |i: usize, r: E| if sig.ra.get(i).copied().unwrap_or(false) { as_u(r) } else { crate::lir::num(r) };
     let call = E::Call { f: format!("s_{fid}"), ctx: !ctx_arg(fid).is_empty(), args: bargs };
     let mut bridge_body = unpack;
     if is_leaf(fid) {
@@ -1829,16 +1624,16 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     let mut sem = Sem {
         sigs,
         ranges: crate::range::Ranges::of(&f.body),
-        low: false,
         low32: false,
         tmp: 0,
         scope,
         live,
         fuel: !is_leaf(fid),
-        shifted: shifted(fid),
         lens: HashMap::new(),
         use_lens: false,
         hvars,
+        fid,
+        uninit: false,
     };
     // loop-carried array params keep their length in a loop variable;
     // elsewhere a length is read at its first use
@@ -1891,6 +1686,13 @@ pub(crate) fn scalar_fn(m: &CoreModule, fid: u32, sigs: &[Option<Sig>], bor: &[V
     }
 
     let mut bridge_body = port_bridge(fid, &sig, &bor[fid as usize], Ty::Res);
+    // a proven fold measures its work, then splits a large range before running
+    // a chunk natively
+    let split = crate::seq::FOLD_BRIDGE.with(|f| f.borrow().get(fid as usize).cloned().flatten());
+    if let Some(mut pre) = split {
+        pre.append(&mut bridge_body);
+        bridge_body = pre;
+    }
     // Every caller native: nothing dives this function, so the bridge
     // has no caller and must not look like one (a live bridge call site
     // with unknown arguments blocks the backend's interprocedural

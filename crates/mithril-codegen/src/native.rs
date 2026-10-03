@@ -449,11 +449,19 @@ fn shared_work(body: &mut Vec<S>, charged: bool) -> bool {
     safe
 }
 
+thread_local! {
+    /// Physical frames for native recursion. A device lane has a small fixed
+    /// stack, so a recursive call component runs as one dispatch loop over
+    /// explicit frames; a CPU thread's stack holds the recursion directly (the
+    /// same logical calls and returns, no frame traffic). Rust emission clears it.
+    pub(crate) static FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// Native functions in a recursive call component share a dispatch loop.
 /// Nonrecursive functions and the dive/rule forms retain their existing lowering.
 pub(crate) fn lower(module: &mithril_front::core::CoreModule, fns: &mut Vec<FnDef>, plans: &BTreeMap<u32, FoldPlan>, joins: &[u16], fwd: u16) -> Vec<u32> {
     let bounds: BTreeMap<_, _> = crate::bounds::analyze(module).into_iter().enumerate().map(|(fid, vars)| {
-        let vars = if crate::scalar::shifted(fid as u32) { BTreeSet::new() } else { vars.into_iter().map(|v| format!("v{v}")).collect() };
+        let vars = vars.into_iter().map(|v| format!("v{v}")).collect();
         (format!("s_{fid}"), vars)
     }).collect();
     let mut entries = Vec::new();
@@ -472,6 +480,9 @@ pub(crate) fn lower(module: &mithril_front::core::CoreModule, fns: &mut Vec<FnDe
         let mut m = Machine::new(&group, &bounds, single_entry.then_some(name.as_str()));
         let fid: u32 = name[2..].parse().unwrap();
         if let Some(plan) = plans.get(&fid) { fns.push(folds::expand(&m, name, plan, joins[fid as usize], fwd)); }
+        if !FRAMES.with(|f| f.get()) {
+            continue;
+        }
         m.hoist_captures();
         if coalesced { exits::complete(&mut m); }
         joins::share(&mut m);
@@ -571,7 +582,7 @@ pub(crate) fn lower(module: &mithril_front::core::CoreModule, fns: &mut Vec<FnDe
         params.extend((0..nargs).map(|j| (format!("a{j}"), Ty::I64)));
         for f in fns.iter_mut().filter(|f| m.entries.contains_key(&f.name)) {
             let fid: u32 = f.name[2..].parse().unwrap();
-            if !f.ctx && !crate::scalar::shifted(fid) && f.params.len() == module.fns[fid as usize].arity + 1 && f.params.iter().skip(1).all(|(_,t)| *t==Ty::I64) {
+            if !f.ctx && f.params.len() == module.fns[fid as usize].arity + 1 && f.params.iter().skip(1).all(|(_,t)| *t==Ty::I64) {
                 entries.push(fid);
             }
             let mut args = vec![v("fuel"), u64_(m.entries[&f.name] as u64)];
@@ -648,7 +659,7 @@ pub(crate) fn regions(m: &mithril_front::core::CoreModule, all: &[Option<crate::
             let Some(fast) = fasts.get(&f.name) else { continue };
             if let (Ty::ResArr(k), Kind::SK(n)) = (f.ret, sigs[fid].as_ref().unwrap().ret) { if k != n { continue; } }
             if plans.contains_key(&(fid as u32)) {
-                let args = std::iter::once(v("fuel")).chain((0..m.fns[fid].arity).map(|i| as_i(v(format!("v{i}"))))).collect();
+                let args = std::iter::once(v("fuel")).chain((0..m.fns[fid].arity).map(|i| p("take_i", vec![v(format!("v{i}"))]))).collect();
                 f.body = vec![S::If(ready.clone(), fast.clone(), vec![]),
                     let_("region_mode", Ty::Bool, c("native_enter", vec![])),
                     let_("region_root", Ty::U32, c(&format!("expand_s_{fid}"), args)),

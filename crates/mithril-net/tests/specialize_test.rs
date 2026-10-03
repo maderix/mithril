@@ -25,9 +25,11 @@ fn oracle(m: &CoreModule) -> Val {
         .unwrap()
 }
 
+/// The per-function pass alone (the shapes below are about one body's
+/// readback); `specialize` also clones callees on known arguments.
 fn spec(src: &str) -> (CoreModule, CoreModule) {
     let m = cm(src);
-    let (s, _) = specialize(&m, FUEL);
+    let (s, _) = mithril_net::reduce::specialize_fns(&m, FUEL);
     assert_eq!(s.fns.len(), m.fns.len(), "specialization must keep every function");
     (m, s)
 }
@@ -68,6 +70,11 @@ fn every_fixture_specializes_to_the_same_value() {
     for entry in std::fs::read_dir(&dir).unwrap() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) != Some("py") {
+            continue;
+        }
+        // fixtures whose arrays are too large for the oracle (it copies an
+        // array per update) carry an independently computed value instead
+        if p.file_name().is_some_and(|f| f == "fill_uninit.py") {
             continue;
         }
         let src = std::fs::read_to_string(&p).unwrap();
@@ -527,7 +534,9 @@ def main():
             _ => e.kids().into_iter().map(|k| top_calls(k, g)).sum(),
         }
     }
-    assert_eq!(top_calls(body(&s, "f"), z), 1, "a branch-only z() was hoisted: {:?}", body(&s, "f"));
+    // the unconditional z() may be read back inside the branch that uses it
+    // (expose.rs), but the branch-only one never moves out of its branch
+    assert!(top_calls(body(&s, "f"), z) <= 1, "a branch-only z() was hoisted: {:?}", body(&s, "f"));
 }
 
 /// A call whose result is shared (a Dup) inside an arm stays in the arm.
@@ -647,4 +656,155 @@ fn an_arm_binder_flowing_into_a_closure_body_binds_after_the_match() {
         assert_scoped(&s);
         assert_eq!(oracle(&m), oracle(&s), "{body_src}");
     }
+}
+
+#[test]
+fn failed_static_evaluations_are_charged_to_the_speculation_budget() {
+    // `run(600)` unrolls a known loop whose iterations call `build` and
+    // `comps` with known arguments; each call is too large to finish in a
+    // scratch net. Without a charge, every iteration retried its calls and
+    // compilation took minutes; with one, the calls stay residual.
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/general/graph_dfs.py")).unwrap();
+    let m = desugar(&parse(&src).unwrap()).unwrap();
+    let t = std::time::Instant::now();
+    let (s, _) = specialize(&m, mithril_net::REDUCE_FUEL);
+    assert!(t.elapsed().as_secs() < 30, "specialization took {:?}", t.elapsed());
+    // `run(600)` may call a clone of `run` specialized on 600 (known.rs)
+    let runs: Vec<u32> = s.fns.iter().enumerate().filter(|(_, f)| f.name == "run" || f.name.starts_with("run_")).map(|(i, _)| i as u32).collect();
+    assert!(runs.iter().any(|r| calls(body(&s, "main"), *r)), "the large call stays a call");
+}
+
+// ---- readback order that exposes forks (expose.rs) ----
+
+fn calls_to(e: &Core, g: u32) -> usize {
+    let mut n = 0;
+    e.walk(&mut |x| if matches!(x, Core::Call(f, _) if *f == g) { n += 1 });
+    n
+}
+
+#[test]
+fn a_call_before_an_independent_test_is_read_back_inside_its_arms() {
+    // subsetsum's shape: the test reads w, not skip; one arm calls count again
+    let src = "def weight(i):\n    return (i * 7 + 3) & 15\n\ndef count(i, n, room):\n    if i == n:\n        return 1\n    skip = count(i + 1, n, room)\n    w = weight(i)\n    if w > room:\n        return skip\n    take = count(i + 1, n, room - w)\n    return (skip + take) & 4294967295\n\ndef main():\n    return count(0, array_len(array_new(12, 0)), 40)\n";
+    let (m, s) = spec(src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+    let c = fid(&s, "count");
+    // the test comes before any recursive call: find the If on w > room
+    fn first_if(e: &Core) -> Option<&Core> {
+        match e {
+            Core::If(..) => Some(e),
+            Core::Let(_, _, b) => first_if(b),
+            _ => None,
+        }
+    }
+    let Core::If(_, _, rest) = body(&s, "count") else { panic!("count does not start with its base case") };
+    let Some(Core::If(test, then, els)) = first_if(rest) else { panic!("no test after the base case: {rest:?}") };
+    assert!(!has(test, |x| matches!(x, Core::Call(g, _) if *g == c)), "the test waits for a recursive call");
+    assert_eq!(calls_to(then, c), 1, "the pruned arm makes one call: {then:?}");
+    assert_eq!(calls_to(els, c), 2, "the full arm makes two calls: {els:?}");
+    // in the full arm the two calls are independent: neither argument reads the other's binder
+    let Core::Let(x, r1, b1) = &**els else { panic!("full arm does not bind its first call: {els:?}") };
+    let Core::Let(_, r2, _) = &**b1 else { panic!("full arm does not bind its second call: {els:?}") };
+    assert!(matches!(**r1, Core::Call(g, _) if g == c) && matches!(**r2, Core::Call(g, _) if g == c));
+    assert!(!r2.reads(*x), "the second call reads the first: {els:?}");
+}
+
+#[test]
+fn calls_stay_where_the_test_needs_them() {
+    // the test reads the call's result: nothing to move
+    let reads = "def f(i):\n    return i * 3 + 1\n\ndef g(n, k):\n    x = f(n)\n    if x > k:\n        return f(n + 1) + x\n    return x\n\ndef main():\n    n = array_len(array_new(5, 0))\n    return g(n, 3) + g(n, 99)\n";
+    let (m, s) = spec(reads);
+    assert_eq!(oracle(&m), oracle(&s));
+    // no arm calls anything independent: nothing to expose
+    let plain = "def f(i):\n    if i < 1:\n        return 1\n    return f(i - 1) + i\n\ndef g(n, c):\n    x = f(n)\n    if c > 0:\n        return x\n    return x + 1\n\ndef main():\n    n = array_len(array_new(6, 0))\n    return g(n, 1) + g(n, 0)\n";
+    let (m2, s2) = spec(plain);
+    assert_eq!(oracle(&m2), oracle(&s2));
+    let gf = fid(&s2, "f");
+    assert!(matches!(body(&s2, "g"), Core::Let(_, r, _) if matches!(**r, Core::Call(h, _) if h == gf)), "g's call moved without exposing a fork: {:?}", body(&s2, "g"));
+}
+
+#[test]
+fn an_arm_that_ignores_the_call_gets_no_binding() {
+    // the net erases a call whose result is unused; the readback places none there
+    let src = "def f(i):\n    if i < 1:\n        return 1\n    return f(i - 1) + f(i - 1)\n\ndef g(n, c):\n    x = f(n)\n    if c > 0:\n        return x + f(n + 1)\n    return 7\n\ndef main():\n    n = array_len(array_new(6, 0))\n    return g(n, 1) + g(n, 0)\n";
+    let (m, s) = spec(src);
+    assert_scoped(&s);
+    assert_eq!(oracle(&m), oracle(&s));
+    let gf = fid(&s, "f");
+    fn find_if(e: &Core) -> Option<(&Core, &Core)> {
+        match e {
+            Core::If(_, t, f) => Some((t, f)),
+            Core::Let(_, _, b) => find_if(b),
+            _ => None,
+        }
+    }
+    let (then, els) = find_if(body(&s, "g")).expect("g keeps its test");
+    assert_eq!(calls_to(then, gf), 2, "{then:?}");
+    assert_eq!(calls_to(els, gf), 0, "the arm returning 7 still calls f: {els:?}");
+}
+
+// ---- specialization on known arguments (known.rs) ----
+
+fn full(src: &str) -> (CoreModule, CoreModule) {
+    let mut m = parse(src).unwrap_or_else(|d| panic!("parse error line {}: {}", d.line, d.msg));
+    let _ = mithril_reassoc::analyze(&mut m);
+    let m = desugar(&m).unwrap();
+    let (s, _) = specialize(&m, FUEL);
+    assert_eq!(oracle(&m), oracle(&s), "specialized module computes a different value");
+    (m, s)
+}
+
+fn named<'a>(m: &'a CoreModule, prefix: &str) -> Vec<&'a mithril_front::core::CoreFn> {
+    m.fns.iter().filter(|f| f.name.starts_with(prefix)).collect()
+}
+
+#[test]
+fn a_loop_invariant_constant_reaches_the_loop_body() {
+    let src = "def scale(n, k):\n    s = 0\n    for i in range(n):\n        s = s * 3 + i % k\n    return s\n\ndef main():\n    n = array_len(array_new(50, 0))\n    return scale(n, 8)\n";
+    let (_, s) = full(src);
+    // the loop's clone divides by the constant (codegen makes it a mask)
+    let modk = |f: &&mithril_front::core::CoreFn| has(&f.body, |e| matches!(e, Core::Op2(mithril_front::ast::BinOp::Mod, _, k) if **k == Core::Num(8)));
+    assert!(s.fns.iter().any(|f| modk(&f)), "no function divides by the constant 8: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_parameter_that_changes_is_never_fixed() {
+    let src = "def f(n, k):\n    if n == 0:\n        return k\n    return f(n - 1, k + 1)\n\ndef main():\n    n = array_len(array_new(9, 0))\n    return f(n, 0)\n";
+    let (_, s) = full(src);
+    assert!(named(&s, "f_1k").is_empty(), "k changes in the recursion: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+}
+
+#[test]
+fn mutual_recursion_fixes_nothing() {
+    let src = "def ev(n, k):\n    if n == 0:\n        return k\n    return od(n - 1, k)\n\ndef od(n, k):\n    if n == 0:\n        return 0 - k\n    return ev(n - 1, k)\n\ndef main():\n    n = array_len(array_new(7, 0))\n    return ev(n, 5)\n";
+    let (m, s) = full(src);
+    assert_eq!(s.fns.len(), m.fns.len(), "a parameter through a call cycle is not fixed");
+}
+
+#[test]
+fn a_proven_fold_keeps_its_counter_bound_and_accumulator() {
+    let src = "def total(n, k):\n    s = 0\n    for i in range(n):\n        s = s + i * k\n    return s\n\ndef main():\n    return total(array_len(array_new(100000, 0)), 3) + total(40, 2)\n";
+    let (_, s) = full(src);
+    let mut fixed_extra = false;
+    for f in s.fns.iter().filter(|f| f.fold.is_some()) {
+        // a fold clone may fix its extra (k), never its counter, bound or
+        // accumulator (the `Var` its loop returns)
+        let Core::If(_, _, e) = &f.body else { panic!("{} is no fold shape", f.name) };
+        let Core::Var(acc) = **e else { panic!("{} returns no accumulator", f.name) };
+        for p in [0, 1, acc] {
+            assert!(!f.name.contains(&format!("_{p}k")), "fold {} fixed structural parameter {p}", f.name);
+        }
+        fixed_extra |= f.name.contains('k');
+    }
+    assert!(fixed_extra, "the fold's extra k is fixed: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+}
+
+#[test]
+fn clones_do_not_chain_and_originals_no_call_reaches_lose_their_code() {
+    let src = "def f(i):\n    if i < 1:\n        return 1\n    return f(i - 1) + i\n\ndef g(n, c):\n    x = f(n)\n    if c > 0:\n        return x\n    return x + 1\n\ndef main():\n    n = array_len(array_new(6, 0))\n    return g(n, 1) + g(n, 1) + g(n, 0)\n";
+    let (_, s) = full(src);
+    assert_eq!(named(&s, "g_1k1").len(), 1, "one clone per fixed argument, never a clone of a clone: {:?}", s.fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+    assert!(named(&s, "g_1k1_").is_empty());
+    assert_eq!(body(&s, "g"), &Core::Num(0), "g is no longer called");
 }

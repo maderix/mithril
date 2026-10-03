@@ -100,6 +100,11 @@ pub enum Combiner {
     /// 2^32; the join must re-mask its result to the low 32 bits.
     WrapAdd32,
     TupleWrapAdd32(usize),
+    /// An index fill: the loop's state is an array written once per
+    /// iteration at the loop index (`a = array_set(a, i, e)`), and nothing
+    /// in the body reads the array. Writes at distinct indices commute, so
+    /// chunks of the range write their parts of one buffer in any order.
+    Fill,
 }
 
 #[derive(Clone, PartialEq, Debug)]

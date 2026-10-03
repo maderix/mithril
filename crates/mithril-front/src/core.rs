@@ -286,13 +286,6 @@ pub enum Val {
     L(u32, std::sync::Arc<Core>, std::sync::Arc<Vec<(u32, Val)>>),
 }
 
-/// Wrap a 64-bit result down to the signed 56-bit `int` range, matching
-/// `mithril_core::port::Port::as_i64`'s sign-extension trick: shift the
-/// low 56 bits to the top of the word and arithmetic-shift back down.
-pub fn wrap56(v: i64) -> i64 {
-    ((v as u64) << 8) as i64 >> 8
-}
-
 pub fn floor_div(a: i64, b: i64) -> i64 {
     let q = a.wrapping_div(b);
     let r = a.wrapping_rem(b);
@@ -312,13 +305,13 @@ pub fn py_mod(a: i64, b: i64) -> i64 {
     }
 }
 
-/// i56 semantics of a binary op (one definition for the oracle and the
-/// reducer); `None` on a zero divisor.
+/// Integer semantics of a binary op: 64-bit, wrapping (one definition for
+/// the oracle and the reducer); `None` on a zero divisor.
 pub fn int_op(op: BinOp, x: i64, y: i64) -> Option<i64> {
     if y == 0 && matches!(op, BinOp::Div | BinOp::FloorDiv | BinOp::Mod) {
         return None;
     }
-    Some(wrap56(match op {
+    Some(match op {
         BinOp::Add => x.wrapping_add(y),
         BinOp::Sub => x.wrapping_sub(y),
         BinOp::Mul => x.wrapping_mul(y),
@@ -330,7 +323,7 @@ pub fn int_op(op: BinOp, x: i64, y: i64) -> Option<i64> {
         BinOp::BitAnd => x & y,
         BinOp::BitOr => x | y,
         BinOp::BitXor => x ^ y,
-    }))
+    })
 }
 
 /// f64 semantics of a binary op; `None` where it is not defined on floats.

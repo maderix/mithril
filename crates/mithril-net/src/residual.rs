@@ -213,7 +213,7 @@ pub(crate) fn scan(net: &Net, free: &[(Port, u32)]) -> Index {
             continue;
         }
         match p.tag() {
-            Tag::Num | Tag::Era | Tag::Flo | Tag::Ext => {}
+            Tag::Num | Tag::Big | Tag::Era | Tag::Flo | Tag::Ext => {}
             Tag::Kont | Tag::Arr | Tag::Other => panic!("ICE: runtime-only agent {:?} at compile time", p.tag()),
             Tag::Var => {
                 let w = p.payload() as u32;
@@ -613,7 +613,7 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn read(&mut self, p: Port) -> Core {
         match p.tag() {
-            Tag::Num => Core::Num(p.as_i64()),
+            Tag::Num | Tag::Big => Core::Num(p.int_value()),
             Tag::Flo => Core::Flo(f64::from_bits(crate::flo_bits(self.net.cell(p.payload() as u32)))),
             Tag::Con => {
                 let fields: Vec<Core> = con_fields(self.net, p).into_iter().map(|f| self.atom(f)).collect();

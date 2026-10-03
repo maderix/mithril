@@ -102,7 +102,7 @@ tiny work budgets that force pausing, and on the GPU (see Tests).
 
 - Functions (`def`), `if`/`elif`/`else`, `while`, `for i in range(a, b)`,
   `return`, assignment and tuple destructuring (`a, b = t`).
-- Integers are 56-bit signed with wrap-around; floats are f64 by default.
+- Integers are 64-bit signed with wrap-around; floats are f64 by default.
   `sqrt(x)` and `f32(n)` make a value binary32, and f32 then spreads through
   the arithmetic; `int(x)` converts back.
 - Algebraic data types with `@data`, taken apart with `match`/`case`

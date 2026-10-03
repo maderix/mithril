@@ -45,7 +45,13 @@ RUN_CAP_S = 60
 
 # small size: (sed substitutions, expected checksum) — mirrors tests/e2e/run.sh
 SMALL = {
+    "collatz": (["s/return total(3000000)/return total(1000)/"], "59431"),
+    "heat2d": (["s/return run(1024, 500)/return run(32, 10)/"], "131504068"),
+    "histogram": (["s/hist(536870912)/hist(1000)/"], "4456"),
     "kdtree": (["s/    n = 18/    n = 10/", "s/return qbatch(t, 18, 0)/return qbatch(t, 10, 0)/"], "2478099586"),
+    "knapsack": (["s/return solve(8000, 100000)/return solve(20, 1000)/"], "7590"),
+    "msort": (["s/gen(524288, /gen(1000, /"], "873274365"),
+    "subsetsum": (["s/    n = 32/    n = 16/"], "7379"),
 }
 
 # mid size for the perf signal (no expected value; t1 and t16 must agree)

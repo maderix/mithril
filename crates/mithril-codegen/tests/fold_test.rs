@@ -1,6 +1,6 @@
 //! Certified summaries must agree with both net reduction and native execution.
 use mithril_front::{desugar,parse,eval_core};
-use mithril_codegen::{emit_rust_opts,EmitOpts,fmt_val};
+use mithril_codegen::{emit_rust,fmt_val};
 use std::process::Command;
 
 #[test]
@@ -24,8 +24,8 @@ fn recursive_summaries_preserve_counts_and_wrapping_seeds() {
             assert_eq!(mithril_net::readback(&net,mithril_net::root_port()).map(|v| fmt_val(&v)),Some(want.clone()),"net: n={n} seed={seed}");
             let runtime=constant.replace(&format!("n = {n}"),&format!("n = array_len(array_new({n}, 0))"));
             let m=desugar(&parse(&runtime).unwrap()).unwrap();
-            for rep in [Some(false),Some(true)] {
-                let code=emit_rust_opts(&m,EmitOpts { int_rep:rep });
+            {
+                let code=emit_rust(&m);
                 std::fs::write(dir.join("main.rs"),code).unwrap();
                 let c=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs"))
                     .arg("--extern").arg(format!("mithril_rt={}",root.join("target/release/libmithril_rt.rlib").display()))
@@ -35,7 +35,7 @@ fn recursive_summaries_preserve_counts_and_wrapping_seeds() {
                 for threads in ["1","4"] { for fuel in ["1","64"] {
                     let r=Command::new(dir.join("run")).args([threads,fuel]).output().unwrap();
                     assert!(r.status.success(),"{}",String::from_utf8_lossy(&r.stderr));
-                    assert_eq!(String::from_utf8_lossy(&r.stdout).trim(),want,"n={n} seed={seed} rep={rep:?} threads={threads} fuel={fuel}");
+                    assert_eq!(String::from_utf8_lossy(&r.stdout).trim(),want,"n={n} seed={seed} threads={threads} fuel={fuel}");
                 } }
             }
         }
@@ -59,8 +59,8 @@ fn control_that_depends_on_seed_high_bits_keeps_original_execution() {
         assert_eq!(mithril_net::readback(&net,mithril_net::root_port()).map(|v|fmt_val(&v)),Some(want.clone()));
         let source = constant.replace("return f(4,", "return f(array_len(array_new(4, 0)),");
         let m = desugar(&parse(&source).unwrap()).unwrap();
-        for rep in [Some(false),Some(true)] {
-            std::fs::write(dir.join("main.rs"),emit_rust_opts(&m,EmitOpts { int_rep:rep })).unwrap();
+        {
+            std::fs::write(dir.join("main.rs"),emit_rust(&m)).unwrap();
             let c = Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs"))
                 .arg("--extern").arg(format!("mithril_rt={}",root.join("target/release/libmithril_rt.rlib").display()))
                 .arg("-L").arg(format!("dependency={}",root.join("target/release/deps").display()))
@@ -69,7 +69,7 @@ fn control_that_depends_on_seed_high_bits_keeps_original_execution() {
             for threads in ["1","4"] { for fuel in ["1","64"] {
                 let r = Command::new(dir.join("run")).args([threads,fuel]).output().unwrap();
                 assert!(r.status.success());
-                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(),want,"seed={seed} rep={rep:?} threads={threads} fuel={fuel}");
+                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(),want,"seed={seed} threads={threads} fuel={fuel}");
             } }
         }
     }

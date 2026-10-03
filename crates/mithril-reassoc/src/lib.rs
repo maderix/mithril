@@ -1,12 +1,12 @@
 //! mithril-reassoc: fold detection + associativity prover + Lean proof
 //! obligations (Task 4; Rust port of spike 4 over the surface AST,
-//! generalized from Z_2^32 to Z_2^56).
+//! generalized from Z_2^32 to Z_2^64).
 //!
 //! `analyze` walks every `for v in range(n)` loop, matches the two
 //! accumulation shapes (`acc = f(acc, e)` with `f` inlined symbolically,
 //! and the `acc = acc ⊕ e` binop spine), proves the combiner associative
 //! with 0 (or the all-zero tuple) as identity by polynomial normal form
-//! over Z_2^56, checks the accumulator provably holds that identity when
+//! over Z_2^64, checks the accumulator provably holds that identity when
 //! the loop is entered, and marks proven folds on `Stmt::For`'s `fold`
 //! field for Task 3's desugar to carry into `CoreFn.fold`. Everything
 //! else is declined with a reason — soundness over coverage.
@@ -19,12 +19,12 @@ pub mod split;
 pub use lean::lean_obligations;
 
 use detect::{detect, is_componentwise_add, prove, step_from_expr, step_from_fn, uses_var, Cand, Step};
-use mithril_front::ast::{Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
+use mithril_front::ast::{BinOp, Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
 use std::collections::HashMap;
 
 /// One analyzed `for` loop. For loops that are not accumulation-shaped at
 /// all, `acc` is empty. `arity` (1 = scalar, k = k-tuple componentwise)
-/// and `bits` (56 native, 32 for `& 4294967295`-masked u32-emulation
+/// and `bits` (64 native, 32 for `& 4294967295`-masked u32-emulation
 /// folds) describe the proven combiner and are what `lean_obligations`
 /// shapes the obligation from; both are 0 on declined/non-fold reports.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -35,6 +35,8 @@ pub struct FoldReport {
     pub reason: String,
     pub arity: usize,
     pub bits: u32,
+    /// A proven index fill (no combiner: arity and bits are 0).
+    pub fill: bool,
 }
 
 /// What the accumulator provably holds when a loop is entered.
@@ -147,7 +149,13 @@ fn analyze_for(
     inits: &HashMap<String, Init>,
     out: &mut Vec<FoldReport>,
 ) {
-    let report = |acc: &str, proven, reason, arity, bits| FoldReport { func: func.to_string(), acc: acc.to_string(), proven, reason, arity, bits };
+    let report = |acc: &str, proven, reason, arity, bits| FoldReport { func: func.to_string(), acc: acc.to_string(), proven, reason, arity, bits, fill: false };
+    if let Some(acc) = fill_target(var, body) {
+        *fold = Some(FoldInfo { combiner: Combiner::Fill, proven: true });
+        let reason = "PROVEN index fill (writes at distinct indices commute)".to_string();
+        out.push(FoldReport { fill: true, ..report(acc, true, reason, 0, 0) });
+        return;
+    }
     out.push(match prove_for(var, body, fns, inits) {
         Ok((acc, combiner, arity, bits, desc)) => {
             *fold = Some(FoldInfo { combiner, proven: true });
@@ -155,6 +163,55 @@ fn analyze_for(
         }
         Err((acc, reason)) => report(acc, false, reason, 0, 0),
     });
+}
+
+/// The array a loop fills, when the loop is an index fill: straight-line
+/// assignments to fresh locals, then `a = array_set(a, var, e)`, with `a` read
+/// nowhere else in the body and the loop variable never assigned. Each
+/// iteration then writes `e` at its own index, and `e` cannot see the writes of
+/// other iterations (lemma `fill_chunks`).
+fn fill_target<'a>(var: &str, body: &'a [Stmt]) -> Option<&'a str> {
+    let (Stmt::Assign(a, Expr::Call(f, args)), work) = body.split_last()? else { return None };
+    if f != "array_set" || args.len() != 3 || args[0] != Expr::Var(a.clone()) || a == var {
+        return None;
+    }
+    // the index is the loop variable, or a local set to it plus or minus a value
+    // the body does not assign (`range(lo, hi)` binds `i = counter + lo`): either
+    // way distinct iterations write distinct indices
+    let is_var = |e: &Expr| *e == Expr::Var(var.to_string());
+    let offset = |e: &Expr| work.iter().all(|st| !matches!(st, Stmt::Assign(x, _) if uses_var(e, x))) && !uses_var(e, a) && !uses_var(e, var);
+    let index_ok = match &args[1] {
+        e if is_var(e) => true,
+        Expr::Var(x) => work.iter().any(|st| match st {
+            Stmt::Assign(y, Expr::Bin(BinOp::Add, l, r)) if y == x => (is_var(l) && offset(r)) || (is_var(r) && offset(l)),
+            Stmt::Assign(y, Expr::Bin(BinOp::Sub, l, r)) if y == x => is_var(l) && offset(r),
+            _ => false,
+        }),
+        _ => false,
+    };
+    if !index_ok {
+        return None;
+    }
+    // a local read before its assignment would carry a value between iterations
+    let assigned: std::collections::BTreeSet<&String> = work.iter().filter_map(|st| match st {
+        Stmt::Assign(x, _) => Some(x),
+        _ => None,
+    }).collect();
+    let mut locals = std::collections::BTreeSet::new();
+    let carried = |e: &Expr, locals: &std::collections::BTreeSet<&String>| {
+        uses_var(e, a) || assigned.iter().any(|x| !locals.contains(x) && uses_var(e, x))
+    };
+    for st in work {
+        let Stmt::Assign(x, e) = st else { return None };
+        if x == a || x == var || locals.contains(x) || carried(e, &locals) {
+            return None;
+        }
+        locals.insert(x);
+    }
+    if carried(&args[2], &locals) {
+        return None;
+    }
+    Some(a)
 }
 
 /// A proven loop: (accumulator, combiner, arity, bits, description); or
@@ -186,7 +243,7 @@ fn prove_for<'a>(
     };
     let (assoc, ident) = prove(&step);
     if !assoc {
-        return Err(decline("combiner is not associative over Z_2^56, DECLINED".into()));
+        return Err(decline("combiner is not associative over Z_2^64, DECLINED".into()));
     }
     if !ident {
         return Err(decline("zero is not a left identity of the combiner, DECLINED".into()));
@@ -218,5 +275,5 @@ fn prove_for<'a>(
             format!("componentwise wrapping add mod 2^32 on {k}-tuple"),
         ),
     };
-    Ok((acc, combiner, step.arity, if mode32 { 32 } else { 56 }, desc))
+    Ok((acc, combiner, step.arity, if mode32 { 32 } else { 64 }, desc))
 }

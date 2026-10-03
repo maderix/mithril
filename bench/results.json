@@ -6,46 +6,47 @@
   "kernel": "6.17.4-76061704-generic",
   "rustc": "rustc 1.86.0 (05f9846f8 2025-03-31)",
   "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0",
-  "git_head": "7b6e11384cf6bb8ca0d94d1e2dc9632b9a202534",
-  "git_branch": "mithril-v1",
-  "date": "2026-09-29 23:10:26 IST",
-  "note": "CPU lanes: harness at 723be4c; GPU lane (build --gpu / exec): harness at 2a3f23e; both quiet, min of 3"
+  "git_head": "61702e101d112cd9b7e89ef7121d52c079f05ecf",
+  "git_branch": "master",
+  "date": "2026-10-03 10:19:38 IST"
  },
  "timeout": 300.0,
- "n": 3,
+ "n": null,
  "rows": [
   {
-   "name": "kdtree",
-   "expected": "1660315459",
+   "name": "collatz",
+   "expected": "428343355",
    "lanes": {
     "C": {
      "label": "C",
      "cmd": [
-      "/tmp/mithril-bench-k4z6z3al/kdtree.c.bin"
+      "/tmp/mithril-bench-aqfowlap/collatz.gcc.bin"
      ],
      "status": "ok",
-     "time": 0.33333607700114953,
+     "time": 0.34474124503321946,
      "runs": [
-      0.33513098799812724,
-      0.33917731800102047,
-      0.33333607700114953
+      0.3500152859487571,
+      0.34474124503321946,
+      0.3451526319840923
      ],
-     "notes": [],
+     "notes": [
+      "gcc -O3"
+     ],
      "error": null
     },
     "SEQ": {
      "label": "SEQ",
      "cmd": [
-      "/tmp/mithril-bench-k4z6z3al/kdtree.mithril.bin",
+      "/tmp/mithril-bench-aqfowlap/collatz.mithril.bin",
       "--threads",
       "1"
      ],
      "status": "ok",
-     "time": 0.4061769979998644,
+     "time": 0.65725772397127,
      "runs": [
-      0.41160649100129376,
-      0.4061769979998644,
-      0.41112745400096173
+      0.6603576769703068,
+      0.6584288980229758,
+      0.65725772397127
      ],
      "notes": [],
      "error": null
@@ -53,16 +54,16 @@
     "PAR16": {
      "label": "PAR16",
      "cmd": [
-      "/tmp/mithril-bench-k4z6z3al/kdtree.mithril.bin",
+      "/tmp/mithril-bench-aqfowlap/collatz.mithril.bin",
       "--threads",
       "16"
      ],
      "status": "ok",
-     "time": 0.08961783799895784,
+     "time": 0.05679394298931584,
      "runs": [
-      0.08961783799895784,
-      0.09045850499751396,
-      0.08969171799981268
+      0.05679394298931584,
+      0.05716253095306456,
+      0.05827504501212388
      ],
      "notes": [],
      "error": null
@@ -72,25 +73,504 @@
      "cmd": [
       "/home/maderix/Mithril/target/release/mithril",
       "exec",
-      "/tmp/mithril-bench-pjj55kg1/kdtree.gpu"
+      "/tmp/mithril-bench-woo0_jwi/collatz.gpu"
      ],
      "status": "ok",
-     "time": 1.3042607400020643,
+     "time": 0.12086280999938026,
      "runs": [
-      1.3042607400020643,
-      1.516303494998283,
-      1.5173616690008203
+      0.12992599100107327,
+      0.12086280999938026,
+      0.12148238701047376
      ],
-     "notes": [],
+     "notes": [
+      "kept from 61702e1"
+     ],
      "error": null
     }
    },
    "notes": [
-    "build 1.0s",
-    "GPU lane: built artefact, harness at 2a3f23e"
+    "build 0.5s"
    ],
    "build_error": null,
-   "build_time": 0.9674394619978557
+   "build_time": 0.5377959699835628
+  },
+  {
+   "name": "heat2d",
+   "expected": "4071368130",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/heat2d.gpu"
+     ],
+     "status": "ok",
+     "time": 136.4788267830154,
+     "runs": [
+      136.4788267830154
+     ],
+     "notes": [],
+     "error": null
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/heat2d.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.5221321600256488,
+     "runs": [
+      0.5248855149839073,
+      0.5238144299946725,
+      0.5221321600256488
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/heat2d.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 1.4054909590049647,
+     "runs": [
+      1.4054909590049647,
+      1.4079689549980685,
+      1.4057870169635862
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/heat2d.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 1.4080321950023063,
+     "runs": [
+      1.4112414470291696,
+      1.4107212100061588,
+      1.4080321950023063
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
+  },
+  {
+   "name": "histogram",
+   "expected": "2415919104",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/histogram.gpu"
+     ],
+     "status": "ok",
+     "time": 0.12524710601428524,
+     "runs": [
+      0.13176116102840751,
+      0.12631968996720389,
+      0.12524710601428524
+     ],
+     "notes": [],
+     "error": null
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/histogram.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.3800479359924793,
+     "runs": [
+      0.38301375904120505,
+      0.3800479359924793,
+      0.3812776179984212
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/histogram.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 1.3006449500098825,
+     "runs": [
+      1.3070926559739746,
+      1.3136758399778046,
+      1.3006449500098825
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/histogram.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 0.16775447397958487,
+     "runs": [
+      0.16775447397958487,
+      0.16964314400684088,
+      0.17129213397856802
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
+  },
+  {
+   "name": "kdtree",
+   "expected": "1660315459",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/kdtree.gpu"
+     ],
+     "status": "ok",
+     "time": 1.215161838044878,
+     "runs": [
+      2.354665216000285,
+      1.215161838044878,
+      1.2155911640147679
+     ],
+     "notes": [],
+     "error": null
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/kdtree.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.356760552036576,
+     "runs": [
+      0.356760552036576,
+      0.3608828000142239,
+      0.3639709330163896
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/kdtree.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 0.3890808860305697,
+     "runs": [
+      0.3920785299851559,
+      0.3890808860305697,
+      0.3962824770133011
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/kdtree.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 0.08789748995332047,
+     "runs": [
+      0.08789748995332047,
+      0.08903896395349875,
+      0.08908684400375932
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
+  },
+  {
+   "name": "knapsack",
+   "expected": "2118152",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/knapsack.gpu"
+     ],
+     "status": "ok",
+     "time": 103.73640876298305,
+     "runs": [
+      103.73640876298305
+     ],
+     "notes": [],
+     "error": null
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/knapsack.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.349663981993217,
+     "runs": [
+      0.35284132399829105,
+      0.349663981993217,
+      0.35013583896216005
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/knapsack.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 0.5584267820231616,
+     "runs": [
+      0.572763633041177,
+      0.5756970280199312,
+      0.5584267820231616
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/knapsack.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 0.5489723440259695,
+     "runs": [
+      0.5666401269845665,
+      0.5729287919821218,
+      0.5489723440259695
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
+  },
+  {
+   "name": "msort",
+   "expected": "3393182426",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/msort.gpu"
+     ],
+     "status": "ok",
+     "time": 6.251035060966387,
+     "runs": [
+      6.533382922993042,
+      6.251035060966387,
+      6.557924841996282
+     ],
+     "notes": [],
+     "error": null
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/msort.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.39324342302279547,
+     "runs": [
+      0.4045421119662933,
+      0.40453946200432256,
+      0.39324342302279547
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/msort.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 0.28430603799642995,
+     "runs": [
+      0.29149897902971134,
+      0.28430603799642995,
+      0.28884441300760955
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/msort.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 0.11971736699342728,
+     "runs": [
+      0.12146021699300036,
+      0.11971736699342728,
+      0.1241623520036228
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
+  },
+  {
+   "name": "subsetsum",
+   "expected": "181039267",
+   "lanes": {
+    "GPU": {
+     "label": "GPU",
+     "cmd": [
+      "/home/maderix/Mithril/target/release/mithril",
+      "exec",
+      "/tmp/mithril-bench-woo0_jwi/subsetsum.gpu"
+     ],
+     "status": "DNF",
+     "time": null,
+     "runs": [],
+     "notes": [],
+     "error": "timeout after 300s (run 1)"
+    },
+    "C": {
+     "label": "C",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/subsetsum.c.bin"
+     ],
+     "status": "ok",
+     "time": 0.5446863470133394,
+     "runs": [
+      0.5446863470133394,
+      0.5448996360064484,
+      0.5469527439563535
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "SEQ": {
+     "label": "SEQ",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/subsetsum.mithril.bin",
+      "--threads",
+      "1"
+     ],
+     "status": "ok",
+     "time": 1.6148470259504393,
+     "runs": [
+      1.6414010109729134,
+      1.6148470259504393,
+      1.627176358946599
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    },
+    "PAR16": {
+     "label": "PAR16",
+     "cmd": [
+      "/tmp/mithril-bench-kxotwjga/subsetsum.mithril.bin",
+      "--threads",
+      "16"
+     ],
+     "status": "ok",
+     "time": 1.106362471007742,
+     "runs": [
+      1.1267537400126457,
+      1.106362471007742,
+      1.1258726650266908
+     ],
+     "notes": [
+      "kept from 61702e1"
+     ],
+     "error": null
+    }
+   },
+   "notes": [],
+   "build_error": null,
+   "build_time": 0.0
   }
  ]
 }

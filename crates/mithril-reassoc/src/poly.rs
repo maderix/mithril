@@ -1,5 +1,5 @@
-//! Polynomial normal form over Z_2^k (wrapping arithmetic), k = 56 for
-//! native i56 folds and k = 32 for `& 4294967295`-masked (u32-emulation)
+//! Polynomial normal form over Z_2^k (wrapping arithmetic), k = 64 for
+//! native int folds and k = 32 for `& 4294967295`-masked (u32-emulation)
 //! folds.
 //!
 //! A `Poly` maps a monomial (a sorted `(variable, exponent)` list) to its
@@ -11,8 +11,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-/// Coefficient mask for native i56 folds (Z_2^56).
-pub const MASK56: u64 = (1u64 << 56) - 1;
+/// Coefficient mask for native int folds (Z_2^64).
+pub const MASK64: u64 = u64::MAX;
 /// Coefficient mask for `& 4294967295`-masked folds (Z_2^32).
 pub const MASK32: u64 = (1u64 << 32) - 1;
 
@@ -43,7 +43,7 @@ pub fn padd(p: &Poly, q: &Poly, mask: u64) -> Poly {
     let mut r = p.clone();
     for (m, c) in q {
         let e = r.entry(m.clone()).or_insert(0);
-        *e = (*e + *c) & mask; // both <= mask < 2^63, no u64 overflow
+        *e = e.wrapping_add(*c) & mask; // mod 2^64 first: 2^k divides it
         if *e == 0 {
             r.remove(m);
         }
@@ -66,7 +66,7 @@ pub fn pmul(p: &Poly, q: &Poly, mask: u64) -> Poly {
             let m: Mono = d.into_iter().map(|(v, e)| (v.clone(), e)).collect();
             let c = ((*c1 as u128 * *c2 as u128) & mask as u128) as u64;
             let e = r.entry(m).or_insert(0);
-            *e = (*e + c) & mask;
+            *e = e.wrapping_add(c) & mask;
         }
     }
     r.retain(|_, c| *c != 0);
@@ -95,22 +95,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_identities_mod_2_56() {
+    fn ring_identities_mod_2_64() {
         // (x + y)^2 == x^2 + 2xy + y^2
         let (x, y) = (pvar("x"), pvar("y"));
-        let s = padd(&x, &y, MASK56);
-        let lhs = pmul(&s, &s, MASK56);
+        let s = padd(&x, &y, MASK64);
+        let lhs = pmul(&s, &s, MASK64);
         let rhs = padd(
-            &padd(&pmul(&x, &x, MASK56), &pmul(&pconst(2, MASK56), &pmul(&x, &y, MASK56), MASK56), MASK56),
-            &pmul(&y, &y, MASK56),
-            MASK56,
+            &padd(&pmul(&x, &x, MASK64), &pmul(&pconst(2, MASK64), &pmul(&x, &y, MASK64), MASK64), MASK64),
+            &pmul(&y, &y, MASK64),
+            MASK64,
         );
         assert_eq!(lhs, rhs);
-        // x - x == 0, and coefficients wrap mod 2^56
-        assert!(padd(&x, &pneg(&x, MASK56), MASK56).is_empty());
-        assert!(pconst(1i64 << 56, MASK56).is_empty()); // 2^56 == 0 (mod 2^56)
-        assert_eq!(pconst(-1, MASK56), pconst((1i64 << 56) - 1, MASK56));
-        assert!(pmul(&pconst(1 << 28, MASK56), &pconst(1 << 28, MASK56), MASK56).is_empty());
+        // x - x == 0, and coefficients wrap mod 2^64 (sums and products
+        // past 2^64 included), not mod 2^56
+        assert!(padd(&x, &pneg(&x, MASK64), MASK64).is_empty());
+        assert_eq!(pconst(-1, MASK64), pconst_u(u64::MAX, MASK64));
+        assert!(!pconst(1i64 << 56, MASK64).is_empty());
+        assert!(pmul(&pconst(1 << 32, MASK64), &pconst(1 << 32, MASK64), MASK64).is_empty());
+        assert!(padd(&pconst(i64::MIN, MASK64), &pconst(i64::MIN, MASK64), MASK64).is_empty());
+        assert_eq!(padd(&pconst(-1, MASK64), &pconst(-1, MASK64), MASK64), pconst(-2, MASK64));
     }
 
     #[test]
@@ -118,7 +121,7 @@ mod tests {
         assert!(pconst(1i64 << 32, MASK32).is_empty()); // 2^32 == 0 (mod 2^32)
         assert_eq!(pconst(-1, MASK32), pconst((1i64 << 32) - 1, MASK32));
         assert!(pmul(&pconst(1 << 16, MASK32), &pconst(1 << 16, MASK32), MASK32).is_empty());
-        // but 2^32 != 0 in the 56-bit ring
-        assert!(!pconst(1i64 << 32, MASK56).is_empty());
+        // but 2^32 != 0 in the 64-bit ring
+        assert!(!pconst(1i64 << 32, MASK64).is_empty());
     }
 }

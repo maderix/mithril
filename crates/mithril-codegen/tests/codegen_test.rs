@@ -608,7 +608,10 @@ fn native_arrays_match_oracle_under_suspension() {
     // linear and made unique where they enter (the bridge)
     let fill_loop = cm.fns.iter().position(|f| f.name.starts_with("__for")).unwrap();
     assert!(rs[rs.find(&format!("fn s_{fill_loop}(")).expect("fill's loop is native")..].contains("arr_set_u("), "native write still checks the refcount");
-    assert!(dive_form(&cm, &rs, "fill").contains("arr_own(ctx"), "bridge does not make an owned array unique");
+    // fill's loop is an index fill: its bridge makes the array unique before a
+    // split can lend it (fill itself has a native and a dive form)
+    let fill_bridge = &rs[rs.find(&format!("fn d_{fill_loop}(")).expect("fill's loop has a bridge")..];
+    assert!(fill_bridge[..fill_bridge[1..].find("\nfn ").unwrap_or(fill_bridge.len())].contains("arr_own(ctx"), "bridge does not make an owned array unique");
     // step returns (array, array, int) as a native tuple the loop destructures
     let step = native_form(&cm, &rs, "step");
     assert!(step.contains("-> (i64, i64, i64)"), "step does not return a native tuple");
@@ -636,10 +639,10 @@ fn native_arrays_match_oracle_under_suspension() {
 }
 
 
-// ---- native int representations (plain / pre-shifted) ----
+// ---- 64-bit ints ----
 
 #[test]
-fn int_representations_agree_with_oracle() {
+fn int_arithmetic_agrees_with_oracle() {
     let src = fixture("int_reps.py");
     let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
     let _ = mithril_reassoc::analyze(&mut m);
@@ -647,31 +650,58 @@ fn int_representations_agree_with_oracle() {
     let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
     let want = oracle(&cm);
     let id = |n: &str| cm.fns.iter().position(|f| f.name == n).unwrap();
-    for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
-        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
-        // the arithmetic, the DP rows and the recursion all run natively
-        for f in ["mix", "dp", "walk"] {
-            assert!(rs.contains(&format!("fn s_{}(", id(f))), "{tag}: {f} is not native");
-        }
-        if rep == Some(true) {
-            let native = &rs[rs.find("fn s_").unwrap()..rs.find("fn net_entries").unwrap()];
-            assert!(!native.contains("wrap56("), "shifted: native code still re-wraps");
-        }
-        if rep.is_none() {
-            // the rolling-row inner loop keeps array lengths in locals
-            assert!(rs.contains("arr_get_n("), "chosen: DP loop does not use length locals");
-        }
-        let bin = compile(&rs, &format!("int_reps_{tag}"));
-        for t in ["1", "4"] {
-            assert_eq!(run(&bin, &[t]), want, "int_reps {tag} --threads {t}");
-            assert_eq!(run(&bin, &[t, "3"]), want, "int_reps {tag} --threads {t} fuel 3");
+    let rs = mithril_codegen::emit_rust(&sm);
+    // the arithmetic, the DP rows and the recursion all run natively
+    for f in ["mix", "dp", "walk"] {
+        assert!(rs.contains(&format!("fn s_{}(", id(f))), "{f} is not native");
+    }
+    // the rolling-row inner loop keeps array lengths in locals
+    assert!(rs.contains("arr_get_n("), "DP loop does not use length locals");
+    let bin = compile(&rs, "int_reps");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "int_reps --threads {t}");
+        assert_eq!(run(&bin, &[t, "3"]), want, "int_reps --threads {t} fuel 3");
+    }
+}
+
+#[test]
+fn ints_past_56_bits_are_boxed_at_ports_and_released() {
+    // big_ints.py moves values past 56 bits through native code, a dive that
+    // suspends holding them (fuel 1), a raw array, constructor fields,
+    // tuples, a fold join, a branch and sharing; the expected value is
+    // computed independently (Python ints wrapped to 64 bits). Both the
+    // specialized residual and the unspecialized program run, on every
+    // thread count and starved budget, and release every box and array.
+    let src = fixture("big_ints.py");
+    let want = "(-550790321401084777, 4374143999468740608, 3690717486816165888, -1742893055792381952, 1701234759239204864, \
+                (-550790321401084777, -1652370964203254331), -550790321401084776, 1, -1101580642802169554, -9223372036854775807)";
+    let mut m = mithril_front::parse(&src).unwrap();
+    let _ = mithril_reassoc::analyze(&mut m);
+    let cm = desugar(&m).unwrap();
+    assert_eq!(oracle(&cm), want);
+    let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
+    let mix = cm.fns.iter().position(|f| f.name == "mix").unwrap();
+    // the printed result is still held: its own boxes are the only live ones
+    let held = want.split(|c: char| !(c == '-' || c.is_ascii_digit())).filter_map(|w| w.parse::<i64>().ok()).filter(|v| !(-(1i64 << 55)..1i64 << 55).contains(v)).count();
+    let live = format!("bigs_live={held} ");
+    for (tag, module) in [("residual", &sm), ("unspecialized", &cm)] {
+        let rs = emit_rust(module);
+        assert!(rs.contains(&format!("fn s_{mix}(")), "{tag}: mix is not native");
+        let bin = compile(&rs, &format!("big_ints_{tag}"));
+        for t in ["1", "4", "16"] {
+            for fuel in ["", "1", "7", "64"] {
+                let args: Vec<&str> = [t, fuel].into_iter().filter(|a| !a.is_empty()).collect();
+                let (out, err) = run_env(&bin, &args, &[("MITHRIL_STATS", "1")]);
+                assert_eq!(out.trim(), want, "{tag} --threads {t} fuel {fuel:?}");
+                assert!(err.contains("arrays_live=0") && format!("{err} ").contains(&live), "{tag} --threads {t} fuel {fuel:?}: leaked: {err}");
+            }
         }
     }
 }
 
 #[test]
 fn raw_int_array_converts_on_first_non_int_write() {
-    // all-int arrays store pre-shifted words; storing a list converts the
+    // all-int arrays store plain words; storing a list converts the
     // array to tagged elements (and a shared copy keeps its raw words)
     let (_cm, rs) = trmc_golden("hetero_array.py");
     // the write path converts (arr_set and arr_unraw live in mithril_rt::prelude)
@@ -685,6 +715,90 @@ fn heavy_fold_splits_by_measured_work() {
     let (_cm, rs) = trmc_golden("heavy_fold.py");
     assert!(rs.contains("FOLD_EST_"), "fold has no work estimate");
     assert!(rs.contains("sat_mul(") && rs.contains("est)"), "fold split ignores the estimate");
+}
+
+#[test]
+fn proven_folds_keep_their_native_loop_and_share_lent_arrays() {
+    // every thread count and starved budget (trmc_golden), then the fold
+    // helpers: a native loop whose bridge splits the range and runs the chunk
+    let (cm, rs) = trmc_golden("fold_borrowed_extra.py");
+    let folds: Vec<usize> = (0..cm.fns.len()).filter(|&f| rs.contains(&format!("static FOLD_EST_{f}:"))).collect();
+    assert_eq!(folds.len(), 2, "both loops are proven folds");
+    for f in folds {
+        assert!(rs.contains(&format!("fn s_{f}(")), "fold {f} lost its native loop");
+        let bridge = rs.split(&format!("fn d_{f}(")).nth(1).expect("fold has a bridge");
+        let bridge = bridge.split("\nfn ").next().unwrap();
+        assert!(bridge.contains("par-fold split") && bridge.contains(&format!("s_{f}(")), "fold {f}: bridge does not split then run natively");
+    }
+    // the lent array is released exactly once, by its owner
+    let want = oracle(&cm);
+    let bin = compile(&rs, "fold_borrowed_extra_stats");
+    for t in ["1", "4", "16"] {
+        for fuel in ["1", "64"] {
+            let (out, err) = run_env(&bin, &[t, fuel], &[("MITHRIL_STATS", "1")]);
+            assert_eq!(out.trim(), want, "--threads {t} fuel {fuel}");
+            assert!(err.contains("arrays_live=0"), "--threads {t} fuel {fuel}: arrays leaked: {err}");
+        }
+    }
+}
+
+#[test]
+fn index_fills_write_one_buffer_from_every_chunk() {
+    // every thread count and starved budget (trmc_golden): the chunks of a
+    // fill write disjoint parts of one buffer, a shared array is copied
+    // before the first split, and the near misses stay sequential
+    let (cm, rs) = trmc_golden("fill_loops.py");
+    let fills: Vec<&str> = cm.fns.iter().filter(|f| f.fold.as_ref().is_some_and(|fi| fi.combiner == mithril_front::core::Combiner::Fill)).map(|f| f.name.as_str()).collect();
+    assert_eq!(fills.len(), 3, "tab, stencil and refill fill; carried and bump do not: {fills:?}");
+    let want = oracle(&cm);
+    let bin = compile(&rs, "fill_loops_stats");
+    for t in ["1", "4", "16"] {
+        for fuel in ["1", "7", "64"] {
+            let (out, err) = run_env(&bin, &[t, fuel], &[("MITHRIL_STATS", "1")]);
+            assert_eq!(out.trim(), want, "--threads {t} fuel {fuel}");
+            assert!(err.contains("arrays_live=0"), "--threads {t} fuel {fuel}: arrays leaked: {err}");
+        }
+    }
+}
+
+#[test]
+fn fresh_arrays_a_fill_covers_skip_their_initial_value() {
+    // fill_uninit.py: full and stencil allocate their buffer without the
+    // initial value; short (bound below the length), offset (counter from 1),
+    // shifted (index i + 1) and peek (read before the fill) keep it, and the
+    // elements they leave unwritten read 7. The value is computed
+    // independently (CPython wrapped to 64 bits; the oracle copies an array
+    // per update, too slow at this size). Every thread count and starved
+    // budget, with no array left alive.
+    let want = "(3451376496, 1884045312, 7, 200712762, 7, 2389189737, 7, 701548700, 732613360)";
+    let (cm, rs) = pipeline(&fixture("fill_uninit.py"), 1 << 20);
+    for (f, skips) in [("full", true), ("stencil", true), ("short", false), ("offset", false), ("shifted", false), ("peek", false)] {
+        let id = cm.fns.iter().position(|x| x.name == f).unwrap();
+        let forms: String = [format!("fn s_{id}("), format!("fn d_{id}(")].iter().filter_map(|h| rs.find(h.as_str()).map(|i| rs[i..].split("\nfn ").next().unwrap().to_string())).collect();
+        assert_eq!(forms.contains("arr_new_raw_uninit("), skips, "{f}");
+    }
+    let bin = compile(&rs, "fill_uninit");
+    for t in ["1", "4", "16"] {
+        for fuel in ["", "1", "7", "64"] {
+            let args: Vec<&str> = [t, fuel].into_iter().filter(|a| !a.is_empty()).collect();
+            let (out, err) = run_env(&bin, &args, &[("MITHRIL_STATS", "1")]);
+            assert_eq!(out.trim(), want, "--threads {t} fuel {fuel:?}");
+            assert!(err.contains("arrays_live=0"), "--threads {t} fuel {fuel:?}: arrays leaked: {err}");
+        }
+    }
+}
+
+#[test]
+fn a_search_forks_once_its_test_is_read_first() {
+    // every thread count and starved budget (trmc_golden); on 4 threads the
+    // search runs in parallel waves; the deep recursion holds on every worker
+    let (cm, rs) = trmc_golden("fork_after_test.py");
+    let want = oracle(&cm);
+    let bin = compile(&rs, "fork_after_test_stats");
+    let (out, err) = run_env(&bin, &["4"], &[("MITHRIL_STATS", "1")]);
+    assert_eq!(out.trim(), want);
+    let waves: u64 = err.split_whitespace().find_map(|w| w.strip_prefix("waves=")).and_then(|w| w.parse().ok()).unwrap_or(0);
+    assert!(waves > 0, "the search did not run in parallel: {err}");
 }
 
 #[test]
@@ -711,23 +825,21 @@ fn mutual_tail_recursion_becomes_a_loop() {
 }
 
 #[test]
-fn f32_primitives_match_oracle_in_every_representation() {
+fn f32_primitives_match_oracle() {
     let src = fixture("f32_ops.py");
     let mut m = mithril_front::parse(&src).unwrap_or_else(|d| panic!("parse: line {}: {}", d.line, d.msg));
     let _ = mithril_reassoc::analyze(&mut m);
     let cm = desugar(&m).unwrap_or_else(|d| panic!("desugar: line {}: {}", d.line, d.msg));
     let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
     let want = oracle(&cm);
-    for (tag, rep) in [("chosen", None), ("plain", Some(false)), ("shifted", Some(true))] {
-        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
-        // the arithmetic runs natively on hardware binary32
-        let ops = cm.fns.iter().position(|f| f.name == "ops").unwrap();
-        assert!(rs.contains(&format!("fn s_{ops}(")), "{tag}: ops is not native");
-        assert!(rs.contains("f32_mul("), "{tag}: no hardware f32 multiply");
-        let bin = compile(&rs, &format!("f32_ops_{tag}"));
-        for t in ["1", "4"] {
-            assert_eq!(run(&bin, &[t]), want, "f32_ops {tag} --threads {t}");
-        }
+    let rs = mithril_codegen::emit_rust(&sm);
+    // the arithmetic runs natively on hardware binary32
+    let ops = cm.fns.iter().position(|f| f.name == "ops").unwrap();
+    assert!(rs.contains(&format!("fn s_{ops}(")), "ops is not native");
+    assert!(rs.contains("f32_mul("), "no hardware f32 multiply");
+    let bin = compile(&rs, "f32_ops");
+    for t in ["1", "4"] {
+        assert_eq!(run(&bin, &[t]), want, "f32_ops --threads {t}");
     }
 }
 
@@ -741,12 +853,10 @@ fn f32_surface_matches_oracle_and_numpy() {
     let mut m = mithril_front::parse(&fixture("f32_surface.py")).unwrap();
     let _ = mithril_reassoc::analyze(&mut m);
     let (sm, _) = mithril_net::specialize(&desugar(&m).unwrap(), 1 << 20);
-    for (tag, rep) in [("plain", Some(false)), ("shifted", Some(true))] {
-        let rs = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
-        let bin = compile(&rs, &format!("f32_surface_{tag}"));
-        for t in ["1", "4", "16"] {
-            assert_eq!(run(&bin, &[t]), want, "f32_surface {tag} --threads {t}");
-        }
+    let rs = mithril_codegen::emit_rust(&sm);
+    let bin = compile(&rs, "f32_surface");
+    for t in ["1", "4", "16"] {
+        assert_eq!(run(&bin, &[t]), want, "f32_surface --threads {t}");
     }
 }
 
@@ -1052,7 +1162,8 @@ fn independent_loop_iterations_split_and_keep_sequential_results() {
     assert_eq!(split_loops("loop_split_shapes.py"), 5);
     assert_eq!(split_loops("loop_split_kept.py"), 0);
     assert_eq!(split_loops("loop_image.py"), 2);
-    for name in ["loop_split_shapes.py", "loop_split_kept.py", "loop_image.py"] {
+    assert_eq!(split_loops("loop_split_bounded.py"), 0);
+    for name in ["loop_split_shapes.py", "loop_split_kept.py", "loop_image.py", "loop_split_bounded.py"] {
         golden(name, 0, &["1", "4", "16"]);
     }
 }
@@ -1082,12 +1193,12 @@ fn native_port_boundaries_preserve_layout_ownership_and_work() {
         let (cm, _) = pipeline(&fixture(name), 1 << 20);
         let want = oracle(&cm);
         let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
-        for rep in [Some(false), Some(true)] {
-            let code = mithril_codegen::emit_rust_opts(&sm, mithril_codegen::EmitOpts { int_rep: rep });
-            let binary = compile(&code, &format!("boundary-{}-{rep:?}", name.trim_end_matches(".py")));
+        {
+            let code = mithril_codegen::emit_rust(&sm);
+            let binary = compile(&code, &format!("boundary-{}", name.trim_end_matches(".py")));
             for threads in ["1", "4", "16"] {
                 for fuel in ["1", "64", "4096"] {
-                    assert_eq!(run(&binary, &[threads, fuel]), want, "{name} rep={rep:?} threads={threads} fuel={fuel}");
+                    assert_eq!(run(&binary, &[threads, fuel]), want, "{name} threads={threads} fuel={fuel}");
                 }
             }
         }
@@ -1109,14 +1220,14 @@ fn local_tuple_entries_pack_outer_fields_and_execute_the_ready_path() {
         let mut net = mithril_net::build(&net_cm);
         mithril_net::reduce(&mut net, &net_cm, 1 << 20);
         assert_eq!(fmt_val(&mithril_net::readback(&net, mithril_net::root_port()).unwrap()), want);
-        for rep in [Some(false), Some(true)] {
+        {
             let (program, lowered) = mithril_codegen::lower(&cm);
             let fid = lowered.fns.iter().position(|f| f.name == "walk").unwrap();
             let entry = program.fns.iter().find(|f| f.name == format!("n_{fid}")).expect("tuple walk needs an aggregate entry");
             assert!(matches!(entry.ret, mithril_codegen::lir::Ty::ResArr(_)));
             // Direct calls exercise the scalar or local-region aggregate
             // bridge selected for this layout; closure bodies reduce as nets.
-            let mut code = mithril_codegen::emit_rust_opts(&cm, mithril_codegen::EmitOpts { int_rep: rep });
+            let mut code = mithril_codegen::emit_rust(&cm);
             let boxed = code.find(&format!("fn d_{fid}(")).unwrap();
             let begin = boxed + code[boxed..].find("{\n").unwrap() + 2;
             let mut depth = 1;
@@ -1132,11 +1243,11 @@ fn local_tuple_entries_pack_outer_fields_and_execute_the_ready_path() {
             let end = code.rfind("\n}").unwrap();
             code.insert_str(end, "\neprintln!(\"boundary_hits={}\", BOUNDARY_HITS.load(std::sync::atomic::Ordering::Relaxed));");
             code.push_str("\nstatic BOUNDARY_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);\n");
-            let binary = compile(&code, &format!("local-boundary-{case}-{rep:?}"));
+            let binary = compile(&code, &format!("local-boundary-{case}"));
             for threads in ["1", "4", "16"] {
                 for fuel in ["1", "64", "4096"] {
                     let (got, stderr) = run_env(&binary, &[threads, fuel], &[]);
-                    assert_eq!(got, want, "{case} rep={rep:?} threads={threads} fuel={fuel}");
+                    assert_eq!(got, want, "{case} threads={threads} fuel={fuel}");
                     let hits: usize = stderr.lines().find_map(|s| s.strip_prefix("boundary_hits=")).unwrap().parse().unwrap();
                     if threads == "1" && fuel == "4096" { assert!(hits > 0, "aggregate adapter must actually execute"); }
                 }

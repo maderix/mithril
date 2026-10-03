@@ -19,8 +19,8 @@ fn run_native(src: &str, name: &str) {
     assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
     let dir = std::env::temp_dir().join(format!("mithril-native-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for rep in [Some(false), Some(true)] {
-        let code = mithril_codegen::emit_rust_opts(&module, mithril_codegen::EmitOpts { int_rep: rep });
+    {
+        let code = mithril_codegen::emit_rust(&module);
         std::fs::write(dir.join("main.rs"), code).unwrap();
         let c = Command::new("rustc").args(["--edition=2021", "-O"]).arg(dir.join("main.rs"))
             .arg("--extern").arg(format!("mithril_rt={}", target.join("release/libmithril_rt.rlib").display()))
@@ -31,7 +31,7 @@ fn run_native(src: &str, name: &str) {
             for fuel in ["1", "64"] {
                 let r = Command::new(dir.join("run")).args([threads, fuel]).output().unwrap();
                 assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
-                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name}: rep={rep:?} threads={threads} fuel={fuel}");
+                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name}: threads={threads} fuel={fuel}");
             }
         }
     }

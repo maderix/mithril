@@ -16,7 +16,7 @@ use crate::{Program, Redex, Stats};
 use std::any::Any;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread;
 
@@ -27,6 +27,11 @@ static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 const PAR_WORK: u128 = 1 << 14;
 /// Stack for pool workers (native recursion inside fuel-bounded dives).
 const WORKER_STACK: usize = 16 << 20;
+/// Spins (`spin_loop` hints, tens of microseconds) a worker waits for the
+/// next wave, and the coordinator for a wave's end, before parking: a
+/// futex wake of every worker per wave cost knapsack at 16 threads 0.66 s
+/// against 0.44 s at one (40,000 back-to-back waves of a few microseconds).
+const SPIN: u32 = 1 << 14;
 
 pub struct Engine {
     threads: usize,
@@ -90,7 +95,7 @@ impl Engine {
 
         let mut ctx0 = Wctx::new(ar, prog, fuel, n_rules);
         let workers: Vec<Mutex<Wctx>> = (1..threads).map(|_| Mutex::new(Wctx::new(ar, prog, fuel, n_rules))).collect();
-        let pool = Pool::default();
+        let pool = Pool { spins: if threads <= physical_cores() { SPIN } else { 0 }, ..Pool::default() };
         let mut buckets: Vec<Vec<Redex>> = vec![Vec::new(); n_rules];
         let mut recs: Vec<Vec<u32>> = vec![Vec::new(); n_rules];
         let mut parallel_waves = 0;
@@ -106,6 +111,59 @@ impl Engine {
             let mut spawned = false;
             loop {
                 ctx0.merge_into(&mut buckets, &mut recs);
+                // range requests run first, as one wave each round
+                let mut ranges = mem::take(&mut ctx0.range_reqs);
+                for w in &workers {
+                    ranges.append(&mut lock(w).range_reqs);
+                }
+                if !ranges.is_empty() {
+                    let total: u64 = ranges.iter().map(|r| (r.hi - r.lo).max(0) as u64).sum();
+                    let sums: Vec<std::sync::atomic::AtomicU64> = ranges.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+                    if threads == 1 || total < RANGE_PAR {
+                        for (q, r) in ranges.iter().enumerate() {
+                            let v = prog.range_leaf(r.fid, r.lo, r.hi, &r.ports, &mut ctx0);
+                            sums[q].fetch_add(v as u64, Ordering::Relaxed);
+                        }
+                    } else {
+                        if !spawned {
+                            spawned = true;
+                            for w in &workers {
+                                let pool = &pool;
+                                thread::Builder::new()
+                                    .name("mithril-worker".into())
+                                    .stack_size(WORKER_STACK)
+                                    .spawn_scoped(sc, move || worker_loop(pool, w))
+                                    .expect("failed to spawn worker thread");
+                            }
+                        }
+                        parallel_waves += 1;
+                        {
+                            let mut wv = write(&pool.wave);
+                            let mut at = 0u64;
+                            wv.pre = Vec::with_capacity(ranges.len() + 1);
+                            for r in &ranges {
+                                wv.pre.push(at);
+                                at += (r.hi - r.lo).max(0) as u64;
+                            }
+                            wv.pre.push(at);
+                            wv.ranges = mem::take(&mut ranges);
+                            wv.sums = sums;
+                            wv.block = (total as usize / (threads * 8)).clamp(64, 1 << 16);
+                            wv.next.store(0, Ordering::Relaxed);
+                        }
+                        run_wave(&pool, threads, &mut ctx0);
+                        if let Some(p) = lock(&pool.panic).take() {
+                            panic::resume_unwind(p);
+                        }
+                        let mut wv = write(&pool.wave);
+                        ranges = mem::take(&mut wv.ranges);
+                        wv.pre.clear();
+                        return_sums(&mut wv.sums, &ranges, &mut ctx0, prog);
+                        continue;
+                    }
+                    complete_ranges(&ranges, &sums, &mut ctx0, prog);
+                    continue;
+                }
                 let Some((rule, work)) = pick(&buckets, &recs, &costs) else { break };
                 let k = rule as usize;
                 let n = buckets[k].len() + recs[k].len();
@@ -166,19 +224,7 @@ impl Engine {
                         w.set_fuel(f);
                     }
                 }
-                {
-                    let mut c = lock(&pool.ctrl);
-                    c.running = threads - 1;
-                    c.epoch += 1;
-                }
-                pool.start.notify_all();
-                drain(&read(&pool.wave), &mut ctx0);
-                {
-                    let mut c = lock(&pool.ctrl);
-                    while c.running > 0 {
-                        c = pool.done.wait(c).unwrap_or_else(PoisonError::into_inner);
-                    }
-                }
+                run_wave(&pool, threads, &mut ctx0);
                 if let Some(p) = lock(&pool.panic).take() {
                     panic::resume_unwind(p);
                 }
@@ -207,6 +253,61 @@ impl Engine {
     }
 }
 
+/// Indices below which a range request runs on the coordinator.
+const RANGE_PAR: u64 = 1 << 12;
+
+/// Start the prepared wave on the pool, drain it here too, and wait for
+/// its end: spin, then park until the last worker (which sees `waiting`)
+/// notifies under the lock.
+fn run_wave(pool: &Pool, threads: usize, ctx0: &mut Wctx) {
+    {
+        let mut c = lock(&pool.ctrl);
+        c.epoch += 1;
+        pool.running.store(threads - 1, Ordering::SeqCst);
+        pool.epoch.store(c.epoch, Ordering::SeqCst);
+    }
+    if pool.parked.load(Ordering::SeqCst) > 0 {
+        pool.start.notify_all();
+    }
+    drain(&read(&pool.wave), ctx0);
+    if !spin_until(pool.spins, || pool.running.load(Ordering::Acquire) == 0) {
+        let mut c = lock(&pool.ctrl);
+        pool.waiting.store(true, Ordering::SeqCst);
+        while pool.running.load(Ordering::SeqCst) > 0 {
+            c = pool.done.wait(c).unwrap_or_else(PoisonError::into_inner);
+        }
+        pool.waiting.store(false, Ordering::SeqCst);
+        drop(c);
+    }
+}
+
+fn return_sums(sums: &mut Vec<std::sync::atomic::AtomicU64>, ranges: &[crate::RangeReq], ctx0: &mut Wctx, prog: &dyn Program) {
+    let taken = mem::take(sums);
+    complete_ranges(ranges, &taken, ctx0, prog);
+}
+
+/// Release each request's ports but its accumulator and deliver its result
+/// to the two slots of its record (see `RangeReq`).
+fn complete_ranges(ranges: &[crate::RangeReq], sums: &[std::sync::atomic::AtomicU64], ctx0: &mut Wctx, prog: &dyn Program) {
+    for (q, r) in ranges.iter().enumerate() {
+        let acc = r.ports[r.acc as usize];
+        for (k, p) in r.ports.iter().enumerate() {
+            if k != r.acc as usize {
+                prog.release(*p, ctx0);
+            }
+        }
+        let slot = (r.rec as u64) << 3;
+        if r.kind == 0 {
+            ctx0.deliver(slot, acc);
+            ctx0.deliver(slot | 1, acc);
+        } else {
+            let s = sums[q].load(Ordering::Relaxed) as i64;
+            ctx0.deliver(slot, crate::prelude::num(if r.kind == 2 { s & 0xffff_ffff } else { s }));
+            ctx0.deliver(slot | 1, acc);
+        }
+    }
+}
+
 /// Per-dive budget for a parallel wave of `n` entries: the base budget
 /// times the entries each worker will take (capped).
 fn wave_fuel(base: i64, n: usize, threads: usize) -> i64 {
@@ -229,12 +330,17 @@ fn pick(buckets: &[Vec<Redex>], recs: &[Vec<u32>], costs: &[u128]) -> Option<(u1
     best
 }
 
-/// The wave currently being drained by the pool.
+/// The wave currently being drained by the pool: a bucket's entries, or
+/// the indices of range requests (`pre`: each request's first index in the
+/// wave's index space; `sums`: each sum's partials).
 #[derive(Default)]
 struct Wave {
     rule: u16,
     redexes: Vec<Redex>,
     recs: Vec<u32>,
+    ranges: Vec<crate::RangeReq>,
+    pre: Vec<u64>,
+    sums: Vec<std::sync::atomic::AtomicU64>,
     next: AtomicUsize,
     block: usize,
 }
@@ -242,17 +348,59 @@ struct Wave {
 #[derive(Default)]
 struct Ctrl {
     epoch: u64,
-    running: usize,
     quit: bool,
 }
 
+/// Waves start by bumping `epoch` (under `ctrl`, mirrored in the atomic) and
+/// end when `running` reaches 0. Workers and the coordinator spin on the
+/// atomics first and park on the condvars only after `SPIN`: `parked` and
+/// `waiting` tell the other side a wake is needed.
 #[derive(Default)]
 struct Pool {
     ctrl: Mutex<Ctrl>,
     start: Condvar,
     done: Condvar,
+    epoch: AtomicU64,
+    running: AtomicUsize,
+    parked: AtomicUsize,
+    waiting: AtomicBool,
+    /// `SPIN` when every thread has a physical core, else 0: a spinner on a
+    /// core's second hardware thread slows the thread working beside it
+    /// (8 cores x 2: heat2d at 15 and 16 threads 0.25 -> 0.42 s)
+    spins: u32,
     wave: RwLock<Wave>,
     panic: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+/// Physical cores (distinct package and core ids, Linux sysfs); the
+/// logical CPU count where the topology is not readable.
+fn physical_cores() -> usize {
+    let logical = thread::available_parallelism().map_or(1, |n| n.get());
+    let mut cores = std::collections::HashSet::new();
+    for cpu in 0..logical {
+        let read = |f: &str| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{f}")).ok();
+        match (read("physical_package_id"), read("core_id")) {
+            (Some(p), Some(c)) => cores.insert((p.trim().to_string(), c.trim().to_string())),
+            _ => return logical,
+        };
+    }
+    cores.len().max(1)
+}
+
+/// Spin up to `spins` times for `ready`; whether it became true. Every 64th
+/// spin yields the core, so a worker preempted mid-wave can run.
+fn spin_until(spins: u32, ready: impl Fn() -> bool) -> bool {
+    for i in 0..spins {
+        if ready() {
+            return true;
+        }
+        if i % 64 == 63 {
+            thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    ready()
 }
 
 /// Tells parked workers to exit when the coordinator leaves the scope,
@@ -267,6 +415,9 @@ impl Drop for QuitOnDrop<'_> {
 
 /// Claim blocks of entries from the shared cursor until the wave is empty.
 fn drain(wv: &Wave, ctx: &mut Wctx) {
+    if !wv.ranges.is_empty() {
+        return drain_ranges(wv, ctx);
+    }
     let nx = wv.redexes.len();
     let n = nx + wv.recs.len();
     while let Some(range) = crate::sync::claim_block(&wv.next, wv.block, n) {
@@ -280,14 +431,42 @@ fn drain(wv: &Wave, ctx: &mut Wctx) {
     }
 }
 
+/// Claim blocks of the range requests' indices; a block crossing a request
+/// boundary runs as one native loop per request it covers.
+fn drain_ranges(wv: &Wave, ctx: &mut Wctx) {
+    let total = *wv.pre.last().unwrap_or(&0) as usize;
+    let prog = ctx.program();
+    while let Some(block) = crate::sync::claim_block(&wv.next, wv.block, total) {
+        let (mut t, end) = (block.start as u64, block.end as u64);
+        let mut q = wv.pre.partition_point(|&p| p <= t) - 1;
+        while t < end {
+            let r = &wv.ranges[q];
+            let stop = end.min(wv.pre[q + 1]);
+            let (lo, hi) = (r.lo + (t - wv.pre[q]) as i64, r.lo + (stop - wv.pre[q]) as i64);
+            let v = prog.range_leaf(r.fid, lo, hi, &r.ports, ctx);
+            if r.kind != 0 {
+                wv.sums[q].fetch_add(v as u64, Ordering::Relaxed);
+            }
+            t = stop;
+            q += 1;
+        }
+    }
+}
+
 fn worker_loop(pool: &Pool, me: &Mutex<Wctx>) {
     let mut seen = 0u64;
     loop {
-        {
+        if spin_until(pool.spins, || pool.epoch.load(Ordering::Acquire) != seen) {
+            seen = pool.epoch.load(Ordering::Acquire);
+        } else {
+            // announce the park before checking under the lock, so a wave
+            // started meanwhile either is seen here or wakes this worker
+            pool.parked.fetch_add(1, Ordering::SeqCst);
             let mut c = lock(&pool.ctrl);
             while c.epoch == seen && !c.quit {
                 c = pool.start.wait(c).unwrap_or_else(PoisonError::into_inner);
             }
+            pool.parked.fetch_sub(1, Ordering::SeqCst);
             if c.quit {
                 return;
             }
@@ -301,9 +480,8 @@ fn worker_loop(pool: &Pool, me: &Mutex<Wctx>) {
         if let Err(p) = res {
             lock(&pool.panic).get_or_insert(p);
         }
-        let mut c = lock(&pool.ctrl);
-        c.running -= 1;
-        if c.running == 0 {
+        if pool.running.fetch_sub(1, Ordering::SeqCst) == 1 && pool.waiting.load(Ordering::SeqCst) {
+            let _c = lock(&pool.ctrl);
             pool.done.notify_all();
         }
     }

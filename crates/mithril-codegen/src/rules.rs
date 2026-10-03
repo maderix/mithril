@@ -216,6 +216,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     let mut susp = Vec::new();
                     let split = crate::seq::split_frame(*x, bo);
                     let fork = split.is_some();
+                    ex.captured.clear();
                     if let Some((p_body, live, j_body)) = split {
                         let (rn, rx) = join_records(ex, sq, *x, live, &j_body, par, &mut susp);
                         susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rx)])));
@@ -223,6 +224,7 @@ fn rtail(ex: &mut Ex, e: &Core, par: &E, b: &mut Vec<S>, sq: &mut SegQ) {
                     } else {
                         let rn = wait_rec(ex, sq, vec![*x], (**bo).clone(), par, &mut susp);
                         susp.push(do_(c("set_parent", vec![v("rec"), rec_addr(&rn)])));
+                        ex.release_abandoned(&mut susp);
                     }
                     ex.rem = saved;
                     let dive = if fork { "dive_res_fork" } else { "dive_res" };
@@ -280,13 +282,13 @@ pub(crate) fn rule_params() -> Vec<(String, Ty)> {
 /// A continuation segment: fires when its record fills; slots arrive in
 /// `a` / `b` (owned), the spilled environment is read back off the cell
 /// chain (owned; the chain cells are freed as they are read).
-pub(crate) fn segment_fn(seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &std::collections::HashMap<u32, u8>, tys: &crate::ty::Types, iret: &[bool], shared: &std::cell::RefCell<crate::seq::Shared>) -> FnDef {
+pub(crate) fn segment_fn(seg: &Seg, bor: &[Vec<bool>], sq: &mut SegQ, unbox: &std::collections::HashMap<u32, u8>, tys: &crate::ty::Types, shared: &std::cell::RefCell<crate::seq::Shared>) -> FnDef {
     let mut s = vec![
         S::Comment(format!("segment of fn {} slots {:?} env {:?}", seg.fid, seg.slots, seg.env)),
         fuel_local(),
         let_("parent", Ty::U64, c("rec_parent", vec![cast(v("aux"), Ty::U32)])),
     ];
-    let mut ex = Ex::new(false, seg.fid, false, &seg.body, HashSet::new(), bor, None, unbox, iret, tys, shared);
+    let mut ex = Ex::new(false, seg.fid, false, &seg.body, HashSet::new(), bor, None, unbox, tys, shared);
     if !seg.slots.is_empty() {
         s.push(let_(vn(seg.slots[0]), Ty::U64, v("a")));
     }

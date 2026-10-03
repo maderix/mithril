@@ -40,7 +40,7 @@ def __f32_eq(a, b):
 def __f32_of_int(n):
     if n < 0:
         if 0 - n < 0:
-            return 3674210304
+            return 3741319168
         return __f32_of_int(0 - n) ^ 2147483648
     if n < 4294967296:
         return f32_from_u32(n)
@@ -58,7 +58,7 @@ def __int_of_f32(x):
     e = ((x >> 23) & 255) - 127
     if e < 32:
         return f32_to_u32(x)
-    if e >= 55:
+    if e >= 63:
         return 0
     return f32_to_u32(x - ((e - 31) << 23)) << (e - 31)
 ";

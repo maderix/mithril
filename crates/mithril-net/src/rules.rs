@@ -55,6 +55,15 @@ fn cmp_result(code: u16, ord: Option<std::cmp::Ordering>) -> Port {
     Port::num(cmp_bool(CmpOp::ALL[(code - 16) as usize], ord) as i64)
 }
 
+/// The integer an operand holds; a consumed boxed operand is released.
+fn take_int(p: Port) -> i64 {
+    let v = p.int_value();
+    if p.tag() == Tag::Big {
+        p.big_release();
+    }
+    v
+}
+
 /// Numeric fold with `eval_core`'s semantics (`int_op`, `flo_op`,
 /// `cmp_bool`; floats boxed in cells, comparisons producing 0/1). `None`
 /// where the op cannot fold at compile time: a failing evaluation (division
@@ -66,19 +75,20 @@ fn compute(net: &mut Net, code: u16, x: Port, y: Port) -> Option<Port> {
             return None;
         }
         let (p, unary) = crate::prim_of_code(code);
-        if !p.is_f32() || x.tag() != Tag::Num || (!unary && y.tag() != Tag::Num) {
+        let int = |p: Port| matches!(p.tag(), Tag::Num | Tag::Big);
+        if !p.is_f32() || !int(x) || (!unary && !int(y)) {
             return None;
         }
-        let args: Vec<i64> = if unary { vec![x.as_i64()] } else { vec![x.as_i64(), y.as_i64()] };
-        return Some(Port::num(mithril_front::core::f32_prim(p, &args)));
+        let args: Vec<i64> = if unary { vec![take_int(x)] } else { vec![take_int(x), take_int(y)] };
+        return Some(Port::int(mithril_front::core::f32_prim(p, &args)));
     }
     match (x.tag(), y.tag()) {
-        (Tag::Num, Tag::Num) => {
-            let (a, b) = (x.as_i64(), y.as_i64());
+        (Tag::Num | Tag::Big, Tag::Num | Tag::Big) => {
+            let (a, b) = (take_int(x), take_int(y));
             if code >= 16 {
                 return Some(cmp_result(code, Some(a.cmp(&b))));
             }
-            int_op(BinOp::ALL[code as usize], a, b).map(Port::num)
+            int_op(BinOp::ALL[code as usize], a, b).map(Port::int)
         }
         (Tag::Flo, Tag::Flo) => {
             let (ax, ay) = (x.payload() as u32, y.payload() as u32);

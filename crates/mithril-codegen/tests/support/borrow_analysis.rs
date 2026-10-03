@@ -10,7 +10,7 @@ fn matched(source: Core, fields: Vec<u32>, body: Core) -> Core {
     Core::Match(Box::new(source), vec![(0, fields, body)])
 }
 fn escape(body: &Core, own: &[bool], callees: &[Vec<bool>], ints: &[u32]) -> u64 {
-    escape_mask(body, own.len(), own, callees, &|x| ints.contains(&x))
+    escape_mask(u32::MAX, body, own.len(), own, callees, &|x| ints.contains(&x))
 }
 
 #[test]
@@ -40,7 +40,23 @@ fn storage_and_parameter_ownership_define_escape_boundaries() {
     for (body, expected) in cases {
         assert_eq!(escape(&body, &[true; 3], &[vec![true, false]], &[]), expected, "{body:?}");
     }
-    assert_eq!(escape_mask(&v(0), 61, &[false; 61], &[], &|_| false), u64::MAX);
+    assert_eq!(escape_mask(u32::MAX, &v(0), 61, &[false; 61], &[], &|_| false), u64::MAX);
+}
+
+#[test]
+fn a_self_call_carrying_an_owned_value_in_a_lent_slot_unlends_it() {
+    // f(a, k): a self call passing a fresh array where `a` was lent would make
+    // the slot hold an owned value no one frees; passing `a` itself, or a field
+    // of a lent value, keeps the slot lent.
+    let lent = [vec![true, false]];
+    let fresh = bind(2, Core::Prim(Prim::ArrNew, vec![v(1), v(1)]), Core::Call(0, vec![v(2), v(1)]));
+    assert_eq!(escape_mask(0, &fresh, 2, &[true, false], &lent, &|_| false), 1);
+    let same = Core::Call(0, vec![v(0), v(1)]);
+    assert_eq!(escape_mask(0, &same, 2, &[true, false], &lent, &|_| false), 0);
+    let field = matched(v(0), vec![2], Core::Call(0, vec![v(2), v(1)]));
+    assert_eq!(escape_mask(0, &field, 2, &[true, false], &lent, &|_| false), 0);
+    // another function's call is judged by its own modes, not by this rule
+    assert_eq!(escape_mask(1, &fresh, 2, &[true, false], &lent, &|_| false), 0);
 }
 
 #[test]

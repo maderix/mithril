@@ -1,6 +1,6 @@
 //! Fold detection over the surface AST plus the associativity/identity
 //! prover: a Rust port of spike 4's detector, generalized from Z_2^32 to
-//! Z_2^56, with a sound masked mode for u32-emulating benchmark ports:
+//! Z_2^64, with a sound masked mode for u32-emulating benchmark ports:
 //! combiners whose top-level result is masked with the exact literal
 //! `& 4294967295` have all such masks stripped and are proved in Z_2^32
 //! instead (the low 32 bits of wrapping `+ - *` depend only on the low
@@ -8,7 +8,7 @@
 //! the provable fragment is *declined* (the loop stays sequential) —
 //! soundness over coverage.
 
-use crate::poly::{padd, pconst, pmul, pneg, psubst, pvar, Poly, MASK32, MASK56};
+use crate::poly::{padd, pconst, pmul, pneg, psubst, pvar, Poly, MASK32, MASK64};
 use mithril_front::ast::{BinOp, Expr, FnDef, Stmt};
 use mithril_front::desugar::free_reads_expr;
 use std::collections::{BTreeSet, HashMap};
@@ -134,7 +134,7 @@ pub fn uses_var(e: &Expr, name: &str) -> bool {
 /// 2^k - 1). `Err` = opaque: outside the wrapping `+ - *` fragment (div,
 /// shifts, comparisons, calls, ...), with a human-readable reason. In
 /// Z_2^32 mode (`mask == MASK32`) `& 4294967295` is the identity and is
-/// stripped recursively; in Z_2^56 mode it is opaque, since stripping it
+/// stripped recursively; in Z_2^64 mode it is opaque, since stripping it
 /// is only sound when the combiner's result is re-masked.
 pub fn sym_eval(e: &Expr, env: &HashMap<String, Poly>, mask: u64) -> Result<Poly, String> {
     match e {
@@ -174,7 +174,7 @@ pub fn sym_eval(e: &Expr, env: &HashMap<String, Poly>, mask: u64) -> Result<Poly
 
 /// A combiner in normal form: `polys[i]` is output component `i` as a
 /// polynomial over `a0..a{arity-1}`, `b0..b{arity-1}`, with coefficients
-/// in Z_2^k (`mask` = MASK56 native, MASK32 for masked u32-emulation).
+/// in Z_2^k (`mask` = MASK64 native, MASK32 for masked u32-emulation).
 pub struct Step {
     pub polys: Vec<Poly>,
     pub arity: usize,
@@ -208,7 +208,7 @@ pub fn step_from_fn(f: &FnDef, loop_masked: bool) -> Result<Step, String> {
                     f.name
                 ));
             }
-            let mask = if mode32 { MASK32 } else { MASK56 };
+            let mask = if mode32 { MASK32 } else { MASK64 };
             let mut env = HashMap::new();
             for j in 0..k {
                 env.insert(format!("{pa}[{j}]"), pvar(&format!("a{j}")));
@@ -219,7 +219,7 @@ pub fn step_from_fn(f: &FnDef, loop_masked: bool) -> Result<Step, String> {
         }
         e => {
             let mode32 = loop_masked || strip_top_mask(e).is_some();
-            let mask = if mode32 { MASK32 } else { MASK56 };
+            let mask = if mode32 { MASK32 } else { MASK64 };
             let mut env = HashMap::new();
             env.insert(pa.clone(), pvar("a0"));
             env.insert(pb.clone(), pvar("b0"));
@@ -233,7 +233,7 @@ pub fn step_from_fn(f: &FnDef, loop_masked: bool) -> Result<Step, String> {
 /// result was `& 4294967295`-masked (already stripped by `detect`), so
 /// the proof runs in Z_2^32.
 pub fn step_from_expr(acc: &str, op: BinOp, left: &Expr, top_masked: bool) -> Result<Step, String> {
-    let mask = if top_masked { MASK32 } else { MASK56 };
+    let mask = if top_masked { MASK32 } else { MASK64 };
     let mut env = HashMap::new();
     env.insert(acc.to_string(), pvar("a0"));
     let l = sym_eval(left, &env, mask)?;
@@ -248,7 +248,7 @@ pub fn step_from_expr(acc: &str, op: BinOp, left: &Expr, top_masked: bool) -> Re
 }
 
 /// Prove `(associative, zero-is-left-identity)` for a combiner step by
-/// polynomial normal-form equality in the step's ring (Z_2^56 or Z_2^32).
+/// polynomial normal-form equality in the step's ring (Z_2^64 or Z_2^32).
 pub fn prove(step: &Step) -> (bool, bool) {
     let k = step.arity;
     let m = step.mask;

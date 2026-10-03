@@ -166,8 +166,8 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
             c => unreachable!("builtin code {}", c),
         });
     }
-    if tag(x) == T_NUM && tag(y) == T_NUM {
-        let (a, b) = (as_i(x), as_i(y));
+    if is_int(x) && is_int(y) {
+        let (a, b) = (take_i(x), take_i(y));
         if code >= 16 {
             let r = match code { 16 => a < b, 17 => a <= b, 18 => a > b, 19 => a >= b, 20 => a == b, 21 => a != b, _ => unreachable!() };
             return Some(num(r as i64));
@@ -180,7 +180,7 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
             4 => floor_div(a, b), 5 => py_mod(a, b), 6 => a.wrapping_shl(b as u32), 7 => a.wrapping_shr(b as u32),
             8 => a & b, 9 => a | b, 10 => a ^ b, c => unreachable!("int opcode {}", c),
         };
-        return Some(num(wrap56(r)));
+        return Some(num(r));
     }
     let (a, b) = (flo_val(ctx, x), flo_val(ctx, y));
     // the operands may be shared with compiled code: drop one reference each
@@ -308,7 +308,7 @@ fn apply_spawn(ctx: &mut Wctx, f: u64, a: u64, parent: u64) {
 "#;
 
 /// The `Program` impl (`{n_rules}`, `{net_rule}`, `{diving}`,
-/// `{fire_arms}`, `{dive_arms}`).
+/// `{fire_arms}`, `{dive_arms}`, `{range_arms}`).
 pub const PROGRAM: &str = r#"struct Pg { fuel: u32, entries: Vec<Entry>, metas: Vec<MatchMeta> }
 
 impl Program for Pg {
@@ -341,6 +341,17 @@ impl Program for Pg {
                 DiveResult::Suspended(NO_REC)
             }
         }
+    }
+    #[allow(unused_variables, unreachable_code)]
+    fn range_leaf(&self, fid: u32, lo: i64, hi: i64, ports: &[u64], ctx: &mut Wctx) -> i64 {
+        // a native loop runs whole: its budget is never observed
+        let mut fuel = i64::MAX / 2;
+        match fid {
+{range_arms}            _ => unreachable!("range fold {}", fid),
+        }
+    }
+    fn release(&self, p: u64, ctx: &mut Wctx) {
+        free_val(ctx, p)
     }
 }
 "#;
@@ -382,7 +393,7 @@ fn main() {
             println!("{}", show(&eng, root));
             if std::env::var_os("MITHRIL_STATS").is_some() {
                 let st = eng.stats();
-                eprintln!("peak_cells={} live_peak={} waves={} rewrites={} arrays_live={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites, ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed));
+                eprintln!("peak_cells={} live_peak={} waves={} rewrites={} arrays_live={} bigs_live={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites, ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed), mithril_rt::mithril_core::port::BIG_LIVE.load(std::sync::atomic::Ordering::Relaxed));
             }
         })
         .expect("spawn main runner");

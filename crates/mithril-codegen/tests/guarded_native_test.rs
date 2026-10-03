@@ -89,8 +89,8 @@ fn guarded_native_and_growth_paths_match_rules_and_interpreter() {
             mithril_net::reduce(&mut net, &net_m, 1 << 20);
             assert_eq!(mithril_codegen::fmt_val(&mithril_net::readback(&net, mithril_net::root_port()).expect("rules must reach a value")), want);
             let fid = id(&m, "caller");
-            for rep in [Some(false), Some(true)] {
-                let original = mithril_codegen::emit_rust_opts(&m, mithril_codegen::EmitOpts { int_rep: rep });
+            {
+                let original = mithril_codegen::emit_rust(&m);
                 let start = original.find(&format!("fn s_{fid}(" )).expect("caller must have an actual native form");
                 let insert = start + original[start..].find("\n").unwrap() + 1;
                 let mut instrumented = original.clone();
@@ -109,7 +109,7 @@ fn guarded_native_and_growth_paths_match_rules_and_interpreter() {
                     for threads in ["1", "4"] { for fuel in ["1", "64"] {
                         let r = Command::new(dir.join("run")).args([threads, fuel]).output().unwrap();
                         assert!(r.status.success(), "{name} {mode}: {}", String::from_utf8_lossy(&r.stderr));
-                        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name} n={n} rep={rep:?} {mode} threads={threads} fuel={fuel}");
+                        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name} n={n} {mode} threads={threads} fuel={fuel}");
                         let err = String::from_utf8_lossy(&r.stderr);
                         let hits: usize = err.lines().find_map(|l| l.strip_prefix("native_hits=")).unwrap().parse().unwrap();
                         if mode == "grow" { assert_eq!(hits, 0); }

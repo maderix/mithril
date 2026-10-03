@@ -14,6 +14,8 @@ pub type R = Result<u64, u64>;
 pub const NONE: u64 = u64::MAX;
 pub const M56: u64 = (1u64 << 56) - 1;
 pub const T_NUM: u64 = 2;
+/// An int outside the inline 56-bit range: a shared heap block (`Port::int`).
+pub const T_BIG: u64 = 15;
 pub const T_FLO: u64 = 3;
 pub const T_CON: u64 = 4;
 pub const T_ARR: u64 = 14; // mithril_core::port::Tag::Arr
@@ -23,9 +25,16 @@ pub const TU: u64 = 16;
 #[inline] pub fn ic(slot: u64, v: i64) -> u64 { ((TU + slot) << 56) | ((v as u64) & M56) }
 /// match dispatch key: boxed ctors -> ctor tag, unboxed -> 0x1000 + slot
 
-#[inline] pub fn num(v: i64) -> u64 { (T_NUM << 56) | ((v as u64) & M56) }
-#[inline] pub fn as_i(p: u64) -> i64 { ((p << 8) as i64) >> 8 }
-#[inline] pub fn wrap56(v: i64) -> i64 { ((v as u64) << 8) as i64 >> 8 }
+/// An int as a port: inline when it fits 56 bits, else a boxed `T_BIG`.
+#[inline] pub fn num(v: i64) -> u64 { if (v << 8) >> 8 == v { (T_NUM << 56) | ((v as u64) << 8 >> 8) } else { big(v) } }
+#[cold] #[inline(never)] fn big(v: i64) -> u64 { crate::Port::int(v).0 }
+/// The int a `T_NUM` or `T_BIG` port holds (the port is not consumed).
+#[inline] pub fn as_i(p: u64) -> i64 { if tag(p) == T_BIG { big_value(p) } else { ((p << 8) as i64) >> 8 } }
+#[cold] #[inline(never)] fn big_value(p: u64) -> i64 { crate::Port(p).int_value() }
+/// The int of a port being consumed: a boxed one is released.
+#[inline] pub fn take_i(p: u64) -> i64 { if tag(p) == T_BIG { take_big(p) } else { ((p << 8) as i64) >> 8 } }
+#[cold] #[inline(never)] fn take_big(p: u64) -> i64 { let v = crate::Port(p).int_value(); crate::Port(p).big_release(); v }
+#[inline] pub fn is_int(p: u64) -> bool { tag(p) == T_NUM || tag(p) == T_BIG }
 #[inline] pub fn con(addr: u32, k: u16, ar: u8) -> u64 { (T_CON << 56) | ((addr as u64) << 16) | ((k as u64) << 4) | ar as u64 }
 #[inline] pub fn con_addr(p: u64) -> u32 { ((p >> 16) & ((1u64 << 40) - 1)) as u32 }
 #[inline] pub fn con_tag(p: u64) -> u16 { ((p >> 4) & 0xFFF) as u16 }
@@ -133,19 +142,6 @@ pub const ARR_RAW: u64 = 1 << 62;
 #[inline(always)] pub fn f32_le(a: i64, b: i64) -> i64 { (f32b(a) <= f32b(b)) as i64 }
 #[inline(always)] pub fn f32_from_u32(a: i64) -> i64 { f32i((a as u32) as f32) }
 #[inline(always)] pub fn f32_to_u32(a: i64) -> i64 { let x = f32b(a); if x.is_nan() || x < 0.0 || x >= 4294967296.0 { 0 } else { x as u32 as i64 } }
-/// Native int representation: an i56 value held as `x << 8`, so i64
-/// wrapping arithmetic is i56 wrapping arithmetic.
-#[inline(always)]
-pub fn sh(p: u64) -> i64 {
-    (p << 8) as i64
-}
-
-/// A native (pre-shifted) int back to a tagged port.
-#[inline(always)]
-pub fn retag(x: i64) -> u64 {
-    ((x as u64) >> 8) | (T_NUM << 56)
-}
-
 #[inline(always)]
 pub fn arr_raw(p: u64) -> bool {
     // SAFETY: as arr_rc
@@ -157,7 +153,7 @@ pub fn arr_raw(p: u64) -> bool {
 pub fn arr_elem(p: u64, k: usize) -> u64 {
     // SAFETY: callers pass k < len
     let e = unsafe { *arr_elems(p).add(k) };
-    if arr_raw(p) { retag(e as i64) } else { e }
+    if arr_raw(p) { num(e as i64) } else { e }
 }
 
 /// An all-int array of n copies of the native int x.
@@ -172,6 +168,30 @@ pub fn arr_new_raw(n: i64, x: i64) -> u64 {
     p
 }
 
+/// A raw int array whose elements are all written before any read (a fill
+/// covers it: codegen's `uninit_lets`), so they get no initial value.
+pub fn arr_new_raw_uninit(n: i64) -> u64 {
+    if n < 0 {
+        panic!("negative array size {}", n);
+    }
+    let n = n as usize;
+    ARR_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let layout = std::alloc::Layout::array::<u64>(n + 2).expect("array size");
+    // SAFETY: a nonzero layout (n + 2 >= 2 words); the block is freed as the
+    // `Box<[u64]>` of the same length (arr_free_block), whose layout this is
+    let b = unsafe { std::alloc::alloc(layout) } as *mut u64;
+    if b.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: the header words are in bounds; the elements stay unwritten
+    // until the fill writes each one
+    unsafe {
+        *b = 1;
+        *b.add(1) = n as u64 | ARR_RAW;
+    }
+    (T_ARR << 56) | (b as u64)
+}
+
 /// A raw array about to store a non-int: switch it to tagged elements.
 #[cold]
 #[inline(never)]
@@ -179,7 +199,7 @@ pub fn arr_unraw(a: u64) {
     let n = arr_len_of(a);
     for k in 0..n {
         // SAFETY: k < n; `a` uniquely ours
-        unsafe { *arr_elems(a).add(k) = retag(*arr_elems(a).add(k) as i64) }
+        unsafe { *arr_elems(a).add(k) = num(*arr_elems(a).add(k) as i64) }
     }
     // SAFETY: as above
     unsafe { *arr_block(a).add(1) &= !ARR_RAW }
@@ -188,7 +208,7 @@ pub fn arr_unraw(a: u64) {
 #[inline(always)]
 pub fn is_heap(v: u64) -> bool {
     let t = tag(v);
-    t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM
+    t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM || t == T_BIG
 }
 
 #[inline(always)]
@@ -267,10 +287,10 @@ pub fn arr_oob(i: i64, n: usize) -> ! {
 /// refcounting, one shift to or from the tagged form.
 #[inline(always)]
 pub fn arr_get_i(a: u64, i: i64) -> u64 {
-    retag(arr_get_r(a, i) as i64)
+    num(arr_get_r(a, i) as i64)
 }
 
-/// Native read: the raw (pre-shifted) element.
+/// Native read: the raw element (a plain i64 word in an int array).
 #[inline(always)]
 pub fn arr_get_r(a: u64, i: i64) -> u64 {
     let n = arr_len_of(a);
@@ -318,7 +338,7 @@ pub fn arr_set_n(a: u64, n: usize, i: i64, v: u64) -> u64 {
 
 #[inline]
 pub fn arr_new_i(n: i64, v: u64) -> u64 {
-    arr_new_raw(n, sh(v))
+    arr_new_raw(n, take_i(v))
 }
 
 /// Spawn a saturated call: arity <= 2 rides in (a, b); wider calls put
@@ -353,8 +373,8 @@ pub fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
         let (xa, xb) = (ctx.cell(ca), ctx.cell(cb));
         ctx.free(cb);
         let add = |x: u64, y: u64| {
-            let v = as_i(x).wrapping_add(as_i(y));
-            num(if mask32 { v & 0xFFFF_FFFF } else { wrap56(v) })
+            let v = take_i(x).wrapping_add(take_i(y));
+            num(if mask32 { v & 0xFFFF_FFFF } else { v })
         };
         ctx.set(ca, 0, add(xa[0], xb[0]));
         if n <= 2 {
@@ -380,6 +400,13 @@ pub fn tup_add(ctx: &mut Wctx, a: u64, b: u64, mask32: bool) -> u64 {
 #[inline] pub fn set_parent(ctx: &mut Wctx, rec: u32, parent: u64) { ctx.set_parent(rec, parent) }
 #[inline] pub fn ready_rec(ctx: &mut Wctx, rec: u32) { ctx.ready_rec(rec) }
 #[inline] pub fn deliver(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver(parent, v) }
+/// Request a proven fold's range as one parallel wave (`crate::RangeReq`);
+/// the caller suspends to the returned record of the fold's join rule.
+pub fn range_launch(ctx: &mut Wctx, fid: u32, join: u16, lo: i64, hi: i64, ports: &[u64], acc: u32, kind: u32) -> u32 {
+    let rec = ctx.alloc_rec(join, 2, 0, 0, NONE);
+    ctx.range_request(crate::RangeReq { fid, rec, lo, hi, ports: ports.to_vec(), acc, kind });
+    rec
+}
 #[inline] pub fn deliver_deferred(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver_deferred(parent, v) }
 #[inline] pub fn rec_parent(ctx: &Wctx, rec: u32) -> u64 { ctx.rec(rec).parent }
 #[inline] pub fn rec_d(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).d }
@@ -421,6 +448,11 @@ pub fn dive_res(ctx: &mut Wctx, f: u16, args: &[u64]) -> Result<u64, u32> {
 #[inline] pub fn stack_guard() {}
 /// `n` units of work charged to the budget (the device charges none: see lir::work_fuel)
 #[inline] pub fn work_fuel(fuel: &mut i64, n: i64) { *fuel -= n; }
+/// Work charged since a mark, and the work one budget stands for: the CPU charges
+/// work to the budget itself, so a budget is its own quantum (fold estimates).
+#[inline] pub fn work_mark(fuel: &i64) -> i64 { *fuel }
+#[inline] pub fn work_since(fuel: &i64, mark: i64) -> i64 { mark - *fuel }
+#[inline] pub fn work_quantum(ctx: &Wctx) -> i64 { ctx.fuel() }
 /// Uninterrupted native regions settle all work once, modulo the fuel word.
 #[inline] pub fn native_work_fuel(fuel: &mut i64, n: i64) { *fuel = fuel.wrapping_sub(n); }
 /// The scheduler chooses a native subtree only after exposing enough work.
@@ -614,6 +646,10 @@ pub fn dup_val<T: Tables>(ctx: &mut Wctx, p: u64) -> u64 {
             crate::sync::rc_share::<u64, _>(arr_rc(p));
             p
         }
+        T_BIG => {
+            crate::Port(p).big_share();
+            p
+        }
         _ => p,
     }
 }
@@ -623,8 +659,8 @@ pub fn arr_new<T: Tables>(ctx: &mut Wctx, n: i64, v: u64) -> u64 {
     if n < 0 {
         panic!("negative array size {}", n);
     }
-    if tag(v) == T_NUM {
-        return arr_new_raw(n, sh(v));
+    if is_int(v) {
+        return arr_new_raw(n, take_i(v));
     }
     let n = n as usize;
     if !is_heap(v) {
@@ -665,9 +701,9 @@ pub fn arr_set<T: Tables>(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
     }
     let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy::<T>(ctx, a) };
     if arr_raw(a) {
-        if tag(v) == T_NUM {
+        if is_int(v) {
             // SAFETY: bounds checked; `a` is now uniquely ours
-            unsafe { *arr_elems(a).add(i as usize) = sh(v) as u64 };
+            unsafe { *arr_elems(a).add(i as usize) = take_i(v) as u64 };
             return a;
         }
         arr_unraw(a);
@@ -689,7 +725,7 @@ pub fn arr_set_i<T: Tables>(ctx: &mut Wctx, a: u64, i: i64, v: u64) -> u64 {
     let a = if arr_rc(a).load(std::sync::atomic::Ordering::Acquire) == 1 { a } else { arr_copy::<T>(ctx, a) };
     debug_assert!(arr_raw(a) || n == 0);
     // SAFETY: bounds checked; `a` is now uniquely ours
-    unsafe { *arr_elems(a).add(i as usize) = sh(v) as u64 };
+    unsafe { *arr_elems(a).add(i as usize) = take_i(v) as u64 };
     a
 }
 
@@ -745,7 +781,7 @@ pub fn arr_drop<T: Tables>(ctx: &mut Wctx, p: u64) {
 #[inline(always)]
 pub fn free_val<T: Tables>(ctx: &mut Wctx, p: u64) {
     let t = tag(p);
-    if t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM {
+    if t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM && t != T_BIG {
         return;
     }
     free_val_slow::<T>(ctx, p);
@@ -822,6 +858,7 @@ pub fn untup<T: Tables, const K: usize>(ctx: &mut Wctx, p: u64) -> [u64; K] {
 pub fn free_val_slow<T: Tables>(ctx: &mut Wctx, p: u64) {
     match tag(p) {
         T_ARR => arr_drop::<T>(ctx, p),
+        T_BIG => crate::Port(p).big_release(),
         // a dropped closure: the net erases it (and the work pending
         // in its body)
         T_LAM => T::drop_closure(ctx, p),
@@ -864,9 +901,11 @@ pub fn free_val_slow<T: Tables>(ctx: &mut Wctx, p: u64) {
 
 #[inline]
 pub fn bin<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
-    if tag(a) == T_NUM && tag(b) == T_NUM {
+    if is_int(a) && is_int(b) {
         let (x, y) = (as_i(a), as_i(b));
-        return num(wrap56(match op {
+        if own & 1 != 0 { free_val::<T>(ctx, a); }
+        if own & 2 != 0 { free_val::<T>(ctx, b); }
+        return num(match op {
             0 => x.wrapping_add(y),
             1 => x.wrapping_sub(y),
             2 => x.wrapping_mul(y),
@@ -878,7 +917,7 @@ pub fn bin<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
             8 => x & y,
             9 => x | y,
             _ => x ^ y,
-        }));
+        });
     }
     let (x, y) = (flo_val(ctx, a), flo_val(ctx, b));
     if own & 1 != 0 { free_val::<T>(ctx, a); }
@@ -889,8 +928,11 @@ pub fn bin<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
 
 #[inline]
 pub fn cmp<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
-    let o = if tag(a) == T_NUM && tag(b) == T_NUM {
-        as_i(a).partial_cmp(&as_i(b))
+    let o = if is_int(a) && is_int(b) {
+        let o = as_i(a).partial_cmp(&as_i(b));
+        if own & 1 != 0 { free_val::<T>(ctx, a); }
+        if own & 2 != 0 { free_val::<T>(ctx, b); }
+        o
     } else {
         // read, then release (a freed cell's first word is its free-list link)
         let o = flo_val(ctx, a).partial_cmp(&flo_val(ctx, b));
@@ -925,7 +967,7 @@ pub fn show<T: Tables>(eng: &Engine, p: u64) -> String {
     match tag(p) {
         t if t >= TU => format!("C{}({})", T::unbox_cid(t - TU), as_i(p)),
         T_LAM => "<closure>".to_string(),
-        T_NUM => as_i(p).to_string(),
+        T_NUM | T_BIG => as_i(p).to_string(),
         T_FLO => format!("{:?}", f64::from_bits(eng.cell((p & M56) as u32)[0])),
         T_CON => {
             let k = con_tag(p);

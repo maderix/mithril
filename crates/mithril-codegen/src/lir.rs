@@ -443,7 +443,7 @@ pub fn borrowed_cells(body: &mut Vec<S>) {
                 f,
                 ctx: false,
                 args,
-            } if matches!(f.as_str(), "as_i" | "sh") && args.len() == 1 => read(&args[0]),
+            } if f == "as_i" && args.len() == 1 => read(&args[0]),
             _ => None,
         }
     }

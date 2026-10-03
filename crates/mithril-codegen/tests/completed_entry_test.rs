@@ -1,8 +1,5 @@
 use mithril_codegen::lir::{self, *, completed};
 
-// These two lowering probes override one process-wide representation setting.
-static REP_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn function(name: &str, body: Vec<S>) -> FnDef {
     FnDef { name: name.into(), ctx: false, params: vec![("budget".into(), Ty::RefI64), ("n".into(), Ty::I64)], ret: Ty::I64, body, inline: Inline::Default, cold: false }
 }
@@ -72,9 +69,7 @@ fn branch_cycles_are_checked_and_shared_callees_are_cloned_once() {
 
 #[test]
 fn credited_and_completed_native_code_match_the_interpreter() {
-    let _rep = REP_ENV.lock().unwrap();
     use std::{path::{Path, PathBuf}, process::Command};
-    std::env::set_var("MITHRIL_PLAIN_INTS", "1");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("target"));
     let build = Command::new("cargo").args(["build", "--release", "-p", "mithril-rt"]).current_dir(&root).output().unwrap();
@@ -117,7 +112,6 @@ fn credited_and_completed_native_code_match_the_interpreter() {
             assert_eq!(String::from_utf8_lossy(&run.stdout).lines().collect::<Vec<_>>(), vec![want.as_str(); 3], "{name} n={n}");
         }
     }
-    std::env::remove_var("MITHRIL_PLAIN_INTS");
 }
 
 #[test]
@@ -134,10 +128,8 @@ fn erased_cost_computation_must_be_total_and_have_no_effects() {
 
 #[test]
 fn recursive_fold_entry_can_complete_without_budget_observation() {
-    let _rep = REP_ENV.lock().unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = std::fs::read_to_string(root.join("crates/mithril-codegen/tests/fixtures/recursive_counts.py")).unwrap();
-    std::env::set_var("MITHRIL_PLAIN_INTS", "1");
     let module = mithril_front::desugar(&mithril_front::parse(&source).unwrap()).unwrap();
     let (program, _) = mithril_codegen::lower(&module);
     assert!(!program.native_entries.is_empty());
@@ -145,7 +137,6 @@ fn recursive_fold_entry_can_complete_without_budget_observation() {
     let (entries, clones) = completed::entries(&program.fns, &roots);
     assert_eq!(entries.len(), roots.len(), "existing pure integer native entries must receive completed-task variants");
     assert!(!clones.is_empty());
-    std::env::remove_var("MITHRIL_PLAIN_INTS");
 }
 
 #[test]

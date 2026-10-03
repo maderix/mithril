@@ -1,7 +1,13 @@
 //! A loop ending in `s = E(s, ..)` whose other work ignores `s` runs that work as a tree
 //! of independent calls (parallel), then applies `E` in iteration order: same result.
+//!
+//! A split costs a leaf and an apply step per iteration, a constant, so it only pays
+//! when an iteration's work can grow. The interaction rules decide that: work whose
+//! residual, after compile-time reduction, still reaches a call cycle can grow; work
+//! the rules reduce to plain operations stays one native loop.
 
 use mithril_front::ast::{Expr, FnDef, Module, Stmt};
+use mithril_front::core::Core;
 use mithril_front::desugar::{assigned_names, free_reads_expr, free_reads_stmts};
 use std::collections::BTreeSet;
 
@@ -34,8 +40,14 @@ def __appK(__s, __t, __lo, __hi, INV):
 pub fn split_independent_loops(m: &mut Module) {
     // a loop in a function reached from parallel work (a split loop's work, a proven
     // fold's body, or a function that calls itself twice on one path) is kept
+    // the residual decides which loops may split; reduce only when some loop could
+    let every: BTreeSet<String> = m.fns.iter().map(|f| f.name.clone()).collect();
+    if run(&mut m.clone(), &BTreeSet::new(), &every).fns.is_empty() {
+        return;
+    }
+    let grows = unbounded(m);
     let mut trial = m.clone();
-    let tried = run(&mut trial, &BTreeSet::new());
+    let tried = run(&mut trial, &BTreeSet::new(), &grows);
     let forking = m.fns.iter().filter(|f| self_calls(&f.body, &f.name) >= 2).map(|f| f.name.clone());
     let mut inside: BTreeSet<String> = forking.collect();
     let mut todo: Vec<String> = tried.fns.iter().filter(|f| f.name.starts_with("__work")).map(|f| f.name.clone()).collect();
@@ -50,20 +62,60 @@ pub fn split_independent_loops(m: &mut Module) {
         f.body.iter().for_each(|st| stmt_calls(st, &mut called));
         todo.extend(called.into_iter().filter(|g| inside.insert(g.clone())));
     }
-    let helpers = run(m, &inside);
+    let helpers = run(m, &inside, &grows);
     m.datas.extend(helpers.datas);
     m.fns.extend(helpers.fns);
 }
 
-fn run(m: &mut Module, keep: &BTreeSet<String>) -> Module {
+fn run(m: &mut Module, keep: &BTreeSet<String>, grows: &BTreeSet<String>) -> Module {
     let mut helpers = Module::default();
     let user: BTreeSet<String> = m.fns.iter().map(|f| f.name.clone()).collect();
     for f in m.fns.iter_mut().filter(|f| !keep.contains(&f.name)) {
         let mut vars: BTreeSet<String> = f.params.iter().cloned().collect();
         vars.extend(assigned_names(&f.body));
-        f.body = rewrite(std::mem::take(&mut f.body), &vars, &user, &mut helpers);
+        f.body = rewrite(std::mem::take(&mut f.body), &vars, &user, grows, &mut helpers);
     }
     helpers
+}
+
+/// Functions whose work can still grow after compile-time reduction. The module is
+/// reduced by the interaction rules; a function grows when its residual reaches a call
+/// cycle (a loop or recursion the rules could not unfold) or applies a closure.
+fn unbounded(m: &Module) -> BTreeSet<String> {
+    let all = || m.fns.iter().map(|f| f.name.clone()).collect();
+    let Ok(cm) = mithril_front::desugar(m) else { return all() };
+    let (sm, _) = mithril_net::specialize(&cm, mithril_net::REDUCE_FUEL);
+    let n = sm.fns.len();
+    let mut calls = vec![BTreeSet::new(); n];
+    let mut opaque = vec![false; n];
+    for (i, f) in sm.fns.iter().enumerate() {
+        f.body.walk(&mut |e| match e {
+            Core::Call(g, _) => {
+                calls[i].insert(*g as usize);
+            }
+            Core::App(..) => opaque[i] = true,
+            _ => {}
+        });
+    }
+    let reach = |from: usize| {
+        let (mut seen, mut todo) = (BTreeSet::new(), vec![from]);
+        while let Some(g) = todo.pop() {
+            for &h in &calls[g] {
+                if seen.insert(h) {
+                    todo.push(h);
+                }
+            }
+        }
+        seen
+    };
+    let reaches: Vec<BTreeSet<usize>> = (0..n).map(reach).collect();
+    let cyclic: Vec<bool> = (0..n).map(|i| reaches[i].contains(&i) || opaque[i]).collect();
+    sm.fns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| cyclic[*i] || reaches[*i].iter().any(|&j| cyclic[j]))
+        .map(|(_, f)| f.name.clone())
+        .collect()
 }
 
 /// The most calls to `name` one activation of `body` can make.
@@ -105,15 +157,15 @@ fn stmt_calls(st: &Stmt, out: &mut BTreeSet<String>) {
     for block in blocks { for st in block { stmt_calls(st, out); } }
 }
 
-fn rewrite(stmts: Vec<Stmt>, vars: &BTreeSet<String>, user: &BTreeSet<String>, helpers: &mut Module) -> Vec<Stmt> {
+fn rewrite(stmts: Vec<Stmt>, vars: &BTreeSet<String>, user: &BTreeSet<String>, grows: &BTreeSet<String>, helpers: &mut Module) -> Vec<Stmt> {
     let mut out = Vec::new();
     for (i, s) in stmts.iter().enumerate() {
         let Stmt::For(v, n, body, fold) = s else {
             out.push(s.clone());
             continue;
         };
-        let body = rewrite(body.clone(), vars, user, helpers);
-        match fold.is_none().then(|| split(v, n, &body, &stmts[i + 1..], vars, user, helpers)).flatten() {
+        let body = rewrite(body.clone(), vars, user, grows, helpers);
+        match fold.is_none().then(|| split(v, n, &body, &stmts[i + 1..], vars, user, grows, helpers)).flatten() {
             Some(new) => out.extend(new),
             None => out.push(Stmt::For(v.clone(), n.clone(), body, fold.clone())),
         }
@@ -121,7 +173,8 @@ fn rewrite(stmts: Vec<Stmt>, vars: &BTreeSet<String>, user: &BTreeSet<String>, h
     out
 }
 
-fn split(v: &str, n: &Expr, body: &[Stmt], rest: &[Stmt], vars: &BTreeSet<String>, user: &BTreeSet<String>, helpers: &mut Module) -> Option<Vec<Stmt>> {
+#[allow(clippy::too_many_arguments)]
+fn split(v: &str, n: &Expr, body: &[Stmt], rest: &[Stmt], vars: &BTreeSet<String>, user: &BTreeSet<String>, grows: &BTreeSet<String>, helpers: &mut Module) -> Option<Vec<Stmt>> {
     let (Stmt::Assign(s, upd), before) = body.split_last()? else { return None };
     let mut work = before.to_vec();
     let mut local = BTreeSet::new();
@@ -143,8 +196,10 @@ fn split(v: &str, n: &Expr, body: &[Stmt], rest: &[Stmt], vars: &BTreeSet<String
     let k = helpers.fns.len();
     let calls = |e: &Expr| e.any(&|x| matches!(x, Expr::Call(f, _) if user.contains(f) || helpers.fns.iter().any(|h| &h.name == f)));
     let upd = hoist(upd, s, &calls, &format!("__w{k}_"), &mut work);
-    if !work.iter().any(|st| matches!(st, Stmt::Assign(_, e) if calls(e))) {
-        return None; // plain arithmetic stays a native loop
+    // only work that can grow pays for a leaf; helpers made by earlier splits recurse
+    let grows_call = |e: &Expr| e.any(&|x| matches!(x, Expr::Call(f, _) if grows.contains(f) || helpers.fns.iter().any(|h| &h.name == f)));
+    if !work.iter().any(|st| matches!(st, Stmt::Assign(_, e) if grows_call(e))) {
+        return None; // bounded work stays a native loop
     }
 
     let defined = assigned_names(&work);

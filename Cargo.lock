@@ -152,6 +152,7 @@ name = "mithril-reassoc"
 version = "0.1.0"
 dependencies = [
  "mithril-front",
+ "mithril-net",
 ]
 
 [[package]]

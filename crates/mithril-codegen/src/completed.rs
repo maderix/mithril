@@ -17,7 +17,7 @@ fn frame_helper(f: &str) -> bool {
     operations::helper(f).is_some_and(|h| h.effect == operations::Effect::Frame)
 }
 fn helper(f: &str) -> bool {
-    frame_helper(f) || matches!(f, "as_i" | "num" | "wrap56" | "sh" | "retag" | "floor_div" | "py_mod" | "stack_guard" | "native_frames" | "native_records" | "native_ok" | "native_check")
+    frame_helper(f) || matches!(f, "as_i" | "num" | "floor_div" | "py_mod" | "stack_guard" | "native_frames" | "native_records" | "native_ok" | "native_check")
 }
 fn check(f: &FnDef, functions: &BTreeMap<&str, &FnDef>) -> Option<(String, BTreeSet<String>, BTreeSet<String>)> {
     if f.ctx || !matches!(f.ret, Ty::I64 | Ty::Tup(_)) { return None; }

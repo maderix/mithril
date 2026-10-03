@@ -1,4 +1,4 @@
-use mithril_codegen::{emit_rust_opts, fmt_val, EmitOpts};
+use mithril_codegen::{emit_rust, fmt_val};
 use mithril_front::{core::CoreModule, desugar, eval_core, parse};
 use std::{path::Path, process::Command};
 
@@ -35,12 +35,7 @@ fn borrowed_recursive_walks_have_guarded_compact_continuations() {
             !p.native_entries.contains(&(fid as u32)),
             "heap handles are not integer-only task entries"
         );
-        let code = emit_rust_opts(
-            &m,
-            EmitOpts {
-                int_rep: Some(false),
-            },
-        );
+        let code = emit_rust(&m);
         assert!(
             code.contains("native_ready(ctx, &[])"),
             "read-only walks use the surrounding WORK frontier"
@@ -105,8 +100,8 @@ fn borrowed_regions_match_rules_in_both_representations_and_execution_modes() {
             want
         );
         let fid = m.fns.iter().position(|f| f.name == "walk").unwrap();
-        for rep in [Some(false), Some(true)] {
-            let mut code = emit_rust_opts(&m, EmitOpts { int_rep: rep });
+        {
+            let mut code = emit_rust(&m);
             let header = format!("fn s_{fid}(");
             let start = code.find(&header).expect("walk must have a scalar entry");
             let insert = start + code[start..].find("{\n").unwrap() + 2;
@@ -145,7 +140,7 @@ fn borrowed_regions_match_rules_in_both_representations_and_execution_modes() {
                     .unwrap();
                 assert!(
                     compiled.status.success(),
-                    "{case} {rep:?}: {}",
+                    "{case}: {}",
                     String::from_utf8_lossy(&compiled.stderr)
                 );
                 for threads in ["1", "4"] {
@@ -156,13 +151,13 @@ fn borrowed_regions_match_rules_in_both_representations_and_execution_modes() {
                             .unwrap();
                         assert!(
                             got.status.success(),
-                            "{case} {rep:?} {mode} {threads} {fuel}: {}",
+                            "{case} {mode} {threads} {fuel}: {}",
                             String::from_utf8_lossy(&got.stderr)
                         );
                         assert_eq!(
                             String::from_utf8_lossy(&got.stdout).trim(),
                             want,
-                            "{case} {rep:?} {mode} {threads} {fuel}"
+                            "{case} {mode} {threads} {fuel}"
                         );
                         let err = String::from_utf8_lossy(&got.stderr);
                         let hits: usize = err

@@ -155,7 +155,7 @@ pub(crate) fn discover(module: &mithril_front::core::CoreModule, fns: &[FnDef]) 
     for (name, group) in components(fns) {
         let name = &name;
         let fid: u32 = name[2..].parse().unwrap();
-        if crate::scalar::shifted(fid) || group.values().any(|f| f.ctx || f.params.iter().skip(1).any(|(_,t)| *t != Ty::I64)) { continue; }
+        if group.values().any(|f| f.ctx || f.params.iter().skip(1).any(|(_,t)| *t != Ty::I64)) { continue; }
         // The single entry must break the call cycle; reject other internal
         // cycles before expanding their bodies.
         if !single_entry(&group, name) { continue; }

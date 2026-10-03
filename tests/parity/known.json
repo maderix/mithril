@@ -27,5 +27,33 @@
    "rc": 0
   },
   "why": "Image output now contains a flat row-major pixel array. All dimensions and pixel values are preserved exactly from the pinned reference oracle; only the nested tuple representation changed."
+ },
+ "fixture/mithril-codegen/loop_split_shapes": {
+  "correct": {
+   "out": "6730270553\n",
+   "rc": 0
+  },
+  "why": "the fixture's f now loops a data-dependent number of times (the split pass is decided by the residual, and a constant trip count unrolls); CPython with binary32 rounding for f32 prints the same value"
+ },
+ "fixture/mithril-codegen/int_reps": {
+  "correct": {
+   "out": "-652237\n",
+   "rc": 0
+  },
+  "why": "ints are 64-bit (wrapping at 2^64, boxed past 56 bits at a port); the reference wrapped at 2^56. CPython with every op wrapped to 64 bits prints the same value, as does every lane"
+ },
+ "fixture/mithril-codegen/recursive_expr": {
+  "correct": {
+   "out": "-102597903888614000\n",
+   "rc": 0
+  },
+  "why": "ints are 64-bit (wrapping at 2^64, boxed past 56 bits at a port); the reference wrapped at 2^56. CPython with every op wrapped to 64 bits prints the same value, as does every lane"
+ },
+ "gen/g236": {
+  "correct": {
+   "out": "(34033508, 0, 77996280949, 68066988)\n",
+   "rc": 0
+  },
+  "why": "ints are 64-bit (wrapping at 2^64, boxed past 56 bits at a port); the reference wrapped at 2^56. CPython with every op wrapped to 64 bits prints the same value, as does every lane"
  }
 }

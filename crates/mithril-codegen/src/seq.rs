@@ -81,13 +81,29 @@ pub(crate) fn arith(code: u8, a: E, b: E) -> E {
         1 => bin(Bop::Sub, a, b),
         2 => bin(Bop::Mul, a, b),
         3 => bin(Bop::Div, a, b),
-        4 => p("floor_div", vec![a, b]),
-        5 => p("py_mod", vec![a, b]),
+        // floor semantics make a power-of-two divisor exact for every sign:
+        // x // 2^k is the arithmetic shift, x % 2^k the low k bits
+        4 => match pow2(&b) {
+            Some(k) => bin(Bop::Shr, a, i64_(k)),
+            None => p("floor_div", vec![a, b]),
+        },
+        5 => match pow2(&b) {
+            Some(k) => bin(Bop::And, a, i64_((1i64 << k) - 1)),
+            None => p("py_mod", vec![a, b]),
+        },
         6 => bin(Bop::Shl, a, b),
         7 => bin(Bop::Shr, a, b),
         8 => bin(Bop::And, a, b),
         9 => bin(Bop::Or, a, b),
         _ => bin(Bop::Xor, a, b),
+    }
+}
+
+/// `k` when `e` is the constant 2^k (k < 62).
+fn pow2(e: &E) -> Option<i64> {
+    match e {
+        E::Int(c, _) if *c > 0 && (*c as u64).is_power_of_two() && c.trailing_zeros() < 62 => Some(c.trailing_zeros() as i64),
+        _ => None,
     }
 }
 
@@ -146,8 +162,6 @@ pub(crate) struct Ex<'m> {
     pub kframes: Vec<(u32, Core)>,
     /// ctor id -> unbox slot (arity-1 int ctors carried in the port).
     pub unbox: &'m std::collections::HashMap<u32, u8>,
-    /// fn -> returns a proven i56 (calls to these are int expressions).
-    pub iret: &'m [bool],
     /// Inferred types (for share recording) and the module-wide recorder.
     pub tys: &'m Types,
     pub shared: &'m std::cell::RefCell<Shared>,
@@ -157,14 +171,14 @@ pub(crate) struct Ex<'m> {
     /// Variables proven to hold i56 immediates (see `numeric_vars`): their
     /// dup/free are elided and arithmetic on them is emitted inline.
     pub ints: HashSet<u32>,
+    /// value ranges of the body (which ints are small)
+    pub ranges: crate::range::Ranges,
     /// Vars moved or shared into records by the capture being emitted.
     pub captured: HashSet<u32>,
     /// Rule form: dives whose continuation is being emitted inline, nested.
     pub inline_calls: u32,
     /// Vars holding a native scalar tuple result, as locals `q<var>_<i>`.
     pub ntup: HashSet<u32>,
-    /// ... of those, the ones whose callee holds shifted ints
-    pub ntup_sh: HashSet<u32>,
     /// The let binder whose right-hand side is being emitted.
     pub cur_let: Option<u32>,
     /// Dive form of a TRMC function: (ctor id, hole-fill rule).
@@ -182,8 +196,12 @@ thread_local! {
     /// `FOLDS[g]`: `g` is a proven fold split by its CALL rule (its dive
     /// form measures fuel per iteration, see fold.rs).
     pub(crate) static FOLDS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The filled array's parameter of each index-fill fold.
+    pub(crate) static FILLS: std::cell::RefCell<Vec<Option<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// the in-dive split code of each proven fold (see fold.rs)
     pub(crate) static FOLD_SPLIT: std::cell::RefCell<Vec<Option<Vec<S>>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// A native fold's bridge preamble: the first-iteration probe, then the split.
+    pub(crate) static FOLD_BRIDGE: std::cell::RefCell<Vec<Option<Vec<S>>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// `NTUP[g] = k > 0`: dive function `g` has a native multi-value entry
     /// `n_<g>(..) -> Result<[u64; k], u64>` (see `ntup_fns`).
     pub(crate) static NTUP: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -235,14 +253,15 @@ impl<'m> Ex<'m> {
         bor: &'m [Vec<bool>],
         sq: Option<&'m mut SegQ>,
         unbox: &'m std::collections::HashMap<u32, u8>,
-        iret: &'m [bool],
         tys: &'m Types,
         shared: &'m std::cell::RefCell<Shared>,
     ) -> Ex<'m> {
         let mut rem = Cnt::new();
         if dive { cnt_dive(body, &mut rem) } else { crate::cnt_rule(body, &mut rem) }
-        let ints = if self_fid == u32::MAX { HashSet::new() } else { crate::ints_of(tys, self_fid as usize) };
-        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), ntup_sh: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), unbox, iret, tys, shared, toks: Vec::new() }
+        // immediates: ints that provably fit a tagged word (others may be boxed)
+        let ranges = crate::range::Ranges::of(body);
+        let ints = if self_fid == u32::MAX { HashSet::new() } else { crate::ints_of(tys, self_fid as usize).into_iter().filter(|x| ranges.small_var(*x)).collect() };
+        Ex { tmp: 0, dive, self_fid, loop_form, rem, pinned: 0, pinset: HashSet::new(), dying: Vec::new(), bset, bor, ints, ranges, captured: HashSet::new(), inline_calls: 0, ntup: HashSet::new(), cur_let: None, trmc: None, pending: None, dps_param: None, nret: 0, sq, kframes: Vec::new(), unbox, tys, shared, toks: Vec::new() }
     }
 
     /// Owned inputs the body never reads die at once.
@@ -321,19 +340,7 @@ impl<'m> Ex<'m> {
         let saved = self.rem.clone();
         let mut cb: Vec<S> = Vec::new();
         let child = self.capture_chain(rv, own, &mut cb);
-        // Every record took one reference (sharing when the frame still
-        // had other uses); the frame itself is now abandoned, so release
-        // what it still owns. Borrowed and held (pinned) values are not
-        // ours to drop.
-        if self.pinned == 0 {
-            let mut left: Vec<u32> = self.rem.iter().filter(|(_, r)| **r > 0).map(|(v, _)| *v).collect();
-            left.sort_unstable();
-            for x in left {
-                if self.owned(x) && self.captured.contains(&x) {
-                    cb.push(free(v(vn(x))));
-                }
-            }
-        }
+        self.release_abandoned(&mut cb);
         cb.push(ret(cast(v(child), Ty::U64)));
         self.rem = saved;
         // The chain runs once per suspension; keeping it out of line keeps
@@ -349,6 +356,23 @@ impl<'m> Ex<'m> {
         b.push(S::Fn(Box::new(FnDef { name, ctx: true, params, ret: Ty::U64, body: cb, inline: Inline::Never, cold: true })));
         let ex = self.hole_exit(call, b);
         b.push(ret(err(ex)));
+    }
+
+    /// After a suspension's records are built: every record took one reference
+    /// (sharing when the frame still had other uses), and the frame itself is
+    /// abandoned, so release what it still owns. Borrowed and held (pinned)
+    /// values are not ours to drop. The dive capture and the rule form's
+    /// suspension path both end here.
+    pub(crate) fn release_abandoned(&mut self, b: &mut Vec<S>) {
+        if self.pinned == 0 {
+            let mut left: Vec<u32> = self.rem.iter().filter(|(_, r)| **r > 0).map(|(v, _)| *v).collect();
+            left.sort_unstable();
+            for x in left {
+                if self.owned(x) && self.captured.contains(&x) {
+                    b.push(free(v(vn(x))));
+                }
+            }
+        }
     }
 
     /// Emit the record chain for a suspension into `b`, returning the name
@@ -465,16 +489,17 @@ impl<'m> Ex<'m> {
         self.self_fid != u32::MAX && self.tys.expr(self.self_fid as usize, e) == CTy::Arr(true)
     }
 
-    /// An expression whose runtime value is a proven i56 immediate.
+    /// An expression whose runtime value is a proven immediate: an int that
+    /// fits a tagged word (an array element, a call result or a parameter may
+    /// be a boxed 64-bit int).
     fn is_int(&self, e: &Core) -> bool {
         match e {
-            Core::Prim(mithril_front::core::Prim::ArrGet, xs) => self.int_arr(&xs[0]),
             Core::Prim(mithril_front::core::Prim::ArrLen, _) => true,
             Core::Prim(p, _) if p.is_f32() => true,
-            Core::Num(_) | Core::Cmp(..) => true,
-            Core::Op2(_, a, b) => self.is_int(a) && self.is_int(b),
+            Core::Num(n) => (-(1i64 << 55)..(1i64 << 55)).contains(n),
+            Core::Cmp(..) => true,
+            Core::Op2(_, a, b) => self.is_int(a) && self.is_int(b) && self.ranges.small(e),
             Core::Var(i) => self.ints.contains(i),
-            Core::Call(g, _) => self.iret.get(*g as usize).copied().unwrap_or(false),
             Core::If(_, t, f) => self.is_int(t) && self.is_int(f),
             Core::Let(_, _, b) => self.is_int(b),
             _ => false,
@@ -500,6 +525,47 @@ impl<'m> Ex<'m> {
 
     fn is_braw(&self, e: &Core) -> bool {
         matches!(e, Core::Var(i) if self.bset.contains(i))
+    }
+
+    /// An expression whose value is an int (inline or boxed).
+    fn int_typed(&self, e: &Core) -> bool {
+        match e {
+            Core::Op2(_, a, b) => self.int_typed(a) && self.int_typed(b),
+            _ => self.self_fid != u32::MAX && self.tys.expr(self.self_fid as usize, e) == CTy::Int,
+        }
+    }
+
+    /// The native i64 of an int-typed `e`: arithmetic and comparisons on
+    /// int operands run in registers, so an intermediate past 56 bits is
+    /// never boxed; a variable is read in place and released at its last use.
+    fn ival(&mut self, e: &Core, b: &mut Vec<S>) -> E {
+        match e {
+            Core::Num(n) => i64_(*n),
+            Core::Op2(op, x, y) if self.int_typed(x) && self.int_typed(y) => {
+                let (ex, ey) = (self.ival(x, b), self.ival(y, b));
+                let t = self.fresh();
+                crate::value::bind(t, Ty::I64, arith(bin_code(op), ex, ey), b)
+            }
+            Core::Cmp(op, x, y) if self.int_typed(x) && self.int_typed(y) => {
+                let (ex, ey) = (self.ival(x, b), self.ival(y, b));
+                cast(compare(cmp_code(op), ex, ey), Ty::I64)
+            }
+            Core::Var(i) if !self.ints.contains(i) && !self.bset.contains(i) && !self.pinset.contains(i) => {
+                let last = self.take_use(*i) == Some(true);
+                let t = self.fresh();
+                crate::value::bind(t, Ty::I64, p(if last { "take_i" } else { "as_i" }, vec![v(vn(*i))]), b)
+            }
+            _ => {
+                let p = self.val(e, false, b);
+                self.int_of(e, p)
+            }
+        }
+    }
+
+    /// The native int of `arg`, lowered to `e`: an owned port that may be a
+    /// boxed int is released after the read.
+    fn int_of(&self, arg: &Core, e: E) -> E {
+        if self.is_int(arg) || self.is_braw(arg) { as_i(e) } else { p("take_i", vec![e]) }
     }
 
     /// Read variable `i`. `esc` = the value escapes into a structure /
@@ -649,23 +715,26 @@ impl<'m> Ex<'m> {
 
     /// A call to native scalar `g`: `[*fuel -= 1;] s_g(ctx?, fuel, conv(args)..)`.
     fn native_call(&mut self, g: u32, args: &[Core], b: &mut Vec<S>) -> E {
-        let es: Vec<E> = args.iter().map(|a| self.val(a, false, b)).collect();
+        let es: Vec<E> = args.iter().map(|a| { let e = self.val(a, false, b); self.int_of(a, e) }).collect();
         if self.dive && crate::scalar::is_leaf(g) {
             b.push(work_fuel(i64_(1)));
         }
-        let conv = if crate::scalar::shifted(g) { "sh" } else { "as_i" };
         let mut a = vec![fuel_arg(self.dive)];
-        a.extend(es.into_iter().map(|e| p(conv, vec![e])));
+        a.extend(es);
         E::Call { f: format!("s_{g}"), ctx: !crate::scalar::ctx_arg(g).is_empty(), args: a }
     }
 
     /// A native result component back into a port.
-    fn native_back(g: u32, e: E) -> E {
-        crate::value::int_port(e, crate::scalar::shifted(g))
+    fn native_back(_g: u32, e: E) -> E {
+        num(e)
     }
 
     /// A binary op or comparison: native on proven ints, else the runtime helper.
     fn binop(&mut self, x: &Core, y: &Core, b: &mut Vec<S>, code: u8, helper: &str, int: impl FnOnce(E, E) -> E) -> E {
+        if self.int_typed(x) && self.int_typed(y) {
+            let (ex, ey) = (self.ival(x, b), self.ival(y, b));
+            return self.temp(num(int(ex, ey)), b);
+        }
         let ints = self.is_int(x) && self.is_int(y);
         let own = (!self.is_braw(x) as u8) | ((!self.is_braw(y) as u8) << 1);
         let ex = self.val(x, false, b);
@@ -691,6 +760,12 @@ impl<'m> Ex<'m> {
                 use mithril_front::core::Prim;
                 let t = self.fresh();
                 match pr {
+                    Prim::ArrNew if self.cur_let.is_some_and(|x| crate::uninit_let(self.self_fid, x)) => {
+                        // written in full by a fill before any read (`uninit_lets`)
+                        let n = self.val(&args[0], false, b);
+                        let n = self.int_of(&args[0], n);
+                        b.push(let_(&t, Ty::U64, p("arr_new_raw_uninit", vec![n])));
+                    }
                     Prim::ArrNew => {
                         let n = self.val(&args[0], false, b);
                         // n copies of a boxed element: its type is shared
@@ -702,14 +777,16 @@ impl<'m> Ex<'m> {
                             }
                         }
                         let x = self.val(&args[1], true, b);
-                        b.push(let_(&t, Ty::U64, if int { p("arr_new_i", vec![as_i(n), x]) } else { c("arr_new", vec![as_i(n), x]) }));
+                        let n = self.int_of(&args[0], n);
+                        b.push(let_(&t, Ty::U64, if int { p("arr_new_i", vec![n, x]) } else { c("arr_new", vec![n, x]) }));
                     }
                     Prim::ArrGet => {
                         let int = self.int_arr(&args[0]);
                         let (a, post) = self.borrow_read(&args[0], b);
                         let i = self.val(&args[1], false, b);
+                        let i = self.int_of(&args[1], i);
                         // a boxed element stays in the array too: shared
-                        let e = if int { p("arr_get_i", vec![a, as_i(i)]) } else { self.share_let(); c("arr_get", vec![a, as_i(i)]) };
+                        let e = if int { p("arr_get_i", vec![a, i]) } else { self.share_let(); c("arr_get", vec![a, i]) };
                         b.push(let_(&t, Ty::U64, e));
                         b.extend(post.map(free));
                     }
@@ -717,9 +794,10 @@ impl<'m> Ex<'m> {
                         // index and value first (they may read the array), then
                         // take the array: its last use moves instead of dup+free
                         let i = self.val(&args[1], false, b);
+                        let i = self.int_of(&args[1], i);
                         let x = self.val(&args[2], true, b);
                         let a = self.val(&args[0], true, b);
-                        b.push(let_(&t, Ty::U64, c(if self.int_arr(&args[0]) { "arr_set_i" } else { "arr_set" }, vec![a, as_i(i), x])));
+                        b.push(let_(&t, Ty::U64, c(if self.int_arr(&args[0]) { "arr_set_i" } else { "arr_set" }, vec![a, i, x])));
                     }
                     Prim::ArrLen => {
                         let (a, post) = self.borrow_read(&args[0], b);
@@ -727,7 +805,7 @@ impl<'m> Ex<'m> {
                         b.extend(post.map(free));
                     }
                     _ => {
-                        let es: Vec<E> = args.iter().map(|a| as_i(self.val(a, false, b))).collect();
+                        let es: Vec<E> = args.iter().map(|a| { let e = self.val(a, false, b); self.int_of(a, e) }).collect();
                         b.push(let_(&t, Ty::U64, num(p(crate::scalar::f32_fn(*pr), es))));
                     }
                 }
@@ -738,7 +816,7 @@ impl<'m> Ex<'m> {
                 self.temp(c("flo", vec![E::Flo(*x)]), b)
             }
             Core::Var(i) => self.use_var(*i, esc, b),
-            // ints: storing is the i56 wrap (num keeps 56 bits, as_i sign-extends)
+            // ints: 64-bit; num boxes a value past 56 bits
             Core::Op2(op, x, y) => self.binop(x, y, b, bin_code(op), "bin", |ex, ey| arith(bin_code(op), ex, ey)),
             Core::Cmp(op, x, y) => self.binop(x, y, b, cmp_code(op), "cmp", |ex, ey| cast(compare(cmp_code(op), ex, ey), Ty::I64)),
             Core::If(cd, th, el) => {
@@ -795,11 +873,7 @@ impl<'m> Ex<'m> {
                 let Core::Var(y) = &**x else { unreachable!() };
                 let _ = self.take_use(*y);
                 let q = v(format!("q{y}_{i}"));
-                if self.ntup_sh.contains(y) {
-                    p("retag", vec![q])
-                } else {
-                    num(q)
-                }
+                num(q)
             }
             Core::Proj(x, i) => {
                 let (sv, hold) = self.scrutinee(x, b);
@@ -1196,9 +1270,6 @@ impl<'m> Ex<'m> {
         let call = self.native_call(*g, args, b);
         b.push(S::Let(Pat::Tup((0..k).map(|i| format!("q{x}_{i}")).collect()), Ty::Infer, call));
         self.ntup.insert(x);
-        if crate::scalar::shifted(*g) {
-            self.ntup_sh.insert(x);
-        }
         true
     }
 
@@ -1346,7 +1417,6 @@ pub(crate) fn dive_fn<'m>(
     fwd: u16,
     unbox: &'m std::collections::HashMap<u32, u8>,
     tys: &'m Types,
-    iret: &'m [bool],
     shared: &'m std::cell::RefCell<Shared>,
 ) -> Vec<FnDef> {
     let f = &m.fns[fid as usize];
@@ -1386,7 +1456,7 @@ pub(crate) fn dive_fn<'m>(
         out.push(ret(err(exit)));
         vec![do_(p("stack_guard", vec![])), burn_fuel(), S::If(bin(Bop::Lt, E::Deref("fuel".into()), i64_(0)), out, vec![])]
     };
-    let mut ex = Ex::new(true, fid, lp, body, bset.clone(), bor, Some(sq), unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, lp, body, bset.clone(), bor, Some(sq), unbox, tys, shared);
     ex.trmc = trmc.zip(hole_rule);
     ex.nret = nret;
     // the fuel-out spawn takes references to borrowed params
@@ -1447,6 +1517,11 @@ pub(crate) fn dive_fn<'m>(
             lb[2] = work_fuel(i64_(1));
         }
         if is_fold {
+            // a fill writes its buffer in place from both halves of a split:
+            // the buffer is made unique before the first loop head can split
+            if let Some(a) = FILLS.with(|f| f.borrow().get(fid as usize).copied().flatten()) {
+                s.push(crate::lir::set(vn(a as u32), c("arr_own", vec![v(vn(a as u32))])));
+            }
             s.push(let_("fold_start", Ty::U64, v("v0")));
             lb.extend(FOLD_SPLIT.with(|f| f.borrow().get(fid as usize).cloned().flatten()).unwrap_or_default());
         }
@@ -1593,7 +1668,6 @@ pub(crate) fn dps_fn<'m>(
     sq: &'m mut SegQ,
     unbox: &'m std::collections::HashMap<u32, u8>,
     tys: &'m Types,
-    iret: &'m [bool],
     shared: &'m std::cell::RefCell<Shared>,
 ) -> FnDef {
     let ar = m.fns[fid as usize].arity;
@@ -1601,7 +1675,7 @@ pub(crate) fn dps_fn<'m>(
     params.extend((0..ar).filter(|i| *i != pp).map(|i| (vn(i as u32), Ty::U64)));
     params.push(("head_out".into(), Ty::RefU64));
     params.push(("hole_out".into(), Ty::RefU32));
-    let mut ex = Ex::new(true, fid, true, body, HashSet::new(), bor, Some(sq), unbox, iret, tys, shared);
+    let mut ex = Ex::new(true, fid, true, body, HashSet::new(), bor, Some(sq), unbox, tys, shared);
     ex.rem.remove(&(pp as u32));
     ex.trmc = Some((cid, 0));
     ex.dps_param = Some(pp);

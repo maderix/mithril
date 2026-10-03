@@ -179,7 +179,7 @@ fn erased<C: Cells>(c: &C, mut p: Port) -> bool {
 }
 
 fn is_value<C: Cells, P: Prog<C> + ?Sized>(prog: &P, p: Port) -> bool {
-    matches!(p.tag(), Tag::Num | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
+    matches!(p.tag(), Tag::Num | Tag::Big | Tag::Flo | Tag::Con | Tag::Lam) || prog.is_ext_value(p)
 }
 
 /// Process one redex; returns the number of rewrites performed (0 for pure
@@ -238,8 +238,8 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
         (Tag::Lam, Tag::App) => beta(c, b, a),
         (Tag::Op, _) if is_value(prog, b) => op_rule(c, prog, a, b),
         (_, Tag::Op) if is_value(prog, a) => op_rule(c, prog, b, a),
-        (Tag::Swi, Tag::Num) => swi_rule(c, a, b),
-        (Tag::Num, Tag::Swi) => swi_rule(c, b, a),
+        (Tag::Swi, Tag::Num | Tag::Big) => swi_rule(c, a, b),
+        (Tag::Num | Tag::Big, Tag::Swi) => swi_rule(c, b, a),
         (Tag::Mat, _) if is_value(prog, b) => mat_rule(c, prog, a, b),
         (_, Tag::Mat) if is_value(prog, a) => mat_rule(c, prog, b, a),
         (Tag::Dup, Tag::Dup) => dup_dup(c, a, b),
@@ -256,6 +256,7 @@ pub fn process<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, a: Port, b: P
 fn era_value<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, p: Port) {
     match p.tag() {
         Tag::Era | Tag::Num => {}
+        Tag::Big => p.big_release(),
         Tag::Flo | Tag::Con if prog.shared(c, p) => prog.erase_ext(c, p),
         Tag::Flo => c.free_cell(p.payload() as u32),
         Tag::Con => {
@@ -353,7 +354,10 @@ fn op_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, op: Port, val: Po
 fn swi_rule<C: Cells>(c: &mut C, swi: Port, num: Port) {
     let (ret, arms) = take(c, swi.payload() as u32);
     let (t, e) = take(c, arms.payload() as u32);
-    let (taken, dead) = if num.as_i64() != 0 { (t, e) } else { (e, t) };
+    let (taken, dead) = if num.int_value() != 0 { (t, e) } else { (e, t) };
+    if num.tag() == Tag::Big {
+        num.big_release();
+    }
     link(c, era(), dead);
     c.push_redex(taken, ret);
 }
@@ -408,6 +412,11 @@ fn dup_rule<C: Cells, P: Prog<C> + ?Sized>(c: &mut C, prog: &P, dup: Port, val: 
     let (o1, o2) = take(c, dup_addr(dup));
     match val.tag() {
         Tag::Num => {
+            link(c, val, o1);
+            link(c, val, o2);
+        }
+        Tag::Big => {
+            val.big_share();
             link(c, val, o1);
             link(c, val, o2);
         }

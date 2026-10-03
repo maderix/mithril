@@ -4,7 +4,6 @@ use mithril_rt::Redex;
 #[test]
 #[ignore = "requires CUDA and nvcc; changes native and cache settings"]
 fn shared_integer_prefixes_execute_in_native_and_growth_paths() {
-    std::env::set_var("MITHRIL_PLAIN_INTS", "1");
     let cases = [
         ("scalar", "def tree(n):\n    if n < 2:\n        return 1\n    return tree(n - 1) + tree(n - 2)\n\ndef caller(n):\n    k = (n * 17 + 3) & 4294967295\n    if k % 2 == 0:\n        return tree(n - 1)\n    return tree(n)\n"),
         ("tuple", "def tree(n, a, b, c, d):\n    if n < 2:\n        return (a, b)\n    x = tree(n - 1, a, b, c, d)\n    y = tree(n - 2, a, b, c, d)\n    return ((x[0] + y[0] + c) & 4294967295, (x[1] + y[1] - d) & 4294967295)\n\ndef caller(n):\n    if n == 0:\n        return (17, 29)\n    return tree(n, 4294967295, 23, 17, 9)\n"),
@@ -16,7 +15,7 @@ fn shared_integer_prefixes_execute_in_native_and_growth_paths() {
         let want = mithril_codegen::fmt_val(&mithril_front::eval_core(&m, m.main, &[]));
         let (lir, module) = mithril_codegen::lower(&m);
         let fid = module.fns.iter().position(|f| f.name == "caller").unwrap();
-        let prefix = lir.fns.iter().find(|f| f.name == format!("prefix_s_{fid}")).expect("a shared prefix must actually be emitted");
+        let prefix = lir.fns.iter().find(|f| f.name == format!("prefix_s_{fid}")).unwrap_or_else(|| panic!("{name} n={n}: a shared prefix must actually be emitted"));
         let mithril_codegen::lir::Ty::Tup(width) = prefix.ret else { panic!("prefix result must be a tagged tuple") };
         let cu = mithril_gpu::emit_cuda(&m).unwrap();
         let header = format!("__device__ T{width} prefix_s_{fid}(");
@@ -157,7 +156,6 @@ extern "C" __global__ void k_boot(u64,u64,u64,int fuel) {
 #[test]
 #[ignore = "requires CUDA and nvcc; changes device settings"]
 fn generated_native_phases_reset_the_claim_counter() {
-    std::env::set_var("MITHRIL_PLAIN_INTS", "1");
     let source = "def f(n):\n    if n == 0:\n        return 1\n    return (f(n - 1) * 31 + n) & 4294967295\n\ndef g(n, a):\n    if n == 0:\n        return a & 4294967295\n    return (g(n - 1, a + 2) * 3 + n) & 4294967295\n\ndef main():\n    n = array_len(array_new(3, 0))\n    return f(n) + g(n, n + 10)\n";
     let m = mithril_front::desugar(&mithril_front::parse(source).unwrap()).unwrap();
     let (lir, m) = mithril_codegen::lower(&m);
@@ -489,7 +487,6 @@ fn instrument_task_call(mut source: String, rule: u32, statement: &str) -> Strin
 
 #[test]
 fn completed_native_launches_print_checked_value_entries_and_keep_normal_charges() {
-    std::env::set_var("MITHRIL_PLAIN_INTS", "1");
     let source = "def f(n):\n    if n == 0:\n        return 1\n    return (f(n - 1) * 31 + n) & 4294967295\n\ndef main():\n    return f(array_len(array_new(19, 0)))\n";
     let m = mithril_front::desugar(&mithril_front::parse(source).unwrap()).unwrap();
     let (program, m) = mithril_codegen::lower(&m);

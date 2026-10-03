@@ -5,11 +5,6 @@
 
 use crate::Diag;
 
-/// Largest/smallest value representable in the 56-bit two's-complement
-/// `int` type (mirrors `mithril_core::port::{I56_MAX, I56_MIN}`; this crate
-/// has no dependency on `mithril-core`, so the constants are restated).
-pub const I56_MAX: i64 = (1i64 << 55) - 1;
-pub const I56_MIN: i64 = -(1i64 << 55);
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum TokKind {
@@ -266,7 +261,7 @@ impl<'a> Lexer<'a> {
             let text = std::str::from_utf8(&self.src[hstart..self.pos]).unwrap();
             let v = u64::from_str_radix(text, 16)
                 .map_err(|_| Diag::new(line, "invalid hex literal"))?;
-            if v > I56_MAX as u64 {
+            if v > i64::MAX as u64 {
                 return Err(Diag::new(line, "int literal out of range"));
             }
             self.out.push(Token { kind: TokKind::Int(v as i64), line });
@@ -298,7 +293,7 @@ impl<'a> Lexer<'a> {
             self.out.push(Token { kind: TokKind::Float(v), line });
         } else {
             let v: i128 = text.parse().map_err(|_| Diag::new(line, "invalid int literal"))?;
-            if v < I56_MIN as i128 || v > I56_MAX as i128 {
+            if v > i64::MAX as i128 {
                 return Err(Diag::new(line, "int literal out of range"));
             }
             self.out.push(Token { kind: TokKind::Int(v as i64), line });

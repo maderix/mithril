@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Fuel for the compile-time net reducer.
-const REDUCE_FUEL: u64 = 1 << 20;
+use mithril_net::REDUCE_FUEL;
 
 // ---------------------------------------------------------------- errors
 
@@ -209,7 +209,7 @@ fn run_tool(mut c: Command, what: &str) -> Result<(), CliErr> {
 
 fn rustc_rlib(out_dir: &Path, name: &str, src: &Path) -> Result<(), CliErr> {
     let mut c = Command::new("rustc");
-    c.args(["--edition", "2021", "-O", "--crate-type", "rlib", "--crate-name", name])
+    c.args(["--edition", "2021", "-C", "opt-level=3", "--crate-type", "rlib", "--crate-name", name])
         .arg(src)
         .arg("--out-dir")
         .arg(out_dir)
@@ -279,7 +279,7 @@ fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
     let tmp = make_temp_dir()?;
     fs::write(tmp.join("main.rs"), src)?;
     let mut c = Command::new("rustc");
-    c.args(["--edition", "2021", "-O"])
+    c.args(["--edition", "2021", "-C", "opt-level=3"])
         .arg(tmp.join("main.rs"))
         .arg("-o")
         .arg(out_bin)
@@ -468,8 +468,11 @@ fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
 /// `mithril oracle f.py`: the reference interpreter's value of `main`
 /// (the same front stages as `run`, then `eval_core`, printed by `fmt_val`).
 fn cmd_oracle(args: &[String]) -> Result<i32, CliErr> {
-    let (m, _) = front(&parse_opts(args)?.file)?;
-    let cm = to_core(&m)?;
+    // the oracle interprets the source as written: no fold or loop-split rewrite,
+    // no compile-time reduction, so it checks those passes instead of sharing them
+    let path = parse_opts(args)?.file;
+    let src = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let cm = to_core(&mithril_front::parse(&src)?)?;
     // eval_core recurses once per loop iteration; give it a deep stack
     let t = std::thread::Builder::new()
         .stack_size(1 << 30)

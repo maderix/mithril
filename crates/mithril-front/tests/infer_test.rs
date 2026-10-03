@@ -134,6 +134,17 @@ fn conversions_truncate_and_round() {
     assert_eq!(run(src), want);
 }
 
+#[test]
+fn conversions_cover_the_64_bit_range() {
+    // past 2^55 (the reach of the inline port form): both directions are
+    // exact to binary32, the most negative int converts, and 2^63 is the edge
+    assert_eq!(f32_bits("f32(0 - 9223372036854775807 - 1)"), 0xDF00_0000); // -2^63
+    assert_eq!(f32_bits("f32(36028797018963969)"), 0x5B00_0000); // 2^55 + 1 rounds to 2^55
+    assert_eq!(int("def main():\n    return int(f32(1152921504606846977))\n"), 1 << 60);
+    assert_eq!(int("def main():\n    return int(f32(0 - 4611686018427387904))\n"), -(1 << 62));
+    assert_eq!(int("def main():\n    return int(f32(9223372036854775807))\n"), 0); // rounds to 2^63
+}
+
 // ---- inference through every construct ----
 
 #[test]

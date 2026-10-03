@@ -56,6 +56,8 @@
 //! same module, so it never needs to live inside the `Net`.
 
 pub mod build;
+pub mod expose;
+pub mod known;
 pub mod reduce;
 pub mod residual;
 pub mod rules;
@@ -66,8 +68,12 @@ use mithril_front::core::{Core, CoreModule, Prim, UNREACHABLE_CTOR};
 use mithril_front::Diag;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The rule-firing budget of compile-time reduction (the residual keeps the rest).
+pub const REDUCE_FUEL: u64 = 1 << 20;
+
 pub use build::{build, root_port};
-pub use reduce::{readback, reduce, specialize, SpecReport};
+pub use known::specialize;
+pub use reduce::{readback, reduce, SpecReport};
 pub use rules::link;
 
 // ---- opcode space (Op payload low 16 bits) ----

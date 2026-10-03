@@ -59,7 +59,7 @@ fn helper_ret(f: &str) -> Ty {
         if matches!(h.effect, Effect::Value | Effect::Borrow | Effect::Allocate) { return h.result; }
     }
     match f {
-        "sat_mul" | "imax" | "fuel_of" | "atomic_load" => Ty::I64,
+        "sat_mul" | "imax" | "fuel_of" | "atomic_load" | "work_mark" | "work_since" | "work_quantum" => Ty::I64,
         "con_ar" => Ty::U8,
         "con_addr" | "rec_d" | "rec_s" => Ty::U32,
         "arr_len_of" => Ty::Usize,
@@ -559,6 +559,7 @@ pub fn print(prog: &LirProgram) -> String {
     let _ = writeln!(out, "#define FIELD_RULE {}\n#define WHOLE_RULE {}\n#define RELINK_RULE {}", prog.settle_rules[0], prog.settle_rules[1], prog.settle_rules[2]);
     let _ = writeln!(out, "#define NATIVE_FRAMES {}", u8::from(prog.fns.iter().any(|f| f.name.starts_with("native_s_"))));
     let _ = writeln!(out, "#define NATIVE_ENTRIES {}", prog.native_entries.len());
+    let _ = writeln!(out, "#define RANGE_FILLS {}", prog.range_fills.len());
     let _ = writeln!(out, "#include \"engine.cu\"\n");
     // tables
     let lin: Vec<&str> = prog.lin.iter().map(|b| if *b { "true" } else { "false" }).collect();
@@ -631,12 +632,31 @@ pub fn print(prog: &LirProgram) -> String {
     }
     let _ = writeln!(out, "  default: g_abort(AB_UNREACHABLE); return;\n  }}\n}}");
     native_kernels(prog, &value_entries, &functions, &mut out);
+    range_leaves(prog, &mut out);
     net_region(prog, &mut out);
     out
 }
 
 // Separate launches execute the same native entry selected by a populated
 // work frontier. Each launch needs only its reachable runtime state.
+/// The range pass's leaf: index `i` of a proven fold, through the fold's
+/// own native loop over `[i, i + 1)` (engine.cu, range launches); a sum's
+/// term starts from the identity 0.
+fn range_leaves(prog: &LirProgram, out: &mut String) {
+    if prog.range_fills.is_empty() { return; }
+    let _ = writeln!(out, "__device__ i64 prog_range_leaf(u32 fid, i64 i, const u64 *ports) {{\ni64 fuel = (i64)G.fuel;\nswitch (fid) {{");
+    for r in &prog.range_fills {
+        let arg = |k: usize, int: bool| match (k == r.acc && r.kind != 0, int) {
+            (true, _) => ", 0".to_string(),
+            (false, true) => format!(", as_i(ports[{k}])"),
+            (false, false) => format!(", (i64)(ports[{k}])"),
+        };
+        let args: String = r.ints.iter().enumerate().skip(2).map(|(k, int)| arg(k, *int)).collect();
+        let _ = writeln!(out, "case {}u: return s_{}(&fuel, i, i + 1{args});", r.fid, r.fid);
+    }
+    let _ = writeln!(out, "default: g_abort(AB_UNREACHABLE); return 0;\n}}\n}}");
+}
+
 fn native_kernels(prog: &LirProgram, value_entries: &BTreeMap<String, String>, functions: &HashMap<&str, &FnDef>, out: &mut String) {
     if prog.native_entries.is_empty() { return; }
     let entries: Vec<String> = prog.native_entries.iter().map(|f| (1+f).to_string()).collect();

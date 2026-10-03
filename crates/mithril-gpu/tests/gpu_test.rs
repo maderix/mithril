@@ -85,6 +85,7 @@ const FIXTURES: &[&str] = &[
     "unfold_wrap.py",
     "ifconv_native.py",
     "int_reps.py",
+    "big_ints.py",
     "native_arrays.py",
     "arrays.py",
     "hetero_array.py",
@@ -101,6 +102,9 @@ const FIXTURES: &[&str] = &[
     "net_values.py",
     "net_lists.py",
     "heavy_fold.py",
+    "fold_borrowed_extra.py",
+    "fill_loops.py",
+    "loop_split_bounded.py",
     "fork_reach.py",
     "fork_chain.py",
     "fork_split_shapes.py",
@@ -189,6 +193,52 @@ fn gpu_fixtures_match_the_oracle() {
         }
     }
     assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
+}
+
+/// fill_uninit.py's value, computed independently (CPython with every op
+/// wrapped to 64 bits; the oracle copies an array per update, too slow at
+/// this size).
+const FILL_UNINIT: &str = "(3451376496, 1884045312, 7, 200712762, 7, 2389189737, 7, 701548700, 732613360)";
+
+#[test]
+fn large_fills_print_as_range_launches() {
+    // every proven fill gets the launch; only a fresh array a fill covers in
+    // full is allocated without its initial value (full, stencil)
+    let (_, cu) = pipeline("fill_uninit.py");
+    let cu = cu.expect("fill_uninit runs on the device");
+    // full, short, offset, peek and stencil fill; shifted is no fill and
+    // total's hash (s * 31 + x) is no proven fold
+    assert!(cu.contains("#define RANGE_FILLS 5"));
+    assert_eq!(cu.matches("range_launch(").count(), 5);
+    assert!(cu.contains("__device__ i64 prog_range_leaf("));
+    assert_eq!(cu.matches("arr_new_raw_uninit(").count(), 4, "full and stencil, each in its native and dive forms");
+}
+
+#[test]
+fn large_sums_print_as_range_launches_from_the_identity() {
+    // an int sum's range launch names its kind (1: mod 2^64, 2: mod 2^32) and
+    // its leaf starts each term from 0; the device results are checked by
+    // gpu_fixtures_match_the_oracle (fold_sum, fold_sum_masked, heavy_fold)
+    for (name, kind) in [("fold_sum.py", 1), ("fold_sum_masked.py", 2)] {
+        let (_, cu) = pipeline(name);
+        let cu = cu.expect("runs on the device");
+        let launch = cu.split("range_launch(").nth(1).expect("a range launch");
+        let args = &launch[..launch.find(");").unwrap()];
+        assert!(args.ends_with(&format!(", {kind}u")), "{name}: {args}");
+        let leaf = &cu[cu.find("prog_range_leaf(u32 fid").unwrap()..];
+        assert!(leaf.contains("(&fuel, i, i + 1, 0"), "{name}: the term does not start from the identity");
+    }
+}
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_range_launched_fills_match_independent_values() {
+    if !gpu_on() {
+        return;
+    }
+    let (_, cu) = pipeline("fill_uninit.py");
+    let r = compile_and_run(&cu.unwrap(), BOOT, &cache_dir()).unwrap();
+    assert_eq!(r.text, FILL_UNINIT);
 }
 
 #[test]

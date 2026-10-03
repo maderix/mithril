@@ -92,10 +92,23 @@ pub(crate) fn unboxed_ctors(
     m: &CoreModule,
     tys: &ty::Types,
 ) -> std::collections::HashMap<u32, u8> {
+    // the int field rides the tagged word's 56-bit payload: unbox a
+    // constructor only where every construction passes a small int
+    let mut big_field = vec![false; m.ctors.len()];
+    for f in &m.fns {
+        let r = range::Ranges::of(&f.body);
+        f.body.walk(&mut |e| {
+            if let Core::Ctor(c, xs) | Core::Reuse(_, c, xs) = e {
+                if xs.len() == 1 && !r.small(&xs[0]) {
+                    big_field[*c as usize] = true;
+                }
+            }
+        });
+    }
     let mut slot = 0u8;
     let mut out = std::collections::HashMap::new();
     for c in 0..m.ctors.len() as u32 {
-        if m.ctors[c as usize].1 == 1 && tys.field[c as usize][0] == ty::Ty::Int {
+        if m.ctors[c as usize].1 == 1 && tys.field[c as usize][0] == ty::Ty::Int && !big_field[c as usize] {
             assert!(slot < 200, "too many unboxed ctor tags");
             out.insert(c, slot);
             slot += 1;
@@ -114,28 +127,17 @@ pub(crate) fn ints_of(tys: &ty::Types, fid: usize) -> std::collections::HashSet<
 }
 
 
-/// Native int representation override (tests): `None` = chosen per
-/// function by cost, `Some(false)` = all plain, `Some(true)` = all
-/// pre-shifted. Both representations must compute identical results.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct EmitOpts {
-    pub int_rep: Option<bool>,
-}
-
 /// Emit the Rust program of a module that has been specialized by the
 /// interaction rules (`mithril_net::specialize`): the residual program.
 pub fn emit_rust(m: &CoreModule) -> String {
-    emit_rust_opts(m, EmitOpts::default())
-}
-
-pub fn emit_rust_opts(m: &CoreModule, opts: EmitOpts) -> String {
     // the passes recurse along let chains, which compile-time unfolding
     // makes long: run on a stack sized for that, not the caller's
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(1 << 30)
             .spawn_scoped(s, move || {
-                scalar::FORCE_REP.with(|f| f.set(opts.int_rep));
+                // the CPU's stacks hold native recursion (see native::FRAMES)
+                native::FRAMES.with(|f| f.set(false));
                 emit_rust_inner(m)
             })
             .expect("spawn codegen thread")
@@ -204,6 +206,27 @@ pub struct LirProgram {
     pub net_live: Vec<bool>,
     /// the forwarding segment (a suspended `apply` delivers through it)
     pub fwd: u16,
+    /// proven folds that run as range launches (device): their native leaf
+    pub range_fills: Vec<RangeFill>,
+}
+
+/// A proven fold whose large ranges run as one device-wide pass: thread `t`
+/// runs the native leaf `s_<fid>` over `[lo + t, lo + t + 1)`. `ints[i]`:
+/// parameter `i` is an int (read with `as_i`), else an array handle. A fill
+/// writes its buffer; a sum (`kind` 1: mod 2^64, 2: mod 2^32) starts each
+/// index's term from the identity at the accumulator `acc`.
+#[derive(Clone, Debug)]
+pub struct RangeFill {
+    pub fid: u32,
+    pub ints: Vec<bool>,
+    pub acc: usize,
+    pub kind: u32,
+}
+
+thread_local! {
+    /// The target runs a large proven fold as a range launch (both do: one
+    /// device pass, or one CPU wave instead of a split tree's waves).
+    pub(crate) static RANGE_FILLS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// Lower a specialized module (see `emit_rust`); `rust_program` prints the
@@ -250,22 +273,36 @@ impl Lowering {
     fn configure(&self, plans: &std::collections::BTreeMap<u32, native::FoldPlan>) -> Vec<Option<scalar::Sig>> {
         let m = &self.module;
         let mut scal = self.native_sigs.clone();
+        // A proven fold keeps its native loop: its bridge splits a large range at
+        // entry and runs each chunk natively (its callers get dual forms, below).
         let seed = (0..m.fns.len()).map(|f| scal[f].is_some() &&
-            (fork_recursive(f as u32, &m.fns[f]) || self.folds[f].is_some() || plans.contains_key(&(f as u32)))).collect();
+            (fork_recursive(f as u32, &m.fns[f]) || plans.contains_key(&(f as u32)))).collect();
         for (f, parallel) in fixpoint(seed, |f, set| self.calls[f].iter().any(|g| set[*g as usize])).into_iter().enumerate() {
             if parallel { scal[f] = None; }
         }
-        scalar::SHIFTED.with(|s| *s.borrow_mut() = scalar::choose_reps(m, &scal));
+        // A native function whose calls reach a proven fold has two forms: native
+        // callers run it natively (the fold's loop runs whole), and dive callers run
+        // its dive form, whose calls reach the fold's bridge and its range split.
+        // Both, and the fold itself, can suspend: a dive caller must not treat them
+        // as bounded.
+        let nf = m.fns.len();
+        let fold = |g: usize| self.folds[g].is_some() && scal[g].is_some();
+        let seed: Vec<bool> = (0..nf).map(|f| scal[f].is_some() && !fold(f) && self.calls[f].iter().any(|g| fold(*g as usize))).collect();
+        let dual = fixpoint(seed, |f, set| scal[f].is_some() && !fold(f) && self.calls[f].iter().any(|g| set[*g as usize]));
+        let splits: Vec<bool> = (0..nf).map(|f| dual[f] || fold(f)).collect();
+        scalar::DUAL.with(|d| *d.borrow_mut() = splits.clone());
+        DUAL_FORM.with(|d| *d.borrow_mut() = dual);
+        UNINIT.with(|u| *u.borrow_mut() = self.module.fns.iter().map(|f| uninit_lets(&self.module, &f.body)).collect());
         scalar::CTX.with(|s| *s.borrow_mut() = scalar::needs_ctx(m, &scal));
         scalar::LEAF.with(|s| *s.borrow_mut() = (0..m.fns.len()).map(|f| scal[f].is_some() && !any_call(&m.fns[f].body)).collect());
-        BOUNDED.with(|s| *s.borrow_mut() = bounded_fns(m).iter().zip(&scal).map(|(b, sig)| *b || sig.is_some()).collect());
+        BOUNDED.with(|s| *s.borrow_mut() = bounded_fns(m).iter().zip(&scal).zip(&splits).map(|((b, sig), sp)| (*b || sig.is_some()) && !sp).collect());
         scalar::SIGS.with(|s| *s.borrow_mut() = scal.clone());
         scal
     }
 }
 pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
     if let Some(value) = core_value(&m.fns[m.main as usize].body) {
-        let empty = |constant: Option<Val>| LirProgram { native_entries: Vec::new(), fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0 };
+        let empty = |constant: Option<Val>| LirProgram { native_entries: Vec::new(), fns: Vec::new(), rules: Vec::new(), diving: Vec::new(), dives: Vec::new(), folds: Vec::new(), lin: Vec::new(), lin_tup: true, unbox_cid: Vec::new(), net_rule: 0, fill_rule: 0, settle_rules: [0; 3], constant, net: mithril_net::NetProg::new(m), net_live: Vec::new(), fwd: 0, range_fills: Vec::new() };
         return (empty(Some(value)), m.clone());
     }
     let analysis = Lowering::new(m);
@@ -288,7 +325,6 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
     let mut sq = rules::SegQ { next, q: vec![], memo: Default::default(), holes: vec![] };
     let fwd = sq.add(u32::MAX, vec![0], vec![], Core::Var(0));
     CLOSURES.with(|c| *c.borrow_mut() = Some(mithril_net::NetProg::new(m)));
-    let iret: Vec<_> = tys.ret.iter().map(|t| *t == ty::Ty::Int).collect();
     let shared = std::cell::RefCell::new(seq::Shared::default());
     // fold splits deep-share the fold's extra args (see fold.rs)
     for (fid, pf) in folds.iter().enumerate() {
@@ -341,6 +377,8 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
         .collect();
     seq::NTUP.with(|n| *n.borrow_mut() = ntup);
     seq::FOLDS.with(|f| *f.borrow_mut() = folds.iter().map(|p| p.is_some()).collect());
+    seq::FILLS.with(|f| *f.borrow_mut() = folds.iter().map(|p| p.as_ref().filter(|pf| pf.fill).map(|pf| pf.acc)).collect());
+    let dual: Vec<bool> = DUAL_FORM.with(|d| d.borrow().clone());
     {
         // a native function's bridge is live when something may dive it:
         // the entry, a fold, or any caller that is not native
@@ -348,7 +386,7 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
             .map(|g| {
                 g as u32 == m.main
                     || folds[g].is_some()
-                    || (0..nf).any(|f| calls[f].contains(&(g as u32)) && scal[f].is_none())
+                    || (0..nf).any(|f| calls[f].contains(&(g as u32)) && (scal[f].is_none() || dual[f]))
                     || !(0..nf).any(|f| f != g && calls[f].contains(&(g as u32)))
             })
             .collect();
@@ -358,30 +396,66 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
         *f.borrow_mut() = folds
             .iter()
             .enumerate()
-            .map(|(fid, p)| p.as_ref().map(|pf| fold::split_snippet_dive(fid as u32, m.fns[fid].arity, pf, join_rule[fid])))
+            .map(|(fid, p)| p.as_ref().map(|pf| fold::split_snippet_dive(fid as u32, m.fns[fid].arity, pf, join_rule[fid], &bor[fid])))
+            .collect()
+    });
+    // a proven fill or int sum with an all-int/array native leaf, on a target
+    // that runs large ranges as one pass
+    let range_fill = |fid: usize| -> Option<RangeFill> {
+        let pf = folds[fid].as_ref()?;
+        let sig = scal[fid].as_ref()?;
+        let ok = RANGE_FILLS.with(|f| f.get()) && (pf.fill || pf.tuple.is_none()) && sig.params.iter().all(|p| matches!(p, scalar::PTy::I | scalar::PTy::A | scalar::PTy::B));
+        let kind = if pf.fill { 0 } else if pf.mask32 { 2 } else { 1 };
+        ok.then(|| RangeFill { fid: fid as u32, ints: sig.params.iter().map(|p| *p == scalar::PTy::I).collect(), acc: pf.acc, kind })
+    };
+    let range_fills: Vec<RangeFill> = (0..nf).filter_map(range_fill).collect();
+    seq::FOLD_BRIDGE.with(|f| {
+        *f.borrow_mut() = folds
+            .iter()
+            .enumerate()
+            .map(|(fid, p)| {
+                p.as_ref().map(|pf| {
+                    let ar = m.fns[fid].arity;
+                    let mut pre = Vec::new();
+                    if pf.fill {
+                        // the buffer is made unique before a split lends it
+                        pre.push(lir::let_(seq::vn(pf.acc as u32), lir::Ty::U64, lir::c("arr_own", vec![lir::v(seq::vn(pf.acc as u32))])));
+                    }
+                    pre.extend(fold::probe_snippet(fid as u32, ar, pf, &bor[fid]));
+                    if let Some(r) = range_fills.iter().find(|r| r.fid == fid as u32) {
+                        pre.extend(fold::range_snippet(fid as u32, ar, pf, join_rule[fid], &bor[fid], r.kind));
+                    }
+                    pre.extend(fold::split_snippet_dive(fid as u32, ar, pf, join_rule[fid], &bor[fid]));
+                    pre
+                })
+            })
             .collect()
     });
     // every IR function, in emission order (a function's forms adjacent)
     let mut fns: Vec<lir::FnDef> = Vec::new();
     let mut emit = |defs: Vec<lir::FnDef>| fns.extend(defs);
     for fid in 0..nf {
-        if scal[fid].is_some() {
+        if dual[fid] {
+            // native form for native callers, dive form for dive callers
+            emit(scalar::scalar_fn(m, fid as u32, &scal, &bor, false));
+            emit(seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &shared));
+        } else if scal[fid].is_some() {
             // native scalar form + bridging dive form (see scalar.rs)
             emit(scalar::scalar_fn(m, fid as u32, &scal, &bor, true));
         } else {
-            emit(seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &iret, &shared));
+            emit(seq::dive_fn(m, fid as u32, &bodies[fid], &bor, &bsets[fid], &mut sq, fwd, &unbox, &tys, &shared));
         }
         if let Some(q) = &fast_code[fid] {
             emit(vec![q.clone()]);
         }
         if let Some((p, c)) = dps[fid] {
-            emit(vec![seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &iret, &shared)]);
+            emit(vec![seq::dps_fn(m, fid as u32, p, c, &bodies[fid], &bor, &mut sq, &unbox, &tys, &shared)]);
         }
         emit(vec![call_fn(m, fid as u32, folds[fid].as_ref(), join_rule[fid])]);
         if let Some(pf) = &folds[fid] {
             emit(vec![fold::join_fn(fid as u32, pf)]);
         } else if let Some(plan) = plans.get(&(fid as u32)) {
-            emit(vec![fold::join_fn(fid as u32, &fold::ParFold { acc: 0, mask32: true, tuple: (plan.seeds.len() > 1).then_some(plan.seeds.len()) })]);
+            emit(vec![fold::join_fn(fid as u32, &fold::ParFold { acc: 0, mask32: true, tuple: (plan.seeds.len() > 1).then_some(plan.seeds.len()), fill: false })]);
         }
     }
     // Segments may enqueue further segments while being emitted.
@@ -389,7 +463,7 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
     while done < sq.q.len() {
         let seg = sq.q[done].clone();
         done += 1;
-        emit(vec![rules::segment_fn(&seg, &bor, &mut sq, &unbox, &tys, &iret, &shared)]);
+        emit(vec![rules::segment_fn(&seg, &bor, &mut sq, &unbox, &tys, &shared)]);
     }
 
     // the net region: generic redexes and the records that feed a call's
@@ -469,6 +543,7 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
         net,
         net_live,
         fwd,
+        range_fills,
     };
     (prog, m_u.clone())
 }
@@ -591,7 +666,19 @@ fn emit_rust_inner(m: &CoreModule) -> String {
     }
     out.push_str(&fns_code);
     out.push_str(&net_text);
-    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms)];
+    // range requests: each fold's native loop over a block of its range (a
+    // sum's term from the identity at its accumulator)
+    let mut range_arms = String::new();
+    for r in &prog.range_fills {
+        let ctx = prog.fns.iter().find(|f| f.name == format!("s_{}", r.fid)).is_some_and(|f| f.ctx);
+        let args: String = r.ints.iter().enumerate().skip(2).map(|(k, int)| match (k == r.acc && r.kind != 0, int) {
+            (true, _) => ", 0".to_string(),
+            (false, true) => format!(", as_i(ports[{k}])"),
+            (false, false) => format!(", ports[{k}] as i64"),
+        }).collect();
+        range_arms.push_str(&format!("            {} => s_{}({}&mut fuel, lo, hi{args}) as i64,\n", r.fid, r.fid, if ctx { "ctx, " } else { "" }));
+    }
+    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms), ("range_arms", range_arms)];
     out.push_str(&fill(mithril_rt::template::PROGRAM, &vars));
     out.push_str(mithril_rt::template::MAIN);
     out
@@ -719,6 +806,58 @@ thread_local! {
     /// out of `f` is acyclic, so `f` can never run out of fuel and a call to
     /// it is an ordinary expression (no fuel check, no capture).
     static BOUNDED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Native functions that also get a dive form (see `configure`).
+    static DUAL_FORM: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// fn -> its let binders allocated without an initial value (`uninit_lets`).
+    static UNINIT: std::cell::RefCell<Vec<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `let x = array_new(n, c)` in `fid` is allocated without writing `c`.
+pub(crate) fn uninit_let(fid: u32, x: u32) -> bool {
+    UNINIT.with(|u| u.borrow().get(fid as usize).is_some_and(|s| s.contains(&x)))
+}
+
+/// Let binders whose fresh int array is written in full before any read: its
+/// one use is the buffer of a proven fill whose counter starts at 0, whose
+/// bound is the array's length (the same pure expression) and whose write
+/// index is the counter itself. Every element is then written by the fill
+/// before anything reads the array, so the initial value is never observed
+/// and the allocation skips writing it.
+fn uninit_lets(m: &CoreModule, body: &Core) -> std::collections::HashSet<u32> {
+    use mithril_front::core::Prim;
+    // the buffer parameter of a proven fill that writes at its counter
+    let buffer = |g: u32| -> Option<usize> {
+        let pf = fold::par_fold(m, g).filter(|pf| pf.fill)?;
+        let acc = pf.acc as u32;
+        let at_counter = m.fns[g as usize].body.any(&mut |e| match e {
+            Core::Prim(Prim::ArrSet, a) => (a[0] == Core::Var(acc) && a[1] == Core::Var(0)).then_some(true),
+            _ => None,
+        });
+        at_counter.then_some(pf.acc)
+    };
+    let mut out = std::collections::HashSet::new();
+    body.walk(&mut |e| {
+        let Core::Let(x, r, rest) = e else { return };
+        let Core::Prim(Prim::ArrNew, a) = &**r else { return };
+        let pure = !a[0].any(&mut |e| matches!(e, Core::Call(..) | Core::App(..)).then_some(true));
+        if !pure || !matches!(a[1], Core::Num(_)) {
+            return;
+        }
+        let (mut uses, mut filled) = (0, false);
+        rest.walk(&mut |e| match e {
+            Core::Var(y) if y == x => uses += 1,
+            Core::Call(g, args) => {
+                if let Some(acc) = buffer(*g) {
+                    filled |= args.len() > acc && args[acc] == Core::Var(*x) && args[0] == Core::Num(0) && args[1] == a[0];
+                }
+            }
+            _ => {}
+        });
+        if filled && uses == 1 {
+            out.insert(*x);
+        }
+    });
+    out
 }
 
 /// Functions on no call cycle (fixpoint over the call graph).
@@ -1017,7 +1156,7 @@ fn borrows(m: &CoreModule, bodies: &[Core], tys: &ty::Types, unbox: &std::collec
     for _ in 0..32 {
         let mut changed = false;
         for f in 0..nf {
-            let esc = escape_mask(&bodies[f], m.fns[f].arity, &bor[f], &bor, &|v| tys.var(f, v) == ty::Ty::Int);
+            let esc = escape_mask(f as u32, &bodies[f], m.fns[f].arity, &bor[f], &bor, &|v| tys.var(f, v) == ty::Ty::Int);
             for (i, b) in bor[f].iter_mut().enumerate() {
                 if *b && esc & (1u64 << i) != 0 {
                     *b = false;
@@ -1071,8 +1210,11 @@ fn origin_of(e: &Core, origins: &std::collections::HashMap<u32, u64>) -> u64 {
 }
 
 /// Lent parameters stored in a constructor, tuple or owning call argument;
-/// array reads lend their first argument and integer fields never escape.
-fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) -> u64 {
+/// array reads lend their first argument and integer fields never escape. A
+/// self call that passes a value of no lent origin in a lent slot makes that
+/// slot hold values the function owns (a loop carrying a fresh array), so the
+/// slot cannot be lent.
+fn escape_mask(fid: u32, body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>], is_int: &dyn Fn(u32) -> bool) -> u64 {
     if arity > 60 {
         return u64::MAX;
     }
@@ -1083,6 +1225,15 @@ fn escape_mask(body: &Core, arity: usize, own_bor: &[bool], bor: &[Vec<bool>], i
             Core::Ctor(_, xs) | Core::Tuple(xs) | Core::Reuse(_, _, xs) | Core::Prim(_, xs) | Core::Call(_, xs) => xs,
             _ => return,
         };
+        if let Core::Call(g, _) = e {
+            if *g == fid {
+                for (j, x) in args.iter().enumerate() {
+                    if own_bor.get(j).copied().unwrap_or(false) && origin_of(x, origins) == 0 {
+                        esc |= 1u64 << j;
+                    }
+                }
+            }
+        }
         for (j, x) in args.iter().enumerate() {
             let escapes = match e {
                 Core::Prim(mithril_front::core::Prim::ArrGet | mithril_front::core::Prim::ArrLen, _) => j > 0,

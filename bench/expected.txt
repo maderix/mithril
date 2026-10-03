@@ -1,2 +1,10 @@
-# Full-size checksum of the spatial-tree benchmark.
+# Full-size checksums of the benchmark programs in bench/ports, one per
+# line: <name> <checksum>. Every lane (C twin, Mithril at 1 and 16 threads,
+# GPU) must print exactly this value.
+collatz 428343355
+heat2d 4071368130
+histogram 2415919104
 kdtree 1660315459
+knapsack 2118152
+msort 3393182426
+subsetsum 181039267

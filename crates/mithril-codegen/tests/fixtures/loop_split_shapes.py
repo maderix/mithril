@@ -1,6 +1,13 @@
 # Loops the split pass rewrites: the result must be the sequential one.
+# f loops a data-dependent number of times, so the rules cannot unfold it at
+# compile time and each iteration's work is worth a split leaf.
 def f(i, k):
-    return (i * 2654435761 + k) & 1048575
+    h = i * 2654435761 + k
+    j = 0
+    while j < (i & 3) + 1:
+        h = (h * 1103515245 + 12345) & 2147483647
+        j = j + 1
+    return h & 1048575
 
 
 def last_write(n):

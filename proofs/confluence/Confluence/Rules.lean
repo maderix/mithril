@@ -1,7 +1,7 @@
 import Confluence.Diamond
 
 /-!
-# Layer B, part 3: Mithril's P1 rule table
+# Layer B, part 3: Mithril's core rule table
 
 The pure core of `crates/mithril-core/src/rules.rs` (`process`), written as an
 oriented table of local right-hand sides over Mithril's agent kinds. Port
@@ -143,7 +143,7 @@ def projSel (i n : Nat) : RHS Kind where
 to the constructor's fields (a chain of `n` APPs, new agents `0..n-1`, the last
 returning to the MAT's return port); the other `m - 1` arms are erased (new
 agents `n..`). `rules.rs` passes the fields to the arm closure as extra `Ref`
-arguments; the application chain is the same call written with P1 agents. -/
+arguments; the application chain is the same call written with the model's agents. -/
 def matSel (j m n : Nat) : RHS Kind where
   agents := List.replicate n .app ++ List.replicate (m - 1) .era
   wire
@@ -174,7 +174,7 @@ structure Prog where
   path, like every rule's). Any function of the pair is allowed. -/
   unfold : Nat → Nat → Kind → Option (RHS Kind)
 
-/-- Mithril's P1 rule table: one orientation per unordered pair of kinds. -/
+/-- Mithril's core rule table: one orientation per unordered pair of kinds. -/
 def table (P : Prog) : Kind → Kind → Option (RHS Kind)
   | .era, k => some (eraseAll (arity k))
   | _, .era => none
@@ -389,7 +389,7 @@ end Entries
 a fixed-point-free involution on exactly the valid ports (interface aux ports
 and new agents' ports), so every rule consumes its interface once and leaves no
 dangling port. The checks below are evaluated by the kernel (`decide`). A proof
-for all arities is not part of P1 (see README). -/
+for all arities is not part of this proof (see README). -/
 
 def rhsValid (R : RHS Kind) (na nb : Nat) : RP → Bool
   | .ia i => decide (1 ≤ i ∧ i ≤ na)

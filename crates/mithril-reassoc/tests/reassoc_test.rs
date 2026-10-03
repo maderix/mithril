@@ -1,5 +1,5 @@
 //! Task 4 tests: fold detection over the surface AST, associativity +
-//! identity proving over Z_2^56, AST marking + desugar carry-through,
+//! identity proving over Z_2^64, AST marking + desugar carry-through,
 //! sequential (eval_core) semantics preservation, and Lean obligations.
 
 use mithril_front::ast::{Combiner, FoldInfo, Module, Stmt};
@@ -93,7 +93,7 @@ fn fold_scalar_sum_proven() {
     let r = report(&reps, "total");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "s");
-    assert_eq!((r.arity, r.bits), (1, 56));
+    assert_eq!((r.arity, r.bits), (1, 64));
     assert_eq!(fold_of(&m, "total"), &Some(FoldInfo { combiner: Combiner::WrapAdd, proven: true }));
 }
 
@@ -103,7 +103,7 @@ fn fold_tuple_hist_proven() {
     let r = report(&reps, "hist");
     assert!(r.proven, "expected proven, got: {}", r.reason);
     assert_eq!(r.acc, "h");
-    assert_eq!((r.arity, r.bits), (8, 56));
+    assert_eq!((r.arity, r.bits), (8, 64));
     assert_eq!(
         fold_of(&m, "hist"),
         &Some(FoldInfo { combiner: Combiner::TupleWrapAdd(8), proven: true })
@@ -249,7 +249,7 @@ def total32(n):
     let text = lean_obligations(&reps);
     assert!(text.contains("Fin 2 → BitVec 32"), "text:\n{text}");
     assert!(text.contains("(a b : BitVec 32)"), "text:\n{text}");
-    assert!(!text.contains("BitVec 56"), "masked-only module must not emit BitVec 56:\n{text}");
+    assert!(!text.contains("BitVec 64"), "masked-only module must not emit BitVec 64:\n{text}");
     let home = std::env::var("HOME").unwrap_or_default();
     let lean = std::path::Path::new(&home).join(".elan/bin/lean");
     if !lean.exists() {
@@ -469,18 +469,22 @@ const GOLDEN: &str = "\
 -- One obligation pair per transformed fold; the generic
 -- foldl == treeReduce lemma is proved once below.
 
-abbrev V8 := Fin 8 → BitVec 56
+abbrev V8 := Fin 8 → BitVec 64
 def comb_hist_h (a b : V8) : V8 := fun i => a i + b i
 theorem assoc_hist_h : ∀ a b c, comb_hist_h (comb_hist_h a b) c = comb_hist_h a (comb_hist_h b c) := by
   intro a b c; funext i; simp [comb_hist_h, BitVec.add_assoc]
 theorem ident_hist_h : ∀ b, comb_hist_h (fun _ => 0) b = b := by
   intro b; funext i; simp [comb_hist_h]
+theorem comm_hist_h : ∀ a b, comb_hist_h a b = comb_hist_h b a := by
+  intro a b; funext i; simp [comb_hist_h, BitVec.add_comm]
 
-def comb_recolor_s (a b : BitVec 56) : BitVec 56 := a + b
+def comb_recolor_s (a b : BitVec 64) : BitVec 64 := a + b
 theorem assoc_recolor_s : ∀ a b c, comb_recolor_s (comb_recolor_s a b) c = comb_recolor_s a (comb_recolor_s b c) := by
   intro a b c; simp [comb_recolor_s, BitVec.add_assoc]
 theorem ident_recolor_s : ∀ b, comb_recolor_s 0 b = b := by
   intro b; simp [comb_recolor_s]
+theorem comm_recolor_s : ∀ a b, comb_recolor_s a b = comb_recolor_s b a := by
+  intro a b; simp [comb_recolor_s, BitVec.add_comm]
 
 -- Generic justification, proved once for the compiler: folding chunk
 -- results equals folding the concatenation (leaf order preserved).
@@ -517,6 +521,7 @@ fn lean_obligations_rejects_proven_report_without_arity() {
         reason: "PROVEN".into(),
         arity: 0,
         bits: 0,
+        fill: false,
     };
     lean_obligations(&[r]);
 }
@@ -588,4 +593,53 @@ fn fold_chain_with_two_accumulator_leaves_declined() {
     let (m, reports) = analyzed(src);
     assert!(!report(&reports, "f").proven);
     assert!(fold_of(&m, "f").is_none());
+}
+
+// ---- index fills ----
+
+fn is_fill(src: &str, func: &str) -> bool {
+    let (m, reports) = analyzed(src);
+    let marked = matches!(fold_of(&m, func), Some(FoldInfo { combiner: Combiner::Fill, proven: true }));
+    let reported = reports.iter().any(|r| r.func == func && r.fill && r.proven);
+    assert_eq!(marked, reported, "{func}: marking and report disagree");
+    marked
+}
+
+#[test]
+fn index_fill_shapes_are_detected() {
+    // plain index, locals before the write, other arrays read
+    assert!(is_fill("def f(n):\n    a = array_new(n, 0)\n    for i in range(n):\n        a = array_set(a, i, i * 3)\n    return a\n", "f"));
+    assert!(is_fill("def f(g, n):\n    a = array_new(n, 0)\n    for i in range(n):\n        x = array_get(g, i)\n        y = x * 2 + i\n        a = array_set(a, i, x + y)\n    return a\n", "f"));
+    // range(lo, hi) binds i = counter + lo: an injective index
+    let (m, _) = analyzed("def f(a, lo, hi):\n    for i in range(lo, hi):\n        a = array_set(a, i, i)\n    return a\n");
+    let fold = m.fns[0].body.iter().find_map(|s| match s { Stmt::For(_, _, _, f) => Some(f.clone()), _ => None }).unwrap();
+    assert_eq!(fold, Some(FoldInfo { combiner: Combiner::Fill, proven: true }));
+}
+
+#[test]
+fn near_miss_fills_stay_sequential() {
+    // reads the array it writes
+    assert!(!is_fill("def f(a, n):\n    for i in range(n):\n        a = array_set(a, i, array_get(a, i) + 1)\n    return a\n", "f"));
+    // a local read before its assignment carries a value between iterations
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    x = 1\n    for i in range(n):\n        a = array_set(a, i, x)\n        x = x + i\n    return a\n", "f"));
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    x = 1\n    for i in range(n):\n        x = x * 3 + i\n        a = array_set(a, i, x)\n    return a\n", "f"));
+    // two iterations may write the same index
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    for i in range(n):\n        a = array_set(a, i % 7, i)\n    return a\n", "f"));
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    for i in range(n):\n        j = i * 2\n        a = array_set(a, j, i)\n    return a\n", "f"));
+    // the offset changes inside the body
+    assert!(!is_fill("def f(n):\n    a = array_new(n + n, 0)\n    for i in range(n):\n        k = i\n        j = i + k\n        a = array_set(a, j, i)\n    return a\n", "f"));
+    // the write is not the last statement, or the body branches
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    s = 0\n    for i in range(n):\n        a = array_set(a, i, i)\n        s = s + i\n    return a\n", "f"));
+    assert!(!is_fill("def f(n):\n    a = array_new(n, 0)\n    for i in range(n):\n        if i > 3:\n            a = array_set(a, i, i)\n    return a\n", "f"));
+}
+
+#[test]
+fn index_fills_preserve_sequential_semantics() {
+    let src = "def f(g, lo, hi):\n    a = array_new(hi, 9)\n    for i in range(lo, hi):\n        x = array_get(g, i)\n        a = array_set(a, i, x * x + i)\n    return a\n\ndef main():\n    g = array_new(40, 3)\n    a = f(g, 5, 40)\n    return (array_get(a, 4), array_get(a, 5), array_get(a, 39), array_len(a))\n";
+    let (m, _) = analyzed(src);
+    let cm: CoreModule = desugar(&m).unwrap();
+    let plain = desugar(&mithril_front::parse(src).unwrap()).unwrap();
+    assert_eq!(format!("{:?}", eval_core(&cm, cm.main, &[])), format!("{:?}", eval_core(&plain, plain.main, &[])));
+    let lean = lean_obligations(&analyzed(src).1);
+    assert!(lean.contains("theorem fill_chunks"), "fill lemma not emitted");
 }

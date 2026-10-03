@@ -9,8 +9,9 @@ pub struct Helper { pub result: Ty, pub effect: Effect, pub ctx: bool, pub may_f
 pub fn helper(name: &str) -> Option<Helper> {
     use Effect::*;
     let (result, effect, ctx, may_fail) = match name {
-        "wrap56" | "as_i" | "sh" => (Ty::I64, Value, false, false),
-        "tag" | "num" | "retag" => (Ty::U64, Value, false, false),
+        "wrap56" | "as_i" => (Ty::I64, Value, false, false),
+        "take_i" => (Ty::I64, Own, false, false),
+        "tag" | "num" => (Ty::U64, Value, false, false),
         "con_tag" => (Ty::U16, Value, false, false),
         "floor_div" | "py_mod" => (Ty::I64, Value, false, true),
         "field" => (Ty::U64, Borrow, true, true),
@@ -43,7 +44,7 @@ impl Policy {
             E::Call { f, ctx, .. } => helper(f).is_some_and(|h| h.ctx == *ctx && match self {
                 Self::Copy => (!h.may_fail && matches!(f.as_str(), "wrap56" | "tag" | "as_i" | "con_tag")) || (h.effect == Effect::Borrow && f == "field"),
                 Self::Exit => h.effect == Effect::Value && !h.may_fail,
-                Self::Prefix => h.effect == Effect::Value && matches!(f.as_str(), "wrap56" | "floor_div" | "py_mod" | "sh" | "retag" | "num" | "as_i"),
+                Self::Prefix => h.effect == Effect::Value && matches!(f.as_str(), "wrap56" | "floor_div" | "py_mod" | "num" | "as_i"),
             }),
             E::V(n) => !matches!(self, Self::Prefix) || n != "fuel",
             E::Int(..) | E::Bool(_) | E::Cast(..) | E::Not(_) | E::Neg(_) => true,

@@ -52,6 +52,8 @@ pub struct Wctx<'e> {
     /// Generic net redexes (pairs of agent ports) waiting for the rule
     /// table; drained by `reduce_net`.
     net_work: Vec<(Port, Port)>,
+    /// Range requests made since the last merge (see `RangeReq`).
+    pub(crate) range_reqs: Vec<crate::RangeReq>,
 }
 
 /// The worker's arena is a `Cells`: the rule table rewrites it directly.
@@ -111,6 +113,7 @@ impl<'e> Wctx<'e> {
             check_free: std::env::var_os("MITHRIL_CHECK_FREE").is_some(),
             freed: Vec::new(),
             net_work: Vec::new(),
+            range_reqs: Vec::new(),
         }
     }
 
@@ -366,6 +369,16 @@ impl<'e> Wctx<'e> {
 
     /// Queue `e` for `rule` in a later wave.
     #[inline]
+    /// The program this context runs.
+    pub(crate) fn program(&self) -> &'e dyn Program {
+        self.prog
+    }
+
+    /// Queue a range request for the coordinator (see `RangeReq`).
+    pub fn range_request(&mut self, req: crate::RangeReq) {
+        self.range_reqs.push(req);
+    }
+
     pub fn spawn(&mut self, rule: u16, e: Redex) {
         assert!((rule as usize) < self.out.len(), "spawn: rule {rule} out of range");
         self.mark(rule);

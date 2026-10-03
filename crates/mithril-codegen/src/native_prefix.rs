@@ -2,15 +2,15 @@
 //! return protocol and charges. Unsupported continuations keep both bodies.
 use super::*;
 use crate::scalar::{Kind, PTy, Sig};
-use crate::value::{int_port, native_int};
 use mithril_front::core::CoreModule;
 
 fn charge(s: &S) -> bool {
     matches!(s, S::Do(E::Call { f, ctx: false, args }) if f == "work_fuel" && *args == vec![v("fuel"), v("fl")])
 }
-fn integer_port(fid: u32, e: E, pack: bool) -> E {
-    let shifted = crate::scalar::shifted(fid);
-    if pack { int_port(e, shifted) } else { native_int(e, shifted) }
+/// An int between its port and native forms; an owned port argument may
+/// be a box, released after the read.
+fn integer_port(e: E, pack: bool) -> E {
+    if pack { num(e) } else { p("take_i", vec![e]) }
 }
 fn returned(ret_ty: Ty, values: Vec<E>, ports: bool) -> E {
     let value = match ret_ty {
@@ -96,6 +96,27 @@ fn plan(
                 return Some(out);
             }
             S::Do(_) if charge(s) && matches!(body.get(i + 1), Some(S::Ret(_))) => {}
+            // a tail call settles this frame's work, then returns the call itself
+            S::Ret(E::Call { f, ctx: false, args }) if f.starts_with("s_") && i + 1 == body.len() && i > 0 && charge(&body[i - 1]) => {
+                let fid: u32 = f[2..].parse().ok()?;
+                let sig = sigs.get(fid as usize)?.as_ref()?;
+                let callee_ret = match sig.ret {
+                    Kind::S1 => Ty::I64,
+                    Kind::SK(k) => Ty::Tup(k),
+                    Kind::No => return None,
+                };
+                if sig.params.iter().any(|p| *p != PTy::I)
+                    || callee_ret != ret_ty
+                    || args.len() != sig.params.len() + 1
+                    || args.first() != Some(&v("fuel"))
+                    || args[1..].iter().any(|e| !operations::Policy::Prefix.accepts(e))
+                {
+                    return None;
+                }
+                routes.insert(1 + fid as u64, (fid, args.len() - 1));
+                out.push(pack(1 + fid as i64, args[1..].to_vec()));
+                return Some(out);
+            }
             S::Ret(e) if i + 1 == body.len() && i > 0 && charge(&body[i - 1]) && operations::Policy::Prefix.accepts(e) => {
                 let e = match e {
                     E::V(n) => tuples.get(n).unwrap_or(e).clone(),
@@ -170,7 +191,14 @@ pub(super) fn share(
     }
     let allowed: BTreeSet<_> = protocols.values().flat_map(|ps| ps.iter().cloned()).collect();
     let mut valid = true;
+    let params: BTreeSet<String> = growth.params.iter().map(|(n, _)| n.clone()).collect();
     walk_stmts(&growth.body[3..], &mut |s| {
+        // releasing an owned int parameter on a path that does not use it is
+        // storage, as take_i is: the prefix releases every argument at entry
+        let release = matches!(s, S::Do(E::Call { f, args, .. }) if f == "free_val" && matches!(args.as_slice(), [E::V(n)] if params.contains(n)));
+        if release {
+            return;
+        }
         valid &= matches!(
             s,
             S::Let(Pat::One(_), _, _) | S::If(..) | S::Ret(_) | S::Unreachable
@@ -185,6 +213,9 @@ pub(super) fn share(
                     *f = "wrap56".into();
                     args.remove(0);
                 }
+                // releasing an owned int is storage, not meaning: the shared
+                // prefix reads its arguments with take_i once at entry
+                E::Call { f, ctx: false, args } if f == "take_i" && args.len() == 1 => *f = "as_i".into(),
                 E::Ok(x) => *e = (**x).clone(),
                 E::Arr(xs) => *e = E::Tup(xs.clone()),
                 _ => {}
@@ -206,7 +237,7 @@ pub(super) fn share(
     ]
     .concat();
     let fid: u32 = native.name[2..].parse().ok()?;
-    let convert = |e, target, ports, pack| if ports { integer_port(target, e, pack) } else { e };
+    let convert = |e, _target: u32, ports, pack| if ports { integer_port(e, pack) } else { e };
     let prepare = |ports| S::Let(Pat::Tup(names.clone()), Ty::Infer,
         p(&prefix.name, native.params[1..].iter().map(|(n, _)| convert(v(n), fid, ports, false)).collect()));
     let dispatch = |ports| {

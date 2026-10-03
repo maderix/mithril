@@ -90,6 +90,31 @@ pub trait Program: Sync {
     fn rule_cost(&self, rule: u16) -> u32;
     fn fire(&self, rule: u16, e: Redex, ctx: &mut Wctx);
     fn dive(&self, f: u16, args: &[u64], fuel: &mut i64, ctx: &mut Wctx) -> DiveResult;
+    /// Proven fold `fid`'s native loop over `[lo, hi)` with a range request's
+    /// ports (see `RangeReq`); a sum returns its partial from the identity.
+    fn range_leaf(&self, _fid: u32, _lo: i64, _hi: i64, _ports: &[u64], _ctx: &mut Wctx) -> i64 {
+        unreachable!("the program has no range folds")
+    }
+    /// Release a value the program owns (a completed range request's ports).
+    fn release(&self, _p: u64, _ctx: &mut Wctx) {}
+}
+
+/// A proven fold over a large range, run as one parallel wave: workers take
+/// blocks of `[lo, hi)` through the fold's native loop, then the coordinator
+/// releases the ports (each owned by the request) and delivers to the two
+/// slots of record `rec` (of the fold's join rule): a fill's buffer twice
+/// (`kind` 0), or a sum and the incoming accumulator `ports[acc]` (`kind`
+/// 1: mod 2^64, 2: mod 2^32). The same request as the device's (engine.cu,
+/// range launches).
+#[derive(Clone, Debug)]
+pub struct RangeReq {
+    pub fid: u32,
+    pub rec: u32,
+    pub lo: i64,
+    pub hi: i64,
+    pub ports: Vec<u64>,
+    pub acc: u32,
+    pub kind: u32,
 }
 
 /// Per-run statistics, reset at the start of every `Engine::run`.

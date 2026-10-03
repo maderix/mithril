@@ -212,7 +212,7 @@ fn erase_under<C: Cells>(net: &mut C, env: &mut Env, u: u32, b: &NExpr, bound: &
 
 fn inst<C: Cells>(net: &mut C, prog: &[Entry], env: &mut Env, e: &NExpr) -> Port {
     match e {
-        NExpr::Num(n) => Port::num(*n),
+        NExpr::Num(n) => Port::int(*n),
         NExpr::Flo(f) => net.alloc_flo(*f),
         NExpr::Var(v) => env.take(*v),
         NExpr::Op2(code, a, b) => {

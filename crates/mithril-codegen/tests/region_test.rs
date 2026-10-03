@@ -1,5 +1,5 @@
 use mithril_front::{desugar, parse, eval_core};
-use mithril_codegen::{emit_rust_opts, EmitOpts, fmt_val};
+use mithril_codegen::{emit_rust, fmt_val};
 use std::process::Command;
 
 #[test]
@@ -19,8 +19,8 @@ fn native_and_suspended_regions_match_for_wide_and_thin_frontiers() {
         let source = format!("{body}\ndef main():\n    n = array_len(array_new(7, 0))\n    return {call}\n");
         let module = desugar(&parse(&source).unwrap()).unwrap();
         let want = fmt_val(&eval_core(&module, module.main, &[]));
-        for rep in [Some(false), Some(true)] {
-            let code = emit_rust_opts(&module, EmitOpts { int_rep: rep });
+        {
+            let code = emit_rust(&module);
             std::fs::write(dir.join("main.rs"), code).unwrap();
             let c = Command::new("rustc").args(["--edition=2021", "-O"]).arg(dir.join("main.rs"))
                 .arg("--extern").arg(format!("mithril_rt={}", target.join("libmithril_rt.rlib").display()))
@@ -30,7 +30,7 @@ fn native_and_suspended_regions_match_for_wide_and_thin_frontiers() {
             for threads in ["1", "4"] { for fuel in ["1", "64"] {
                 let r = Command::new(dir.join("run")).args([threads, fuel]).output().unwrap();
                 assert!(r.status.success(), "{name}: {}", String::from_utf8_lossy(&r.stderr));
-                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name}: rep={rep:?} threads={threads} fuel={fuel}");
+                assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), want, "{name}: threads={threads} fuel={fuel}");
             } }
         }
     }

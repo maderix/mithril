@@ -21,6 +21,10 @@ pub(crate) struct ParFold {
     pub mask32: bool,
     /// Accumulator is an n-tuple (TupleWrapAdd modes).
     pub tuple: Option<usize>,
+    /// An index fill: the accumulator is the array being filled. Both halves of
+    /// a split write their own index ranges of one buffer, which the right half
+    /// borrows from the left without a reference; the join returns the left's.
+    pub fill: bool,
 }
 
 /// Decide whether `fid` gets the chunked par_fold shape, and find its
@@ -33,11 +37,12 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
         return None;
     }
     let (mask32, tuple) = match &fi.combiner {
-        Combiner::WrapAdd => (false, None),
+        Combiner::WrapAdd | Combiner::Fill => (false, None),
         Combiner::WrapAdd32 => (true, None),
         Combiner::TupleWrapAdd(n) => (false, Some(*n)),
         Combiner::TupleWrapAdd32(n) => (true, Some(*n)),
     };
+    let fill = fi.combiner == Combiner::Fill;
     let ar = f.arity;
     if ar < 3 || !f.self_tail_rec {
         return None;
@@ -73,32 +78,45 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
             }
         }
     }
-    Some(ParFold { acc, mask32, tuple })
+    Some(ParFold { acc, mask32, tuple, fill })
 }
 
 /// The range-split preamble of the fold fn's CALL rule (before the dive).
 pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -> Vec<S> {
-    split_code(fid, ar, pf, join_rule, v("parent"), crate::lir::ret_unit())
+    split_code(fid, ar, pf, join_rule, &[], v("parent"), crate::lir::ret_unit())
 }
 
 /// The same split inside the fold's dive, at each loop head: the remaining
 /// range [v0, v1) splits once its measured work exceeds a budget; the dive
 /// suspends to the join record, whose parent the caller attaches (the
-/// accumulator so far rides in the left half).
-pub(crate) fn split_snippet_dive(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -> Vec<S> {
-    split_code(fid, ar, pf, join_rule, E::Const("NONE".into()), ret(crate::lir::err(crate::lir::cast(v("j"), Ty::U64))))
+/// accumulator so far rides in the left half). `bor` are the parameters the
+/// function borrows from its caller.
+pub(crate) fn split_snippet_dive(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, bor: &[bool]) -> Vec<S> {
+    split_code(fid, ar, pf, join_rule, bor, E::Const("NONE".into()), ret(crate::lir::err(crate::lir::cast(v("j"), Ty::U64))))
 }
 
-fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: E, exit: S) -> Vec<S> {
+fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, bor: &[bool], parent: E, exit: S) -> Vec<S> {
     let rc = 1 + fid;
     let zline = match pf.tuple {
         None => let_("tz", Ty::U64, num(i64_(0))),
         Some(n) => let_("tz", Ty::U64, c("zeros", vec![crate::lir::usize_(n)])),
     };
-    let left: Vec<E> = (0..ar).map(|i| if i == 1 { v("tmid") } else { v(vn(i as u32)) }).collect();
-    // The left chunk takes the original extras; the right chunk gets deep
-    // copies (both spawned calls own their arguments).
+    // The left chunk takes the original extras, or a reference to a borrowed
+    // one (the caller keeps its own); the right chunk gets copies. Both spawned
+    // calls own their arguments.
     let mut dups = Vec::new();
+    let left: Vec<E> = (0..ar)
+        .map(|i| {
+            if i == 1 {
+                v("tmid")
+            } else if i != 0 && i != pf.acc && bor.get(i).copied().unwrap_or(false) {
+                dups.push(let_(format!("tl{i}"), Ty::U64, c("dup_val", vec![v(vn(i as u32))])));
+                v(format!("tl{i}"))
+            } else {
+                v(vn(i as u32))
+            }
+        })
+        .collect();
     let right: Vec<E> = (0..ar)
         .map(|i| {
             if i == 0 {
@@ -106,7 +124,7 @@ fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: E, exit
             } else if i == 1 {
                 v("v1")
             } else if i == pf.acc {
-                v("tz")
+                v(if pf.fill { vn(i as u32) } else { "tz".into() })
             } else {
                 dups.push(let_(format!("td{i}"), Ty::U64, c("dup_val", vec![v(vn(i as u32))])));
                 v(format!("td{i}"))
@@ -116,7 +134,9 @@ fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: E, exit
     // Split by work, not iterations: FOLD_EST_<fid> is the measured fuel
     // per iteration (set when a chunk's dive runs out of fuel; 1 until
     // then), so a range splits while its estimated work exceeds one budget
-    let budget = p("imax", vec![c("fuel_of", vec![]), i64_(256)]);
+    // estimates are work units; one budget is one work quantum (on the CPU the
+    // budget itself, on the device the work after which a dive yields)
+    let budget = p("imax", vec![c("work_quantum", vec![]), i64_(256)]);
     let mut inner = vec![let_("mid", Ty::I64, bin(Bop::Add, v("lo"), bin(Bop::Div, bin(Bop::Sub, v("hi"), v("lo")), i64_(2)))), let_("tmid", Ty::U64, num(v("mid"))), zline];
     inner.extend(dups);
     inner.push(let_("j", Ty::U32, c("alloc_rec", vec![u16_(join_rule as u64), u32_(2), u32_(0), u32_(0), parent])));
@@ -136,6 +156,80 @@ fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: E, exit
     ]
 }
 
+/// Work above which a fold's range runs as one device-wide pass instead
+/// of chunk tasks: about 2^16 units is tens of microseconds on one lane,
+/// the order of a launch round trip (heat2d at width 256: one lane took
+/// 25 ms per 65 K-cell step; the range kernel takes 8 us at 1 M cells).
+const RANGE_MIN: i64 = 1 << 16;
+
+/// The fold's range launch (device): the request owns a reference to every
+/// argument (a borrowed one is shared, an owned one moves), the bridge
+/// suspends to a record of the join rule, and the completion delivers to
+/// both of its slots (a fill's buffer twice; a sum and the incoming
+/// accumulator). `kind`: 0 fill, 1 sum, 2 sum mod 2^32 (`RangeFill`).
+pub(crate) fn range_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, bor: &[bool], kind: u32) -> Vec<S> {
+    let mut launch = Vec::new();
+    let ports: Vec<E> = (0..ar)
+        .map(|i| {
+            if i >= 2 && i != pf.acc && bor.get(i).copied().unwrap_or(false) {
+                launch.push(let_(format!("tr{i}"), Ty::U64, c("dup_val", vec![v(vn(i as u32))])));
+                v(format!("tr{i}"))
+            } else {
+                v(vn(i as u32))
+            }
+        })
+        .collect();
+    let (lo, hi) = (as_i(v("v0")), as_i(v("v1")));
+    launch.push(let_("rj", Ty::U32, c("range_launch", vec![u32_(fid as u64), u16_(join_rule as u64), lo.clone(), hi.clone(), E::Slice(ports), u32_(pf.acc as u64), u32_(kind as u64)])));
+    launch.push(ret(crate::lir::err(crate::lir::cast(v("rj"), Ty::U64))));
+    let est = p("imax", vec![p("atomic_load", vec![E::Addr(format!("FOLD_EST_{fid}"))]), i64_(1)]);
+    let work = p("sat_mul", vec![bin(Bop::Sub, hi, lo), est]);
+    vec![S::Comment("range launch: the fold runs as one device-wide pass".into()), S::If(bin(Bop::Gt, work, i64_(RANGE_MIN)), launch, vec![])]
+}
+
+/// The native bridge's first measurement. A native chunk never runs out of
+/// budget, so the dive's measurement never fires for it: while the fold has no
+/// estimate, the bridge runs one iteration natively, measures its work, and
+/// continues on the range after it, where the split sees the estimate. The
+/// estimate is in work units, the same on both backends. A borrowed parameter is
+/// lent to both calls; an owned one gives the probe a reference.
+pub(crate) fn probe_snippet(fid: u32, ar: usize, pf: &ParFold, bor: &[bool]) -> Vec<S> {
+    let mut body = vec![let_("f0", Ty::I64, p("work_mark", vec![v("fuel")])), let_("tp", Ty::U64, num(bin(Bop::Add, as_i(v("v0")), i64_(1))))];
+    let mut probe = vec![v("fuel")];
+    for i in 0..ar {
+        probe.push(if i == 1 {
+            v("tp")
+        } else if i == 0 || i == pf.acc || bor.get(i).copied().unwrap_or(false) {
+            v(vn(i as u32))
+        } else {
+            body.push(let_(format!("tq{i}"), Ty::U64, c("dup_val", vec![v(vn(i as u32))])));
+            v(format!("tq{i}"))
+        });
+    }
+    let rest: Vec<E> = std::iter::once(v("fuel")).chain((0..ar).map(|i| match i {
+        0 => v("tp"),
+        _ if i == pf.acc => v("pa"),
+        _ => v(vn(i as u32)),
+    })).collect();
+    // the work one iteration takes
+    let used = p("work_since", vec![v("fuel"), v("f0")]);
+    let est = used;
+    body.push(S::Res(
+        E::Call { f: format!("d_{fid}"), ctx: true, args: probe },
+        "pa".into(),
+        vec![
+            do_(p("atomic_store", vec![E::Addr(format!("FOLD_EST_{fid}")), p("imax", vec![est, i64_(1)])])),
+            do_(p("flag_store", vec![E::Addr(format!("FOLD_MEAS_{fid}")), E::Bool(true)])),
+            ret(E::Call { f: format!("d_{fid}"), ctx: true, args: rest }),
+        ],
+        "pe".into(),
+        vec![S::Unreachable],
+    ));
+    let unmeasured = E::Not(Box::new(p("flag_load", vec![E::Addr(format!("FOLD_MEAS_{fid}"))])));
+    let long = bin(Bop::Ge, bin(Bop::Sub, as_i(v("v1")), as_i(v("v0"))), i64_(2));
+    vec![S::If(unmeasured, vec![S::If(long, body, vec![])], vec![])]
+}
+
 /// The per-fold work estimate and the dive-side measurement: at a fuel-out
 /// the chunk has run `v0 - fold_start` iterations on one budget.
 pub(crate) fn est_static(fid: u32) -> String {
@@ -152,7 +246,7 @@ pub(crate) fn heavy_wrapper(fid: u32, ar: usize) -> FnDef {
         let_("r", Ty::Res, E::Call { f: format!("dd_{fid}"), ctx: true, args: dive_args(ar) }),
         S::If(
             p("is_err", vec![E::Addr("r".into())]),
-            vec![S::If(E::Not(Box::new(p("flag_load", vec![E::Addr(format!("FOLD_MEAS_{fid}"))]))), vec![do_(p("atomic_max", vec![E::Addr(format!("FOLD_EST_{fid}")), c("fuel_of", vec![])]))], vec![])],
+            vec![S::If(E::Not(Box::new(p("flag_load", vec![E::Addr(format!("FOLD_MEAS_{fid}"))]))), vec![do_(p("atomic_max", vec![E::Addr(format!("FOLD_EST_{fid}")), c("work_quantum", vec![])]))], vec![])],
             vec![],
         ),
         ret(v("r")),
@@ -163,7 +257,7 @@ pub(crate) fn heavy_wrapper(fid: u32, ar: usize) -> FnDef {
 pub(crate) fn est_update(fid: u32) -> Vec<S> {
     vec![
         let_("it", Ty::I64, p("imax", vec![bin(Bop::Sub, as_i(v("v0")), as_i(v("fold_start"))), i64_(1)])),
-        do_(p("atomic_store", vec![E::Addr(format!("FOLD_EST_{fid}")), p("imax", vec![bin(Bop::Div, c("fuel_of", vec![]), v("it")), i64_(1)])])),
+        do_(p("atomic_store", vec![E::Addr(format!("FOLD_EST_{fid}")), p("imax", vec![bin(Bop::Div, c("work_quantum", vec![]), v("it")), i64_(1)])])),
         do_(p("flag_store", vec![E::Addr(format!("FOLD_MEAS_{fid}")), E::Bool(true)])),
     ]
 }
@@ -173,10 +267,12 @@ pub(crate) fn est_update(fid: u32) -> Vec<S> {
 /// place into the left one, the right one freed) and delivers the sum.
 pub(crate) fn join_fn(fid: u32, pf: &ParFold) -> FnDef {
     let combine = match pf.tuple {
+        // both halves filled one buffer; the right's value is the borrowed alias
+        _ if pf.fill => vec![let_("r", Ty::U64, v("a"))],
         None => {
             let sum = bin(Bop::Add, v("x"), v("y"));
-            let r = if pf.mask32 { bin(Bop::And, sum, i64_(0xFFFF_FFFF)) } else { p("wrap56", vec![sum]) };
-            vec![let_("x", Ty::I64, as_i(v("a"))), let_("y", Ty::I64, as_i(v("b"))), let_("r", Ty::U64, num(r))]
+            let r = if pf.mask32 { bin(Bop::And, sum, i64_(0xFFFF_FFFF)) } else { sum };
+            vec![let_("x", Ty::I64, p("take_i", vec![v("a")])), let_("y", Ty::I64, p("take_i", vec![v("b")])), let_("r", Ty::U64, num(r))]
         }
         Some(_) => vec![let_("r", Ty::U64, c("tup_add", vec![v("a"), v("b"), E::Bool(pf.mask32)]))],
     };

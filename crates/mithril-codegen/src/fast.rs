@@ -75,34 +75,29 @@ impl Fp<'_> {
     }
 
     /// A pure int expression as raw i64 (statements for value branches
-    /// into `b`); `low` = only its low bits are observed.
-    fn pexpr(&mut self, e: &Core, low: bool, b: &mut Vec<S>) -> E {
+    /// into `b`).
+    fn pexpr(&mut self, e: &Core, b: &mut Vec<S>) -> E {
         match e {
             Core::Num(n) => i64_(*n),
             Core::Var(i) if self.ints.contains(i) => v(format!("w{i}")),
             Core::Var(i) => as_i(v(vn(*i))),
             Core::Op2(op, x, y) => {
-                let (ex, ey) = (self.pexpr(x, crate::range::feeds_mask(op, y), b), self.pexpr(y, false, b));
-                let body = arith(bin_code(op), ex, ey);
-                if self.ranges.wrap(op, x, y, low) {
-                    p("wrap56", vec![body])
-                } else {
-                    body
-                }
+                let (ex, ey) = (self.pexpr(x, b), self.pexpr(y, b));
+                arith(bin_code(op), ex, ey)
             }
             Core::Cmp(op, x, y) => {
-                let (ex, ey) = (self.pexpr(x, false, b), self.pexpr(y, false, b));
+                let (ex, ey) = (self.pexpr(x, b), self.pexpr(y, b));
                 cast(compare(cmp_code(op), ex, ey), Ty::I64)
             }
             Core::If(cd, t, f) => {
-                let ec = self.pexpr(cd, false, b);
+                let ec = self.pexpr(cd, b);
                 self.tmp += 1;
                 let tn = format!("x{}", self.tmp);
                 let mut bt = Vec::new();
-                let et = self.pexpr(t, false, &mut bt);
+                let et = self.pexpr(t, &mut bt);
                 bt.push(set(&tn, et));
                 let mut bf = Vec::new();
-                let ef = self.pexpr(f, false, &mut bf);
+                let ef = self.pexpr(f, &mut bf);
                 bf.push(set(&tn, ef));
                 b.push(S::Decl(tn.clone(), Ty::I64));
                 b.push(S::If(bin(Bop::Ne, ec, i64_(0)), bt, bf));
@@ -112,34 +107,36 @@ impl Fp<'_> {
         }
     }
 
-    /// Release owned boxed params this committed path does not return.
+    /// Release owned boxed params this committed path does not return: an
+    /// int param is owned and may be a box unless proven small.
     fn frees(&self, keep: Option<u32>, b: &mut Vec<S>) {
         for pp in 0..self.arity() as u32 {
-            if Some(pp) != keep && !self.int_param(pp) && !self.bor[pp as usize] && !self.imm.contains(&pp) {
+            let boxed = if self.int_param(pp) { !self.ranges.small_var(pp) } else { !self.bor[pp as usize] && !self.imm.contains(&pp) };
+            if Some(pp) != keep && boxed {
                 b.push(free(v(vn(pp))));
             }
         }
     }
 
-    /// Commit the path: release what it does not return, return `x`.
+    /// Commit the path: compute `x`, release what it does not return, return it.
     fn commit(&mut self, keep: Option<u32>, x: E, b: &mut Vec<S>) {
+        b.push(let_("fast_r", Ty::U64, x));
         self.frees(keep, b);
         self.tails += 1;
-        b.push(ret(ok(x)));
+        b.push(ret(ok(v("fast_r"))));
     }
 
     fn tail(&mut self, e: &Core, b: &mut Vec<S>) {
         match e {
             Core::Let(x, r, bo) if self.pure(r) => {
-                let low = self.ranges.masked(*x);
-                let s = self.pexpr(r, low, b);
+                let s = self.pexpr(r, b);
                 b.push(let_(format!("w{x}"), Ty::I64, s));
                 self.ints.insert(*x);
                 self.tail(bo, b);
             }
             Core::Let(..) => self.fallback(b),
             Core::If(cd, t, f) if self.pure(cd) => {
-                let s = self.pexpr(cd, false, b);
+                let s = self.pexpr(cd, b);
                 let saved = (self.ints.clone(), self.imm.clone());
                 let mut bt = Vec::new();
                 self.tail(t, &mut bt);
@@ -190,7 +187,7 @@ impl Fp<'_> {
             Core::Ctor(cid, args) | Core::Reuse(_, cid, args) => {
                 if let (Some(slot), [a]) = (self.unbox.get(cid), args.as_slice()) {
                     if self.pure(a) {
-                        let s = self.pexpr(a, false, b);
+                        let s = self.pexpr(a, b);
                         return self.commit(None, p("ic", vec![u64_(*slot as u64), s]), b);
                     }
                 } else if args.is_empty() {
@@ -203,7 +200,7 @@ impl Fp<'_> {
                 self.commit(Some(*pp), x, b);
             }
             other if self.pure(other) => {
-                let s = self.pexpr(other, false, b);
+                let s = self.pexpr(other, b);
                 self.commit(None, num(s), b);
             }
             _ => self.fallback(b),

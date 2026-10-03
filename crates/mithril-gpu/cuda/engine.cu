@@ -97,7 +97,7 @@ extern "C" {
 // the runtime descriptor is written once by the host: constant memory, so
 // a field read is a cached broadcast, not a dependent global load
 __constant__ Dev G;
-__device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, widest frontier, grow cycles, work cycles
+__device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, widest frontier, grow cycles, work cycles, range launches
 // The rule table plus one rule the engine owns: ERA, the erasure of a
 // value (the net's ERA-CON rewrites). A large teardown spills its subtrees
 // as ERA tasks, so every lane erases a share instead of one lane walking
@@ -111,6 +111,7 @@ __device__ u64 g_rounds[8];            // rounds, grow sweeps, work phases, wide
 __shared__ u32 s_era[256];
 __shared__ u32 s_era_depth[256];
 __shared__ u32 s_work[256];
+__shared__ u64 s_work_all[256]; // work charged by the lane's task, never wrapped
 __device__ u32 g_nrules = NRULES_ALL;
 }
 
@@ -149,6 +150,11 @@ __device__ bool prog_native_rule(u32 rule);
 #else
 __device__ inline bool prog_native_rule(u32) { return false; }
 #endif
+#if defined(RANGE_FILLS) && RANGE_FILLS
+__device__ i64 prog_range_leaf(u32 fid, i64 i, const u64 *ports);
+#else
+__device__ inline i64 prog_range_leaf(u32, i64, const u64 *) { return 0; }
+#endif
 __device__ inline bool rule_forks(u32 r) { return r == ERA_RULE || prog_forks(r); }
 __device__ R prog_dive(u32 f, const u64 *args, i64 *fuel);
 __device__ bool lin(u16 k);
@@ -163,6 +169,7 @@ __device__ inline u32 lane() {
 // ---- ports: tag:8 | payload:56; CON payload: addr:40 | ctor:12 | arity:4 ----
 
 #define T_NUM 2ull
+#define T_BIG 15ull // an int past 56 bits: a one-element heap block [rc, len, value]
 #define T_FLO 3ull
 #define T_CON 4ull
 #define T_LAM 6ull
@@ -175,9 +182,17 @@ __device__ inline u32 lane() {
 #define ROOT 0ull
 
 __device__ inline u64 tag(u64 p) { return p >> 56; }
-__device__ inline u64 num(i64 v) { return (T_NUM << 56) | ((u64)v & M56); }
-__device__ inline i64 as_i(u64 p) { return ((i64)(p << 8)) >> 8; }
-__device__ inline i64 wrap56(i64 v) { return ((i64)((u64)v << 8)) >> 8; }
+__device__ u64 big_box(i64 v);
+// an int as a port: inline when it fits 56 bits, else boxed
+__device__ inline u64 num(i64 v) {
+  if (v >= -(1ll << 55) && v < (1ll << 55)) return (T_NUM << 56) | ((u64)v & M56);
+  return big_box(v);
+}
+__device__ inline i64 as_i(u64 p) {
+  if ((p >> 56) == T_BIG) return (i64)G.heap[(p & M56) + 2];
+  return ((i64)(p << 8)) >> 8;
+}
+__device__ inline bool is_int(u64 p) { u64 t = p >> 56; return t == T_NUM || t == T_BIG; }
 __device__ inline u64 ic(u64 slot, i64 v) { return ((TU + slot) << 56) | ((u64)v & M56); }
 __device__ inline u64 con(u32 addr, u16 k, u8 ar) {
   return (T_CON << 56) | ((u64)addr << 16) | ((u64)(k & 0xfffu) << 4) | (u64)ar;
@@ -185,8 +200,6 @@ __device__ inline u64 con(u32 addr, u16 k, u8 ar) {
 __device__ inline u32 con_addr(u64 p) { return (u32)((p >> 16) & ((1ull << 40) - 1)); }
 __device__ inline u16 con_tag(u64 p) { return (u16)((p >> 4) & 0xfffu); }
 __device__ inline u8 con_ar(u64 p) { return (u8)(p & 0xf); }
-__device__ inline i64 sh(u64 p) { return (i64)(p << 8); }
-__device__ inline u64 retag(i64 x) { return ((u64)x >> 8) | (T_NUM << 56); }
 __device__ inline u64 rec_addr(u32 rec) { return (u64)rec << 3; }
 __device__ inline i64 imax(i64 a, i64 b) { return a > b ? a : b; }
 __device__ inline i64 sat_mul(i64 a, i64 b) {
@@ -210,6 +223,7 @@ __device__ inline void stack_mark() {
   s_sp0[threadIdx.x] = sp_now();
   s_era[threadIdx.x] = s_era_depth[threadIdx.x] = 0;
   s_work[threadIdx.x] = 0;
+  s_work_all[threadIdx.x] = 0;
 }
 // Work charged on the device: it deepens no stack, so it does not touch
 // the depth budget, but every WORK_CAP units it forces the frame's next
@@ -217,6 +231,7 @@ __device__ inline void stack_mark() {
 // nothing and runs to its end: design.md section 5.5).
 #define WORK_CAP (1u << 20)
 __device__ inline void work_fuel(i64 *fuel, i64 n) {
+  s_work_all[threadIdx.x] += (u64)n;
   u32 w = s_work[threadIdx.x] + (u32)n;
   if (w >= WORK_CAP) {
     w = 0;
@@ -227,10 +242,16 @@ __device__ inline void work_fuel(i64 *fuel, i64 n) {
 // A native region cannot suspend internally. Keep every credit, including
 // overflow across several work quanta, for the next enclosing dive check.
 __device__ inline void native_work_fuel(i64 *fuel, i64 n) {
+  s_work_all[threadIdx.x] += (u64)n;
   u64 total = (u64)s_work[threadIdx.x] + (u64)n;
   if (total >= WORK_CAP) *fuel = -1;
   s_work[threadIdx.x] = (u32)(total % WORK_CAP);
 }
+// Work charged since a mark, and the work one budget stands for: the device
+// budget bounds depth, and a dive yields every WORK_CAP units (fold estimates).
+__device__ inline i64 work_mark(i64 *) { return (i64)s_work_all[threadIdx.x]; }
+__device__ inline i64 work_since(i64 *, i64 mark) { return (i64)s_work_all[threadIdx.x] - mark; }
+__device__ inline i64 work_quantum() { return (i64)WORK_CAP; }
 __device__ inline bool stack_deep() {
   if (s_sp0[threadIdx.x] - sp_now() <= (unsigned long long)g_stack_limit) return false;
   g_abort(AB_DEEP);
@@ -904,8 +925,16 @@ __device__ inline double flo_val(u64 p) { return __longlong_as_double(cell0((u32
 // Freed blocks go on the lane's intrusive free list of their size class (the
 // link in word 0, the head index+1): the cells' access model, no atomics.
 // Eight classes per octave: a block is at most 1/8 larger than its array.
+// A large block goes on a shared per-class stack instead: the lane that
+// frees it (the last of a split's chunks) is rarely the one that allocates
+// the next (the loop's continuation), and per-lane lists stranded every
+// freed row of a DP until the heap ran out (knapsack: 106 K words live of
+// 724 M allocated). One atomic per large block is negligible against
+// filling it. The stack head is (ABA tag << 32) | (index + 1).
 #define ACLS 256
+#define ASHARED_WORDS 4096
 __device__ u32 g_afree[MAXLANES * ACLS];
+__device__ unsigned long long g_ashared[ACLS];
 __device__ inline u64 arr_cls_words(u32 c) { return c < 8 ? 8 : (8ull + (c & 7)) << (c / 8 - 3); }
 __device__ inline u32 arr_cls(usize n) {
   u64 w = n + 2;
@@ -920,10 +949,47 @@ __device__ inline usize arr_len_of(u64 p) { return arr_block(p)[1] & ARR_LEN_MAS
 __device__ inline u64 *arr_elems(u64 p) { return arr_block(p) + 2; }
 __device__ inline bool arr_raw(u64 p) { return (arr_block(p)[1] & ARR_RAW) != 0; }
 __device__ inline bool arr_boxed(u64 p) { return (arr_block(p)[1] & ARR_BOXED) != 0; }
-__device__ inline bool is_heap(u64 v) { u64 t = tag(v); return t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM; }
+__device__ inline bool is_heap(u64 v) { u64 t = tag(v); return t == T_CON || t == T_FLO || t == T_ARR || t == T_LAM || t == T_BIG; }
 __device__ inline void arr_mark_boxed(u64 a, u64 v) { if (is_heap(v)) arr_block(a)[1] |= ARR_BOXED; }
-__device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return arr_raw(p) ? retag((i64)e) : e; }
+__device__ inline u64 arr_elem(u64 p, usize k) { u64 e = arr_elems(p)[k]; return arr_raw(p) ? num((i64)e) : e; }
+__device__ u32 ashared_pop(u32 cls) {
+  unsigned long long old = *(volatile unsigned long long *)&g_ashared[cls];
+  for (;;) {
+    u32 head = (u32)old;
+    if (head == 0) return 0;
+    u32 next = (u32)*(volatile u64 *)&G.heap[head - 1];
+    unsigned long long seen = atomicCAS(&g_ashared[cls], old, (((old >> 32) + 1) << 32) | next);
+    if (seen == old) return head;
+    old = seen;
+  }
+}
+__device__ void ashared_push(u32 cls, u64 base) {
+  unsigned long long old = *(volatile unsigned long long *)&g_ashared[cls];
+  for (;;) {
+    *(volatile u64 *)&G.heap[base] = (u32)old;
+    __threadfence();
+    unsigned long long seen = atomicCAS(&g_ashared[cls], old, (((old >> 32) + 1) << 32) | (base + 1));
+    if (seen == old) return;
+    old = seen;
+  }
+}
+__device__ __noinline__ u64 arr_alloc_block(usize n);
 __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
+  u64 p = arr_alloc_block(n);
+  usize m = arr_len_of(p); // 0 when the allocation aborted
+  for (usize k = 0; k < m; k++) arr_elems(p)[k] = fill;
+  return p;
+}
+// A raw int array whose elements are all written before any read (a fill
+// covers it: codegen's `uninit_lets`), so they get no initial value.
+__device__ u64 arr_new_raw_uninit(i64 n) {
+  if (n < 0) { g_abort(AB_OOB); n = 0; }
+  u64 p = arr_alloc_block((usize)n);
+  if ((p & M56) != 0) arr_block(p)[1] |= ARR_RAW;
+  return p;
+}
+// An array block of n elements, not yet written.
+__device__ __noinline__ u64 arr_alloc_block(usize n) {
   if ((u64)n + 2 > G.hcap) { // before the class: a huge n has no class
     g_abort(AB_HEAP);
     return (T_ARR << 56) | 0;
@@ -934,6 +1000,8 @@ __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
   if (*h) {
     base = *h - 1;
     *h = (u32)G.heap[base];
+  } else if (u32 got = arr_cls_words(cls) >= ASHARED_WORDS ? ashared_pop(cls) : 0) {
+    base = got - 1;
   } else {
     u64 words = arr_cls_words(cls);
     base = atomicAdd(G.hbump, words);
@@ -945,13 +1013,17 @@ __device__ __noinline__ u64 arr_alloc_fill(usize n, u64 fill) {
   u64 *b = &G.heap[base];
   b[0] = 1;
   b[1] = (u64)n | ((u64)cls << ARR_CLS_SHIFT);
-  for (usize k = 0; k < n; k++) b[2 + k] = fill;
   return (T_ARR << 56) | base;
 }
 __device__ inline u64 arr_alloc(usize n) { return arr_alloc_fill(n, 0); }
+__device__ __noinline__ u64 big_box(i64 v) { return (T_BIG << 56) | (arr_alloc_fill(1, (u64)v) & M56); }
 __device__ inline void arr_free_block(u64 p) {
   u64 base = p & M56;
   u32 cls = (u32)(G.heap[base + 1] >> ARR_CLS_SHIFT) & 255;
+  if (arr_cls_words(cls) >= ASHARED_WORDS) {
+    ashared_push(cls, base);
+    return;
+  }
   u32 *h = &g_afree[lane() * ACLS + cls];
   G.heap[base] = *h;
   *h = (u32)base + 1;
@@ -965,7 +1037,7 @@ __device__ inline u64 arr_new_raw(i64 n, i64 x) {
 }
 __device__ __noinline__ void arr_unraw(u64 a) {
   usize n = arr_len_of(a);
-  for (usize k = 0; k < n; k++) arr_elems(a)[k] = retag((i64)arr_elems(a)[k]);
+  for (usize k = 0; k < n; k++) arr_elems(a)[k] = num((i64)arr_elems(a)[k]);
   arr_block(a)[1] &= ~ARR_RAW;
 }
 __device__ inline u64 arr_get_r(u64 a, i64 i) {
@@ -973,7 +1045,7 @@ __device__ inline u64 arr_get_r(u64 a, i64 i) {
   if (i < 0 || (usize)i >= n) { arr_oob(i, n); return 0; }
   return arr_elems(a)[i];
 }
-__device__ inline u64 arr_get_i(u64 a, i64 i) { return retag((i64)arr_get_r(a, i)); }
+__device__ inline u64 arr_get_i(u64 a, i64 i) { return num((i64)arr_get_r(a, i)); }
 __device__ inline u64 arr_set_u(u64 a, i64 i, u64 v) {
   usize n = arr_len_of(a);
   if (i < 0 || (usize)i >= n) { arr_oob(i, n); return a; }
@@ -989,7 +1061,9 @@ __device__ inline u64 arr_set_n(u64 a, usize n, i64 i, u64 v) {
   arr_elems(a)[i] = v;
   return a;
 }
-__device__ inline u64 arr_new_i(i64 n, u64 v) { return arr_new_raw(n, sh(v)); }
+__device__ void free_val(u64 p);
+__device__ inline i64 take_i(u64 p) { i64 v = as_i(p); if ((p >> 56) == T_BIG) free_val(p); return v; }
+__device__ inline u64 arr_new_i(i64 n, u64 v) { return arr_new_raw(n, take_i(v)); }
 __device__ inline u64 arr_rc_load(u64 p) { return *(volatile u64 *)arr_block(p); }
 __device__ __noinline__ u64 arr_copy(u64 a) {
   // the block's own length: an allocation that aborted returns the empty
@@ -1009,7 +1083,7 @@ __device__ __noinline__ u64 arr_copy(u64 a) {
 __device__ inline u64 arr_own(u64 a) { return arr_rc_load(a) == 1 ? a : arr_copy(a); }
 __device__ __noinline__ u64 arr_new(i64 n, u64 v) {
   if (n < 0) { g_abort(AB_OOB); n = 0; }
-  if (tag(v) == T_NUM) return arr_new_raw(n, sh(v));
+  if (is_int(v)) return arr_new_raw(n, take_i(v));
   usize un = (usize)n;
   if (!is_heap(v)) return arr_alloc_fill(un, v);
   u64 p = arr_alloc(un);
@@ -1029,8 +1103,8 @@ __device__ __noinline__ u64 arr_set(u64 a, i64 i, u64 v) {
   if (i < 0 || (usize)i >= n) { arr_oob(i, n); return a; }
   a = arr_rc_load(a) == 1 ? a : arr_copy(a);
   if (arr_raw(a)) {
-    if (tag(v) == T_NUM) {
-      arr_elems(a)[i] = (u64)sh(v);
+    if (is_int(v)) {
+      arr_elems(a)[i] = (u64)take_i(v);
       return a;
     }
     arr_unraw(a);
@@ -1044,7 +1118,7 @@ __device__ inline u64 arr_set_i(u64 a, i64 i, u64 v) {
   usize n = arr_len_of(a);
   if (i < 0 || (usize)i >= n) { arr_oob(i, n); return a; }
   a = arr_rc_load(a) == 1 ? a : arr_copy(a);
-  arr_elems(a)[i] = (u64)sh(v);
+  arr_elems(a)[i] = (u64)take_i(v);
   return a;
 }
 // An ERA continuation owns the zero-reference array until its suffix is erased.
@@ -1092,13 +1166,13 @@ __device__ __forceinline__ u64 dup_val(u64 p) {
     if (con_ar(p) > 0) rc_inc(con_addr(p));
     return p;
   }
-  if (t == T_ARR) { atomicAdd((unsigned long long *)arr_block(p), 1ull); return p; }
+  if (t == T_ARR || t == T_BIG) { atomicAdd((unsigned long long *)arr_block(p), 1ull); return p; }
   return p;
 }
 // drop a reference; the last one tears the value down
 __device__ inline void free_val(u64 p) {
   u64 t = tag(p);
-  if (t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM) return;
+  if (t != T_CON && t != T_FLO && t != T_ARR && t != T_LAM && t != T_BIG) return;
   free_val_slow(p);
 }
 __device__ __forceinline__ void free_val_slow(u64 p) {
@@ -1107,6 +1181,7 @@ __device__ __forceinline__ void free_val_slow(u64 p) {
   struct Leave { __device__ ~Leave() { s_era_depth[threadIdx.x]--; } } leave;
   u64 t = tag(p);
   if (t == T_ARR) { arr_drop(p); return; }
+  if (t == T_BIG) { if (atomicAdd((unsigned long long *)arr_block(p), 0xffffffffffffffffull) == 1ull) arr_free_block(p); return; }
   if (t == T_LAM) { drop_closure(p); return; }
   if (t >= TU) return;
   if (t == T_FLO) {
@@ -1140,8 +1215,10 @@ __device__ __forceinline__ void free_val_slow(u64 p) {
 
 // dynamic arithmetic (ints, or boxed floats)
 __device__ __noinline__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
-  if (tag(a) == T_NUM && tag(b) == T_NUM) {
+  if (is_int(a) && is_int(b)) {
     i64 x = as_i(a), y = as_i(b), r = 0;
+    if (own & 1) free_val(a);
+    if (own & 2) free_val(b);
     switch (op) {
     case 0: r = (i64)((u64)x + (u64)y); break;
     case 1: r = (i64)((u64)x - (u64)y); break;
@@ -1155,7 +1232,7 @@ __device__ __noinline__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
     case 9: r = x | y; break;
     default: r = x ^ y; break;
     }
-    return num(wrap56(r));
+    return num(r);
   }
   double x = flo_val(a), y = flo_val(b), r = 0.0;
   if (own & 1) free_val(a);
@@ -1171,8 +1248,10 @@ __device__ __noinline__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
 }
 __device__ __noinline__ u64 cmp(u8 op, u64 a, u64 b, u8 own) {
   bool r = false;
-  if (tag(a) == T_NUM && tag(b) == T_NUM) {
+  if (is_int(a) && is_int(b)) {
     i64 x = as_i(a), y = as_i(b);
+    if (own & 1) free_val(a);
+    if (own & 2) free_val(b);
     switch (op) {
     case 0: r = x < y; break;
     case 1: r = x <= y; break;
@@ -1210,8 +1289,8 @@ __device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
     if (n == 0) return a;
     u32 ca = con_addr(pa), cb = con_addr(pb);
     u64 x0 = cell0(ca), y0 = cell0(cb);
-    i64 s = (i64)((u64)as_i(x0) + (u64)as_i(y0));
-    cell_set(ca, 0, num(mask32 ? (s & 0xffffffffll) : wrap56(s)));
+    i64 s = (i64)((u64)take_i(x0) + (u64)take_i(y0));
+    cell_set(ca, 0, num(mask32 ? (s & 0xffffffffll) : s));
     if (n > 2) {
       pa = cell1(ca);
       pb = cell1(cb);
@@ -1219,8 +1298,8 @@ __device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
     } else {
       if (n == 2) {
         u64 x1 = cell1(ca), y1 = cell1(cb);
-        i64 s1 = (i64)((u64)as_i(x1) + (u64)as_i(y1));
-        cell_set(ca, 1, num(mask32 ? (s1 & 0xffffffffll) : wrap56(s1)));
+        i64 s1 = (i64)((u64)take_i(x1) + (u64)take_i(y1));
+        cell_set(ca, 1, num(mask32 ? (s1 & 0xffffffffll) : s1));
       }
       free_node(cb);
       return a;
@@ -1412,7 +1491,7 @@ __device__ const u16 *prog_mat_arms(u16 mid, int *n);
 __device__ inline bool is_ext_value(u64 p) { u64 t = tag(p); return t >= TU || t == T_ARR; }
 __device__ inline bool is_value(u64 p) {
   u64 t = tag(p);
-  return t == T_NUM || t == T_FLO || t == T_CON || t == T_LAM || is_ext_value(p);
+  return t == T_NUM || t == T_BIG || t == T_FLO || t == T_CON || t == T_LAM || is_ext_value(p);
 }
 __device__ inline bool is_closure(u64 r) { return ref_entry(r) >= NFNS; }
 
@@ -1477,8 +1556,8 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
     default: g_abort(AB_UNREACHABLE); return false;
     }
   }
-  if (tag(x) == T_NUM && tag(y) == T_NUM) {
-    i64 a = as_i(x), b = as_i(y);
+  if (is_int(x) && is_int(y)) {
+    i64 a = take_i(x), b = take_i(y);
     if (code >= 16) {
       bool r = false;
       switch (code) {
@@ -1507,7 +1586,7 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
     case 9: r = a | b; break;
     default: r = a ^ b; break;
     }
-    *out = num(wrap56(r));
+    *out = num(r);
     return true;
   }
   double a = flo_val(x), b = flo_val(y);
@@ -1552,6 +1631,7 @@ __device__ inline bool shared_val(u64 p) {
 __device__ __noinline__ void era_value(u64 p) {
   u64 t = tag(p);
   if (t == T_ERA || t == T_NUM) return;
+  if (t == T_BIG) { free_val(p); return; }
   if (shared_val(p)) { free_val(p); return; }
   if (t == T_FLO) { free_node((u32)payload(p)); return; }
   if (t == T_CON) {
@@ -1678,8 +1758,9 @@ __device__ __noinline__ void swi_rule(u64 swi, u64 n) {
   u32 s2 = (u32)payload(arms);
   u64 t = cell0(s2), e = cell1(s2);
   free_node(s2);
-  u64 taken = as_i(n) != 0 ? t : e;
-  u64 dead = as_i(n) != 0 ? e : t;
+  bool nz = take_i(n) != 0;
+  u64 taken = nz ? t : e;
+  u64 dead = nz ? e : t;
   link(era(), dead);
   push_redex(taken, ret);
 }
@@ -1780,6 +1861,9 @@ __device__ __noinline__ void dup_rule(u64 dup, u64 val) {
   if (t == T_NUM) {
     link(val, o1);
     link(val, o2);
+  } else if (t == T_BIG) {
+    link(val, o1);
+    link(dup_val(val), o2);
   } else if (shared_val(val)) {
     link(val, o1);
     link(dup_val(val), o2);
@@ -1952,8 +2036,8 @@ __device__ __noinline__ int process(u64 a, u64 b) {
   else if (ta == T_LAM && tb == T_APP) beta(b, a);
   else if (ta == T_OP && is_value(b)) op_rule(a, b);
   else if (tb == T_OP && is_value(a)) op_rule(b, a);
-  else if (ta == T_SWI && tb == T_NUM) swi_rule(a, b);
-  else if (ta == T_NUM && tb == T_SWI) swi_rule(b, a);
+  else if (ta == T_SWI && (tb == T_NUM || tb == T_BIG)) swi_rule(a, b);
+  else if ((ta == T_NUM || ta == T_BIG) && tb == T_SWI) swi_rule(b, a);
   else if (ta == T_MAT && is_value(b)) mat_rule(a, b);
   else if (tb == T_MAT && is_value(a)) mat_rule(b, a);
   else if (ta == T_DUP && tb == T_DUP) dup_dup(a, b);
@@ -2277,6 +2361,120 @@ __device__ void work_phase(u32 max_steps) {
 }
 
 // A typed native launch leaves completed cross-lane joins for the engine.
+// ---- range launches: a proven fill or sum as one grid-wide pass ----
+//
+// A proven fold over a large range runs as one pass of the grid in which
+// consecutive threads take consecutive indices of the fold's native leaf,
+// so a warp's loads and stores are contiguous. The fold's root records a
+// request (its argument ports, each owned by the request) and suspends to
+// a record of the fold's join rule; the driver runs every pending request
+// at the next round boundary as a phase of the driver (every lane takes
+// indices, one grid barrier, then lane 0 completes the requests: no host
+// round trip).
+// * A fill: each index is written once by the same leaf (the chunks lemma
+//   with chunks of one index); the completion delivers the buffer to both
+//   slots of the join (a fill's join returns its left value).
+// * A sum (wrapping add, mod 2^64 or 2^32): each index's term is the leaf
+//   from the identity; terms are added in a warp, then once per warp into
+//   the request (the combiner is associative and commutative: the
+//   `assoc_` and `comm_` obligations). The completion delivers the sum and
+//   the fold's incoming accumulator to the two slots of the join.
+#define RREQ_CAP 1024
+#define RREQ_PORTS 12
+#define RANGE_FILL 0
+#define RANGE_SUM 1
+#define RANGE_SUM32 2
+struct RangeReq {
+  u32 fid, rec, n, acc, kind;
+  i64 lo, hi;
+  unsigned long long sum;
+  u64 ports[RREQ_PORTS];
+};
+__device__ RangeReq g_rreq[RREQ_CAP];
+__device__ u32 g_rmade, g_rdone, g_rsnap; // requests made, completed, in the current launch
+__device__ u64 g_rpre[RREQ_CAP + 1];      // index prefix of the launch's requests
+
+__device__ u32 range_launch(u32 fid, u16 join, i64 lo, i64 hi, const u64 *ports, int n, u32 acc, u32 kind) {
+  u32 q = atomicAdd(&g_rmade, 1);
+  if (q - *(volatile u32 *)&g_rdone >= RREQ_CAP || n > RREQ_PORTS) {
+    g_abort(AB_BUCKET);
+    return 0;
+  }
+  RangeReq &r = g_rreq[q & (RREQ_CAP - 1)];
+  r.fid = fid;
+  r.rec = alloc_rec(join, 2u, 0u, 0u, NONE);
+  r.n = (u32)n;
+  r.acc = acc;
+  r.kind = kind;
+  r.sum = 0;
+  r.lo = lo;
+  r.hi = hi;
+  for (int k = 0; k < n; k++) r.ports[k] = ports[k];
+  return r.rec;
+}
+
+// Add a lane's partial sum into its request: once per warp when the warp's
+// lanes share the request, else per lane.
+__device__ inline void range_add(u32 q, unsigned long long part) {
+  const u32 lead = __shfl_sync(0xffffffffu, q, 0);
+  if (__all_sync(0xffffffffu, q == lead)) {
+    for (int d = 16; d > 0; d >>= 1) part += __shfl_down_sync(0xffffffffu, part, d);
+    if ((threadIdx.x & 31) == 0 && q != ~0u) atomicAdd(&g_rreq[(g_rdone + q) & (RREQ_CAP - 1)].sum, part);
+  } else if (q != ~0u && part) {
+    atomicAdd(&g_rreq[(g_rdone + q) & (RREQ_CAP - 1)].sum, part);
+  }
+}
+
+// The range phase: this lane's indices of every request in the launch.
+// Every lane of a warp runs the loop's end together (the warp reduction).
+__device__ void range_run() {
+  s_mode[threadIdx.x] = 0;
+  s_work[threadIdx.x] = 0;
+  const u32 nq = g_rsnap - g_rdone;
+  const u64 total = g_rpre[nq], nl = (u64)gridDim.x * blockDim.x;
+  u32 q = 0, held = ~0u; // held: the sum request `part` belongs to
+  unsigned long long part = 0;
+  for (u64 t = (u64)blockIdx.x * blockDim.x + threadIdx.x; t < total; t += nl) {
+    if (*(volatile u32 *)G.abortf) break;
+    while (t >= g_rpre[q + 1]) q++;
+    const RangeReq &r = g_rreq[(g_rdone + q) & (RREQ_CAP - 1)];
+    i64 v = prog_range_leaf(r.fid, r.lo + (i64)(t - g_rpre[q]), r.ports);
+    if (r.kind == RANGE_FILL) continue;
+    if (held != q && held != ~0u) {
+      atomicAdd(&g_rreq[(g_rdone + held) & (RREQ_CAP - 1)].sum, part);
+      part = 0;
+    }
+    held = q;
+    part += (unsigned long long)v;
+  }
+  range_add(held, part);
+}
+
+// After the barrier, on one lane: release each request's ports and deliver
+// its result.
+__device__ void publish_local();
+__device__ void range_done() {
+  s_mode[threadIdx.x] = 0;
+  s_fuel = G.fuel;
+  for (u32 q = g_rdone; q != g_rsnap; q++) {
+    const RangeReq &r = g_rreq[q & (RREQ_CAP - 1)];
+    u64 acc = r.ports[r.acc];
+    for (u32 k = 0; k < r.n; k++)
+      if (k != r.acc) free_val(r.ports[k]);
+    if (r.kind == RANGE_FILL) {
+      deliver(rec_addr(r.rec), acc);
+      deliver(rec_addr(r.rec) | 1ull, acc);
+    } else {
+      i64 sum = (i64)r.sum;
+      deliver(rec_addr(r.rec), num(r.kind == RANGE_SUM32 ? (sum & 0xffffffffll) : sum));
+      deliver(rec_addr(r.rec) | 1ull, acc);
+    }
+  }
+  publish_local();
+  g_rdone = g_rsnap;
+  g_rounds[6]++;
+}
+
 __device__ void publish_local() {
  u32 L=lane(), n=G.lsn[L];
  for (u32 i=0;i<n;i++) {
@@ -2349,6 +2547,20 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
           }
         }
       }
+      // pending range requests launch at once (they may be all that is left:
+      // the program waits on their joins)
+      u32 made = *(volatile u32 *)&g_rmade;
+      if (*(volatile u32 *)G.abortf == 0 && made != g_rdone) {
+        u64 at = 0;
+        for (u32 q = 0; q != made - g_rdone; q++) {
+          g_rpre[q] = at;
+          const RangeReq &rq = g_rreq[(g_rdone + q) & (RREQ_CAP - 1)];
+          at += (u64)(rq.hi - rq.lo);
+        }
+        g_rpre[made - g_rdone] = at;
+        g_rsnap = made;
+        g_phase = 4;
+      }
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
       if (g_phase == 2) for (int k = 0; k < 40; k++) g_whist[k] = 0;
       if (g_rounds[0] < LOGCAP) {
@@ -2361,6 +2573,13 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
     grid.sync();
     int ph = *(volatile int *)&g_phase;
     if (ph == 0 || ph == 3) return;
+    if (ph == 4) {
+      range_run();
+      grid.sync();
+      if (gid == 0) range_done();
+      grid.sync();
+      continue;
+    }
     long long c0 = clock64();
     if (ph == 1) {
       s_mode[threadIdx.x] = 0;

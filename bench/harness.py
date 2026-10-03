@@ -4,7 +4,7 @@
 For every benchmark ported under bench/ports/<name>.py this runs three CPU
 lanes (plus an optional GPU lane):
 
-  * C      : the C twin bench/ports/<name>.c, compiled with `gcc -O2 -lm`
+  * C      : the C twin bench/ports/<name>.c, the faster of `gcc -O3` and `clang -O3`
   * SEQ    : the Mithril program at `--threads 1`
   * PAR16  : the Mithril program at `--threads 16`
   * GPU    : `mithril run bench/ports/<name>.py --threads 16 --gpu`
@@ -209,15 +209,25 @@ def build_mithril_cli(gpu):
         sys.exit("[harness] mithril binary not found at %s" % MITHRIL_BIN)
 
 
-def compile_c(name, out_dir):
-    """gcc -O2 the C twin; return (binary or None, error)."""
+def compile_c(name, out_dir, timeout=1200):
+    """Build the C twin with gcc -O3 and clang -O3 (the default target, as the
+    Mithril build uses) and keep the faster binary; return (binary, label) or
+    (None, error)."""
     src = os.path.join(PORTS_DIR, name + ".c")
-    binary = os.path.join(out_dir, name + ".c.bin")
-    proc = subprocess.run(["gcc", "-O2", "-o", binary, src, "-lm"],
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
-        return None, "gcc -O2 failed: %s" % proc.stderr.strip()[:400]
-    return binary, None
+    best = None
+    errors = []
+    for cc in ("gcc", "clang"):
+        binary = os.path.join(out_dir, "%s.%s.bin" % (name, cc))
+        proc = subprocess.run([cc, "-O3", "-o", binary, src, "-lm"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            errors.append("%s -O3 failed: %s" % (cc, proc.stderr.strip()[:200]))
+            continue
+        r = run_once([binary], timeout)
+        if r["rc"] == 0 and not r["timeout"] and (best is None or r["wall"] < best[1]):
+            best = (binary, r["wall"], "%s -O3" % cc)
+    if best is None:
+        return None, "; ".join(errors) or "C twin failed to run"
+    return best[0], best[2]
 
 
 def compile_mithril(name, out_dir, timeout):
@@ -326,7 +336,7 @@ def write_results(rows, meta, args):
         "- gcc: %s" % meta["gcc"],
         "- Date: %s" % meta["date"],
         "",
-        "Lanes: `C` = C twin `gcc -O2`; `SEQ` = Mithril program at `--threads 1`; "
+        "Lanes: `C` = C twin, the faster of `gcc -O3` and `clang -O3` (default target, as Mithril's `rustc -O`); `SEQ` = Mithril program at `--threads 1`; "
         "`PAR16` = `--threads %d`. Mithril programs are built once with "
         "`mithril build` (the same pipeline `mithril run` uses; build time in "
         "notes, excluded from lane times). Times are wall-clock minimum of "
@@ -444,12 +454,13 @@ def main():
                    "build_error": None, "build_time": None}
 
             if name in c_twins and not args.skip_cpu:
-                binary, err = compile_c(name, tmpdir)
-                if err:
+                binary, info = compile_c(name, tmpdir, args.timeout)
+                if binary is None:
                     row["lanes"]["C"] = {"label": "C", "status": "FAILED", "time": None,
-                                         "runs": [], "notes": [], "error": err, "cmd": []}
+                                         "runs": [], "notes": [], "error": info, "cmd": []}
                 else:
                     row["lanes"]["C"] = run_lane("C", [binary], exp, args.n, args.timeout)
+                    row["lanes"]["C"].setdefault("notes", []).append(info)
             print("[harness]   C     : %s" % fmt_lane(row["lanes"].get("C")), flush=True)
 
             mbin, btime, berr = (None, 0.0, None) if args.skip_cpu else compile_mithril(name, tmpdir, args.timeout)

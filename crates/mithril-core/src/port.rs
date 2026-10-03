@@ -10,6 +10,16 @@ pub const I56_MAX: i64 = (1i64 << 55) - 1;
 /// Smallest value representable in the 56-bit two's-complement `int` type.
 pub const I56_MIN: i64 = -(1i64 << 55);
 
+/// Boxed ints alive (leak checks report it).
+pub static BIG_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The heap block of a `Big` integer (shared by every runtime on the CPU).
+#[repr(C)]
+pub struct BigBlock {
+    pub rc: std::sync::atomic::AtomicU64,
+    pub v: i64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Port(pub u64); // tag:8 (high) | payload:56 (low)
 
@@ -35,10 +45,14 @@ pub enum Tag {
     Kont = 13,
     /// Runtime only: an array block (a heap value the rules treat as opaque).
     Arr = 14,
+    /// An integer outside the inline 56-bit range: a shared heap block
+    /// `[refcount, value]` (see `Port::int`). Duplication shares it,
+    /// erasure releases it.
+    Big = 15,
     /// Runtime only: any other value form (an unboxed constructor rides
     /// tag bits 16.. with the field in the payload). The rules never
     /// inspect it; the program copies/erases/matches it.
-    Other = 15,
+    Other = 16,
 }
 
 impl Tag {
@@ -59,6 +73,7 @@ impl Tag {
             12 => Tag::Ext,
             13 => Tag::Kont,
             14 => Tag::Arr,
+            15 => Tag::Big,
             _ => Tag::Other,
         }
     }
@@ -86,6 +101,47 @@ impl Port {
             panic!("num({}) out of i56 range [{}, {}]", v, I56_MIN, I56_MAX);
         }
         Port::new(Tag::Num, (v as u64) & MASK56)
+    }
+
+    /// An integer as a port: inline when it fits 56 bits, else boxed.
+    pub fn int(v: i64) -> Port {
+        if (I56_MIN..=I56_MAX).contains(&v) {
+            Port::new(Tag::Num, (v as u64) & MASK56)
+        } else {
+            Port::big(v)
+        }
+    }
+
+    #[cold]
+    fn big(v: i64) -> Port {
+        BIG_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let b = Box::into_raw(Box::new(BigBlock { rc: std::sync::atomic::AtomicU64::new(1), v }));
+        Port::new(Tag::Big, b as u64)
+    }
+
+    /// The integer a `Num` or `Big` port holds.
+    pub fn int_value(self) -> i64 {
+        match self.tag() {
+            // SAFETY: a Big payload is a live block (its holder owns a reference)
+            Tag::Big => unsafe { (*(self.payload() as *const BigBlock)).v },
+            _ => self.as_i64(),
+        }
+    }
+
+    /// One more reference to a `Big` block.
+    pub fn big_share(self) {
+        // SAFETY: as int_value
+        unsafe { (*(self.payload() as *const BigBlock)).rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+    }
+
+    /// Drop a reference to a `Big` block, freeing it with the last one.
+    pub fn big_release(self) {
+        let b = self.payload() as *mut BigBlock;
+        // SAFETY: as int_value; the last reference frees the block once
+        if unsafe { (*b).rc.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) } == 1 {
+            drop(unsafe { Box::from_raw(b) });
+            BIG_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Decode this port's payload as a sign-extended 56-bit integer.

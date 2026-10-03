@@ -123,8 +123,8 @@ unrolling are not passes. They are the rules firing early, on redexes
 that do not depend on runtime input. `mithril net f.py` prints what
 reduction did per function (rewrites, calls kept, ops kept, calls
 evaluated, size before and after). `MITHRIL_NET_CORE=1` dumps the bodies.
-The reduction of each function runs under 2^20 rewrites (`REDUCE_FUEL`
-in the CLI); running out is an internal error.
+The reduction of each function runs under 2^20 rewrites (`REDUCE_FUEL`,
+exported by `mithril-net`); running out is an internal error.
 
 A function is specialized as follows.
 
@@ -154,6 +154,12 @@ constructor condition. Budgets: 50,000 rewrites per top-level attempt,
 shared by everything nested in it; 400,000 speculative rewrites per
 function (each top-level attempt is also charged the cells it cloned);
 nesting depth 256. A failed attempt is memoized by (callee, which arguments are known).
+A static evaluation that does not finish is charged to the same
+per-function budget, and once the budget is spent the remaining calls with
+known arguments are kept as calls. Without the charge, `graph_dfs` before
+its loop split unrolled `run(600)` and retried a 200,000-rewrite
+evaluation of `build` and `comps` per iteration: 158 s to specialize,
+against 3.7 s with it (`specialize_test::failed_static_evaluations_...`).
 The growth ceiling is inherited by nested attempts, so a 300-iteration
 chain stops at the ceiling. Inside a speculation only the branches the
 speculated body parked are instantiated, and the first new residual call
@@ -218,6 +224,25 @@ A residual `Lam` reads as `Core::Lam` with its own frame. A parked `App`
 on an unknown function reads as `App`. The reader un-superposes lazily
 copied closures by selecting sides per copy label, with superpositions
 classified to a fixpoint.
+
+### 3.3.1 Read order that exposes forks
+
+The net has no order between independent redexes; the readback picks one.
+A call read back before a test that does not read its result makes the code
+after the call wait for it, even when an arm of the test holds a second,
+independent call. `expose.rs` reads such a region with the test first: the
+lets between the call and the test (none reading the call) come first, then
+the test, and the call is bound inside each arm that reads its result. An arm
+that does not read it gets no binding, as the net erases a call whose result
+is unused. Each path evaluates the call at most once. The rewrite applies
+only where an arm then holds a call independent of the moved one, which is
+what lets the frame split (section 5.3) fork it.
+
+subsetsum's `count` (`skip = count(..)`, then `if w > room: return skip`,
+then `take = count(..)`) never forked: every suspension saved one
+continuation, and the CPU engine ran 362 waves of one task each. Read with
+the test first, both calls of the full arm are independent: 16 threads went
+from 1.11 s to 0.31 s (C 0.55 s), the same checksum.
 
 ### 3.4 Closures and runtime sharing
 
@@ -366,7 +391,7 @@ From the result, codegen reads two more facts per function:
   int in one place, a tuple, float or constructor in another). Its
   function gets no native form (section 5.2).
 
-Ints are i56, canonical in a 64-bit word. Floats are boxed f64 cells or
+Ints are 64-bit and wrap at 2^64. Floats are boxed f64 cells or
 binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
 definition shared by the oracle and the reducer.
 
@@ -403,8 +428,8 @@ local closure gives a fresh type.
   shapes. A function, field or slot has one type; a helper used at int
   and at f32 is an error, not a retyping. Integer operators on f32 are
   errors.
-* `f32(n)` rounds correctly for every i56 and `int(x)` truncates toward
-  zero, exactly below 2^55 (NaN and larger magnitudes give 0). Both are
+* `f32(n)` rounds correctly for every int and `int(x)` truncates toward
+  zero, exactly below 2^63 (NaN and larger magnitudes give 0). Both are
   helpers written in the language, so a constant argument folds by the
   rules.
 * A destructuring `a, b, ... = e` checks that `e` is a tuple of that
@@ -414,13 +439,22 @@ local closure gives a fresh type.
 
 ### 4.2 Representation
 
-* Unary constructors over an int (`Leaf(v)`) are unboxed: they ride in
-  the port word, no cell.
+* A port carries an int inline (`Tag::Num`) when it fits 56 bits. A
+  larger one is a refcounted box (`Tag::Big`: `BigBlock {rc, v}` on the
+  CPU, a one-element heap block on the device), shared by DUP and
+  released by ERA like an array. Native code holds plain i64 and boxes
+  only where a value leaves through a port. Dive code keeps a proven-small
+  int (range analysis, `range.rs`) as an immediate with no ownership; any
+  other int is an owned value, and arithmetic on int operands runs in
+  registers, so an intermediate past 56 bits (an LCG step before its
+  mask) is never boxed.
+* Unary constructors over an int (`Leaf(v)`) are unboxed when every
+  construction is proven small: they ride in the port word, no cell.
 * Arrays are heap blocks `[count, len | flags, elems]` with value
   semantics, written in place when unique. `Arr(true)` (element type
   resolved to `Int`) gives tag-free reads and writes that free no old
   element; the `boxed` flag lets drop and copy skip element scans. Int
-  arrays store the pre-shifted word (`ARR_RAW`).
+  arrays store plain i64 words (`ARR_RAW`).
 * A type never shared anywhere in the program is linear (`LIN`) and
   carries no count traffic.
 
@@ -552,18 +586,30 @@ Each function is emitted in the forms its uses need.
   id in an inner scope). The dive bridge unpacks and packs nested tuple
   cells. `MITHRIL_WHY_BOXED=1` prints why each function has no native
   form.
+* **Physical frames for native recursion.** On the device a lane's stack is
+  small, so a recursive call component of native functions runs as one
+  dispatch loop over explicit frames (`native.rs`). A CPU thread's stack
+  holds the recursion directly (1 GB on the main thread, 16 MB per worker),
+  so Rust emission keeps the plain recursive calls: the same logical calls
+  and returns, with no frame traffic. The loop was added for the device's
+  symreg fix and cost the CPU about 3.5x instructions there; with plain
+  recursion subsetsum's 1-thread time went from 1.52 s to 1.08 s, and 16
+  threads (with 3.3.1) to 0.23 s.
 * **Bounded functions**: a function on no call cycle, or with a native
   scalar form, cannot run out of budget, so it is a plain call with no
   capture.
 
-The native int representation is chosen per function. Plain holds the
-canonical i56 in an i64 and re-wraps an op whose range is not proven with
-two shifts; masked 32-bit arithmetic runs in u32. Pre-shifted holds
-`x << 8`, where i64 wrapping is i56 wrapping, so add, sub, compare and
-min need no wrap; a var-by-var multiply, a right shift, an array index
-and division cost one op. Each function takes the representation with
-the lower static op count, charging conversions on call edges to
-functions of the other representation, so a recursive pair never splits.
+Native code holds ints as plain i64: the machine's wrapping arithmetic is
+the semantics, so no op needs a fix-up, and masked 32-bit arithmetic runs
+in u32. Int arrays store the same words, so a load or store converts
+nothing. Against the 56-bit form with a per-function pre-shifted variant
+(1 thread, best of 3): heat2d 1.52 to 1.15 s, histogram 1.34 to 0.97 s,
+knapsack 0.60 to 0.52 s, collatz 0.36 to 0.28 s; kdtree, msort and the
+16-thread and device lanes are unchanged within noise except subsetsum
+(0.78 to 0.82 s: LLVM compiles the plain form of `count` to 19.73 G
+instructions against 18.95 G for the shifted one) and kdtree on the
+device (1.23 to 1.32 s: ints read from constructor fields and parameters
+have no range fact, so dive code treats them as possibly boxed).
 The worker context is passed only to native functions that touch arrays.
 
 Two static emission rules follow measurements on hand-edited generated
@@ -593,7 +639,6 @@ on the tree at the time it was adopted:
 | static uniqueness | bfs to 5.19 / 0.52 s |
 | leaf budget at the call site | bfs to 4.85 / 0.48 s |
 | selects as mask arithmetic | bfs to 4.48 / 0.45 s |
-| pre-shifted int representation | editdist SEQ 4.05 s to 2.80 s |
 | length locals | editdist SEQ 2.80 s to 2.27 s |
 | tuples used whole, nested tuples | Cornell Whitted 512 x 512, CPU t16 0.33 s to 0.077 s, device 1.25 s (after the readback fix) to 0.145 s |
 
@@ -711,6 +756,87 @@ the measured budget per iteration (`FOLD_EST_<f>`, taken when a chunk's
 dive runs out of budget; 1 until then). A join rule combines the two
 partial results in order.
 
+A fold helper whose body has a native signature keeps its native loop.
+The split sits in its bridge (`d_<f>`): a range larger than the budget
+forks there, and a range within it runs as one native loop. Only the
+fold's callers are forced into dive form, so every call reaches the
+bridge. Before, the helper itself dived, paying the dive's per-iteration
+budget check and a boxed accumulator: histogram (8-tuple accumulator,
+2^29 keys) took 19.25 s at 1 thread against 0.38 s for its C twin; with
+the native chunk loop, 1.31 s at 1 thread and 0.16 s at 16. The spawned
+halves own their arguments, so a parameter the caller lends (`bor`) is
+given a reference for the left half as well as a copy for the right. The
+dive form had the same omission: lockless/histogram crashed at budgets of
+2, 7 and 64 in the reference build (`codegen_test::proven_folds_keep_...`,
+fixture `fold_borrowed_extra.py`).
+
+### 5.6.0 Index fills
+
+A `for` loop whose last statement is `a = array_set(a, i, e)` is an index fill
+when the index is the loop variable (or the variable plus or minus a value
+the body does not assign, which `range(lo, hi)` produces), the statements
+before it assign fresh locals, and nothing in the body reads `a` or reads a
+local before assigning it. Each iteration then writes `e` at its own index,
+and no `e` sees another iteration's write. `mithril-reassoc` marks such a
+loop `Combiner::Fill`; the Lean lemma `fill_chunks`, emitted with the fold
+obligations and checked by `lean`, states that a loop writing `f j` at each
+index `j` of a list leaves the same array for any list with the same
+indices, so chunks may write one buffer in any order or interleaving.
+
+A fill runs on the fold machinery (5.6): the bridge measures, splits the
+range by work and runs each chunk as a native loop. The accumulator is the
+array: the bridge (and the dive form's entry) makes it unique (`arr_own`)
+before the first split, the right half receives the same buffer without a
+reference count, and the join returns the left half's array. Measured
+(1 thread / 16 threads, seconds; C 0.52): heat2d 1.40 / 1.40 before,
+1.51 / 0.44 after, matching a hand-parallelized edit of the generated code
+(0.36 at 8 threads). knapsack's row fill (100,001 cheap writes per row)
+does not gain: each split level and join is a wave of the CPU engine
+(section 6), about 16 us, against 70 us of work per row (open item 18).
+
+On the device a fill or an int sum (a proven wrapping add, mod 2^64 or
+2^32) whose range carries more than 2^16 work units runs as a range launch
+instead of chunk tasks (`fold::range_snippet`, engine.cu "range
+launches"). The bridge records a request (its argument ports, each
+owned by the request: a borrowed one is shared, an owned one moves) and
+suspends to a record of the fill's join rule. At the next round boundary
+the driver runs a range phase inside `k_run`: every lane of the grid takes
+indices, thread `t` running the fill's own native loop over `[lo + t,
+lo + t + 1)`, so a warp's loads and stores are contiguous; after one grid
+barrier, lane 0 releases each request's ports and delivers its buffer to
+both slots of the join. It is `fill_chunks` with chunks of one index, and
+the leaf is the same native code the CPU runs. A sum's leaf starts each
+index's term from the identity; a lane adds its terms, a warp adds its
+lanes' partials with shuffles, and one atomic per warp adds into the
+request. The completion delivers the sum (masked for mod 2^32) and the
+fold's incoming accumulator to the join's two slots. The order of terms
+is arbitrary, so the Lean obligations state commutativity (`comm_`)
+beside associativity and identity. collatz (3 M sums of a data-dependent
+loop): 550 ms on 32 chunk lanes to 0.5 ms. Chunk tasks were the wrong
+shape for the device: a lane runs a chunk as scalar code over a contiguous
+range, so a warp's 32 accesses touch 32 lines, and the binary split costs
+one scheduler round (about 68 us) per level. heat2d on the device
+(1024 x 1024, 500 steps): timeout at 150 s with the fill on one lane, 2.78 s
+with width-sized chunks on idle lanes, 63 ms with range launches (C 0.53 s;
+the generated `cell` code alone as a standalone kernel: 4.2 ms).
+
+A fresh int array whose one use is the buffer of a proven fill that starts
+at 0, is bounded by the array's length (the same pure expression) and
+writes at its counter is allocated without its initial value
+(`uninit_lets`, `arr_new_raw_uninit`): the fill writes every element before
+anything reads the array, so the value is never observed. A near miss (a
+shorter bound, a counter from 1, a shifted index, a read before the fill)
+keeps it. On the device the initial write was the whole cost left: one lane
+zeroing 1 M words per heat2d step took 2.5 s of 2.55 s, and 4.6 s of
+knapsack's 4.7 s. On the CPU: heat2d 16 threads 0.41 to 0.25 s, knapsack
+1 thread 0.52 to 0.45 s.
+
+A native function whose calls reach a proven fold has two forms: its
+native form, which native callers use (the fold's loop then runs whole),
+and a dive form, which dive callers use and whose calls reach the fold's
+bridge and its split. Both forms, and the fold's bridge, can suspend, so
+they are not in the bounded set a dive caller may call without a capture.
+
 ### 5.6.1 Independent loop iterations
 
 A `for` loop that ends in `s = E(s, ..)`, whose other work never reads or
@@ -722,6 +848,18 @@ result is the sequential one. A loop is not split when its function is
 already reached from parallel work: a split loop's work, a proven fold's
 body, or a function that calls itself twice on one path.
 
+A split costs a leaf constructor and an apply step per iteration, which
+only pays when the work can grow. The interaction rules decide that: the
+module is specialized (section 3.2), and a loop splits only when its work
+calls a function whose residual reaches a call cycle (a loop or recursion
+the rules did not unfold) or applies a closure. Work the rules reduce to
+plain operations stays one native loop. This reduction runs only when
+some loop is a split candidate. Measured (C twin / 1 thread before /
+after): knapsack 0.35 / 15.08 / 0.57 s, heat2d 0.53 / 9.98 / 1.41 s. The
+cornell tracers keep their splits, because `pixel` reaches the recursive
+`trace`. Cheap loops kept whole run on one core; splitting them in
+chunks is an open item (section 12).
+
 The apply walk is native code: the scalar lowering accepts constructor
 values and a `match` on them in tail position (tag dispatch). A value the
 dive side lends is read in place (`PTy::H`); an owned one has exactly one
@@ -730,6 +868,21 @@ path tracer CPU 1.61 s at 1 thread, 0.168 s at 16; GPU 0.27 s (the
 hand-split tree form: 0.20 s). Whitted GPU 0.51 s against 0.19 s for the
 tree form: the in-order apply is one serial chain on one GPU thread
 (about 1.2 us per pixel).
+
+### 5.6.2 Ownership rules found by the fill work
+
+* A self call that passes, in a lent parameter slot, a value of no lent
+  origin (a loop carrying a fresh array) makes that slot hold values the
+  function owns; the slot is not lent (`escape_mask`). Before, `run`'s loop
+  in heat2d leaked one grid per step once it ran in dive form.
+* A suspension in a rule-form segment releases what the abandoned frame
+  still owns after its records took their references, as the dive capture
+  does (`Ex::release_abandoned`). Before, a segment that suspended at a call
+  while an array was still live leaked one reference.
+
+Fixtures `fill_loops.py` (fills, a fill into a shared array, near misses)
+and `fold_borrowed_extra.py` check oracle equality and `arrays_live=0` at
+1 to 16 threads and budgets of 1 to 64.
 
 ### 5.7 Core rewrites owned by codegen
 
@@ -832,8 +985,8 @@ arenas, launches, waits and reports.
 ### 7.1 Cost model
 
 A lane's step is expensive. A synthetic fire (about 24 cell allocations,
-24 frees, 31 reads, a record, a spawn and a delivery; `bench/gpu/fire_cost.cu`
-with the real engine) costs about 30,000 cycles on one thread and about
+24 frees, 31 reads, a record, a spawn and a delivery, measured with the real
+engine) costs about 30,000 cycles on one thread and about
 560,000 cycles per thread with the full grid of 65,536 threads (memory
 round trips: 80 cycles per cell read, 300 to 1,000 per allocation). The
 model that holds:
@@ -858,7 +1011,11 @@ A round (the phase structure was adopted earlier; section 14):
   total pending count). Each forkable rule keeps its largest ready count
   seen in this GROW episode. Newly pushed tasks are traced separately.
 * **GROW** while some pending task can fork, the frontier is narrower
-  than the grow width (default: the lane count, `MITHRIL_GPU_GROW_WIDTH`),
+  than the grow width (default: 16 tasks per lane, at most a quarter of a
+  rule's ring since a sweep can double the frontier;
+  `MITHRIL_GPU_GROW_WIDTH`; tasks are claimed as lanes finish, and subtree
+  sizes vary: subsetsum's largest of 56,712 native tasks took 10x the mean,
+  444 ms at one task per lane, 103 ms at 16),
   and at least one forkable rule's ready count exceeds its episode's
   high-water mark. A newly ready rule can grow even when the total count
   contracts or stays unchanged. Replacements and oscillation cannot keep
@@ -876,7 +1033,16 @@ A round (the phase structure was adopted earlier; section 14):
   **sequential world**, with the dive budget. After a number of fires
   (`MITHRIL_GPU_WORK_STEPS`, default 2^30) a lane hands its remaining
   tasks back to the global rings.
-* The run ends when nothing is pending or the run aborted.
+* **RANGE** before either, whenever range requests are pending (even with
+  no task pending: the program may be waiting on their joins). Every lane
+  takes indices of the requests in the launch, then one barrier, then
+  lane 0 completes them (section 5.6.0).
+* The run ends when nothing is pending or the run aborted. (Ending once
+  the root holds its result and only erasure is pending saved msort 0.7 s
+  of freeing after its result, but erasure that completes is a property
+  the device tests check; keeping the spill on the lane cut msort's rounds
+  from 15,919 to 34 without saving time: the freeing itself is the cost.
+  Neither is adopted.)
 
 Making every call a task (no cuts) doubles the frontier exactly but
 costs a sequential chain one round per step: 100,000 steps took 100,001
@@ -1049,15 +1215,19 @@ elements in place; ownership and ERA semantics are identical.
 | task rings | one ring per rule, a power of two | 2^27 / rules entries, clamped to [2^14, 2^21] (`MITHRIL_GPU_BUCKET`) |
 | lane stacks | 64 tasks per lane, overflow to the global rings | fixed |
 | net worklists | 64 redex pairs per lane, spill to the program's net rule | fixed |
-| array heap | blocks in size classes, 8 per octave (a block is at most 1/8 larger than its array, minimum 8 words); per-lane intrusive free list per class (link in word 0, class in word 1 bits 48 to 55); global bump | a third of the budget, clamped to [2^20, 2^32] words (`MITHRIL_GPU_HEAP`) |
+| array heap | blocks in size classes, 8 per octave (a block is at most 1/8 larger than its array, minimum 8 words); per-lane intrusive free list per class (link in word 0, class in word 1 bits 48 to 55); blocks of 4096 words and more on a shared per-class stack instead (one CAS, ABA-tagged head); global bump | a third of the budget, clamped to [2^20, 2^32] words (`MITHRIL_GPU_HEAP`) |
 
 The budget is free VRAM at start, less the fixed buffers, less the
 driver's stack reserve for all resident threads (SMs x threads per SM x
 the stack size), less 1 GiB of slack.
 
-No free path takes an atomic. A bump-only heap leaked every array block;
-bfs and terrain exhausted it at the big size and run (255 ms, 296 ms)
-with the free lists. Heap words 0 and 1 are an empty array that is never
+No free path takes an atomic below 4096 words. A bump-only heap leaked
+every array block; bfs and terrain exhausted it at the big size and run
+(255 ms, 296 ms) with the free lists. Per-lane lists alone stranded large
+blocks: the lane that frees a DP row (the last of its fill's chunks) is
+rarely the lane that allocates the next (the loop's continuation), so
+knapsack ran out of heap with 106 K words live of 724 M allocated; the
+shared stack for large blocks reuses them. Heap words 0 and 1 are an empty array that is never
 freed: an allocation that aborts on a full heap returns it, so no caller
 writes past the heap.
 
@@ -1171,6 +1341,10 @@ what is checked and what is only claimed:
 | lockless protocols (CPU runtime): a join record fires once and sees every argument; a wave entry is claimed once; a refcounted cell or array is torn down once, after every other owner's reads | **model-checked** | loom over the functions the runtime calls (`mithril-rt/src/sync.rs`), every interleaving and C11 ordering: `cargo test -p mithril-rt --features loom --release --test loom_test`. It found two orderings that let a cell's last owner free or reuse it before another owner's read was ordered before it (a stale or reused value, not undefined behaviour, since cells are atomics): the release was `Release` only, and the unique-owner check a `Relaxed` load. The release is `AcqRel` and the check `Acquire` |
 | the device rule table equals `mithril_core::rules` | **claimed**, checked by tests only | two implementations held together by the oracle |
 | lowering preserves meaning | **claimed**, checked by tests only | oracle equality of generated code |
+
+`mithril oracle` interprets the parsed source directly: no fold
+detection, no loop split and no compile-time reduction run before it, so
+it checks those passes instead of sharing their output.
 
 The oracle agrees with the net, not the other way round: an unused
 binding is never evaluated. `eval_core` skips a `Let` whose variable is
@@ -1403,6 +1577,17 @@ Constraint and proofs:
     tunables with their evidence.
 16. Lean proof of confluence: the pure core is proved (section 8); the extensions (section 8, `proofs/confluence/README.md`) and the conformance link from `mithril_core::rules` to the Lean model are not.
 17. One rule-table source for the CPU and the device: not started.
+18. Split granularity across backends. A fold or fill splits while its
+    estimated work exceeds the budget, and neither backend tells the split
+    whether workers are idle. On the CPU every split level and join is a
+    wave (about 16 us), so short parallel regions repeated in a sequential
+    loop lose: knapsack's 8,000 rows of 70 us each run at 0.70 s on 16
+    threads against 0.59 s on 1. On the device the split compares against
+    the phase budget, which in a work phase is large, so a fill reached
+    from a sequential loop runs whole on one lane: heat2d 278 s, knapsack
+    160 s. terrain's native fold reaches 1,024 chunks against 16,384 for
+    the dive form (1.34 s against 0.29 s). One rule for both, tied to idle
+    capacity rather than to the budget, is the next step.
 
 Measurement:
 

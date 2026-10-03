@@ -369,15 +369,16 @@ fn import_statement_is_diag_naming_import() {
 
 #[test]
 fn int_literal_out_of_range_is_diag() {
-    // 2**60 written as a decimal literal, out of i56 range.
-    let d = err("def f():\n    x = 1152921504606846976\n    return x\n");
+    // 2**70 written as a decimal literal, out of i64 range.
+    let d = err("def f():\n    x = 1180591620717411303424\n    return x\n");
     assert_eq!(d.msg, "int literal out of range");
 }
 
 #[test]
-fn i56_max_literal_is_ok_but_one_more_overflows() {
-    ok("def f():\n    x = 36028797018963967\n    return x\n"); // 2**55 - 1
-    let d = err("def f():\n    x = 36028797018963968\n    return x\n"); // 2**55
+fn i64_max_literal_is_ok_but_one_more_overflows() {
+    ok("def f():\n    x = 36028797018963968\n    return x\n"); // 2**55: past the inline form, still an int
+    ok("def f():\n    x = 9223372036854775807\n    return x\n"); // 2**63 - 1
+    let d = err("def f():\n    x = 9223372036854775808\n    return x\n"); // 2**63
     assert_eq!(d.msg, "int literal out of range");
 }
 
@@ -394,9 +395,11 @@ fn unknown_construct_still_reports_a_line() {
 }
 
 #[test]
-fn hex_literal_past_the_i56_range_is_rejected_not_wrapped() {
+fn hex_literal_past_the_i64_range_is_rejected_not_wrapped() {
     assert!(err("def f():\n    return 0xFFFFFFFFFFFFFFFF\n").msg.contains("out of range"));
-    assert!(err("def f():\n    return 0x80000000000000\n").msg.contains("out of range"));
-    let m = ok("def f():\n    return 0x7FFFFFFFFFFFFF\n");
-    assert_eq!(m.fns[0].body[0], Stmt::Return(Expr::Int(0x7FFFFFFFFFFFFF)));
+    assert!(err("def f():\n    return 0x8000000000000000\n").msg.contains("out of range"));
+    let m = ok("def f():\n    return 0x7FFFFFFFFFFFFFFF\n");
+    assert_eq!(m.fns[0].body[0], Stmt::Return(Expr::Int(0x7FFFFFFFFFFFFFFF)));
+    let m = ok("def f():\n    return 0x80000000000000\n");
+    assert_eq!(m.fns[0].body[0], Stmt::Return(Expr::Int(0x80000000000000)));
 }
