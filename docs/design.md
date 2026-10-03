@@ -787,6 +787,14 @@ obligations and checked by `lean`, states that a loop writing `f j` at each
 index `j` of a list leaves the same array for any list with the same
 indices, so chunks may write one buffer in any order or interleaving.
 
+A row-major nested fill, `for y in range(n): for x in range(m): ...;
+a = array_set(a, y * m + x, e)` with `m` the same for every row, writes the
+indices 0 to n * m - 1 in order. `mithril-reassoc` rewrites it as one loop
+`for c in range(n * m if n > 0 else 0)` that sets `y = c // m` and
+`x = c % m` before the body and writes at `c`: the same writes in the same
+order, and the flat loop is an index fill. The rewrite applies only when
+`y` and `x` are read nowhere outside the two loops.
+
 A fill runs on the fold machinery (5.6): the bridge measures, splits the
 range by work and runs each chunk as a native loop. The accumulator is the
 array: the bridge (and the dive form's entry) makes it unique (`arr_own`)

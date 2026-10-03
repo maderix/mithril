@@ -643,3 +643,69 @@ fn index_fills_preserve_sequential_semantics() {
     let lean = lean_obligations(&analyzed(src).1);
     assert!(lean.contains("theorem fill_chunks"), "fill lemma not emitted");
 }
+
+// ---- row-major nested fills ----
+
+/// The top-level loop of `func` after analysis: (variable, fold).
+fn top_loop(m: &Module, func: &str) -> (String, Option<FoldInfo>) {
+    let f = m.fns.iter().find(|f| f.name == func).unwrap();
+    f.body.iter().find_map(|s| match s { Stmt::For(v, _, _, fold) => Some((v.clone(), fold.clone())), _ => None }).unwrap()
+}
+
+fn collapsed(src: &str) -> bool {
+    let (m, _) = analyzed(src);
+    let (v, fold) = top_loop(&m, "f");
+    let flat = v.starts_with("__cell");
+    assert_eq!(flat, fold == Some(FoldInfo { combiner: Combiner::Fill, proven: true }), "a collapsed loop is a fill, a kept one is not");
+    flat
+}
+
+fn nested(index: &str, inner: &str, value: &str) -> String {
+    format!("def f(n, m):\n    a = array_new(n * m, 0)\n    for y in range(n):\n        for x in range({inner}):\n            a = array_set(a, {index}, {value})\n    return a\n")
+}
+
+#[test]
+fn row_major_nested_fills_collapse_to_one_fill() {
+    for index in ["y * m + x", "m * y + x", "x + y * m", "x + m * y"] {
+        assert!(collapsed(&nested(index, "m", "x * 3 + y")), "{index}");
+    }
+    // locals before the write, a constant row length, other arrays read
+    assert!(collapsed("def f(g, n):\n    a = array_new(n * 8, 0)\n    for y in range(n):\n        for x in range(8):\n            t = array_get(g, x) * y\n            a = array_set(a, y * 8 + x, t + 1)\n    return a\n"));
+    // inside a branch
+    let (m, _) = analyzed("def f(n, m, c):\n    a = array_new(n * m, 0)\n    if c > 0:\n        for y in range(n):\n            for x in range(m):\n                a = array_set(a, y * m + x, x)\n    return a\n");
+    let Stmt::If(_, then, _) = &m.fns[0].body[1] else { panic!("no branch") };
+    assert!(then.iter().any(|s| matches!(s, Stmt::For(v, _, _, Some(_)) if v.starts_with("__cell"))));
+}
+
+#[test]
+fn near_miss_nested_fills_stay_nested() {
+    // the multiplier is not the row length, or the index is not y * m + x
+    assert!(!collapsed(&nested("y * n + x", "m", "x")));
+    assert!(!collapsed(&nested("y * m + x + 1", "m", "x")));
+    assert!(!collapsed(&nested("y * m + y", "m", "x")));
+    assert!(!collapsed(&nested("x * m + y", "m", "x")));
+    // the row length differs between rows
+    assert!(!collapsed(&nested("y * (m + y) + x", "m + y", "x")));
+    // the value reads the array (not a fill)
+    assert!(!collapsed(&nested("y * m + x", "m", "array_get(a, 0)")));
+    // the row length is assigned in the body
+    assert!(!collapsed("def f(n, m):\n    a = array_new(n * m, 0)\n    for y in range(n):\n        for x in range(m):\n            m = m + 0\n            a = array_set(a, y * m + x, x)\n    return a\n"));
+    // the outer body does more than the inner loop
+    assert!(!collapsed("def f(n, m):\n    a = array_new(n * m, 0)\n    s = 0\n    for y in range(n):\n        s = s + y\n        for x in range(m):\n            a = array_set(a, y * m + x, x)\n    return a\n"));
+    // y or x read after the loops (their final values differ when a row is empty)
+    assert!(!collapsed("def f(n, m):\n    a = array_new(n * m, 0)\n    for y in range(n):\n        for x in range(m):\n            a = array_set(a, y * m + x, x)\n    return (a, y)\n"));
+    assert!(!collapsed("def f(n, m):\n    a = array_new(n * m, 0)\n    for y in range(n):\n        for x in range(m):\n            a = array_set(a, y * m + x, x)\n    return (a, x)\n"));
+}
+
+#[test]
+fn collapsed_fills_preserve_sequential_semantics() {
+    // every sign of each bound: a negative or empty dimension writes nothing
+    let src = "def f(n, m, size):\n    a = array_new(size, 5)\n    for y in range(n):\n        for x in range(m):\n            t = x * 31 + y\n            a = array_set(a, y * m + x, t * t + 1)\n    return a\n\ndef sum(a):\n    s = 0\n    for i in range(array_len(a)):\n        s = s * 7 + array_get(a, i)\n    return s\n\ndef main():\n    r = (sum(f(3, 4, 12)), sum(f(5, 1, 5)), sum(f(1, 6, 6)), sum(f(0, 4, 3)), sum(f(3, 0, 3)), sum(f(-2, -3, 3)), sum(f(3, -1, 3)), sum(f(-1, 3, 3)))\n    return r\n";
+    let (m, _) = analyzed(src);
+    assert!(top_loop(&m, "f").0.starts_with("__cell"));
+    let cm: CoreModule = desugar(&m).unwrap();
+    let plain = desugar(&mithril_front::parse(src).unwrap()).unwrap();
+    let got = format!("{:?}", eval_core(&cm, cm.main, &[]));
+    assert_eq!(got, format!("{:?}", eval_core(&plain, plain.main, &[])));
+}
+

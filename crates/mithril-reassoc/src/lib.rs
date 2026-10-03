@@ -19,7 +19,8 @@ pub mod split;
 pub use lean::lean_obligations;
 
 use detect::{detect, is_componentwise_add, prove, step_from_expr, step_from_fn, uses_var, Cand, Step};
-use mithril_front::ast::{BinOp, Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
+use mithril_front::ast::{BinOp, CmpOp, Combiner, Expr, FnDef, FoldInfo, Module, Stmt};
+use mithril_front::desugar::assigned_names;
 use std::collections::HashMap;
 
 /// One analyzed `for` loop. For loops that are not accumulation-shaped at
@@ -49,6 +50,11 @@ enum Init {
 
 /// Analyze every function's `for` loops; mark proven folds in place.
 pub fn analyze(m: &mut Module) -> Vec<FoldReport> {
+    for f in &mut m.fns {
+        let whole = f.body.clone();
+        let mut fresh = 0;
+        f.body = collapse_block(std::mem::take(&mut f.body), &whole, &mut fresh);
+    }
     let fns: HashMap<String, FnDef> = m.fns.iter().map(|f| (f.name.clone(), f.clone())).collect();
     let mut out = Vec::new();
     for f in &mut m.fns {
@@ -136,6 +142,88 @@ fn walk_block(
             }
         }
     }
+}
+
+/// Collapse every row-major nested fill in `stmts` (see `collapse`).
+fn collapse_block(stmts: Vec<Stmt>, whole: &[Stmt], fresh: &mut usize) -> Vec<Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for st in stmts {
+        let st = match st {
+            Stmt::If(c, a, b) => Stmt::If(c, collapse_block(a, whole, fresh), collapse_block(b, whole, fresh)),
+            Stmt::While(c, b) => Stmt::While(c, collapse_block(b, whole, fresh)),
+            Stmt::Match(e, arms) => Stmt::Match(e, arms.into_iter().map(|(p, b)| (p, collapse_block(b, whole, fresh))).collect()),
+            Stmt::For(v, n, b, fold) => match collapse(&v, &n, &b, whole, *fresh) {
+                Some(flat) => {
+                    *fresh += 1;
+                    out.extend(flat);
+                    continue;
+                }
+                None => Stmt::For(v, n, collapse_block(b, whole, fresh), fold),
+            },
+            st => st,
+        };
+        out.push(st);
+    }
+    out
+}
+
+/// A row-major nested fill as one index fill. `for y in range(n): for x in
+/// range(m): ...; a = array_set(a, y * m + x, e)` writes the indices 0 to
+/// n * m - 1 in order, exactly as `for i in range(n * m): y = i // m;
+/// x = i % m; ...; a = array_set(a, i, e)` does, and the flat loop is an index
+/// fill when its body is one (`fill_target`). `m` must be the same for every
+/// row, and `y` and `x` unread outside the loops (their values after an empty
+/// row differ). `whole` is the function body, `k` numbers the fresh names.
+fn collapse(y: &str, n: &Expr, outer: &[Stmt], whole: &[Stmt], k: usize) -> Option<Vec<Stmt>> {
+    let [Stmt::For(x, m, inner, None)] = outer else { return None };
+    let (Stmt::Assign(a, Expr::Call(f, args)), work) = inner.split_last()? else { return None };
+    if f != "array_set" || args.len() != 3 || x == y {
+        return None;
+    }
+    let is = |e: &Expr, v: &str| *e == Expr::Var(v.to_string());
+    let row = |e: &Expr| matches!(e, Expr::Bin(BinOp::Mul, p, q) if (is(p, y) && **q == *m) || (**p == *m && is(q, y)));
+    if !matches!(&args[1], Expr::Bin(BinOp::Add, p, q) if (row(p) && is(q, x)) || (is(p, x) && row(q))) {
+        return None;
+    }
+    let mut assigned = assigned_names(inner);
+    assigned.extend([x.clone(), y.to_string()]);
+    if assigned.iter().any(|v| uses_var(m, v)) {
+        return None;
+    }
+    let this = [Stmt::For(y.to_string(), n.clone(), outer.to_vec(), None)];
+    if [y, x.as_str()].iter().any(|v| reads_of(whole, v) != reads_of(&this, v)) {
+        return None;
+    }
+    let [rows, cols, cells, i] = ["rows", "cols", "cells", "cell"].map(|p| format!("__{p}{k}"));
+    let var = |v: &str| Box::new(Expr::Var(v.to_string()));
+    let mut body = vec![
+        Stmt::Assign(y.to_string(), Expr::Bin(BinOp::FloorDiv, var(&i), var(&cols))),
+        Stmt::Assign(x.clone(), Expr::Bin(BinOp::Mod, var(&i), var(&cols))),
+    ];
+    body.extend(work.iter().cloned());
+    body.push(Stmt::Assign(a.clone(), Expr::Call(f.clone(), vec![args[0].clone(), Expr::Var(i.clone()), args[2].clone()])));
+    fill_target(&i, &body)?;
+    // no rows: no cells (n * m is positive for two negative bounds)
+    let count = Expr::IfExp(
+        Box::new(Expr::Cmp(CmpOp::Gt, var(&rows), Box::new(Expr::Int(0)))),
+        Box::new(Expr::Bin(BinOp::Mul, var(&rows), var(&cols))),
+        Box::new(Expr::Int(0)),
+    );
+    Some(vec![
+        Stmt::Assign(rows, n.clone()),
+        Stmt::Assign(cols, m.clone()),
+        Stmt::Assign(cells.clone(), count),
+        Stmt::For(i, Expr::Var(cells), body, None),
+    ])
+}
+
+/// How many times `stmts` read the variable `v`.
+fn reads_of(stmts: &[Stmt], v: &str) -> usize {
+    let at = |e: &Expr| e.fold(&mut |e, kids: Vec<usize>| kids.iter().sum::<usize>() + (*e == Expr::Var(v.to_string())) as usize);
+    stmts.iter().map(|st| {
+        let (head, blocks) = st.parts();
+        at(head) + blocks.iter().map(|b| reads_of(b, v)).sum::<usize>()
+    }).sum()
 }
 
 /// Detect + prove one `for var in range(_): body` loop; set `fold` iff

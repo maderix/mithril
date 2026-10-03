@@ -1161,10 +1161,32 @@ fn split_loops(name: &str) -> usize {
 fn independent_loop_iterations_split_and_keep_sequential_results() {
     assert_eq!(split_loops("loop_split_shapes.py"), 5);
     assert_eq!(split_loops("loop_split_kept.py"), 0);
-    assert_eq!(split_loops("loop_image.py"), 2);
+    // a row-major image loop is one index fill instead (grid_fill.py)
+    assert_eq!(split_loops("loop_image.py"), 0);
     assert_eq!(split_loops("loop_split_bounded.py"), 0);
     for name in ["loop_split_shapes.py", "loop_split_kept.py", "loop_image.py", "loop_split_bounded.py"] {
         golden(name, 0, &["1", "4", "16"]);
+    }
+}
+
+/// Row-major nested fills run as one flat index fill (a range launch when
+/// large), with the sequential result: the CPython value, every thread count
+/// and starved budget, no array left alive.
+#[test]
+fn row_major_nested_fills_run_as_one_fill() {
+    let want = "(587113987, 1340151378, (153920, 153920, 153920, 153920), 0)";
+    let (cm, rs) = pipeline(&fixture("grid_fill.py"), 1 << 20);
+    assert_eq!(oracle(&cm), want);
+    // one range launch per collapsed loop: grid, swapped, no_cells
+    assert_eq!(rs.matches("range_launch(ctx").count(), 3, "fills without a range launch");
+    let bin = compile(&rs, "grid_fill");
+    for t in ["1", "4", "16"] {
+        for fuel in ["", "1", "7", "64"] {
+            let args: Vec<&str> = [t, fuel].into_iter().filter(|a| !a.is_empty()).collect();
+            let (out, err) = run_env(&bin, &args, &[("MITHRIL_STATS", "1")]);
+            assert_eq!(out.trim(), want, "--threads {t} fuel {fuel:?}");
+            assert!(err.contains("arrays_live=0"), "--threads {t} fuel {fuel:?}: arrays leaked: {err}");
+        }
     }
 }
 

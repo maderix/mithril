@@ -104,6 +104,7 @@ const FIXTURES: &[&str] = &[
     "heavy_fold.py",
     "fold_borrowed_extra.py",
     "fill_loops.py",
+    "grid_fill.py",
     "loop_split_bounded.py",
     "fork_reach.py",
     "fork_chain.py",
