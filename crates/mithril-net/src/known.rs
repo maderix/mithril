@@ -17,7 +17,15 @@
 //! only itself and passes that parameter through unchanged in every such
 //! call. A proven fold keeps its counter, bound and accumulator (its split
 //! relies on that shape). Only int constants are fixed, and the number of
-//! clones is bounded.
+//! clones is bounded. A parameter is fixed only where the constant changes
+//! the cost of repeated work: it is an unchanged parameter of a loop (a
+//! function that calls itself) that the loop divides by (or shifts by), or
+//! the function passes it unchanged to such a parameter of a callee. A constant used once (a sphere's radius, a wall's
+//! position) gains nothing from a clone and costs a specialization: the
+//! Whitted demo's constant arguments cloned every shape function and its
+//! code generation went from seconds to minutes. A loop's own test is not
+//! fixed either (a known bound would unroll the loop and evaluate its body
+//! at compile time in each clone).
 
 use crate::reduce::{specialize_fns, specialize_some, SpecReport};
 use mithril_front::core::{Core, CoreFn, CoreModule};
@@ -40,7 +48,7 @@ pub fn specialize(m: &CoreModule, fuel: u64) -> (CoreModule, Vec<SpecReport>) {
     // fixing more of them names a clone of the original under the union
     let mut origin: HashMap<u32, (u32, Vec<(usize, i64)>)> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
-        let fixable: Vec<Vec<bool>> = (0..out.fns.len()).map(|g| fixable_params(&out, g as u32)).collect();
+        let fixable = repeated(&out, (0..out.fns.len()).map(|g| fixable_params(&out, g as u32)).collect());
         let mut changed = false;
         let mut todo = vec![false; out.fns.len()];
         for f in 0..out.fns.len() {
@@ -171,6 +179,76 @@ fn retarget(e: Core, pick: &mut dyn FnMut(u32, &[Core]) -> Option<u32>) -> Core 
             None => Core::Call(g, args),
         },
         e => e,
+    }
+}
+
+/// Of the `fixable` parameters, those whose constant reaches repeated work:
+/// an unchanged parameter of a loop, or one passed unchanged to such a
+/// parameter of a callee (a fixpoint over the call graph).
+fn repeated(m: &CoreModule, fixable: Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    let looping: Vec<bool> = (0..m.fns.len()).map(|g| m.fns[g].body.any(&mut |e| matches!(e, Core::Call(h, _) if *h as usize == g).then_some(true))).collect();
+    // a loop's own test (the branch that decides whether it calls itself
+    // again) stays: a known bound with a known start lets the per-function
+    // pass unroll the loop and evaluate its body at compile time in every
+    // clone (the Whitted demo's pixel loops: 1,180 traced pixels per clone)
+    let control = |g: usize| -> Vec<bool> {
+        let mut c = vec![false; fixable[g].len()];
+        if let Core::If(test, ..) = &m.fns[g].body {
+            test.walk(&mut |e| {
+                if let Core::Var(v) = e {
+                    if (*v as usize) < c.len() {
+                        c[*v as usize] = true;
+                    }
+                }
+            });
+        }
+        c
+    };
+    // a constant divisor or shift count becomes a shift, mask or multiply;
+    // other uses of a constant measured no gain (design.md)
+    let divisor = |g: usize| -> Vec<bool> {
+        use mithril_front::ast::BinOp::*;
+        let mut d = vec![false; fixable[g].len()];
+        m.fns[g].body.walk(&mut |e| {
+            if let Core::Op2(Div | FloorDiv | Mod | Shl | Shr, _, b) = e {
+                if let Core::Var(v) = **b {
+                    if (v as usize) < d.len() {
+                        d[v as usize] = true;
+                    }
+                }
+            }
+        });
+        d
+    };
+    let mut rep: Vec<Vec<bool>> = fixable.iter().enumerate().map(|(g, fx)| {
+        let (c, d) = (control(g), divisor(g));
+        fx.iter().enumerate().map(|(i, &f)| f && looping[g] && !c[i] && d[i]).collect()
+    }).collect();
+    loop {
+        let mut changed = false;
+        for g in 0..m.fns.len() {
+            let mut reach = vec![false; fixable[g].len()];
+            m.fns[g].body.walk(&mut |e| {
+                if let Core::Call(h, args) = e {
+                    for (j, a) in args.iter().enumerate() {
+                        if let Core::Var(i) = a {
+                            if (*i as usize) < reach.len() && rep.get(*h as usize).is_some_and(|r| r.get(j).copied().unwrap_or(false)) {
+                                reach[*i as usize] = true;
+                            }
+                        }
+                    }
+                }
+            });
+            for (i, r) in reach.into_iter().enumerate() {
+                if r && fixable[g][i] && !rep[g][i] {
+                    rep[g][i] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return rep;
+        }
     }
 }
 

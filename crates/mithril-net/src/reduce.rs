@@ -93,8 +93,8 @@ const SPEC_UNFOLD_AGENTS: usize = 2000;
 /// Nesting bound of speculative unfolds (an unfolded body's own calls are
 /// unfolded in turn: a loop with a static bound unrolls as a chain).
 const SPEC_DEPTH: u32 = 256;
-/// Total speculative rewrites spent per function: accepted or rejected unfolds,
-/// and static evaluations that did not finish.
+/// Total speculative rewrites spent per function: accepted or rejected unfolds
+/// and static evaluations, finished or not.
 const SPEC_TOTAL_FUEL: u64 = 400_000;
 
 /// Specialize every function by the interaction rules. A function's body
@@ -289,7 +289,10 @@ fn run(
                     let key = call_key(&fx.net, a);
                     if memo.memo.get(&key) != Some(&false) && memo.spent < SPEC_TOTAL_FUEL {
                         match evaluate_call(&mut fx.net, eval_prog, a) {
-                            Ok(v) => {
+                            // finished evaluations are charged too, so the
+                            // budget bounds all static work
+                            Ok((v, spent)) => {
+                                memo.spent += spent;
                                 fx.net.residual.swap_remove(i);
                                 crate::rules::link(&mut fx.net, v, b);
                                 *evaluated += 1;
@@ -468,7 +471,7 @@ fn args_known(net: &Net, head: Port) -> bool {
 /// Evaluate a fully static call in a scratch net (evaluation mode, every
 /// call unfolds) under `SPEC_CALL_FUEL`; the value, re-materialized in the
 /// main net, or the rewrites spent if it did not finish (or hit something opaque).
-fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Result<Port, u64> {
+fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Result<(Port, u64), u64> {
     let args: Vec<Val> = crate::list_items(net, crate::ref_head(r)).into_iter().map(|a| readback(net, a).expect("ICE: known argument without a value")).collect();
     let mut scratch = Net::new();
     let root = scratch.alloc(EMPTY, EMPTY);
@@ -488,7 +491,7 @@ fn evaluate_call(net: &mut Net, eval_prog: &NetProg, r: Port) -> Result<Port, u6
     let v = readback(&scratch, crate::root_port()).ok_or(spent)?;
     // the call's argument list is consumed: free it
     let _ = crate::list_collect(net, crate::ref_head(r));
-    Ok(alloc_val(net, &v))
+    Ok((alloc_val(net, &v), spent))
 }
 
 /// Materialize a value as ports/cells.

@@ -84,7 +84,9 @@ fn run(m: &mut Module, keep: &BTreeSet<String>, grows: &BTreeSet<String>) -> Mod
 fn unbounded(m: &Module) -> BTreeSet<String> {
     let all = || m.fns.iter().map(|f| f.name.clone()).collect();
     let Ok(cm) = mithril_front::desugar(m) else { return all() };
-    let (sm, _) = mithril_net::specialize(&cm, mithril_net::REDUCE_FUEL);
+    // which residuals reach a call cycle: the per-function pass decides it
+    // (clones on known arguments change no call cycle)
+    let (sm, _) = mithril_net::reduce::specialize_fns(&cm, mithril_net::REDUCE_FUEL);
     let n = sm.fns.len();
     let mut calls = vec![BTreeSet::new(); n];
     let mut opaque = vec![false; n];

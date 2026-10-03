@@ -154,7 +154,7 @@ constructor condition. Budgets: 50,000 rewrites per top-level attempt,
 shared by everything nested in it; 400,000 speculative rewrites per
 function (each top-level attempt is also charged the cells it cloned);
 nesting depth 256. A failed attempt is memoized by (callee, which arguments are known).
-A static evaluation that does not finish is charged to the same
+Every static evaluation, finished or not, is charged to the same
 per-function budget, and once the budget is spent the remaining calls with
 known arguments are kept as calls. Without the charge, `graph_dfs` before
 its loop split unrolled `run(600)` and retried a 200,000-rewrite
@@ -164,6 +164,10 @@ The growth ceiling is inherited by nested attempts, so a 300-iteration
 chain stops at the ceiling. Inside a speculation only the branches the
 speculated body parked are instantiated, and the first new residual call
 aborts it.
+
+Known-argument clones (`known.rs`): when a loop divides or shifts by a
+constant passed into it unchanged, the callee is copied with that
+parameter fixed, and the rules fold the constant inside the loop.
 
 The first Futamura projection falls out of the rules. An expression
 interpreter (`ev`/`look` over an AST with `Let`, `If` and arithmetic, the
