@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="884" viewBox="0 0 960 884" role="img" aria-labelledby="map-title map-desc"><style>
+svg{--bg:#FFFFFF;--card:#F5F5F7;--hair:rgba(0,0,0,.09);--hair-2:rgba(0,0,0,.18);--ink:#1D1D1F;--ink-2:#515154;--ink-3:#86868B;--accent:#B4531A;--alt:#3D6FB6;--good:#2E7D46}
+@media (prefers-color-scheme: dark){svg{--bg:#0B0B0D;--card:#141417;--hair:rgba(255,255,255,.09);--hair-2:rgba(255,255,255,.17);--ink:#ECEAE4;--ink-2:#B4B4BB;--ink-3:#A6A6B0;--accent:#F5641E;--alt:#7FB0FF;--good:#4FBF72}}
+text{font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+</style><rect width="960" height="884" rx="16" fill="var(--card)"/>
+<title id="map-title">Mithril, end to end</title>
+<desc id="map-desc">A program passes from the Python-subset source through mithril-front (parse, types, desugar to Core), mithril-reassoc (folds proved associative, loops split into task trees), mithril-net (compile-time reduction with the interaction rule table, leaving the residual program), mithril-codegen (native code, dives, rule segments, range launches and net regions), the Rust and CUDA printers, and the two runtimes: mithril-rt on CPU workers and engine.cu in one cooperative GPU kernel. Both runtimes fire the same rule table in their net regions and return the same value. Beside the main path: the reference interpreter, the Lean fold checker, the Lean confluence proof and the gates that compare every lane with the interpreter.</desc>
+<defs><marker id="map-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="var(--ink-3)"/></marker><marker id="map-hot" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="var(--accent)"/></marker><marker id="map-good" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="var(--good)"/></marker><marker id="map-alt" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7Z" fill="var(--alt)"/></marker></defs>
+<text x="28" y="22" style="font-size:11.5px" fill="var(--ink-3)" letter-spacing="1.5">MITHRIL, END TO END · SOURCE → ONE VALUE ON ANY DEVICE</text>
+<text x="932" y="22" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§ = chapter of the introduction</text>
+<rect x="28" y="38" width="660" height="84" rx="6" fill="var(--bg)" stroke="var(--alt)" stroke-width="1"/>
+<text x="42" y="60" style="font-size:14px" fill="var(--alt)" font-weight="600">Source → Core</text>
+<text x="676" y="60" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">mithril-front · §2</text>
+<rect x="42.0" y="74" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="118.0" y="89.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">parse</text>
+<text x="118.0" y="104.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">Python subset</text>
+<path d="M194.0 92.0H201.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="202.0" y="74" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="278.0" y="89.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">types</text>
+<text x="278.0" y="104.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">ints · f64 / f32 · data</text>
+<path d="M354.0 92.0H361.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="362.0" y="74" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="438.0" y="89.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">desugar</text>
+<text x="438.0" y="104.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">loops → tail calls</text>
+<path d="M514.0 92.0H521.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="522.0" y="74" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="598.0" y="89.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">Core</text>
+<text x="598.0" y="104.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">one fn per def</text>
+<rect x="708" y="38" width="224" height="84" rx="6" fill="none" stroke="var(--good)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="58" style="font-size:12.5px" fill="var(--good)" font-weight="600">Reference interpreter</text>
+<text x="720" y="76" style="font-size:10.5px" fill="var(--ink-2)">mithril oracle f.py</text>
+<text x="720" y="91" style="font-size:10.5px" fill="var(--ink-2)">evaluates Core directly</text>
+<text x="922" y="58" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§8</text>
+<path d="M688 92H706" fill="none" stroke="var(--good)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-good)"/>
+<path d="M358 122V138" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="140" width="660" height="84" rx="6" fill="var(--bg)" stroke="var(--good)" stroke-width="1"/>
+<text x="42" y="162" style="font-size:14px" fill="var(--good)" font-weight="600">Parallel structure</text>
+<text x="676" y="162" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">mithril-reassoc · §3</text>
+<rect x="42.0" y="176" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="118.0" y="191.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">find folds</text>
+<text x="118.0" y="206.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">sum · wrap-add · fill</text>
+<path d="M194.0 194.0H201.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="202.0" y="176" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="278.0" y="191.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">prove</text>
+<text x="278.0" y="206.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">associative + identity</text>
+<path d="M354.0 194.0H361.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="362.0" y="176" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="438.0" y="191.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">split loops</text>
+<text x="438.0" y="206.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">tree · call · apply</text>
+<path d="M514.0 194.0H521.0" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="522.0" y="176" width="152.0" height="36" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="598.0" y="191.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">index fills</text>
+<text x="598.0" y="206.0" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">one flat range</text>
+<rect x="708" y="140" width="224" height="84" rx="6" fill="none" stroke="var(--good)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="160" style="font-size:12.5px" fill="var(--good)" font-weight="600">Lean 4 fold checker</text>
+<text x="720" y="178" style="font-size:10.5px" fill="var(--ink-2)">mithril prove f.py</text>
+<text x="720" y="193" style="font-size:10.5px" fill="var(--ink-2)">a fold splits only if Lean</text>
+<text x="720" y="208" style="font-size:10.5px" fill="var(--ink-2)">accepts its proof</text>
+<text x="922" y="160" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§8</text>
+<path d="M688 194H706" fill="none" stroke="var(--good)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-good)"/>
+<path d="M358 224V242" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="244" width="660" height="160" rx="6" fill="var(--accent)" fill-opacity=".06" stroke="var(--accent)" stroke-width="1.5"/>
+<text x="42" y="266" style="font-size:14px" fill="var(--accent)" font-weight="600">Compile-time reduction · the optimizer is the rules</text>
+<text x="676" y="266" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">mithril-net · §4</text>
+<text x="42" y="286" style="font-size:11px" fill="var(--ink-2)">Core becomes a net; every rule whose inputs are written in the source fires, under a budget</text>
+<rect x="42" y="298" width="632" height="56" rx="5" fill="var(--bg)" stroke="var(--accent)" stroke-width="1"/>
+<text x="54" y="316" style="font-size:11.5px" fill="var(--accent)" font-weight="600">the rule table · mithril-core</text>
+<rect x="54.0" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="89.4" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">ERA</text>
+<rect x="130.8" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="166.1" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">DUP</text>
+<rect x="207.5" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="242.9" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">APP–LAM</text>
+<rect x="284.2" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="319.6" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">OP</text>
+<rect x="361.0" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="396.4" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">SWI</text>
+<rect x="437.8" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="473.1" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">MAT</text>
+<rect x="514.5" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="549.9" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">REF</text>
+<rect x="591.2" y="324" width="70.8" height="22" rx="3" fill="var(--card)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="626.6" y="339" style="font-size:10.5px" fill="var(--ink)" text-anchor="middle">DUP–LAM</text>
+<rect x="42.0" y="362" width="205.3" height="32" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="144.7" y="382.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">fold · select · inline</text>
+<path d="M247.3 378.0H254.3" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="255.3" y="362" width="205.3" height="32" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="358.0" y="382.0" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">known-argument clones</text>
+<path d="M460.7 378.0H467.7" fill="none" stroke="var(--ink-3)" stroke-width="1.4" marker-end="url(#map-arrow)"/>
+<rect x="468.7" y="362" width="205.3" height="32" rx="4" fill="var(--accent)" fill-opacity=".12" stroke="var(--accent)" stroke-width="1.4"/>
+<text x="571.3" y="382.0" style="font-size:11.5px" fill="var(--ink)" font-weight="600" text-anchor="middle">residual Core</text>
+<rect x="708" y="274" width="224" height="100" rx="6" fill="none" stroke="var(--good)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="294" style="font-size:12.5px" fill="var(--good)" font-weight="600">Confluence proof</text>
+<text x="720" y="312" style="font-size:10.5px" fill="var(--ink-2)">Lean 4 · proofs/confluence</text>
+<text x="720" y="327" style="font-size:10.5px" fill="var(--ink-2)">any order of firings that</text>
+<text x="720" y="342" style="font-size:10.5px" fill="var(--ink-2)">finishes reaches one net,</text>
+<text x="720" y="357" style="font-size:10.5px" fill="var(--ink-2)">budget cut-offs included</text>
+<text x="922" y="294" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§3 · §8</text>
+<path d="M674 326H706" fill="none" stroke="var(--good)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-good)"/>
+<path d="M358 404V422" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="424" width="660" height="92" rx="6" fill="var(--bg)" stroke="var(--alt)" stroke-width="1"/>
+<text x="42" y="446" style="font-size:14px" fill="var(--alt)" font-weight="600">Lowering · the residual becomes code</text>
+<text x="676" y="446" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">mithril-codegen · §4</text>
+<rect x="42.0" y="462" width="120.0" height="40" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="102.0" y="479" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">native</text>
+<text x="102.0" y="494" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">never pauses</text>
+<rect x="170.0" y="462" width="120.0" height="40" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="230.0" y="479" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">dive</text>
+<text x="230.0" y="494" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">pauses on budget</text>
+<rect x="298.0" y="462" width="120.0" height="40" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="358.0" y="479" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">rule segments</text>
+<text x="358.0" y="494" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">resume after a pause</text>
+<rect x="426.0" y="462" width="120.0" height="40" rx="4" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="486.0" y="479" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">range launches</text>
+<text x="486.0" y="494" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">fills · folds</text>
+<rect x="554.0" y="462" width="120.0" height="40" rx="4" fill="var(--bg)" stroke="var(--alt)" stroke-width="1"/>
+<text x="614.0" y="479" style="font-size:11.5px" fill="var(--ink)" text-anchor="middle">net region</text>
+<text x="614.0" y="494" style="font-size:10px" fill="var(--ink-3)" text-anchor="middle">closures · pending</text>
+<rect x="708" y="424" width="224" height="92" rx="6" fill="none" stroke="var(--alt)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="444" style="font-size:12.5px" fill="var(--alt)" font-weight="600">What the compiler did</text>
+<text x="720" y="462" style="font-size:10.5px" fill="var(--ink-2)">mithril net f.py</text>
+<text x="720" y="477" style="font-size:10.5px" fill="var(--ink-2)">firings and residual size</text>
+<text x="720" y="492" style="font-size:10.5px" fill="var(--ink-2)">per function</text>
+<text x="922" y="444" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§4</text>
+<path d="M688 482H706" fill="none" stroke="var(--alt)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-alt)"/>
+<path d="M193 516V536" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<path d="M523 516V536" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="538" width="320" height="44" rx="6" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="188" y="557" style="font-size:12.5px" fill="var(--ink)" font-weight="600" text-anchor="middle">Rust printer → rustc</text>
+<text x="188" y="573" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="middle">one crate per program</text>
+<rect x="368" y="538" width="320" height="44" rx="6" fill="var(--bg)" stroke="var(--hair-2)" stroke-width="1"/>
+<text x="528" y="557" style="font-size:12.5px" fill="var(--ink)" font-weight="600" text-anchor="middle">CUDA printer → nvcc</text>
+<text x="528" y="573" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="middle">program.cu + engine.cu</text>
+<path d="M188 582V600" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<path d="M528 582V600" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="602" width="320" height="176" rx="6" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.4"/>
+<text x="42" y="624" style="font-size:13.5px" fill="var(--accent)" font-weight="600">CPU · mithril-rt</text>
+<text x="334" y="624" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§2 · §5</text>
+<rect x="40" y="636" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="50" y="654" style="font-size:11.5px" fill="var(--ink)">workers</text>
+<text x="326" y="654" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">1 to 16 threads</text>
+<rect x="40" y="670" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="50" y="688" style="font-size:11.5px" fill="var(--ink)">tasks · records · joins</text>
+<text x="326" y="688" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">lock-free handoffs</text>
+<rect x="40" y="704" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="50" y="722" style="font-size:11.5px" fill="var(--ink)">dives under a budget</text>
+<text x="326" y="722" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">pause → tasks</text>
+<rect x="40" y="738" width="296" height="28" rx="4" fill="var(--accent)" fill-opacity=".10" stroke="var(--accent)" stroke-width="1"/>
+<text x="50" y="756" style="font-size:11.5px" fill="var(--ink)" font-weight="600">net region</text>
+<text x="326" y="756" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">same rule table</text>
+<rect x="368" y="602" width="320" height="176" rx="6" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.4"/>
+<text x="382" y="624" style="font-size:13.5px" fill="var(--accent)" font-weight="600">GPU · engine.cu</text>
+<text x="674" y="624" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§2 · §5</text>
+<rect x="380" y="636" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="390" y="654" style="font-size:11.5px" fill="var(--ink)">one cooperative kernel</text>
+<text x="666" y="654" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">a block per SM</text>
+<rect x="380" y="670" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="390" y="688" style="font-size:11.5px" fill="var(--ink)">grow · work · native · range</text>
+<text x="666" y="688" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">phases</text>
+<rect x="380" y="704" width="296" height="28" rx="4" fill="var(--card)" stroke="var(--hair)" stroke-width="1"/>
+<text x="390" y="722" style="font-size:11.5px" fill="var(--ink)">records · dives · frames</text>
+<text x="666" y="722" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">same model</text>
+<rect x="380" y="738" width="296" height="28" rx="4" fill="var(--accent)" fill-opacity=".10" stroke="var(--accent)" stroke-width="1"/>
+<text x="390" y="756" style="font-size:11.5px" fill="var(--ink)" font-weight="600">net region</text>
+<text x="666" y="756" style="font-size:10px" fill="var(--ink-3)" text-anchor="end">same rule table</text>
+<rect x="708" y="602" width="224" height="84" rx="6" fill="none" stroke="var(--good)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="622" style="font-size:12.5px" fill="var(--good)" font-weight="600">Model checking</text>
+<text x="720" y="640" style="font-size:10.5px" fill="var(--ink-2)">loom: in every interleaving</text>
+<text x="720" y="655" style="font-size:10.5px" fill="var(--ink-2)">a CPU join fires once and</text>
+<text x="720" y="670" style="font-size:10.5px" fill="var(--ink-2)">a value is freed once</text>
+<text x="922" y="622" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§8</text>
+<path d="M692 316H698V758H684" fill="none" stroke="var(--accent)" stroke-dasharray="2 4" stroke-width="1.5" marker-end="url(#map-hot)"/>
+<text x="702" y="732" style="font-size:10px" fill="var(--accent)">same</text>
+<text x="702" y="745" style="font-size:10px" fill="var(--accent)">rules</text>
+<path d="M188 778V798" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<path d="M528 778V798" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#map-hot)"/>
+<rect x="28" y="800" width="660" height="62" rx="6" fill="var(--accent)" fill-opacity=".12" stroke="var(--accent)" stroke-width="1.5"/>
+<text x="42" y="825" style="font-size:14px" fill="var(--ink)" font-weight="600">One value</text>
+<text x="42" y="845" style="font-size:11.5px" fill="var(--ink-2)">the same bits at 1 thread, 16 threads and on the GPU · an image, a checksum, a tuple</text>
+<text x="676" y="825" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§3</text>
+<rect x="708" y="796" width="224" height="70" rx="6" fill="none" stroke="var(--good)" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="720" y="816" style="font-size:12.5px" fill="var(--good)" font-weight="600">Gates</text>
+<text x="720" y="834" style="font-size:10.5px" fill="var(--ink-2)">every lane == interpreter</text>
+<text x="720" y="849" style="font-size:10.5px" fill="var(--ink-2)">1, 4, 16 threads · GPU</text>
+<text x="922" y="816" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§8</text>
+<path d="M688 831H706" fill="none" stroke="var(--good)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-good)"/>
+</svg>

@@ -11,10 +11,17 @@ across a GPU. The answer is the same whichever order the work runs in.
 an illustrated article covering where the language comes from, how it works,
 animated examples, good uses and current limits.
 
-| Whitted ray tracing | Path tracing |
+| Spinning black hole | Path tracing |
 |---|---|
-| <img src="docs/img/cornell_whitted_animated.gif" width="320" alt="Moving mirror and glass spheres in the Whitted Cornell scene"> | <img src="docs/img/cornell_path_animated.gif" width="320" alt="Moving mirror and glass spheres in the path-traced Cornell scene"> |
-| 512×512 · 4 samples per pixel | 256×256 · 64 samples per pixel |
+| <img src="docs/img/black_hole.gif" width="400" alt="A camera descends toward a spinning black hole, its lensed accretion disk arching over and under the shadow"> | <img src="docs/img/cornell_path_animated.gif" width="225" alt="Moving mirror and glass spheres in the path-traced Cornell scene"> |
+| 1280×720 · Kerr light rays | 256×256 · 64 samples per pixel |
+
+The black hole follows each pixel's light backward through the spacetime of a
+hole spinning at 0.99 of the maximum, as a camera descends from 26 to 6
+gravitational radii. The lensed disk, its Doppler and gravitational colour
+shifts, the stars crowding toward the direction of travel: all of it comes
+from the equations of the rays, in single precision.
+[Source](demos/black_hole.py) · [measurements](docs/img/black_hole.md).
 
 Both scenes are plain Mithril programs. The same source runs on 1 thread, 16
 threads and an NVIDIA GPU, and all three write identical pixels.
@@ -45,11 +52,7 @@ result is the same.
 The runtime can therefore run them in parallel, and the compiler can run them
 early.
 
-```
-source (Python subset)  ->  Core  ->  net + rules  ->  residual  ->  LIR  ->  CPU: Rust + mithril-rt
-mithril-front            oracle    compile-time     the program          GPU: CUDA + engine.cu
-                                   reduction        that runs
-```
+<img src="docs/img/mithril-map.svg" width="960" alt="Mithril end to end: source to Core, parallel structure, compile-time reduction with the rule table, lowering, the Rust and CUDA printers, the CPU and GPU runtimes sharing one rule table, and one value; beside the path the reference interpreter, the Lean proofs, model checking and the gates">
 
 - **The optimizer is the rules.** While compiling, Mithril fires every rule
   whose inputs are written in the source. Constant folding, inlining and branch
@@ -141,6 +144,9 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 
 ## Examples
 
+- `demos/black_hole.py`: a spinning black hole seen from a descending camera,
+  rendered by tracing light rays through the Kerr spacetime. Write a strip of
+  40 frames with `mithril run --image hole.ppm demos/black_hole.py --gpu`.
 - `demos/cornell_whitted.py`, `demos/cornell_path.py`: a Whitted ray tracer and
   a path tracer of the Cornell box. Write the image with
   `mithril run --image cornell.ppm demos/cornell_path.py`.
