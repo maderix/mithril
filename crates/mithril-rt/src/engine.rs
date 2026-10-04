@@ -122,6 +122,7 @@ impl Engine {
                     if threads == 1 || total < RANGE_PAR {
                         for (q, r) in ranges.iter().enumerate() {
                             let v = prog.range_leaf(r.fid, r.lo, r.hi, &r.ports, &mut ctx0);
+                            ctx0.hand_off_net();
                             sums[q].fetch_add(v as u64, Ordering::Relaxed);
                         }
                     } else {
@@ -444,6 +445,7 @@ fn drain_ranges(wv: &Wave, ctx: &mut Wctx) {
             let stop = end.min(wv.pre[q + 1]);
             let (lo, hi) = (r.lo + (t - wv.pre[q]) as i64, r.lo + (stop - wv.pre[q]) as i64);
             let v = prog.range_leaf(r.fid, lo, hi, &r.ports, ctx);
+            ctx.hand_off_net();
             if r.kind != 0 {
                 wv.sums[q].fetch_add(v as u64, Ordering::Relaxed);
             }

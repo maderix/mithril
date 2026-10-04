@@ -153,12 +153,7 @@ impl<'e> Wctx<'e> {
         if self.net_work.is_empty() {
             return true;
         }
-        let rule = self.prog.net_rule();
-        assert!(rule != u16::MAX, "ICE: net work left with no net rule");
-        let rest: Vec<(Port, Port)> = std::mem::take(&mut self.net_work);
-        for (a, b) in rest {
-            self.spawn(rule, Redex { a: a.0, b: b.0, aux: 0 });
-        }
+        self.hand_off_net();
         false
     }
 
@@ -438,6 +433,24 @@ impl<'e> Wctx<'e> {
         self.rewrites += 1;
         let prog = self.prog;
         prog.fire(rule, e, self);
+        if self.inline_depth == 0 {
+            self.hand_off_net();
+        }
+    }
+
+    /// No task ends with net work of its own: a link made after the task's
+    /// last `reduce_net` (compiled code waiting on a wire another worker
+    /// fills at that moment) may have found its partner and queued the pair
+    /// here, where nothing would reduce it. The net rule fires it next wave.
+    pub(crate) fn hand_off_net(&mut self) {
+        if self.net_work.is_empty() {
+            return;
+        }
+        let rule = self.prog.net_rule();
+        assert!(rule != u16::MAX, "ICE: net work left with no net rule");
+        for (a, b) in std::mem::take(&mut self.net_work) {
+            self.spawn(rule, Redex { a: a.0, b: b.0, aux: 0 });
+        }
     }
 
     /// Fire an activated record, then recycle it.
