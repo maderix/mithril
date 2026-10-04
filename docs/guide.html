@@ -653,7 +653,7 @@ a = array_set(a, i, v)</code></pre></div>
 </svg><figcaption>Mithril, end to end. Blue arrows are the path one program takes; the dotted blue line is the one rule table shared by the compiler and both runtimes.</figcaption></figure>
 
 <h3>How Mithril reads a program</h3>
-<p>Mithril runs two calculations at once whenever neither needs the other's result. So to see where a program can run in parallel, ask three questions about its shape: which calculations can start together, which must wait for an earlier answer, and what do they share? The five problems below each have a different shape. Each animation runs the real problem and schedules it the way Mithril's runtime does: a task starts as soon as its inputs exist and a worker is free.</p>
+<p>Mithril runs two calculations at once whenever neither needs the other's result. So to see where a program can run in parallel, ask three questions about its shape: which calculations can start together, which must wait for an earlier answer, and what do they share? The six problems below each have a different shape. Each animation runs the real problem and schedules it the way Mithril's runtime does: a task starts as soon as its inputs exist and a worker is free.</p>
 
 <h3>Rendering: every pixel on its own</h3>
 <p>A ray tracer colours a pixel by firing a ray from the camera through it, following the ray as it bounces off the mirror sphere or bends through the glass one, and adding up the light it collects. The calculation reads only the scene description and the pixel's own coordinates; no pixel needs another pixel's answer. The program loops over the image row by row, but Mithril sees that the <code>pixel(x, y)</code> calls are independent and hands them to whichever worker is free.</p>
@@ -3251,6 +3251,300 @@ mithril run bench/ports/kdtree.py --threads 16</pre></aside></div>
 <p class="pn">The next iteration is one <code>__while2</code> call in the taken branch, and it needs this iteration's <code>n</code>. One chain has one active pair at a time; the parallelism comes from the many independent starting values.</p>
 <pre class="dec-cmd">mithril net docs/examples/collatz.py
 mithril run docs/examples/collatz.py --threads 16</pre></aside></div>
+<h3>A spinning black hole: the compiler does the heavy lifting</h3>
+<p>The video at the top of this guide is a Mithril program of about 800 lines. For every pixel it follows a ray of light backward from the camera through the curved spacetime around a black hole spinning at 0.99 of the maximum. Each ray is pushed forward by a Runge-Kutta step, again and again, until it falls through the horizon, crosses the glowing disk of gas or escapes to the stars. The colour it brings back includes the Doppler and gravitational shifts of the light.</p>
+<p>The program's shape is simple: ten loops in a row, each filling an array (the colour table, the camera path, a first ray per pixel, extra rays at sharp edges, four blur passes for the glare, the final image). Inside a fill, pixel <code>i</code> reads only arrays made by earlier fills and writes only its own slot, so every pixel is an independent task. The work per pixel is very uneven, as the map below shows. A ray that hits the near side of the disk stops after about ten steps, a ray that escapes to the stars takes a few hundred, and a ray that spirals into the shadow takes more than a thousand. Idle workers take the next pixels as they finish, so the expensive rays around the shadow never hold up the cheap ones.</p>
+<div class="ex"><figure class="diagram">
+<img src="img/black_hole_steps.png" width="640" height="360" style="width:100%;height:auto;border-radius:10px" alt="Steps each ray takes for one frame: the near disk is dark (about 10 steps), the sky mid blue (about 260), the shadow bright (over 1,000)">
+<figcaption>Steps each ray takes in frame 225, 640 × 360, on a log scale from 9 (dark) to 1,110 (bright); the most any ray takes is 2,169. Dark band: rays stopped by the near disk. Bright core: rays falling into the shadow. Computed by the same program with <code>main</code> returning each ray's step count.</figcaption>
+</figure><aside class="dec" aria-label="Inside the compiler for this example"><div class="dec-h">Inside the compiler</div><div class="dec-src"><a href="../demos/black_hole.py">black_hole.py</a> · 1280 × 720 × 40 frames</div><div class="dec-pair"><figure class="dec-net"><svg class="net-svg" width="304" height="325"
+ viewBox="0.00 0.00 422.40 451.40" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g class="graph" transform="scale(1 1) rotate(0) translate(7.2 444.2)">
+<g class="node">
+<text text-anchor="middle" x="259" y="-14.9"  font-size="12.00" fill="var(--ink)">result</text>
+</g>
+<g class="node">
+<text text-anchor="middle" x="244" y="-415.9"  font-size="12.00" fill="var(--ink)">i</text>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="244" cy="-360" rx="13" ry="13"/>
+<text text-anchor="middle" x="244" y="-356.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M244,-400.9C244,-391.98 244,-381.28 244,-373.2"/>
+</g>
+<g class="node">
+<text text-anchor="middle" x="27" y="-415.9"  font-size="12.00" fill="var(--ink)">cams</text>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M285.5,-154C285.5,-154 232.5,-154 232.5,-154 226.5,-154 220.5,-148 220.5,-142 220.5,-142 220.5,-130 220.5,-130 220.5,-124 226.5,-118 232.5,-118 232.5,-118 285.5,-118 285.5,-118 291.5,-118 297.5,-124 297.5,-130 297.5,-130 297.5,-142 297.5,-142 297.5,-148 291.5,-154 285.5,-154"/>
+<text text-anchor="middle" x="259" y="-132.9"  font-size="12.00" fill="var(--ink)">radiance</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M27,-400.71C27,-378.04 27,-337.04 27,-302 27,-302 27,-302 27,-244 27,-159.84 154.46,-141.65 220.43,-137.88"/>
+</g>
+<g class="node">
+<text text-anchor="middle" x="101" y="-415.9"  font-size="12.00" fill="var(--ink)">tab</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M101,-400.71C101,-378.04 101,-337.04 101,-302 101,-302 101,-302 101,-244 101,-186.52 173.57,-157.81 220.35,-145.27"/>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="235" cy="-301" rx="13" ry="13"/>
+<text text-anchor="middle" x="235" y="-297.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M242.09,-346.91C240.56,-337.24 238.43,-323.74 236.91,-314.07"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="309" cy="-192" rx="15" ry="15"/>
+<text text-anchor="middle" x="309" y="-188.9"  font-size="12.00" fill="var(--ink)">%</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M257.1,-359.71C284.83,-360.39 349.28,-357.55 378,-319 402.62,-285.96 377.21,-262.6 352,-230 343.2,-218.62 330.46,-208.19 321.12,-201.32"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="209" cy="-192" rx="15" ry="15"/>
+<text text-anchor="middle" x="209" y="-188.9"  font-size="12.00" fill="var(--ink)">//</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M232.12,-288.14C227.28,-268.23 217.54,-228.17 212.39,-206.94"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="281" cy="-245" rx="15" ry="15"/>
+<text text-anchor="middle" x="281" y="-241.9"  font-size="12.00" fill="var(--ink)">//</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M243.01,-290.59C250.94,-281.29 263.08,-267.04 271.49,-257.16"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M218.88,-180.33C225.82,-172.83 235.26,-162.64 243.24,-154.02"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="259" cy="-192" rx="15" ry="15"/>
+<text text-anchor="middle" x="259" y="-188.9"  font-size="12.00" fill="var(--ink)">%</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M275.33,-230.87C272.08,-223.31 267.99,-213.84 264.72,-206.27"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M259,-176.81C259,-169.94 259,-161.62 259,-154.37"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M299.12,-180.33C292.18,-172.83 282.74,-162.64 274.76,-154.02"/>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M274,-95C274,-95 244,-95 244,-95 238,-95 232,-89 232,-83 232,-83 232,-71 232,-71 232,-65 238,-59 244,-59 244,-59 274,-59 274,-59 280,-59 286,-65 286,-71 286,-71 286,-83 286,-83 286,-89 280,-95 274,-95"/>
+<text text-anchor="middle" x="259" y="-73.9"  font-size="12.00" fill="var(--ink)">pack</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M259,-58.9C259,-51.68 259,-43.3 259,-36.09"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M259,-117.9C259,-110.68 259,-102.3 259,-95.09"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M359.67,-201.5C359.67,-201.5 350.33,-201.5 350.33,-201.5 347.17,-201.5 344,-198.33 344,-195.17 344,-195.17 344,-188.83 344,-188.83 344,-185.67 347.17,-182.5 350.33,-182.5 350.33,-182.5 359.67,-182.5 359.67,-182.5 362.83,-182.5 366,-185.67 366,-188.83 366,-188.83 366,-195.17 366,-195.17 366,-198.33 362.83,-201.5 359.67,-201.5"/>
+<text text-anchor="middle" x="355" y="-189.2"  font-size="11.00" fill="var(--ink)">0</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M343.58,-183.09C340.51,-181.05 337.16,-178.89 334,-177 320.7,-169.05 305.7,-160.89 292.62,-154.03"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M401.67,-201.5C401.67,-201.5 392.33,-201.5 392.33,-201.5 389.17,-201.5 386,-198.33 386,-195.17 386,-195.17 386,-188.83 386,-188.83 386,-185.67 389.17,-182.5 392.33,-182.5 392.33,-182.5 401.67,-182.5 401.67,-182.5 404.83,-182.5 408,-185.67 408,-188.83 408,-188.83 408,-195.17 408,-195.17 408,-198.33 404.83,-201.5 401.67,-201.5"/>
+<text text-anchor="middle" x="397" y="-189.2"  font-size="11.00" fill="var(--ink)">0</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M385.77,-182.74C382.7,-180.7 379.3,-178.63 376,-177 350.88,-164.6 320.97,-154.44 297.68,-147.47"/>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="172" cy="-301" rx="13" ry="13"/>
+<text text-anchor="middle" x="172" y="-297.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M166.45,-288.87C159.89,-273.98 151.37,-247.44 164,-230 183.2,-203.48 204.02,-220.17 234,-207 238.19,-205.16 242.6,-202.83 246.52,-200.61"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="189" cy="-245" rx="15" ry="15"/>
+<text text-anchor="middle" x="189" y="-241.9"  font-size="12.00" fill="var(--ink)">×</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M175.69,-288.28C178.34,-279.85 181.94,-268.44 184.72,-259.6"/>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M191,-378C191,-378 153,-378 153,-378 147,-378 141,-372 141,-366 141,-366 141,-354 141,-354 141,-348 147,-342 153,-342 153,-342 191,-342 191,-342 197,-342 203,-348 203,-354 203,-354 203,-366 203,-366 203,-372 197,-378 191,-378"/>
+<text text-anchor="middle" x="172" y="-356.9"  font-size="12.00" fill="var(--ink)">height</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M172,-341.9C172,-332.98 172,-322.28 172,-314.2"/>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="329" cy="-245" rx="13" ry="13"/>
+<text text-anchor="middle" x="329" y="-241.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M324.56,-232.68C321.52,-224.93 317.48,-214.63 314.28,-206.46"/>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="281" cy="-301" rx="13" ry="13"/>
+<text text-anchor="middle" x="281" y="-297.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M281,-287.75C281,-279.53 281,-268.69 281,-260.11"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M289.36,-290.59C298.17,-280.68 311.96,-265.17 320.73,-255.3"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M270.92,-292.06C266.98,-289.09 262.36,-285.76 258,-283 239.28,-271.15 216.43,-259.39 202.29,-252.41"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M194.15,-230.87C197.11,-223.31 200.83,-213.84 203.8,-206.27"/>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M356,-319C356,-319 326,-319 326,-319 320,-319 314,-313 314,-307 314,-307 314,-295 314,-295 314,-289 320,-283 326,-283 326,-283 356,-283 356,-283 362,-283 368,-289 368,-295 368,-295 368,-307 368,-307 368,-313 362,-319 356,-319"/>
+<text text-anchor="middle" x="341" y="-297.9"  font-size="12.00" fill="var(--ink)">width</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M337.2,-282.91C335.39,-274.76 333.27,-265.2 331.63,-257.85"/>
+</g>
+</g>
+</svg><figcaption>Before: 14 agents</figcaption></figure><figure class="dec-net"><svg class="net-svg" width="300" height="313"
+ viewBox="0.00 0.00 416.40 435.40" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g class="graph" transform="scale(1 1) rotate(0) translate(7.2 428.2)">
+<g class="node">
+<text text-anchor="middle" x="237" y="-14.9"  font-size="12.00" fill="var(--ink)">result</text>
+</g>
+<g class="node">
+<text text-anchor="middle" x="239" y="-399.9"  font-size="12.00" fill="var(--ink)">i</text>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="239" cy="-349" rx="13" ry="13"/>
+<text text-anchor="middle" x="239" y="-345.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M239,-384.97C239,-377.51 239,-368.92 239,-362.12"/>
+</g>
+<g class="node">
+<text text-anchor="middle" x="27" y="-399.9"  font-size="12.00" fill="var(--ink)">cams</text>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M263.5,-154C263.5,-154 210.5,-154 210.5,-154 204.5,-154 198.5,-148 198.5,-142 198.5,-142 198.5,-130 198.5,-130 198.5,-124 204.5,-118 210.5,-118 210.5,-118 263.5,-118 263.5,-118 269.5,-118 275.5,-124 275.5,-130 275.5,-130 275.5,-142 275.5,-142 275.5,-148 269.5,-154 263.5,-154"/>
+<text text-anchor="middle" x="237" y="-132.9"  font-size="12.00" fill="var(--ink)">radiance</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M27,-384.87C27,-364.43 27,-329.22 27,-299 27,-299 27,-299 27,-244 27,-167.89 137.86,-145.89 198.48,-139.55"/>
+</g>
+<g class="node">
+<text text-anchor="middle" x="101" y="-399.9"  font-size="12.00" fill="var(--ink)">tab</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M101,-384.87C101,-364.43 101,-329.22 101,-299 101,-299 101,-299 101,-244 101,-194.13 158.18,-163.94 198.39,-148.88"/>
+</g>
+<g class="node">
+<ellipse fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="1.2" cx="213" cy="-298" rx="13" ry="13"/>
+<text text-anchor="middle" x="213" y="-294.9"  font-size="12.00" fill="var(--ink)">δ</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M233.23,-337.13C228.92,-329.01 223.06,-317.96 218.75,-309.84"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="315" cy="-298" rx="15" ry="15"/>
+<text text-anchor="middle" x="315" y="-294.9"  font-size="12.00" fill="var(--ink)">%</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M249.57,-341.19C263.52,-332.19 288.03,-316.39 302.76,-306.89"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="163" cy="-245" rx="15" ry="15"/>
+<text text-anchor="middle" x="163" y="-241.9"  font-size="12.00" fill="var(--ink)">//</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M204.29,-288.12C195.67,-279.33 182.48,-265.87 173.34,-256.54"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="213" cy="-245" rx="15" ry="15"/>
+<text text-anchor="middle" x="213" y="-241.9"  font-size="12.00" fill="var(--ink)">//</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M213,-284.91C213,-277.49 213,-267.95 213,-260.17"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M171.2,-232.14C184.3,-213.21 209.99,-176.06 225.1,-154.2"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M173.17,-307.5C173.17,-307.5 138.83,-307.5 138.83,-307.5 135.67,-307.5 132.5,-304.33 132.5,-301.17 132.5,-301.17 132.5,-294.83 132.5,-294.83 132.5,-291.67 135.67,-288.5 138.83,-288.5 138.83,-288.5 173.17,-288.5 173.17,-288.5 176.33,-288.5 179.5,-291.67 179.5,-294.83 179.5,-294.83 179.5,-301.17 179.5,-301.17 179.5,-304.33 176.33,-307.5 173.17,-307.5"/>
+<text text-anchor="middle" x="156" y="-295.2"  font-size="11.00" fill="var(--ink)">921600</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M157.22,-288.12C158.28,-280.35 159.85,-268.95 161.08,-259.97"/>
+</g>
+<g class="node">
+<ellipse fill="var(--bg)" stroke="var(--ink-2)" stroke-width="1.2" cx="237" cy="-192" rx="15" ry="15"/>
+<text text-anchor="middle" x="237" y="-188.9"  font-size="12.00" fill="var(--ink)">%</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M219.06,-231.13C222.67,-223.46 227.24,-213.75 230.86,-206.04"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M237,-176.81C237,-169.94 237,-161.62 237,-154.37"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M269.17,-254.5C269.17,-254.5 254.83,-254.5 254.83,-254.5 251.67,-254.5 248.5,-251.33 248.5,-248.17 248.5,-248.17 248.5,-241.83 248.5,-241.83 248.5,-238.67 251.67,-235.5 254.83,-235.5 254.83,-235.5 269.17,-235.5 269.17,-235.5 272.33,-235.5 275.5,-238.67 275.5,-241.83 275.5,-241.83 275.5,-248.17 275.5,-248.17 275.5,-251.33 272.33,-254.5 269.17,-254.5"/>
+<text text-anchor="middle" x="262" y="-242.2"  font-size="11.00" fill="var(--ink)">720</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M257.65,-235.12C253.67,-227.01 247.75,-214.94 243.27,-205.8"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M273.67,-307.5C273.67,-307.5 252.33,-307.5 252.33,-307.5 249.17,-307.5 246,-304.33 246,-301.17 246,-301.17 246,-294.83 246,-294.83 246,-291.67 249.17,-288.5 252.33,-288.5 252.33,-288.5 273.67,-288.5 273.67,-288.5 276.83,-288.5 280,-291.67 280,-294.83 280,-294.83 280,-301.17 280,-301.17 280,-304.33 276.83,-307.5 273.67,-307.5"/>
+<text text-anchor="middle" x="263" y="-295.2"  font-size="11.00" fill="var(--ink)">1280</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M254.29,-288.12C245.67,-279.33 232.48,-265.87 223.34,-256.54"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M309.87,-283.75C301.03,-261.32 281.94,-214.63 262,-177 257.94,-169.33 252.95,-161.15 248.5,-154.21"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M325.67,-358.5C325.67,-358.5 304.33,-358.5 304.33,-358.5 301.17,-358.5 298,-355.33 298,-352.17 298,-352.17 298,-345.83 298,-345.83 298,-342.67 301.17,-339.5 304.33,-339.5 304.33,-339.5 325.67,-339.5 325.67,-339.5 328.83,-339.5 332,-342.67 332,-345.83 332,-345.83 332,-352.17 332,-352.17 332,-355.33 328.83,-358.5 325.67,-358.5"/>
+<text text-anchor="middle" x="315" y="-346.2"  font-size="11.00" fill="var(--ink)">1280</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M315,-339.46C315,-332.23 315,-321.69 315,-313.19"/>
+</g>
+<g class="node">
+<path fill="var(--alt-tint)" stroke="var(--alt)" stroke-width="1.4" d="M252,-95C252,-95 222,-95 222,-95 216,-95 210,-89 210,-83 210,-83 210,-71 210,-71 210,-65 216,-59 222,-59 222,-59 252,-59 252,-59 258,-59 264,-65 264,-71 264,-71 264,-83 264,-83 264,-89 258,-95 252,-95"/>
+<text text-anchor="middle" x="237" y="-73.9"  font-size="12.00" fill="var(--ink)">pack</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M237,-58.9C237,-51.68 237,-43.3 237,-36.09"/>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--accent)" stroke-width="2.6" d="M237,-117.9C237,-110.68 237,-102.3 237,-95.09"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M353.67,-201.5C353.67,-201.5 344.33,-201.5 344.33,-201.5 341.17,-201.5 338,-198.33 338,-195.17 338,-195.17 338,-188.83 338,-188.83 338,-185.67 341.17,-182.5 344.33,-182.5 344.33,-182.5 353.67,-182.5 353.67,-182.5 356.83,-182.5 360,-185.67 360,-188.83 360,-188.83 360,-195.17 360,-195.17 360,-198.33 356.83,-201.5 353.67,-201.5"/>
+<text text-anchor="middle" x="349" y="-189.2"  font-size="11.00" fill="var(--ink)">0</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M337.94,-184.86C333.35,-182.36 327.95,-179.48 323,-177 307.4,-169.18 289.97,-160.98 274.91,-154.05"/>
+</g>
+<g class="node">
+<path fill="var(--card)" stroke="var(--hair-2)" stroke-width="1.2" d="M395.67,-201.5C395.67,-201.5 386.33,-201.5 386.33,-201.5 383.17,-201.5 380,-198.33 380,-195.17 380,-195.17 380,-188.83 380,-188.83 380,-185.67 383.17,-182.5 386.33,-182.5 386.33,-182.5 395.67,-182.5 395.67,-182.5 398.83,-182.5 402,-185.67 402,-188.83 402,-188.83 402,-195.17 402,-195.17 402,-198.33 398.83,-201.5 395.67,-201.5"/>
+<text text-anchor="middle" x="391" y="-189.2"  font-size="11.00" fill="var(--ink)">0</text>
+</g>
+<g class="edge">
+<path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M379.81,-182.66C376.74,-180.61 373.33,-178.57 370,-177 339.57,-162.67 302.81,-152.08 275.66,-145.41"/>
+</g>
+</g>
+</svg><figcaption>After: 8 agents</figcaption></figure></div>
+<p class="pn"><code>first_ray</code>, the body of the first fill. The calls to <code>width()</code> and <code>height()</code>, the copies of their results and the product <code>w * h</code> fire away at compile time; the literals <code>1280</code>, <code>720</code> and <code>921600</code> are left in their place.</p>
+<p class="pn">Across the whole program: <strong>692 rule firings</strong> and <strong>1,068 calls evaluated</strong> to constants, against 177 calls kept for run time.</p>
+<pre class="dec-cmd">mithril net demos/black_hole.py
+MITHRIL_NET_CORE=1 mithril net demos/black_hole.py
+mithril run demos/black_hole.py --gpu --image hole.ppm</pre></aside></div>
+<p>Many of the black hole's inputs are written in the source: the spin, the camera's path, the size of the disk, the image size. Mithril fires every rule that depends only on those while it compiles, and the results are large. The radius of the innermost stable orbit, a formula with three cube roots and two square roots of the spin, becomes the single constant <code>1.4545</code> inside <code>disk</code> and <code>march</code>. The spin's square <code>0.9801</code> and the camera's tilt (its cosine and sine, <code>0.035</code> and <code>0.99939</code>) appear as numbers in <code>ray</code>. <code>cbrt</code>, whose loop of Newton steps runs a fixed number of times, unrolls from 4 agents into 321 with no call left inside. None of this is a separate optimizer: each step is one firing of the rules from chapter 3, the same rules the runtime fires (chapter 4). What reaches the processor is the physics that depends on the pixel, in straight-line native code.</p>
 </section>
 
 
