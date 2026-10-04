@@ -1476,20 +1476,20 @@ unprofiled runs for before/after performance comparisons.
 the Python oracle at a small size and against an idiomatic Rust twin
 (`rust/*.rs`, `Rc`/`Vec`, written the way the source is written; nobody
 hoists by hand), then timed. Times in seconds, measured by `run.py` at
-`ce63d1e` (one run each, a load below 1).
+`e8441a9` on 4 October 2026 (one run each; the slower rows repeated within 0.02 s).
 
 | program | shape | Rust | Mithril t1 | Mithril t16 |
 |---|---|---|---|---|
-| collatz_mutual | mutual recursion | 0.29 | 0.41 | 0.41 |
-| cow_versions | copy-on-write array versions | 1.00 | 0.91 | 0.91 |
-| dag_share | heavily shared DAG | 1.67 | 1.91 | 0.27 |
-| graph_dfs | DFS over an array of adjacency lists | 0.86 | 1.30 | 0.25 |
-| interp | expression interpreter, env as a list | 2.45 | 1.23 | 0.14 |
-| persist_map | persistent BST with live old versions | 1.47 | 1.55 | 1.56 |
-| sorts | list merge sort and quicksort | 6.04 | 1.43 | 0.55 |
+| collatz_mutual | mutual recursion | 0.30 | 0.31 | 0.32 |
+| cow_versions | copy-on-write array versions | 1.01 | 1.97 | 1.96 |
+| dag_share | heavily shared DAG | 1.73 | 2.54 | 0.36 |
+| graph_dfs | DFS over an array of adjacency lists | 0.90 | 1.46 | 0.27 |
+| interp | expression interpreter, env as a list | 2.40 | 1.72 | 0.19 |
+| persist_map | persistent BST with live old versions | 1.49 | 1.66 | 1.65 |
+| sorts | list merge sort and quicksort | 6.78 | 1.58 | 0.69 |
 | stage_closure | W2: `mk(k) = λx. x + heavy(k)`, 20k applications | 0.00 | 0.00 | 0.00 |
-| pipeline_cfg | stage closures from a runtime config, in a list, over 20k inputs | 0.29 | 0.01 | 0.01 |
-| interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 3.77 | 3.83 |
+| pipeline_cfg | stage closures from a runtime config, in a list, over 20k inputs | 0.30 | 0.02 | 0.02 |
+| interp_closure | closure compilation of a runtime AST over 20k environments | 0.01 | 4.53 | 4.49 |
 
 ### 11.2 The k-d tree probe
 
@@ -1564,14 +1564,13 @@ stage times; the same file runs on the CPU and the device.
 
 | demo | CPU 16 threads (wall) | device (wall) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.061 s | 0.871 s |
-| path, 256 x 256 x 64 paths | 0.238 s | 0.335 s |
+| Whitted, 512 x 512 x 4 samples | 0.049 s | 0.189 s |
+| path, 256 x 256 x 64 paths | 0.173 s | 0.174 s |
 
 The device image is byte-identical to the CPU image for both. All ray
 code is native (vectors and hit records are nested tuples held in
 registers, section 5.2). These static demo timings are medians of three
-built-artifact runs after a warmup on 2 October 2026, using the same compiler
-as the animation measurements. [Raw samples](img/raytracer-static.json). Device wall includes result formatting and process setup;
+built-artifact runs after a warmup on 4 October 2026. [Raw samples](img/raytracer-static.json). Device wall includes result formatting and process setup;
 its `k_run` interval alone does not describe end-to-end rendering cost.
 A test renders the Whitted demo at 12 x 12 and checks it against the
 oracle at 1, 4 and 16 threads.

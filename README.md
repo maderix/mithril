@@ -277,16 +277,16 @@ Useful switches: `MITHRIL_STATS=1` (scheduler statistics of a CPU run),
 ## Results
 
 Recorded wall-clock seconds, compilation excluded. Ryzen 7 7800X3D
-(8 cores, 16 threads), RTX 4090. Render timings are medians of three runs on
-2 October 2026; GPU wall includes context creation and readback. The
-spatial-tree CPU measurements are from 29 September and its GPU measurement
-from 2 October. Every lane produces the same output.
+(8 cores, 16 threads), RTX 4090, 4 October 2026. Render timings are medians
+of three runs; spatial-tree times are minimums (ten runs on the CPU, three on
+the GPU). GPU wall includes context creation and readback. Every lane
+produces the same output.
 
 | program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
 |---|---:|---:|---:|---:|
-| cornell_path | - | 2.149 s | 0.238 s | 0.335 s |
-| cornell_whitted | - | 0.264 s | 0.061 s | 0.871 s |
-| kdtree | 0.333 s | 0.406 s | 0.090 s | 1.280 s |
+| cornell_path | - | 1.687 s | 0.173 s | 0.174 s |
+| cornell_whitted | - | 0.227 s | 0.049 s | 0.189 s |
+| kdtree | 0.362 s | 0.366 s | 0.088 s | 1.421 s |
 
 [Spatial-tree methods](bench/results.md) ·
 [Render measurements](docs/img/raytracer-static.json).
