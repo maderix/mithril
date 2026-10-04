@@ -1,0 +1,120 @@
+{
+ "collatz": {
+  "build_s": 0.62,
+  "full_t16_s": 0.051,
+  "full_t1_s": 0.327,
+  "gen_s": 0.17
+ },
+ "collatz_mutual": {
+  "build_s": 0.7,
+  "full_t16_s": 0.336,
+  "full_t1_s": 0.348,
+  "gen_s": 0.25
+ },
+ "cow_versions": {
+  "build_s": 0.6,
+  "full_t16_s": 1.123,
+  "full_t1_s": 1.13,
+  "gen_s": 1.09
+ },
+ "dag_share": {
+  "build_s": 0.82,
+  "full_t16_s": 0.35,
+  "full_t1_s": 2.005,
+  "gen_s": 0.12
+ },
+ "graph_dfs": {
+  "build_s": 5.53,
+  "full_t16_s": 0.353,
+  "full_t1_s": 1.248,
+  "gen_s": 4.17
+ },
+ "heat2d": {
+  "build_s": 1.54,
+  "full_t16_s": 0.122,
+  "full_t1_s": 0.532,
+  "gen_s": 1.5,
+  "instr": null
+ },
+ "histogram": {
+  "build_s": 0.69,
+  "full_t16_s": 0.094,
+  "full_t1_s": 0.549,
+  "gen_s": 0.05
+ },
+ "interp": {
+  "build_s": 0.84,
+  "full_t16_s": 0.195,
+  "full_t1_s": 1.26,
+  "gen_s": 0.19
+ },
+ "interp_closure": {
+  "build_s": 0.89,
+  "full_t16_s": 4.232,
+  "full_t1_s": 4.131,
+  "gen_s": 2.75
+ },
+ "kdtree": {
+  "build_s": 1.15,
+  "full_t16_s": 0.13,
+  "full_t1_s": 0.396,
+  "gen_s": 0.29
+ },
+ "knapsack": {
+  "build_s": 1.43,
+  "full_t16_s": 0.416,
+  "full_t1_s": 0.405,
+  "gen_s": 0.73,
+  "instr": null
+ },
+ "msort": {
+  "build_s": 0.65,
+  "full_t16_s": 0.134,
+  "full_t1_s": 0.243,
+  "gen_s": 0.16
+ },
+ "path": {
+  "build_s": 2.16,
+  "full_t16_s": 0.161,
+  "full_t1_s": 1.119,
+  "gen_s": 0.56,
+  "instr": null
+ },
+ "persist_map": {
+  "build_s": 0.59,
+  "full_t16_s": 1.599,
+  "full_t1_s": 1.602,
+  "gen_s": 0.02
+ },
+ "pipeline_cfg": {
+  "build_s": 1.8,
+  "full_t16_s": 0.021,
+  "full_t1_s": 0.026,
+  "gen_s": 0.32
+ },
+ "sorts": {
+  "build_s": 1.15,
+  "full_t16_s": 0.745,
+  "full_t1_s": 1.318,
+  "gen_s": 0.31
+ },
+ "stage_closure": {
+  "build_s": 0.44,
+  "full_t16_s": 0.005,
+  "full_t1_s": 0.008,
+  "gen_s": 1.89
+ },
+ "subsetsum": {
+  "build_s": 0.57,
+  "full_t16_s": 0.129,
+  "full_t1_s": 0.553,
+  "gen_s": 0.1
+ },
+ "whitted": {
+  "build_s": 0.98,
+  "full_t16_s": 0.03,
+  "full_t1_s": 0.114,
+  "gen_s": 0.3,
+  "instr": null
+ }
+}

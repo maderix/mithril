@@ -119,7 +119,10 @@ tiny work budgets that force pausing, and on the GPU (see Tests).
 
 ## Build
 
-Requirements: Rust 1.86 or newer and Python 3 (for the test scripts).
+Requirements: Rust 1.86 or newer and Python 3 (for the test scripts). The CPU
+backend runs on Linux x86-64 and, experimentally, on macOS with Apple silicon
+(fast CI and the demo suite pass there with the same values as on Linux); the
+GPU backend needs Linux and an NVIDIA GPU.
 
 ```
 cargo build --release -p mithril-cli                  # CPU only
