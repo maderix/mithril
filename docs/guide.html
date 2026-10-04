@@ -14,12 +14,12 @@
   --bg:#FFFFFF;--card:#F5F5F7;--codebg:#1D1D1F;
   --hair:rgba(0,0,0,.09);--hair-2:rgba(0,0,0,.18);
   --ink:#1D1D1F;--ink-2:#515154;--ink-3:#86868B;
-  --accent:#B4531A;--accent-2:#8E3E11;--accent-tint:rgba(180,83,26,.10);
-  --alt:#3D6FB6;--alt-tint:rgba(61,111,182,.10);
+  --accent:#3D6FB6;--accent-2:#2C568F;--accent-tint:rgba(61,111,182,.10);
+  --alt:#A35A2A;--alt-tint:rgba(163,90,42,.10);
   --good:#2E7D46;--bad:#C0392B;
-  --sel:rgba(180,83,26,.18);--nav-bg:rgba(255,255,255,.82);--glow:rgba(180,83,26,.10);
+  --sel:rgba(61,111,182,.18);--nav-bg:rgba(255,255,255,.82);--glow:rgba(61,111,182,.10);
   --code-txt:#F5F5F7;--code-a:#F0A36B;--code-b:#8CB8FF;--pre-hair:rgba(255,255,255,.10);
-  --inline-code:rgba(0,0,0,.06);--net-line:140,140,146;--net-dot:180,83,26;
+  --inline-code:rgba(0,0,0,.06);--net-line:140,140,146;--net-dot:61,111,182;
   --mono:"JetBrains Mono",ui-monospace,"SF Mono","Cascadia Code",Consolas,Menlo,monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Fira Sans",Ubuntu,"Helvetica Neue",Arial,sans-serif;
   --serif:"Fira Sans",Ubuntu,"Noto Sans",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
@@ -31,12 +31,12 @@
   --bg:#0B0B0D;--card:#141417;--codebg:#0E0E12;
   --hair:rgba(255,255,255,.09);--hair-2:rgba(255,255,255,.17);
   --ink:#ECEAE4;--ink-2:#B4B4BB;--ink-3:#A6A6B0;
-  --accent:#F5641E;--accent-2:#FF7F3C;--accent-tint:rgba(245,100,30,.14);
-  --alt:#7FB0FF;--alt-tint:rgba(127,176,255,.13);
+  --accent:#7FB0FF;--accent-2:#A3C7FF;--accent-tint:rgba(127,176,255,.14);
+  --alt:#D9894F;--alt-tint:rgba(217,137,79,.13);
   --good:#4FBF72;--bad:#E5484D;
-  --sel:rgba(245,100,30,.3);--nav-bg:rgba(11,11,13,.72);--glow:rgba(245,100,30,.20);
+  --sel:rgba(127,176,255,.3);--nav-bg:rgba(11,11,13,.72);--glow:rgba(127,176,255,.20);
   --code-txt:#ECE3CF;--code-a:#F5975A;--code-b:#8CB8FF;--pre-hair:rgba(255,255,255,.08);
-  --inline-code:rgba(255,255,255,.06);--net-line:245,100,30;--net-dot:245,100,30;
+  --inline-code:rgba(255,255,255,.06);--net-line:127,176,255;--net-dot:127,176,255;
   color-scheme:dark;
 }
 *{box-sizing:border-box}
@@ -201,8 +201,8 @@ svg text{fill:currentColor;font-family:var(--mono);font-size:15px}
 
 
 /* worker palette */
-:root{--w0:#B4531A;--w1:#3D6FB6;--w2:#2E8B57;--w3:#8A4FBF}
-:root[data-theme=dark]{--w0:#F5641E;--w1:#7FB0FF;--w2:#4FBF72;--w3:#B48CF0}
+:root{--w0:#3D6FB6;--w1:#A35A2A;--w2:#2E8B57;--w3:#8A4FBF}
+:root[data-theme=dark]{--w0:#7FB0FF;--w1:#D9894F;--w2:#4FBF72;--w3:#B48CF0}
 .anim .controls{margin-bottom:12px}
 .sd-svg .sd-tiny{font-size:11px}
 .sd-svg .sd-kind{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;fill:var(--ink-3)}
@@ -648,7 +648,7 @@ a = array_set(a, i, v)</code></pre></div>
 <text x="720" y="849" style="font-size:10.5px" fill="var(--ink-2)">1, 4, 16 threads · GPU</text>
 <text x="922" y="816" style="font-size:10.5px" fill="var(--ink-3)" text-anchor="end">§8</text>
 <path d="M688 831H706" fill="none" stroke="var(--good)" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#map-good)"/>
-</svg><figcaption>Mithril, end to end. Orange arrows are the path one program takes; the dotted orange line is the one rule table shared by the compiler and both runtimes.</figcaption></figure>
+</svg><figcaption>Mithril, end to end. Blue arrows are the path one program takes; the dotted blue line is the one rule table shared by the compiler and both runtimes.</figcaption></figure>
 
 <h3>How Mithril reads a program</h3>
 <p>Mithril runs two calculations at once whenever neither needs the other's result. So to see where a program can run in parallel, ask three questions about its shape: which calculations can start together, which must wait for an earlier answer, and what do they share? The five problems below each have a different shape. Each animation runs the real problem and schedules it the way Mithril's runtime does: a task starts as soon as its inputs exist and a worker is free.</p>
@@ -2083,7 +2083,7 @@ mithril run demos/cornell_whitted.py --image w.ppm --gpu</pre></aside></div>
 <path fill="none" stroke="var(--ink-3)" stroke-width="1.1" d="M237.36,-405.35C238.65,-397.35 238.85,-386.9 237.94,-378.16"/>
 </g>
 </g>
-</svg><figcaption><code>msort</code> with its match arms drawn as the nets they become when taken, 16 agents. Thick orange edges are active pairs: calls ready to run.</figcaption></figure>
+</svg><figcaption><code>msort</code> with its match arms drawn as the nets they become when taken, 16 agents. Thick blue edges are active pairs: calls ready to run.</figcaption></figure>
 <p class="pn"><code>split</code> hands one half to each <code>msort</code> call. The two calls share no wire, so they are two independent active pairs and run as two tasks; <code>merge</code> waits for both results.</p>
 <pre class="dec-cmd">mithril net docs/examples/msort.py
 mithril run docs/examples/msort.py --threads 16</pre></aside></div>

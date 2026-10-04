@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img"><title>Rewrites in any order</title><desc>Three copies of the net for (2+3)*(4+5). In the first, the left sum is rewritten and then the right one; in the second the right one first; in the third both at the same time. Each then multiplies and ends with 45.</desc><style>
 :root{--bg:#FFFFFF;--card:#F5F5F7;--ink:#1D1D1F;--ink3:#86868B;--hair:rgba(0,0,0,.20);
---accent:#B4531A;--alt:#3D6FB6;--good:#2E7D46;--c1:#3D6FB6;--c2:#2E7D46;--c3:#8E44AD;--c4:#B4531A}
+--accent:#3D6FB6;--alt:#B4531A;--good:#2E7D46;--c1:#B4531A;--c2:#2E7D46;--c3:#8E44AD;--c4:#3D6FB6}
 @media (prefers-color-scheme: dark){:root{--bg:#0B0B0D;--card:#141417;--ink:#ECEAE4;--ink3:#A6A6B0;
---hair:rgba(255,255,255,.22);--accent:#F5641E;--alt:#7FB0FF;--good:#4FBF72;--c1:#7FB0FF;--c2:#4FBF72;--c3:#C39BFF;--c4:#F5641E}}
+--hair:rgba(255,255,255,.22);--accent:#7FB0FF;--alt:#F5641E;--good:#4FBF72;--c1:#F5641E;--c2:#4FBF72;--c3:#C39BFF;--c4:#7FB0FF}}
 text{font-family:ui-sans-serif,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;fill:var(--ink)}
 .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 .agent{fill:var(--card);stroke:var(--ink);stroke-width:1.6}

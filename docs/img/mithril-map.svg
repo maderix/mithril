@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="884" viewBox="0 0 960 884" role="img" aria-labelledby="map-title map-desc"><style>
-svg{--bg:#FFFFFF;--card:#F5F5F7;--hair:rgba(0,0,0,.09);--hair-2:rgba(0,0,0,.18);--ink:#1D1D1F;--ink-2:#515154;--ink-3:#86868B;--accent:#B4531A;--alt:#3D6FB6;--good:#2E7D46}
-@media (prefers-color-scheme: dark){svg{--bg:#0B0B0D;--card:#141417;--hair:rgba(255,255,255,.09);--hair-2:rgba(255,255,255,.17);--ink:#ECEAE4;--ink-2:#B4B4BB;--ink-3:#A6A6B0;--accent:#F5641E;--alt:#7FB0FF;--good:#4FBF72}}
+svg{--bg:#FFFFFF;--card:#F5F5F7;--hair:rgba(0,0,0,.09);--hair-2:rgba(0,0,0,.18);--ink:#1D1D1F;--ink-2:#515154;--ink-3:#86868B;--accent:#3D6FB6;--alt:#B4531A;--good:#2E7D46}
+@media (prefers-color-scheme: dark){svg{--bg:#0B0B0D;--card:#141417;--hair:rgba(255,255,255,.09);--hair-2:rgba(255,255,255,.17);--ink:#ECEAE4;--ink-2:#B4B4BB;--ink-3:#A6A6B0;--accent:#7FB0FF;--alt:#F5641E;--good:#4FBF72}}
 text{font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 </style><rect width="960" height="884" rx="16" fill="var(--card)"/>
 <title id="map-title">Mithril, end to end</title>
