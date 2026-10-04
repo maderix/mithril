@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""Fast regression gate for Mithril: a light version of every check the
-benchmarks and demos make, in about a minute.
+"""Fast regression gate for Mithril: every program the benchmarks and demos
+run, at full size, on the CPU and the GPU, in about two minutes.
 
-Programs: the bench ports (bench/ports), both demos (demos/, a tiny image)
-and the generality corpus (bench/general, small sizes). For each, in
-parallel with memory-capped builds:
+Programs: the bench ports (bench/ports), both demos (demos/) and the
+generality corpus (bench/general). Phase 1 builds everything in parallel
+(memory-capped) and runs the small checks; phase 2 times the full-size runs,
+the CPU and the device as two serialized lanes running side by side.
 
   correctness  small build, --threads 1 and 16, exact value (a fixed
                expected checksum, or the reference oracle's value recorded
                by --update)
-  device       the same small build on the GPU (`build --gpu` + `exec`),
-               exact value (skipped without a GPU or with --no-gpu)
+  full size    the unmodified program at --threads 1 and 16 (wall time) and
+               on the device (device time and process wall); the three
+               values must agree and equal the baseline's
   lowering     the set of functions native-scalar-lowered (fn s_<id>) must
-               not shrink (a function silently falling back to tagged dive
-               code is a 5-30x sequential regression)
+               not shrink
   code size    generated lines and segment count within tolerance
-  compile time code generation of the unmodified program (dump_gen) and the
-               small build, within tolerance of baseline: a specializer or
-               codegen blowup fails here, not in a demo an hour later
-  perf         instruction count (perf stat, noise-free) of a mid-size run
-               within tolerance of baseline; the device run time of a
-               mid-size demo within a looser tolerance
+  compile time code generation (dump_gen) and the small build within
+               tolerance: a specializer or codegen blowup fails here
+  perf         instruction count (perf stat, noise-free) of a mid-size run;
+               every full-size time within tolerance of the baseline. A
+               device run past GPU_RUN_CAP_S is recorded as a timeout: a
+               program that finished before and now times out fails
 
 Everything is compared against tests/ci/baseline.json. `--update` rewrites
 the baseline from the current toolchain, checking every program without a
@@ -53,8 +54,11 @@ BUILD_MEM_KB = 12_000_000
 BUILD_CAP_S = 60
 RUN_CAP_S = 60
 GPU_LOCK = __import__("threading").Lock()  # one device run at a time
-GPU_BUILDS = __import__("threading").Semaphore(3)  # nvcc builds at once
-GPU_BUILD_CAP_S = 180
+GPU_BUILDS = __import__("threading").Semaphore(8)  # nvcc builds at once
+GPU_BUILD_CAP_S = 300
+# a full-size run past these is recorded as a timeout, not waited for
+CPU_RUN_CAP_S = 30
+GPU_RUN_CAP_S = 8
 
 DEMOS = os.path.join(ROOT, "demos")
 GENERAL = os.path.join(ROOT, "bench", "general")
@@ -87,16 +91,12 @@ MID = {
     "knapsack": ["s/return solve(8000, 100000)/return solve(200, 20000)/"],
     "whitted": ["s/^    return 512$/    return 48/"],
 }
-# the device run time of these mid-size variants (MITHRIL_GPU_STATS)
-GPU_MID = {"whitted", "heat2d", "path"}
-# programs checked on the device (each costs an nvcc build)
-GPU_PROGRAMS = set(SMALL) | {"whitted", "path"}
 MID.setdefault("path", ["s/^    return 256$/    return 32/", "s/^    return 64$/    return 8/"])
-
-TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0, "gpu_ms": 1.5}
+TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0,
+       "full_t1_s": 1.3, "full_t16_s": 1.5, "gpu_ms": 1.5, "gpu_wall_ms": 1.5}
 SOFT = set()
 # below these a time is noise, never a failure
-FLOOR = {"build_s": 2.0, "gen_s": 1.0, "gpu_ms": 20.0}
+FLOOR = {"build_s": 2.0, "gen_s": 1.0, "full_t1_s": 0.05, "full_t16_s": 0.05, "gpu_ms": 2.0, "gpu_wall_ms": 300.0}
 HAS_GPU = shutil.which("nvidia-smi") is not None and subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode == 0
 RUN_ENV = dict(os.environ, MITHRIL_NODES=str(1 << 28), MITHRIL_RECS=str(1 << 26))
 
@@ -140,8 +140,10 @@ def last(out, err):
 
 
 def gpu_ms(err):
-    m = re.search(r"run (\d+) ms on", err)
-    return int(m.group(1)) if m else None
+    # every attempt counts: a run the stack guard aborts is rerun with a
+    # doubled stack, and the program pays for both
+    runs = re.findall(r"device events: boot [0-9.]+ ms, run ([0-9.]+) ms", err)
+    return round(sum(map(float, runs)), 3) if runs else None
 
 
 def measure(name, tmp, gpu, update, base):
@@ -182,45 +184,64 @@ def measure(name, tmp, gpu, update, base):
     if name not in SMALL:
         r["expect"] = expect
     r["small_ok"] = expect is not None and r["small_t1"] == expect and r["small_t16"] == expect
-    if gpu and name in GPU_PROGRAMS:
-        art = os.path.join(tmp, f"{name}.small.gpu")
+    # full size: the unmodified program, built for the CPU and the device
+    r["_cpu"] = os.path.join(tmp, f"{name}.full")
+    if run(capped([BIN, "build", source(name), "-o", r["_cpu"]]), BUILD_CAP_S)[0] != 0:
+        r["error"] = "full-size build failed"
+        return r
+    if gpu:
+        r["_gpu"] = os.path.join(tmp, f"{name}.full.gpu")
         with GPU_BUILDS:
-            rc, out, err, dt = run(capped([BIN, "build", "--gpu", src, "-o", art]), GPU_BUILD_CAP_S)
-        if rc != 0:
-            r["gpu"] = "build: " + err.strip()[-100:]
-        else:
-            with GPU_LOCK:
-                rc, out, err, dt = run([BIN, "exec", art], RUN_CAP_S)
-            r["gpu"] = last(out, err)
-        r["gpu_ok"] = r["gpu"] == expect
+            if run(capped([BIN, "build", "--gpu", source(name), "-o", r["_gpu"]]), GPU_BUILD_CAP_S)[0] != 0:
+                r["error"] = "device build failed"
+                return r
     if name in MID:
         msrc = variant(name, MID[name], tmp, "mid")
         mbin = os.path.join(tmp, f"{name}.mid")
         rc, out, err, dt = run(capped([BIN, "build", msrc, "-o", mbin]), BUILD_CAP_S)
         if rc == 0:
-            ins, v1 = instructions([mbin, "--threads", "1"], RUN_CAP_S)
-            rc2, out2, err2, _ = run([mbin, "--threads", "16"], RUN_CAP_S, env=RUN_ENV)
-            v16 = out2.strip().split("\n")[-1] if out2.strip() else ""
-            r["instr"] = ins
-            r["mid_agree"] = (v1 is not None and v1 == v16)
-            if "arena exhausted" in err2 or ins is None:
-                r["mid_exhausted"] = True
-            if gpu and name in GPU_MID:
-                art = os.path.join(tmp, f"{name}.mid.gpu")
-                with GPU_BUILDS:
-                    built = run(capped([BIN, "build", "--gpu", msrc, "-o", art]), GPU_BUILD_CAP_S)[0] == 0
-                if built:
-                    best = None
-                    for _ in range(2):
-                        with GPU_LOCK:
-                            rc3, out3, err3, _ = run([BIN, "exec", art], RUN_CAP_S, env=dict(RUN_ENV, MITHRIL_GPU_STATS="1"))
-                        ms = gpu_ms(err3)
-                        if rc3 == 0 and ms is not None:
-                            best = ms if best is None else min(best, ms)
-                        if last(out3, "") != v1:
-                            r["gpu_mid_differs"] = True
-                    r["gpu_ms"] = best
+            r["_mid"] = mbin
     return r
+
+
+def time_cpu(r):
+    """Full-size runs at 1 and 16 threads (wall time), and the mid-size
+    instruction count; one program at a time."""
+    vals = []
+    for t in (1, 16):
+        rc, out, err, dt = run([r["_cpu"], "--threads", str(t)], CPU_RUN_CAP_S, env=RUN_ENV)
+        if rc == -1:
+            r[f"full_t{t}_timeout"] = True
+            continue
+        r[f"full_t{t}_s"] = round(dt, 3)
+        vals.append(last(out, err))
+    r["full_value"] = vals[0] if vals else None
+    r["full_agree"] = len(set(vals)) <= 1
+    if "_mid" in r:
+        ins, v1 = instructions([r["_mid"], "--threads", "1"], CPU_RUN_CAP_S)
+        rc2, out2, err2, _ = run([r["_mid"], "--threads", "16"], CPU_RUN_CAP_S, env=RUN_ENV)
+        r["instr"] = ins
+        r["mid_agree"] = v1 is not None and v1 == last(out2, "")
+        if "arena exhausted" in err2 or ins is None:
+            r["mid_exhausted"] = True
+
+
+def time_gpu(r):
+    """The full-size device run: device time (best of two when short) and
+    process wall, capped at GPU_RUN_CAP_S; one program at a time."""
+    best = wall = None
+    for i in range(2):
+        rc, out, err, dt = run([BIN, "exec", r["_gpu"]], GPU_RUN_CAP_S, env=dict(RUN_ENV, MITHRIL_GPU_STATS="1"))
+        if rc == -1:
+            r["gpu_timeout"] = True
+            return
+        ms = gpu_ms(err)
+        best = ms if best is None or (ms is not None and ms < best) else best
+        wall = round(dt * 1000) if wall is None else min(wall, round(dt * 1000))
+        r["gpu"] = last(out, err)
+        if dt > 1.0:
+            break
+    r["gpu_ms"], r["gpu_wall_ms"] = best, wall
 
 
 def compare(cur, base):
@@ -230,10 +251,15 @@ def compare(cur, base):
         return [cur["error"]], soft
     if cur.get("small_ok") is False:
         hard.append(f"checksum small t1={str(cur.get('small_t1'))[:40]} t16={str(cur.get('small_t16'))[:40]} expect={str(cur.get('expect'))[:40]}")
-    if cur.get("gpu_ok") is False:
-        hard.append(f"device small {str(cur.get('gpu'))[:60]}")
-    if cur.get("gpu_mid_differs"):
-        hard.append("device mid-size value differs from the CPU's")
+    if cur.get("full_agree") is False:
+        hard.append("full-size values differ between --threads 1 and 16")
+    if "gpu" in cur and cur.get("full_value") is not None and cur["gpu"] != cur["full_value"]:
+        hard.append(f"device value {str(cur['gpu'])[:40]} != CPU {str(cur['full_value'])[:40]}")
+    if base.get("full_value") and cur.get("full_value") and cur["full_value"] != base["full_value"]:
+        hard.append(f"full-size value {str(cur['full_value'])[:40]} != baseline {str(base['full_value'])[:40]}")
+    for k, t in (("gpu", "gpu_timeout"), ("full_t1", "full_t1_timeout"), ("full_t16", "full_t16_timeout")):
+        if cur.get(t) and base.get(f"{k}_ms" if k == "gpu" else f"{k}_s"):
+            hard.append(f"{k} now times out (baseline finished)")
     if cur.get("mid_exhausted"):
         hard.append("mid-size run exhausted the arena (memory regression)")
     elif "instr" in cur and cur.get("mid_agree") is False:
@@ -268,9 +294,21 @@ def main():
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
         results = list(ex.map(lambda n: measure(n, tmp, gpu, a.update, base), names))
+    t1 = time.time()
+    ready = [r for r in results if "error" not in r]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        lanes = [ex.submit(lambda: [time_cpu(r) for r in ready])]
+        if gpu:
+            lanes.append(ex.submit(lambda: [time_gpu(r) for r in ready if "_gpu" in r]))
+        for lane in lanes:
+            lane.result()
+    t2 = time.time()
     shutil.rmtree(tmp, ignore_errors=True)
+    for r in results:
+        for k in [k for k in r if k.startswith("_")]:
+            del r[k]
     fails = 0
-    print(f"{'program':15} {'small':5} {'gpu':4} {'scalar':>6} {'segs':>5} {'lines':>6} {'gen':>5} {'build':>6} {'instr(G)':>9} {'gpu ms':>7}  status")
+    print(f"{'program':15} {'small':5} {'scalar':>6} {'segs':>5} {'lines':>6} {'gen':>5} {'build':>6} {'instr(G)':>9} {'t1 s':>7} {'t16 s':>7} {'gpu ms':>9} {'gpu wall':>8}  status")
     for r in results:
         b = base.get(r["name"], {})
         hard, soft = compare(r, b)
@@ -280,9 +318,10 @@ def main():
         st = "OK" if not hard else "FAIL"
         notes = "; ".join(hard + [f"warn: {s}" for s in soft])
         small = {True: "PASS", False: "FAIL", None: "-"}[r.get("small_ok")]
-        dev = {True: "PASS", False: "FAIL", None: "-"}[r.get("gpu_ok")]
-        print(f"{r['name']:15} {small:5} {dev:4} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('gen_s', '-'):>5} {r.get('build_s', '-'):>6} {insg} {str(r.get('gpu_ms') or '-'):>7}  {st} {notes}")
-    print(f"total {time.time() - t0:.1f}s, {fails} failing")
+        tm = lambda k: "timeout" if r.get(f"{k}_timeout") else str(r.get(f"{k}_s", "-"))
+        gms = "timeout" if r.get("gpu_timeout") else (f"{r['gpu_ms']:.1f}" if r.get("gpu_ms") is not None else "-")
+        print(f"{r['name']:15} {small:5} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('gen_s', '-'):>5} {r.get('build_s', '-'):>6} {insg} {tm('full_t1'):>7} {tm('full_t16'):>7} {gms:>9} {str(r.get('gpu_wall_ms', '-')):>8}  {st} {notes}")
+    print(f"total {time.time() - t0:.1f}s (builds and small checks {t1 - t0:.1f}s, timed runs {t2 - t1:.1f}s), {fails} failing")
     if a.update:
         # merge: `--update --only X` refreshes X and keeps every other entry
         base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
