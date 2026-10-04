@@ -16,10 +16,9 @@ A programming language built on interaction nets.
   to CUDA, with one rule table and one runtime model on both. You pick the
   device when the program runs.
 
-**Read the introduction:
-[Mithril: a programming language for deterministic parallelism](https://maderix.github.io/articles/mithril/)**,
-an illustrated article covering where the language comes from, how it works,
-animated examples, good uses and current limits.
+**Read the field guide: [maderix.github.io/articles/mithril](https://maderix.github.io/articles/mithril/)**,
+an illustrated walk through where the language comes from, how it works,
+worked examples with their interaction nets, good uses and current limits.
 
 | Spinning black hole | Path tracing |
 |---|---|
