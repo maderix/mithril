@@ -399,6 +399,18 @@ Ints are 64-bit and wrap at 2^64. Floats are boxed f64 cells or
 binary32 values. Comparisons with NaN follow IEEE (only `!=` holds), one
 definition shared by the oracle and the reducer.
 
+The core's binary32 operations are the ones IEEE 754 requires to be
+correctly rounded: `+ - * /`, `sqrt`, comparisons and the integer
+conversions. Each is defined once on bit patterns (`core::f32_prim`), used
+by the oracle and compile-time reduction; native CPU code uses plain Rust
+f32 arithmetic (never fused) and the device uses the explicitly rounded
+intrinsics (`__fadd_rn`, `__fmul_rn`, `__fdiv_rn`, `__fsqrt_rn`), which are
+never contracted into a fused multiply-add. Every executor therefore
+computes the same bits. Functions with no correctly rounded hardware form
+(`sin`, `exp`, `log`, `pow`) are not core operations: a standard library
+writes them in Mithril over the core operations, so they have one
+implementation on every executor.
+
 A variable stays boolean across loops and joins when every assignment to
 it is boolean.
 
