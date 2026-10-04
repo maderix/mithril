@@ -276,22 +276,58 @@ Useful switches: `MITHRIL_STATS=1` (scheduler statistics of a CPU run),
 
 ## Results
 
-Recorded wall-clock seconds, compilation excluded. Ryzen 7 7800X3D
-(8 cores, 16 threads), RTX 4090, 4 October 2026. Render timings are medians
-of three runs; spatial-tree times are minimums (ten runs on the CPU, three on
-the GPU). GPU wall includes context creation and readback. Every lane
-produces the same output.
+Wall-clock seconds, compilation excluded; every lane returns the same output.
+
+<details>
+<summary><b>Linux (Ryzen 7 7800X3D, RTX 4090) and macOS (Apple M4)</b></summary>
+
+<br>
+
+Measured on 4 October 2026. The seven benchmark ports are timed against a C
+twin of the same algorithm, compiled with `-O2`; times are minimums of five
+runs (three on the GPU). Render times are medians of three runs after a
+warmup. GPU wall includes context creation and readback.
+
+**Linux** · Ryzen 7 7800X3D (8 cores, 16 threads), RTX 4090, `gcc`
 
 | program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
 |---|---:|---:|---:|---:|
-| cornell_path | - | 1.687 s | 0.173 s | 0.174 s |
-| cornell_whitted | - | 0.227 s | 0.049 s | 0.189 s |
-| kdtree | 0.362 s | 0.366 s | 0.088 s | 1.421 s |
+| collatz | 0.350 s | 0.283 s | 0.027 s | 0.108 s |
+| heat2d | 0.530 s | 0.706 s | 0.111 s | 0.159 s |
+| histogram | 0.387 s | 0.996 s | 0.141 s | 0.140 s |
+| kdtree | 0.369 s | 0.367 s | 0.087 s | 1.356 s |
+| knapsack | 0.351 s | 0.436 s | 0.177 s | 0.484 s |
+| msort | 0.392 s | 0.299 s | 0.125 s | 6.546 s |
+| subsetsum | 0.542 s | 0.768 s | 0.160 s | 0.245 s |
+| cornell_path | - | 1.700 s | 0.170 s | 0.171 s |
+| cornell_whitted | - | 0.223 s | 0.049 s | 0.185 s |
 
-[Spatial-tree methods](bench/results.md) ·
-[Render measurements](docs/img/raytracer-static.json).
+**macOS (experimental CPU backend)** · Apple M4 (4 performance + 6
+efficiency cores), Apple `clang`
 
-### Against Bend 2 on the GPU
+| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads |
+|---|---:|---:|---:|
+| collatz | 0.300 s | 0.305 s | 0.050 s |
+| heat2d | 0.391 s | 0.529 s | 0.123 s |
+| histogram | 0.307 s | 0.506 s | 0.093 s |
+| kdtree | 0.150 s | 0.382 s | 0.127 s |
+| knapsack | 0.293 s | 0.402 s | 0.417 s |
+| msort | 0.113 s | 0.230 s | 0.131 s |
+| subsetsum | 0.561 s | 0.546 s | 0.119 s |
+| cornell_path | - | 1.088 s | 0.161 s |
+| cornell_whitted | - | 0.111 s | 0.029 s |
+
+Every program returns the same output on every lane and on both machines.
+
+[Benchmark ports](bench/ports) ·
+[Render measurements](docs/img/raytracer-static.json)
+
+</details>
+
+<details>
+<summary><b>Against Bend 2 on the GPU</b></summary>
+
+<br>
 
 Process wall time on an RTX 4090, 2 October 2026: the binaries Bend 2.0.31's own
 compiler produced, against Mithril. Minimum of three alternating runs, machine
@@ -321,6 +357,8 @@ Mithril leads on queens (7.2×), raytrace (3.5×) and lexer (1.4×). Bend 2 lead
 13 of the 16 programs, by up to 6.9× on symreg; closing that gap is the per-lane
 efficiency work described in the introduction. The 16 programs are ports of
 Bend's example set; their sources live outside this repository.
+
+</details>
 
 ## Repository layout
 

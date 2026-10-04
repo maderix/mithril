@@ -1564,8 +1564,8 @@ stage times; the same file runs on the CPU and the device.
 
 | demo | CPU 16 threads (wall) | device (wall) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.049 s | 0.189 s |
-| path, 256 x 256 x 64 paths | 0.173 s | 0.174 s |
+| Whitted, 512 x 512 x 4 samples | 0.049 s | 0.185 s |
+| path, 256 x 256 x 64 paths | 0.170 s | 0.171 s |
 
 The device image is byte-identical to the CPU image for both. All ray
 code is native (vectors and hit records are nested tuples held in
