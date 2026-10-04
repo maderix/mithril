@@ -117,7 +117,14 @@ pub enum Stmt {
     /// `for v in range(e): body` — `fold` is always `None` from the parser.
     For(String, Expr, Vec<Stmt>, Option<FoldInfo>),
     Match(Expr, Vec<(Pat, Vec<Stmt>)>),
+    /// leave the innermost loop
+    Break,
+    /// start the innermost loop's next iteration
+    Continue,
 }
+
+/// The expression part of a statement that has none.
+static NO_EXPR: Expr = Expr::Bool(true);
 
 impl Stmt {
     /// Head expression and nested blocks, in source order. Binders stay on the statement.
@@ -127,6 +134,7 @@ impl Stmt {
             Self::If(e, a, b) => (e, vec![a, b]),
             Self::While(e, b) | Self::For(_, e, b, _) => (e, vec![b]),
             Self::Match(e, arms) => (e, arms.iter().map(|(_, b)| b.as_slice()).collect()),
+            Self::Break | Self::Continue => (&NO_EXPR, Vec::new()),
         }
     }
 }
@@ -167,4 +175,6 @@ pub struct FnDef {
 pub struct Module {
     pub datas: Vec<DataDef>,
     pub fns: Vec<FnDef>,
+    /// the line each function's `def` is on, for diagnostics after parsing
+    pub lines: std::collections::HashMap<String, u32>,
 }

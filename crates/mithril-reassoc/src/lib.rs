@@ -104,7 +104,7 @@ fn walk_block(
                 let v = classify_init(e);
                 inits.insert(n.clone(), v);
             }
-            Stmt::Return(_) | Stmt::ExprStmt(_) => {}
+            Stmt::Return(_) | Stmt::ExprStmt(_) | Stmt::Break | Stmt::Continue => {}
             Stmt::If(_, t, e) => {
                 let mut it = inits.clone();
                 walk_block(t, func, fns, &mut it, out);
@@ -176,6 +176,10 @@ fn collapse_block(stmts: Vec<Stmt>, whole: &[Stmt], fresh: &mut usize) -> Vec<St
 /// row differ). `whole` is the function body, `k` numbers the fresh names.
 fn collapse(y: &str, n: &Expr, outer: &[Stmt], whole: &[Stmt], k: usize) -> Option<Vec<Stmt>> {
     let [Stmt::For(x, m, inner, None)] = outer else { return None };
+    // a `break` or `continue` belongs to the inner loop: merging would change it
+    if mithril_front::desugar::has_jump(inner) {
+        return None;
+    }
     let (Stmt::Assign(a, Expr::Call(f, args)), work) = inner.split_last()? else { return None };
     if f != "array_set" || args.len() != 3 || x == y {
         return None;
@@ -259,6 +263,9 @@ fn analyze_for(
 /// iteration then writes `e` at its own index, and `e` cannot see the writes of
 /// other iterations (lemma `fill_chunks`).
 fn fill_target<'a>(var: &str, body: &'a [Stmt]) -> Option<&'a str> {
+    if mithril_front::desugar::has_jump(body) {
+        return None;
+    }
     let (Stmt::Assign(a, Expr::Call(f, args)), work) = body.split_last()? else { return None };
     if f != "array_set" || args.len() != 3 || args[0] != Expr::Var(a.clone()) || a == var {
         return None;

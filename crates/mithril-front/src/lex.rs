@@ -1,8 +1,11 @@
 //! Hand-written lexer for the Python subset: indentation is significant
 //! (an indent/dedent stack, like Python's own tokenizer), 4 spaces per
 //! level. Tabs in leading whitespace are rejected. Numbers include decimal
-//! and `0x` hex ints and simple floats. `#` starts a line comment.
+//! and `0x` hex ints and simple floats. `#` starts a line comment. String
+//! literals are lexed only so that a docstring can be skipped and any other
+//! string reported clearly.
 
+use crate::ast::BinOp;
 use crate::Diag;
 
 
@@ -11,6 +14,7 @@ pub enum TokKind {
     Int(i64),
     Float(f64),
     Name(String),
+    Str(String),
     // Keywords
     Def,
     Return,
@@ -29,10 +33,14 @@ pub enum TokKind {
     True,
     False,
     Class,
+    Pass,
+    Break,
+    Continue,
     // Punctuation / operators
     Plus,
     Minus,
     Star,
+    StarStar,
     Slash,
     SlashSlash,
     Percent,
@@ -48,6 +56,8 @@ pub enum TokKind {
     EqEq,
     NotEq,
     Assign,
+    /// `+=`, `//=`, ... (the operator)
+    AugAssign(BinOp),
     LParen,
     RParen,
     LBracket,
@@ -87,6 +97,9 @@ fn keyword(s: &str) -> Option<TokKind> {
         "True" => TokKind::True,
         "False" => TokKind::False,
         "class" => TokKind::Class,
+        "pass" => TokKind::Pass,
+        "break" => TokKind::Break,
+        "continue" => TokKind::Continue,
         _ => return None,
     })
 }
@@ -95,7 +108,7 @@ fn keyword(s: &str) -> Option<TokKind> {
 /// friendlier "unsupported statement" diagnostic (see parser).
 pub const UNSUPPORTED_KEYWORDS: &[&str] = &[
     "import", "from", "with", "try", "except", "finally", "raise", "yield", "global",
-    "nonlocal", "pass", "break", "continue", "del", "assert",
+    "nonlocal", "del", "assert",
 ];
 
 struct Lexer<'a> {
@@ -181,6 +194,10 @@ impl<'a> Lexer<'a> {
             }
             if c.is_ascii_alphabetic() || c == b'_' {
                 self.lex_name();
+                continue;
+            }
+            if c == b'"' || c == b'\'' {
+                self.lex_string()?;
                 continue;
             }
             self.lex_op()?;
@@ -312,6 +329,35 @@ impl<'a> Lexer<'a> {
         self.out.push(Token { kind, line });
     }
 
+    /// `'...'`, `"..."` or a triple-quoted string (which may span lines).
+    fn lex_string(&mut self) -> Result<(), Diag> {
+        let line = self.line;
+        let q = self.bump();
+        let triple = self.peek() == q && self.peek_at(1) == q;
+        if triple {
+            self.pos += 2;
+        }
+        let start = self.pos;
+        loop {
+            match self.peek() {
+                0 => return Err(Diag::new(line, "unterminated string literal")),
+                b'\\' => {
+                    self.bump();
+                    self.bump();
+                }
+                b'\n' if !triple => return Err(Diag::new(line, "unterminated string literal")),
+                c if c == q && (!triple || (self.peek_at(1) == q && self.peek_at(2) == q)) => break,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
+        self.pos += if triple { 3 } else { 1 };
+        self.out.push(Token { kind: TokKind::Str(text), line });
+        Ok(())
+    }
+
     fn eat(&mut self, c: u8) -> bool {
         let y = self.peek() == c;
         if y {
@@ -324,6 +370,8 @@ impl<'a> Lexer<'a> {
         use TokKind::*;
         let line = self.line;
         let c = self.bump();
+        // `op=`: an augmented assignment (`==`, `<=`, `>=` and `!=` are comparisons)
+        let aug = |lx: &mut Self, op: BinOp| if lx.eat(b'=') { Some(AugAssign(op)) } else { None };
         let kind = match c {
             b'(' | b'[' => {
                 self.paren_depth += 1;
@@ -337,16 +385,20 @@ impl<'a> Lexer<'a> {
             b',' => Comma,
             b'.' => Dot,
             b'@' => At,
-            b'+' => Plus,
-            b'-' => Minus,
-            b'*' => Star,
-            b'%' => Percent,
-            b'&' => Amp,
-            b'|' => Pipe,
-            b'^' => Caret,
-            b'/' => if self.eat(b'/') { SlashSlash } else { Slash },
-            b'<' => if self.eat(b'<') { Shl } else if self.eat(b'=') { Le } else { Lt },
-            b'>' => if self.eat(b'>') { Shr } else if self.eat(b'=') { Ge } else { Gt },
+            b'+' => aug(self, BinOp::Add).unwrap_or(Plus),
+            b'-' => aug(self, BinOp::Sub).unwrap_or(Minus),
+            b'*' if self.eat(b'*') => StarStar,
+            b'*' => aug(self, BinOp::Mul).unwrap_or(Star),
+            b'%' => aug(self, BinOp::Mod).unwrap_or(Percent),
+            b'&' => aug(self, BinOp::BitAnd).unwrap_or(Amp),
+            b'|' => aug(self, BinOp::BitOr).unwrap_or(Pipe),
+            b'^' => aug(self, BinOp::BitXor).unwrap_or(Caret),
+            b'/' if self.eat(b'/') => aug(self, BinOp::FloorDiv).unwrap_or(SlashSlash),
+            b'/' => aug(self, BinOp::Div).unwrap_or(Slash),
+            b'<' if self.eat(b'<') => aug(self, BinOp::Shl).unwrap_or(Shl),
+            b'<' => if self.eat(b'=') { Le } else { Lt },
+            b'>' if self.eat(b'>') => aug(self, BinOp::Shr).unwrap_or(Shr),
+            b'>' => if self.eat(b'=') { Ge } else { Gt },
             b'=' => if self.eat(b'=') { EqEq } else { Assign },
             b'!' if self.eat(b'=') => NotEq,
             other => return Err(Diag::new(line, format!("unexpected character '{}'", other as char))),

@@ -77,7 +77,23 @@ fn main() {
 
 const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
 
+const HELP: &str = "Mithril: compile a Python-subset program and run it on every core or the GPU.
+
+  mithril run f.py [--threads N] [--gpu]   compile and run; prints the value main() returns
+  mithril run f.py --image out.ppm         main() returns (width, height, pixels): write the image
+  mithril oracle f.py                      run on the reference interpreter
+  mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
+  mithril exec prog                        run a program built with --gpu
+  mithril net f.py                         what compile-time reduction did to each function
+  mithril prove f.py                       prove the program's parallel folds (Lean obligations)
+
+The answer is the same on every thread count and on the GPU.";
+
 fn dispatch(args: &[String]) -> Result<i32, CliErr> {
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+        println!("{HELP}\n\n{USAGE}");
+        return Ok(0);
+    }
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("build") => cmd_build(&args[1..]),

@@ -129,6 +129,7 @@ fn self_calls(body: &[Stmt], name: &str) -> usize {
             Stmt::If(c, a, b) => count(c) + self_calls(a, name).max(self_calls(b, name)),
             Stmt::While(c, b) | Stmt::For(_, c, b, _) => count(c) + self_calls(b, name),
             Stmt::Match(e, arms) => count(e) + arms.iter().map(|(_, b)| self_calls(b, name)).max().unwrap_or(0),
+            Stmt::Break | Stmt::Continue => 0,
         })
         .sum()
 }

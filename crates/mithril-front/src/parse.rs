@@ -11,11 +11,100 @@ struct Parser<'a> {
     /// hidden names made so far (range loops, tuple destructuring): keeps
     /// each one unique
     hidden: usize,
+    /// a `**` needs the integer power helper
+    pow_used: bool,
 }
 
 pub fn parse_module(toks: &[Token]) -> Result<Module, Diag> {
-    let mut p = Parser { toks, pos: 0, hidden: 0 };
+    let mut p = Parser { toks, pos: 0, hidden: 0, pow_used: false };
     p.module()
+}
+
+/// `b ** e` for an exponent that is not a small literal (integers; a
+/// negative exponent gives 1).
+const IPOW: &str = "
+def __ipow(b, e):
+    r = 1
+    while e > 0:
+        if e & 1 == 1:
+            r = r * b
+        b = b * b
+        e = e >> 1
+    return r
+";
+
+/// Every use of a module constant `N` becomes the call `N()`, except in a
+/// function that binds `N` itself (Python: assigning a name makes it local);
+/// `min`, `max` and `abs` become comparisons where the program defines no
+/// function of that name.
+fn resolve_globals(m: &mut Module, consts: &[String]) {
+    let defined: std::collections::HashSet<String> = m.fns.iter().map(|f| f.name.clone()).collect();
+    for f in &mut m.fns {
+        let mut local: std::collections::BTreeSet<String> = crate::desugar::assigned_names(&f.body);
+        local.extend(f.params.iter().cloned());
+        let globals: Vec<&String> = consts.iter().filter(|c| !local.contains(*c)).collect();
+        let builtin = |n: &str| !defined.contains(n) && !local.contains(n);
+        let (mn, mx, ab) = (builtin("min"), builtin("max"), builtin("abs"));
+        for_each_expr(&mut f.body, &mut |e| {
+            match e {
+                Expr::Var(n) if globals.iter().any(|g| *g == n) => *e = Expr::Call(n.clone(), Vec::new()),
+                Expr::Call(n, args) if args.len() >= 2 && ((n == "min" && mn) || (n == "max" && mx)) => {
+                    let op = if n == "min" { CmpOp::Le } else { CmpOp::Ge };
+                    let mut args = std::mem::take(args).into_iter();
+                    let first = args.next().unwrap();
+                    *e = args.fold(first, |a, b| {
+                        Expr::IfExp(Box::new(Expr::Cmp(op, Box::new(a.clone()), Box::new(b.clone()))), Box::new(a), Box::new(b))
+                    });
+                }
+                Expr::Call(n, args) if args.len() == 1 && n == "abs" && ab => {
+                    let x = args.pop().unwrap();
+                    let neg = Expr::Neg(Box::new(x.clone()));
+                    *e = Expr::IfExp(Box::new(Expr::Cmp(CmpOp::Ge, Box::new(x.clone()), Box::new(Expr::Int(0)))), Box::new(x), Box::new(neg));
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// Apply `f` to every expression in `ss`, innermost first.
+fn for_each_expr(ss: &mut [Stmt], f: &mut dyn FnMut(&mut Expr)) {
+    fn ex(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        match e {
+            Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::Bool2(_, a, b) | Expr::Index(a, b) => {
+                ex(a, f);
+                ex(b, f);
+            }
+            Expr::Not(a) | Expr::Neg(a) | Expr::Lambda(_, a) => ex(a, f),
+            Expr::IfExp(c, a, b) => {
+                ex(c, f);
+                ex(a, f);
+                ex(b, f);
+            }
+            Expr::Call(_, xs) | Expr::Tuple(xs) => xs.iter_mut().for_each(|x| ex(x, f)),
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => {}
+        }
+        f(e);
+    }
+    for s in ss {
+        match s {
+            Stmt::Assign(_, e) | Stmt::Return(e) | Stmt::ExprStmt(e) => ex(e, f),
+            Stmt::If(c, a, b) => {
+                ex(c, f);
+                for_each_expr(a, f);
+                for_each_expr(b, f);
+            }
+            Stmt::While(c, b) | Stmt::For(_, c, b, _) => {
+                ex(c, f);
+                for_each_expr(b, f);
+            }
+            Stmt::Match(e, arms) => {
+                ex(e, f);
+                arms.iter_mut().for_each(|(_, b)| for_each_expr(b, f));
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -95,21 +184,73 @@ impl<'a> Parser<'a> {
 
     fn module(&mut self) -> Result<Module, Diag> {
         let mut m = Module::default();
+        let mut consts = Vec::new();
         self.eat_newlines();
         while !matches!(self.kind(), TokKind::Eof) {
-            match self.kind() {
+            match self.kind().clone() {
                 TokKind::At => m.datas.push(self.data_def()?),
-                TokKind::Def => m.fns.push(self.fn_def()?),
+                TokKind::Def => {
+                    m.lines.insert(self.peek_name(), self.line());
+                    m.fns.push(self.fn_def()?);
+                }
+                // a module docstring
+                TokKind::Str(_) if self.at(1) == &TokKind::Newline => self.pos += 2,
+                // `NAME = expr`: a constant
+                TokKind::Name(n) if self.at(1) == &TokKind::Assign => {
+                    let line = self.line();
+                    self.pos += 2;
+                    let e = self.expr_list()?;
+                    self.expect_newline()?;
+                    m.lines.insert(n.clone(), line);
+                    consts.push(FnDef { name: n, params: Vec::new(), body: vec![Stmt::Return(e)] });
+                }
+                // `if __name__ == "__main__":` runs a script; `main()` is the entry here
+                TokKind::If if self.at(1) == &TokKind::Name("__name__".into()) => self.skip_main_guard()?,
                 other => {
                     return Err(Diag::new(
                         self.line(),
-                        format!("unsupported top-level construct: {:?}", other),
+                        format!("unsupported top-level construct: {:?} (a module holds functions, @data classes and constants)", other),
                     ))
                 }
             }
             self.eat_newlines();
         }
+        m.fns.extend(consts.iter().cloned());
+        resolve_globals(&mut m, &consts.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+        if self.pow_used {
+            m.fns.extend(parse_module(&crate::lex::lex(IPOW)?)?.fns);
+        }
         Ok(m)
+    }
+
+    /// The token `k` places ahead.
+    fn at(&self, k: usize) -> &TokKind {
+        &self.toks[(self.pos + k).min(self.toks.len() - 1)].kind
+    }
+
+    /// The name after `def`.
+    fn peek_name(&self) -> String {
+        match self.at(1) {
+            TokKind::Name(n) => n.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Skip `if __name__ == "__main__":` and its block.
+    fn skip_main_guard(&mut self) -> Result<(), Diag> {
+        while !matches!(self.kind(), TokKind::Indent | TokKind::Eof) {
+            self.bump();
+        }
+        let mut depth = 0;
+        loop {
+            match self.bump().kind {
+                TokKind::Indent => depth += 1,
+                TokKind::Dedent if depth == 1 => return Ok(()),
+                TokKind::Dedent => depth -= 1,
+                TokKind::Eof => return Ok(()),
+                _ => {}
+            }
+        }
     }
 
     fn data_def(&mut self) -> Result<DataDef, Diag> {
@@ -164,6 +305,20 @@ impl<'a> Parser<'a> {
                 self.expect_newline()?;
                 Ok(Stmt::Return(e))
             }
+            TokKind::Pass | TokKind::Break | TokKind::Continue => {
+                let k = self.bump().kind;
+                self.expect_newline()?;
+                return Ok(match k {
+                    TokKind::Break => vec![Stmt::Break],
+                    TokKind::Continue => vec![Stmt::Continue],
+                    _ => Vec::new(),
+                });
+            }
+            // a docstring, or any string used as a statement
+            TokKind::Str(_) if self.at(1) == &TokKind::Newline => {
+                self.pos += 2;
+                return Ok(Vec::new());
+            }
             TokKind::Name(n) if UNSUPPORTED_KEYWORDS.contains(&n.as_str()) => {
                 Err(Diag::new(self.line(), format!("unsupported statement: {}", n)))
             }
@@ -176,12 +331,23 @@ impl<'a> Parser<'a> {
     fn simple_stmt(&mut self) -> Result<Vec<Stmt>, Diag> {
         let line = self.line();
         let e = self.expr_list()?;
+        // `x op= e` is `x = x op e`
+        if let TokKind::AugAssign(op) = *self.kind() {
+            self.bump();
+            let rhs = self.expr()?;
+            self.expect_newline()?;
+            return match e {
+                Expr::Var(n) => Ok(vec![Stmt::Assign(n.clone(), Expr::Bin(op, Box::new(Expr::Var(n)), Box::new(rhs)))]),
+                _ => Err(Diag::new(line, "augmented assignment needs a plain name on the left")),
+            };
+        }
         if matches!(self.kind(), TokKind::Assign) {
             self.bump();
             let rhs = self.expr_list()?;
             self.expect_newline()?;
             let name = |t: &Expr| match t {
                 Expr::Var(n) => Ok(n.clone()),
+                Expr::Index(..) => Err(Diag::new(line, "assignment to an item: arrays are values, write `a = array_set(a, i, v)`")),
                 _ => Err(Diag::new(line, "invalid assignment target")),
             };
             return match e {
@@ -264,28 +430,43 @@ impl<'a> Parser<'a> {
         self.expect(TokKind::LParen)?;
         let first = self.expr()?;
         // `range(a, b)`: `a` bound once, then a loop over `range(b - a)`
-        // whose body first binds the variable to `counter + a`
-        let end = if matches!(self.kind(), TokKind::Comma) {
+        // whose body first binds the variable to `counter + a`; with a step
+        // `s`, over the trip count, binding `counter * s + a`
+        let mut more = Vec::new();
+        while matches!(self.kind(), TokKind::Comma) && more.len() < 2 {
             self.bump();
-            Some(self.expr()?)
-        } else {
-            None
-        };
+            more.push(self.expr()?);
+        }
         self.expect(TokKind::RParen)?;
         self.expect(TokKind::Colon)?;
         let mut body = self.suite()?;
-        match end {
-            None => Ok(vec![Stmt::For(var, first, body, None)]),
-            Some(b) => {
-                // per-loop names: a nested loop reusing `var` must not reset
-                // the outer loop's start
-                self.hidden += 1;
-                let (ctr, lo) = (format!("__range{}_{var}", self.hidden), format!("__lo{}_{var}", self.hidden));
-                let lo_v = || Box::new(Expr::Var(lo.clone()));
-                body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, Box::new(Expr::Var(ctr.clone())), lo_v())));
-                Ok(vec![Stmt::Assign(lo.clone(), first), Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), lo_v()), body, None)])
-            }
-        }
+        let Some(b) = more.first().cloned() else { return Ok(vec![Stmt::For(var, first, body, None)]) };
+        // per-loop names: a nested loop reusing `var` must not reset the
+        // outer loop's start
+        self.hidden += 1;
+        let (ctr, lo) = (format!("__range{}_{var}", self.hidden), format!("__lo{}_{var}", self.hidden));
+        let v = |n: &str| Box::new(Expr::Var(n.to_string()));
+        let bin = |op, a: Box<Expr>, b: Box<Expr>| Box::new(Expr::Bin(op, a, b));
+        let mut out = vec![Stmt::Assign(lo.clone(), first)];
+        let Some(step) = more.get(1).cloned() else {
+            body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, v(&ctr), v(&lo))));
+            out.push(Stmt::For(ctr, Expr::Bin(BinOp::Sub, Box::new(b), v(&lo)), body, None));
+            return Ok(out);
+        };
+        let st = format!("__step{}_{var}", self.hidden);
+        out.push(Stmt::Assign(st.clone(), step.clone()));
+        // trip count: ceil((b - a) / s) for s > 0, ceil((a - b) / -s) for s < 0
+        let up = || bin(BinOp::FloorDiv, bin(BinOp::Sub, bin(BinOp::Add, bin(BinOp::Sub, Box::new(b.clone()), v(&lo)), v(&st)), Box::new(Expr::Int(1))), v(&st));
+        let down = || bin(BinOp::FloorDiv, bin(BinOp::Sub, bin(BinOp::Sub, v(&lo), Box::new(b.clone())), bin(BinOp::Add, v(&st), Box::new(Expr::Int(1)))), bin(BinOp::Sub, Box::new(Expr::Int(0)), v(&st)));
+        let trips = match step {
+            Expr::Int(0) => return Err(Diag::new(line, "range() step must not be zero")),
+            Expr::Int(k) if k > 0 => *up(),
+            Expr::Int(_) => *down(),
+            _ => Expr::IfExp(Box::new(Expr::Cmp(CmpOp::Gt, v(&st), Box::new(Expr::Int(0)))), up(), down()),
+        };
+        body.insert(0, Stmt::Assign(var.clone(), Expr::Bin(BinOp::Add, bin(BinOp::Mul, v(&ctr), v(&st)), v(&lo))));
+        out.push(Stmt::For(ctr, trips, body, None));
+        Ok(out)
     }
 
     fn match_stmt(&mut self) -> Result<Stmt, Diag> {
@@ -397,24 +578,29 @@ impl<'a> Parser<'a> {
         self.cmp_expr()
     }
 
+    /// `a < b < c` is `a < b and b < c` (values are immutable, so `b`
+    /// is the same value both times).
     fn cmp_expr(&mut self) -> Result<Expr, Diag> {
-        let e = self.bin_level(0)?;
-        let op = match self.kind() {
-            TokKind::Lt => Some(CmpOp::Lt),
-            TokKind::Le => Some(CmpOp::Le),
-            TokKind::Gt => Some(CmpOp::Gt),
-            TokKind::Ge => Some(CmpOp::Ge),
-            TokKind::EqEq => Some(CmpOp::Eq),
-            TokKind::NotEq => Some(CmpOp::Ne),
-            _ => None,
-        };
-        match op {
-            Some(op) => {
-                self.bump();
-                let rhs = self.bin_level(0)?;
-                Ok(Expr::Cmp(op, Box::new(e), Box::new(rhs)))
-            }
-            None => Ok(e),
+        let mut left = self.bin_level(0)?;
+        let mut out: Option<Expr> = None;
+        loop {
+            let op = match self.kind() {
+                TokKind::Lt => CmpOp::Lt,
+                TokKind::Le => CmpOp::Le,
+                TokKind::Gt => CmpOp::Gt,
+                TokKind::Ge => CmpOp::Ge,
+                TokKind::EqEq => CmpOp::Eq,
+                TokKind::NotEq => CmpOp::Ne,
+                _ => return Ok(out.unwrap_or(left)),
+            };
+            self.bump();
+            let right = self.bin_level(0)?;
+            let c = Expr::Cmp(op, Box::new(left), Box::new(right.clone()));
+            out = Some(match out {
+                None => c,
+                Some(prev) => Expr::Bool2(BoolOp::And, Box::new(prev), Box::new(c)),
+            });
+            left = right;
         }
     }
 
@@ -459,7 +645,28 @@ impl<'a> Parser<'a> {
         if matches!(self.kind(), TokKind::Plus) {
             return Err(Diag::new(self.line(), "unary plus is not supported"));
         }
-        self.postfix()
+        self.power()
+    }
+
+    /// `a ** b`, binding tighter than unary minus on its left and right
+    /// associative: a small literal exponent is repeated multiplication (on
+    /// any number type), any other exponent the integer helper.
+    fn power(&mut self) -> Result<Expr, Diag> {
+        let base = self.postfix()?;
+        if !matches!(self.kind(), TokKind::StarStar) {
+            return Ok(base);
+        }
+        self.bump();
+        Ok(match self.unary()? {
+            Expr::Int(0) => Expr::Int(1),
+            Expr::Int(k) if (1..=8).contains(&k) => {
+                (1..k).fold(base.clone(), |acc, _| Expr::Bin(BinOp::Mul, Box::new(acc), Box::new(base.clone())))
+            }
+            e => {
+                self.pow_used = true;
+                Expr::Call("__ipow".into(), vec![base, e])
+            }
+        })
     }
 
     fn postfix(&mut self) -> Result<Expr, Diag> {
@@ -520,6 +727,7 @@ impl<'a> Parser<'a> {
                     Ok(first)
                 }
             }
+            TokKind::Str(_) => Err(Diag::new(line, "strings are not supported: Mithril programs compute numbers, tuples, arrays and @data values")),
             other => Err(Diag::new(line, format!("unexpected token in expression: {:?}", other))),
         }
     }

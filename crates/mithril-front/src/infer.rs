@@ -326,6 +326,7 @@ impl<'m> Infer<'m> {
                     self.fresh_is(t, Ty::Int);
                     self.stmts(body, env);
                 }
+                Stmt::Break | Stmt::Continue => {}
                 Stmt::Match(e, arms) => {
                     let t = self.expr(e, env);
                     for (p, body) in arms {
@@ -403,6 +404,10 @@ impl<'m> Infer<'m> {
             }
             Expr::Bin(op, x, y) => {
                 let (x, y) = (self.ex(x, env)?, self.ex(y, env)?);
+                let r = self.find(self.at[&(e as *const Expr)]);
+                if !is32 && *op == BinOp::Div && self.ty[r] == Ty::Int {
+                    return Err(Diag::new(0, format!("in '{}': `/` on integers is a float division in Python, which Mithril does not support on ints yet; write `//` for integer division", self.cur)));
+                }
                 if !is32 {
                     return Ok(Expr::Bin(*op, b(x), b(y)));
                 }
@@ -448,9 +453,9 @@ impl<'m> Infer<'m> {
             Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| self.ex(a, env)).collect::<Result<_, _>>()?),
             Expr::Tuple(items) => Expr::Tuple(items.iter().map(|a| self.ex(a, env)).collect::<Result<_, _>>()?),
             Expr::Index(t, i) => Expr::Index(b(self.ex(t, env)?), i.clone()),
-            Expr::Not(a) => Expr::Not(b(self.ex(a, env)?)),
-            Expr::Bool2(op, x, y) => Expr::Bool2(*op, b(self.ex(x, env)?), b(self.ex(y, env)?)),
-            Expr::IfExp(c, x, y) => Expr::IfExp(b(self.ex(c, env)?), b(self.ex(x, env)?), b(self.ex(y, env)?)),
+            Expr::Not(a) => Expr::Not(b(self.cond(a, env)?)),
+            Expr::Bool2(op, x, y) => Expr::Bool2(*op, b(self.cond(x, env)?), b(self.cond(y, env)?)),
+            Expr::IfExp(c, x, y) => Expr::IfExp(b(self.cond(c, env)?), b(self.ex(x, env)?), b(self.ex(y, env)?)),
             Expr::Lambda(ps, body) => {
                 let mut inner = env.clone();
                 ps.iter().for_each(|p| {
@@ -459,6 +464,23 @@ impl<'m> Infer<'m> {
                 Expr::Lambda(ps.clone(), b(self.ex(body, &inner)?))
             }
         })
+    }
+
+    /// A condition: an int (true when nonzero, as in Python) or a comparison.
+    fn cond(&mut self, e: &Expr, env: &HashMap<String, usize>) -> Result<Expr, Diag> {
+        let r = self.find(self.at[&(e as *const Expr)]);
+        let what = match &self.ty[r] {
+            Ty::F32 => Some("an f32"),
+            Ty::Tup(_) => Some("a tuple"),
+            Ty::Arr(_) => Some("an array"),
+            Ty::Opaque => Some("a constructor or closure"),
+            Ty::Var if self.flo[r] => Some("an f64"),
+            _ => None,
+        };
+        match what {
+            Some(w) => Err(Diag::new(0, format!("in '{}': a condition is {w}; conditions are ints or comparisons (write e.g. `x != 0.0`)", self.cur))),
+            None => self.ex(e, env),
+        }
     }
 
     /// `f` names the language's builtin here: no local, function or
@@ -478,8 +500,10 @@ impl<'m> Infer<'m> {
                 }
                 Stmt::Return(e) => Stmt::Return(self.ex(e, env)?),
                 Stmt::ExprStmt(e) => Stmt::ExprStmt(self.ex(e, env)?),
-                Stmt::If(c, a, b) => Stmt::If(self.ex(c, env)?, self.st(a, env)?, self.st(b, env)?),
-                Stmt::While(c, body) => Stmt::While(self.ex(c, env)?, self.st(body, env)?),
+                Stmt::If(c, a, b) => Stmt::If(self.cond(c, env)?, self.st(a, env)?, self.st(b, env)?),
+                Stmt::While(c, body) => Stmt::While(self.cond(c, env)?, self.st(body, env)?),
+                Stmt::Break => Stmt::Break,
+                Stmt::Continue => Stmt::Continue,
                 Stmt::For(v, e, body, f) => {
                     let e = self.ex(e, env)?;
                     env.insert(v.clone(), 0);
@@ -502,8 +526,24 @@ impl<'m> Infer<'m> {
     }
 }
 
+/// A diagnostic without a line takes the line of the function it names
+/// (`in 'f': ...`).
+pub(crate) fn locate(mut d: Diag, lines: &HashMap<String, u32>) -> Diag {
+    if d.line == 0 {
+        if let Some(name) = d.msg.strip_prefix("in '").and_then(|r| r.split('\'').next()) {
+            d.line = lines.get(name).copied().unwrap_or(0);
+        }
+    }
+    d
+}
+
 /// Type the module and lower its f32 operations to the builtins.
 pub fn elaborate(m: &mut Module) -> Result<(), Diag> {
+    let lines = m.lines.clone();
+    elaborate_in(m).map_err(|d| locate(d, &lines))
+}
+
+fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
     let src: &Module = &m.clone();
     let mut s = Infer {
         ty: Vec::new(),

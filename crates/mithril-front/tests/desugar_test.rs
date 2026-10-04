@@ -278,17 +278,13 @@ fn a_loop_carries_a_local_closure_it_calls() {
 // ---- "only bool in conditions" ----
 
 #[test]
-fn int_in_if_condition_is_diag() {
-    let src = "def f(n):\n    if n:\n        return 1\n    return 0\n";
-    let d = desugar_err(src);
-    assert!(d.msg.to_lowercase().contains("bool"), "msg was: {}", d.msg);
-}
-
-#[test]
-fn int_in_while_condition_is_diag() {
-    let src = "def f(n):\n    while n:\n        n = n - 1\n    return n\n";
-    let d = desugar_err(src);
-    assert!(d.msg.to_lowercase().contains("bool"), "msg was: {}", d.msg);
+fn an_int_condition_is_true_when_nonzero() {
+    // Python truthiness: `if n:` and `while n:` on an int
+    let cm = dm("def f(n):\n    if n:\n        return 1\n    return 0\n");
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::I(5)]), Val::I(1));
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::I(0)]), Val::I(0));
+    let cm = dm("def f(n):\n    t = 0\n    while n:\n        t = t + n\n        n = n - 1\n    return t\n");
+    assert_eq!(eval_core(&cm, fid(&cm, "f"), &[Val::I(4)]), Val::I(10));
 }
 
 #[test]
@@ -324,7 +320,8 @@ def negate(a):
     assert_eq!(eval_core(&cm, fid(&cm, "both"), &[Val::I(1), Val::I(5)]), Val::I(5));
     assert_eq!(eval_core(&cm, fid(&cm, "both"), &[Val::I(0), Val::I(5)]), Val::I(0));
     assert_eq!(eval_core(&cm, fid(&cm, "either"), &[Val::I(0), Val::I(7)]), Val::I(7));
-    assert_eq!(eval_core(&cm, fid(&cm, "either"), &[Val::I(3), Val::I(7)]), Val::I(1));
+    // Python: `a or b` is `a` when `a` is true
+    assert_eq!(eval_core(&cm, fid(&cm, "either"), &[Val::I(3), Val::I(7)]), Val::I(3));
     assert_eq!(eval_core(&cm, fid(&cm, "negate"), &[Val::I(0)]), Val::I(1));
     assert_eq!(eval_core(&cm, fid(&cm, "negate"), &[Val::I(1)]), Val::I(0));
 }
@@ -466,9 +463,11 @@ fn a_bool_variable_stays_bool_across_a_loop_and_a_join() {
 }
 
 #[test]
-fn a_bool_variable_assigned_an_int_in_a_loop_is_rejected_in_a_condition() {
+fn a_variable_holding_bools_then_ints_is_a_condition_by_truthiness() {
+    // CPython: done is False, 0, 1, 12 on successive iterations; n ends at 13
     let src = "def main():\n    done = False\n    n = 0\n    while n < 3:\n        if done:\n            n = n + 10\n        done = n\n        n = n + 1\n    return n\n";
-    assert!(desugar_err(src).msg.contains("condition must be bool"));
+    let cm = dm(src);
+    assert_eq!(eval_core(&cm, fid(&cm, "main"), &[]), Val::I(13));
 }
 
 #[test]

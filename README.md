@@ -43,6 +43,57 @@ mithril run --image cornell.ppm demos/cornell_path.py --threads 16
 mithril run --image cornell.ppm demos/cornell_path.py --gpu
 ```
 
+## Quickstart
+
+Build the compiler (Rust 1.86 or newer):
+
+```
+git clone https://github.com/maderix/mithril && cd mithril
+cargo build --release -p mithril-cli
+```
+
+Write a program. It is Python: functions, loops, `if`, tuples, arrays.
+`main()` returns the answer.
+
+```python
+# first.py
+def collatz(n):
+    """Steps for n to reach 1."""
+    steps = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps += 1
+    return steps
+
+
+def main():
+    total = 0
+    for i in range(1, 3000000):
+        total += collatz(i)
+    return total
+```
+
+Run it:
+
+```
+target/release/mithril run first.py              # every core
+target/release/mithril run first.py --threads 1  # one thread: the same answer
+target/release/mithril oracle first.py           # the reference interpreter
+```
+
+All three print `428343355`, the value CPython's `main()` returns. Nothing in the
+program names a thread: the loop's iterations are independent and the sum
+is associative, so Mithril splits the loop across the cores (0.28 s on one
+thread, 0.02 s on sixteen). `mithril build first.py -o first` writes an
+executable; `mithril --help` lists the commands. With an NVIDIA GPU, build
+the CLI with `--features gpu` (see [Build](#build)) and add `--gpu`.
+
+The language is a subset of Python: integers (64-bit), floats, `f32`,
+tuples, arrays (`array_new`, `array_get`, `array_set`, `array_len`), `@data`
+classes with `match`, lambdas and closures. Values never change in place, so
+an array update returns the new array: `a = array_set(a, i, v)`. See
+[The language](#the-language) and the [field guide](docs/guide.html).
+
 ## How it works
 
 A Mithril program means what a set of interaction-net rewrite rules says it

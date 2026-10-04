@@ -218,11 +218,17 @@ fn control_flow_summaries_preserve_diagnostics() {
         ("last_statement", "def main():\n    return 3\n    x = 4\n", "does not return on all control-flow paths"),
         ("zero_trip_binding", "def main():\n    for i in range(0):\n        x = 3\n    return x\n", "unknown variable: x"),
         ("int_match_binding", "def f(n):\n    match n:\n        case 0:\n            x = 1\n    if n > 0:\n        return x\n    return 2\n", "unknown variable: x"),
-        ("nested_while_return", "def main():\n    while False:\n        if True:\n            return 1\n    return 2\n", "`return` inside a `while` body is not supported"),
-        ("nested_for_return", "def main():\n    for i in range(0):\n        while False:\n            return 1\n    return 2\n", "`return` inside a `for` body is not supported"),
-        ("bool_reassignment", "def main():\n    ok = True\n    for i in range(2):\n        ok = i\n    if ok:\n        return 1\n    return 2\n", "condition must be bool"),
     ] {
         let error = desugar(&parse(source).unwrap()).unwrap_err();
         assert!(error.msg.contains(message), "{name}: {}", error.msg);
+    }
+    // once rejected, now Python's meaning: a return inside loops, an int as a condition
+    for (name, source, expected) in [
+        ("nested_while_return", "def main():\n    while False:\n        if True:\n            return 1\n    return 2\n", 2),
+        ("nested_for_return", "def main():\n    for i in range(0):\n        while False:\n            return 1\n    return 2\n", 2),
+        ("bool_reassignment", "def main():\n    ok = True\n    for i in range(2):\n        ok = i\n    if ok:\n        return 1\n    return 2\n", 1),
+    ] {
+        let module = desugar(&parse(source).unwrap()).unwrap();
+        assert_eq!(eval_core(&module, module.main, &[]), Val::I(expected), "{name}");
     }
 }

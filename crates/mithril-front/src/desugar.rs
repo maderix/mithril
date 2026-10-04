@@ -3,14 +3,13 @@
 //! top-level functions; `if`/`match` become `Core::If`/`Core::Match` with
 //! their non-returning arms merged via a live-variable tuple (SSA-style).
 //!
-//! Desugar-time diagnostics can't carry a real source line (the surface
-//! `Expr`/`Stmt` types have no line field), so every `Diag` here uses
-//! line `0`; this is a known, documented limitation of the given AST.
+//! The surface `Expr`/`Stmt` types carry no line, so a diagnostic raised
+//! here reports the line of the function's `def`.
 
 use crate::ast::{BinOp, BoolOp, CmpOp, Expr, FnDef, FoldInfo, Module, Pat, Stmt};
 use crate::core::{Core, CoreFn, CoreModule, CtorId, FnId, UNREACHABLE_CTOR};
 use crate::Diag;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 pub fn desugar(m: &Module) -> Result<CoreModule, Diag> {
     let mut fn_table = HashMap::new();
@@ -39,10 +38,22 @@ pub fn desugar(m: &Module) -> Result<CoreModule, Diag> {
         }
         data_ctors.insert(d.name.clone(), names);
     }
-    let t = Tables { fn_table, fn_arity, ctor_table, ctor_owner, data_ctors };
+    // a `return` inside a loop: the loop's helper returns one of two
+    // constructors, its state (it ended) or the function's value
+    let loop_ctors = m.fns.iter().any(|f| loop_returns(&f.body, false)).then(|| {
+        let at = ctors_flat.len() as u32;
+        ctors_flat.push(("__LoopExit".into(), 1));
+        ctors_flat.push(("__LoopReturn".into(), 1));
+        (at, at + 1)
+    });
+    let t = Tables { fn_table, fn_arity, ctor_table, ctor_owner, data_ctors, loop_ctors };
     let mut g = Gen { out_fns: vec![placeholder(); m.fns.len()] };
     for (i, f) in m.fns.iter().enumerate() {
-        let cf = compile_fn(f, &t, &mut g)?;
+        let cf = compile_fn(f, &t, &mut g).map_err(|d| {
+            let line = if d.line == 0 { m.lines.get(&f.name).copied().unwrap_or(0) } else { d.line };
+            let msg = if d.msg.starts_with("in '") { d.msg } else { format!("in '{}': {}", f.name, d.msg) };
+            Diag::new(line, msg)
+        })?;
         g.out_fns[i] = cf;
     }
     // `main` is informational metadata for later tasks (codegen/CLI entry
@@ -62,6 +73,17 @@ struct Tables {
     ctor_table: HashMap<String, (CtorId, usize)>,
     ctor_owner: HashMap<String, String>,
     data_ctors: HashMap<String, Vec<String>>,
+    /// (exit, return) constructors when some loop returns from its function
+    loop_ctors: Option<(CtorId, CtorId)>,
+}
+
+/// A `return` inside a loop body (at any depth) in `stmts`.
+fn loop_returns(stmts: &[Stmt], in_loop: bool) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Return(_) => in_loop,
+        Stmt::While(_, b) | Stmt::For(_, _, b, _) => loop_returns(b, true),
+        _ => s.parts().1.into_iter().any(|b| loop_returns(b, in_loop)),
+    })
 }
 
 /// Growing list of top-level Core functions (user fns + generated loop
@@ -78,13 +100,12 @@ impl Gen {
 }
 
 /// Per-function variable resolution: name -> current `Core::Var` index,
-/// plus which names are currently known (by syntactic classification) to
-/// hold a `bool` value, used to enforce "only bool in conditions".
+/// and the innermost loop being compiled.
 #[derive(Clone, Default)]
 struct Scope {
     vars: HashMap<String, u32>,
-    bool_vars: HashSet<String>,
     next_idx: u32,
+    lp: Option<std::rc::Rc<LoopCtx>>,
 }
 impl Scope {
     fn fresh(&mut self, name: &str) -> u32 {
@@ -102,53 +123,39 @@ impl Scope {
     }
 }
 
-// ---- boolean-condition classification ----
-
-fn is_boolish(e: &Expr, bool_vars: &HashSet<String>) -> bool {
-    match e {
-        Expr::Bool(_) | Expr::Cmp(..) | Expr::Bool2(..) | Expr::Not(_) => true,
-        Expr::IfExp(_, t, el) => is_boolish(t, bool_vars) && is_boolish(el, bool_vars),
-        Expr::Var(n) => bool_vars.contains(n),
-        _ => false,
-    }
+/// The loop whose helper function a body is compiled into: what `continue`
+/// calls, what `break` returns and whether exits are tagged (the body
+/// returns from the function: see `Tables::loop_ctors`).
+struct LoopCtx {
+    id: FnId,
+    /// a `for`: its counter and bound, the first two arguments
+    counter: Option<(String, String)>,
+    /// the rest of the arguments, by name
+    params: Vec<String>,
+    /// the state the loop yields when it ends
+    mutated: Vec<String>,
+    tagged: Option<(CtorId, CtorId)>,
 }
 
-/// Every assignment to `name` in `stmts` (at any depth) is boolean, so the
-/// name stays a bool variable across a loop or a join that assigns it.
-fn stays_bool(name: &str, stmts: &[Stmt], bool_vars: &HashSet<String>) -> bool {
-    stmts.iter().all(|s| match s {
-        Stmt::Assign(n, e) => n != name || is_boolish(e, bool_vars),
-        Stmt::If(_, a, b) => stays_bool(name, a, bool_vars) && stays_bool(name, b, bool_vars),
-        Stmt::While(_, b) | Stmt::For(_, _, b, _) => stays_bool(name, b, bool_vars),
-        Stmt::Match(_, cases) => cases.iter().all(|(_, b)| stays_bool(name, b, bool_vars)),
-        _ => true,
-    })
-}
-
-/// The bool variables among `names` after `bodies` ran (a join or a loop):
-/// bool before and never assigned a non-bool value.
-/// A name that is new after a join (every body defines it) starts out bool.
-fn bools_after(names: &[String], bodies: &[&[Stmt]], scope: &Scope) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for n in names {
-        let bool_before = if scope.vars.contains_key(n) {
-            scope.bool_vars.contains(n)
-        } else {
-            bodies.iter().all(|b| assigned_names(b).contains(n))
-        };
-        let stays = bodies.iter().all(|b| stays_bool(n, b, &scope.bool_vars));
-        if bool_before && stays {
-            out.insert(n.clone());
+impl LoopCtx {
+    /// The next iteration from the names in scope `s`.
+    fn next(&self, s: &Scope) -> Core {
+        let mut args = Vec::new();
+        if let Some((ctr, bound)) = &self.counter {
+            args.push(Core::Op2(BinOp::Add, Box::new(Core::Var(s.vars[ctr])), Box::new(Core::Num(1))));
+            args.push(Core::Var(s.vars[bound]));
         }
+        args.extend(self.params.iter().map(|p| Core::Var(s.vars[p])));
+        Core::Call(self.id, args)
     }
-    out
-}
 
-fn check_cond(e: &Expr, scope: &Scope) -> Result<(), Diag> {
-    if is_boolish(e, &scope.bool_vars) {
-        Ok(())
-    } else {
-        Err(Diag::new(0, "condition must be bool; int (and other non-bool values) are not allowed in conditions"))
+    /// The loop's result when it ends here.
+    fn exit(&self, s: &Scope) -> Core {
+        let st = state_value(&self.mutated, s);
+        match self.tagged {
+            Some((exit, _)) => Core::Ctor(exit, vec![st]),
+            None => st,
+        }
     }
 }
 
@@ -161,8 +168,12 @@ fn check_cond(e: &Expr, scope: &Scope) -> Result<(), Diag> {
 struct BlockFacts {
     assigned: BTreeSet<String>,
     surely: BTreeSet<String>,
+    /// the block ends in a `return`, `break` or `continue` on every path
     returns: bool,
+    /// a `return` anywhere, also inside nested loops
     has_return: bool,
+    /// a `break` or `continue` of the enclosing loop (not of a nested one)
+    has_jump: bool,
     straight: bool,
 }
 
@@ -178,8 +189,11 @@ impl BlockFacts {
             };
             let exhaustive = matches!(s, Stmt::If(..))
                 || matches!(s, Stmt::Match(_, cases) if cases.iter().all(|(p, _)| p.as_int_lit().is_none()));
-            out.returns = matches!(s, Stmt::Return(_)) || (exhaustive && !arms.is_empty() && arms.iter().all(|(_, f)| f.returns));
+            let jump = matches!(s, Stmt::Break | Stmt::Continue);
+            out.returns = matches!(s, Stmt::Return(_)) || jump || (exhaustive && !arms.is_empty() && arms.iter().all(|(_, f)| f.returns));
             out.has_return |= matches!(s, Stmt::Return(_)) || arms.iter().any(|(_, f)| f.has_return);
+            let is_loop = matches!(s, Stmt::While(..) | Stmt::For(..));
+            out.has_jump |= jump || (!is_loop && arms.iter().any(|(_, f)| f.has_jump));
             out.straight &= matches!(s, Stmt::Assign(..) | Stmt::ExprStmt(_) | Stmt::Return(_));
             if let Stmt::Assign(n, _) = s {
                 out.surely.insert(n.clone());
@@ -210,6 +224,11 @@ impl BlockFacts {
         }
         common.unwrap_or_default()
     }
+}
+
+/// A `break` or `continue` of this loop in `body` (not of a nested loop).
+pub fn has_jump(body: &[Stmt]) -> bool {
+    BlockFacts::of(body).has_jump
 }
 
 /// Names assigned anywhere in a block; a for induction variable counts.
@@ -273,14 +292,16 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         Expr::Bin(op, a, b) => Ok(Core::Op2(*op, c(a)?, c(b)?)),
         Expr::Cmp(op, a, b) => Ok(Core::Cmp(*op, c(a)?, c(b)?)),
         Expr::Bool2(BoolOp::And, a, b) => Ok(Core::If(c(a)?, c(b)?, num(0))),
-        Expr::Bool2(BoolOp::Or, a, b) => Ok(Core::If(c(a)?, num(1), c(b)?)),
+        // Python's `a or b` is `a` when `a` is true
+        Expr::Bool2(BoolOp::Or, a, b) => {
+            let mut s = scope.clone();
+            let v = s.fresh_anon();
+            Ok(Core::Let(v, c(a)?, Box::new(Core::If(Box::new(Core::Var(v)), Box::new(Core::Var(v)), c(b)?))))
+        }
         Expr::Not(a) => Ok(Core::If(c(a)?, num(0), num(1))),
         // on ints; `infer` rewrites a float negation before desugaring
         Expr::Neg(a) => Ok(Core::Op2(BinOp::Sub, num(0), c(a)?)),
-        Expr::IfExp(cond, then, els) => {
-            check_cond(cond, scope)?;
-            Ok(Core::If(c(cond)?, c(then)?, c(els)?))
-        }
+        Expr::IfExp(cond, then, els) => Ok(Core::If(c(cond)?, c(then)?, c(els)?)),
         Expr::Call(name, args) => {
             let cargs: Vec<Core> = args.iter().map(|a| compile_expr(a, scope, t)).collect::<Result<_, _>>()?;
             if let Ok(f) = scope.get(name) {
@@ -319,7 +340,7 @@ fn compile_expr(e: &Expr, scope: &Scope, t: &Tables) -> Result<Core, Diag> {
         Expr::Lambda(params, body) => {
             // curried: each parameter is a fresh variable of an inner scope
             let mut s = scope.clone();
-            let idxs: Vec<u32> = params.iter().map(|p| { s.bool_vars.remove(p); s.fresh(p) }).collect();
+            let idxs: Vec<u32> = params.iter().map(|p| s.fresh(p)).collect();
             Ok(lams(idxs, compile_expr(body, &s, t)?))
         }
     }
@@ -347,44 +368,41 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
     match head {
         Stmt::Assign(name, e) => {
             let ce = compile_expr(e, scope, t)?;
-            let boolish = is_boolish(e, &scope.bool_vars);
             let idx = scope.fresh(name);
-            if boolish {
-                scope.bool_vars.insert(name.clone());
-            } else {
-                scope.bool_vars.remove(name);
-            }
             Ok(Core::Let(idx, Box::new(ce), Box::new(compile_block(rest, scope, t, g, k)?)))
         }
-        Stmt::Return(e) => compile_expr(e, scope, t),
+        // inside a loop's helper the function's value leaves tagged
+        Stmt::Return(e) => match (&scope.lp, t.loop_ctors) {
+            (Some(_), Some((_, ret))) => Ok(Core::Ctor(ret, vec![compile_expr(e, scope, t)?])),
+            _ => compile_expr(e, scope, t),
+        },
+        Stmt::Break | Stmt::Continue => {
+            let word = if matches!(head, Stmt::Break) { "break" } else { "continue" };
+            let lp = scope.lp.clone().ok_or_else(|| Diag::new(0, format!("`{word}` outside a loop")))?;
+            Ok(if matches!(head, Stmt::Break) { lp.exit(scope) } else { lp.next(scope) })
+        }
         Stmt::ExprStmt(e) => {
             let ce = compile_expr(e, scope, t)?;
             let idx = scope.fresh_anon();
             Ok(Core::Let(idx, Box::new(ce), Box::new(compile_block(rest, scope, t, g, k)?)))
         }
         Stmt::If(cond, then, els) => {
-            check_cond(cond, scope)?;
             let ccond = compile_expr(cond, scope, t)?;
             let arms = [(Vec::<String>::new(), then.as_slice()), (Vec::new(), els.as_slice())];
             let (cores, _binders, join) = compile_dispatch_arms(&arms, rest, scope, t, g, k)?;
             let producer = Core::If(Box::new(ccond), Box::new(cores[0].clone()), Box::new(cores[1].clone()));
             match join {
-                Some(m) => {
-                    let bools = bools_after(&m, &[then, els], scope);
-                    bind_join_and_continue(producer, &m, bools, rest, scope, t, g, k)
-                }
+                Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
                 None => Ok(producer),
             }
         }
         Stmt::While(cond, body) => {
             let (call, mutated) = compile_while(cond, body, scope, t, g)?;
-            let bools = bools_after(&mutated, &[body], scope);
-            bind_join_and_continue(call, &mutated, bools, rest, scope, t, g, k)
+            continue_after_loop(call, &mutated, BlockFacts::of(body).has_return, rest, scope, t, g, k)
         }
         Stmt::For(var, bound, body, fold) => {
             let (call, mutated) = compile_for(var, bound, body, fold, scope, t, g)?;
-            let bools = bools_after(&mutated, &[body], scope);
-            bind_join_and_continue(call, &mutated, bools, rest, scope, t, g, k)
+            continue_after_loop(call, &mutated, BlockFacts::of(body).has_return, rest, scope, t, g, k)
         }
         Stmt::Match(scrut, cases) => compile_match(scrut, cases, rest, scope, t, g, k),
     }
@@ -395,25 +413,43 @@ fn compile_block(stmts: &[Stmt], scope: &mut Scope, t: &Tables, g: &mut Gen, k: 
 fn bind_join_and_continue(
     producer: Core,
     names: &[String],
-    bools: HashSet<String>,
     rest: &[Stmt],
     scope: &mut Scope,
     t: &Tables,
     g: &mut Gen,
     k: &Cont,
 ) -> Result<Core, Diag> {
-    let bind = |scope: &mut Scope, n: &String| {
-        if bools.contains(n) { scope.bool_vars.insert(n.clone()); } else { scope.bool_vars.remove(n); }
-        scope.fresh(n)
-    };
     let tup = (names.len() != 1).then(|| scope.fresh_anon());
-    let idxs: Vec<u32> = names.iter().map(|n| bind(scope, n)).collect();
+    let idxs: Vec<u32> = names.iter().map(|n| scope.fresh(n)).collect();
     let mut core = compile_block(rest, scope, t, g, k)?;
     let Some(tup) = tup else { return Ok(Core::Let(idxs[0], Box::new(producer), Box::new(core))) };
     for (i, idx) in idxs.iter().enumerate().rev() {
         core = Core::Let(*idx, Box::new(Core::Proj(Box::new(Core::Var(tup)), i)), Box::new(core));
     }
     Ok(Core::Let(tup, Box::new(producer), Box::new(core)))
+}
+
+/// After a loop: its state continues the block. A loop that can return
+/// from the function yields a tagged value, and its return either is the
+/// function's value or, inside an enclosing loop, leaves that loop too.
+#[allow(clippy::too_many_arguments)]
+fn continue_after_loop(
+    call: Core,
+    mutated: &[String],
+    tagged: bool,
+    rest: &[Stmt],
+    scope: &mut Scope,
+    t: &Tables,
+    g: &mut Gen,
+    k: &Cont,
+) -> Result<Core, Diag> {
+    let (true, Some((exit, ret))) = (tagged, t.loop_ctors) else {
+        return bind_join_and_continue(call, mutated, rest, scope, t, g, k);
+    };
+    let (st, v) = (scope.fresh_anon(), scope.fresh_anon());
+    let returned = if scope.lp.is_some() { Core::Ctor(ret, vec![Core::Var(v)]) } else { Core::Var(v) };
+    let ended = bind_join_and_continue(Core::Var(st), mutated, rest, scope, t, g, k)?;
+    Ok(Core::Match(Box::new(call), vec![(exit, vec![st], ended), (ret, vec![v], returned)]))
 }
 
 /// Compile the arms of an `if`/`match` statement that appears mid-block.
@@ -454,7 +490,7 @@ fn compile_dispatch_arms(
     let assigned: BTreeSet<String> = facts.iter().flat_map(|f| f.assigned.iter().cloned()).collect();
     let joinable = !rest.is_empty()
         && arms.iter().zip(&facts).all(|((binds, _), f)| {
-            !f.has_return && binds.iter().all(|b| !assigned.contains(b))
+            !f.has_return && !f.has_jump && binds.iter().all(|b| !assigned.contains(b))
         })
         && assigned.iter().all(|n| scope.vars.contains_key(n));
     let mutated: Vec<String> = assigned.into_iter().collect();
@@ -511,8 +547,8 @@ fn compile_join(
     for n in &names {
         js.fresh(n);
     }
-    let falling: Vec<&[Stmt]> = arms.iter().zip(facts).filter(|(_, f)| !f.returns).map(|((_, b), _)| *b).collect();
-    js.bool_vars = bools_after(&names, &falling, scope);
+    // a `break` or `continue` in the rest still belongs to the enclosing loop
+    js.lp = scope.lp.clone();
     let body = compile_block(rest, &mut js, t, g, k)?;
     g.out_fns[id as usize] = CoreFn {
         name: format!("__join{id}"),
@@ -568,11 +604,7 @@ fn compile_match(
         Core::Match(Box::new(cscrut), arms)
     };
     match join {
-        Some(m) => {
-            let bodies: Vec<&[Stmt]> = cases.iter().map(|(_, b)| b.as_slice()).collect();
-            let bools = bools_after(&m, &bodies, scope);
-            bind_join_and_continue(producer, &m, bools, rest, scope, t, g, k)
-        }
+        Some(m) => bind_join_and_continue(producer, &m, rest, scope, t, g, k),
         None => Ok(producer),
     }
 }
@@ -618,7 +650,7 @@ fn compile_loop(
 ) -> Result<(), Diag> {
     // Parameter indices and exit state precede the body's local bindings.
     let arity = scope.next_idx as usize;
-    let exit = state_value(mutated, &scope);
+    let exit = scope.lp.as_ref().map_or_else(|| state_value(mutated, &scope), |lp| lp.exit(&scope));
     let then = compile_block(body, &mut scope, t, g, next)?;
     let body = Core::If(Box::new(cond), Box::new(then), Box::new(exit));
     g.out_fns[id as usize] = CoreFn {
@@ -632,11 +664,8 @@ fn compile_loop(
 }
 
 fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut Gen) -> Result<(Core, Vec<String>), Diag> {
-    check_cond(cond, scope)?;
     let facts = BlockFacts::of(body);
-    if facts.has_return {
-        return Err(Diag::new(0, "`return` inside a `while` body is not supported"));
-    }
+    let tagged = if facts.has_return { t.loop_ctors } else { None };
     let mut free = BTreeSet::new();
     free_reads_expr(cond, &mut free);
     free_reads_stmts(body, &mut free);
@@ -647,11 +676,10 @@ fn compile_while(cond: &Expr, body: &[Stmt], scope: &Scope, t: &Tables, g: &mut 
     for p in &params_all {
         hscope.fresh(p);
     }
-    hscope.bool_vars = bools_after(&params_all, &[body], scope);
     let hcond = compile_expr(cond, &hscope, t)?;
-    let next = |sc: &Scope, _: &mut Gen| {
-        Ok(Core::Call(helper_id, params_all.iter().map(|p| Core::Var(sc.vars[p])).collect()))
-    };
+    let lp = std::rc::Rc::new(LoopCtx { id: helper_id, counter: None, params: params_all.clone(), mutated: mutated.clone(), tagged });
+    hscope.lp = Some(lp.clone());
+    let next = move |sc: &Scope, _: &mut Gen| Ok(lp.next(sc));
     compile_loop(helper_id, "while", hscope, hcond, body, &mutated, None, t, g, &next)?;
     let call = Core::Call(helper_id, params_all.iter().map(|p| Core::Var(scope.vars[p])).collect());
     Ok((call, mutated))
@@ -667,9 +695,9 @@ fn compile_for(
     g: &mut Gen,
 ) -> Result<(Core, Vec<String>), Diag> {
     let facts = BlockFacts::of(body);
-    if facts.has_return {
-        return Err(Diag::new(0, "`return` inside a `for` body is not supported"));
-    }
+    let tagged = if facts.has_return { t.loop_ctors } else { None };
+    // an early exit makes the loop sequential: no fold
+    let fold = if facts.has_return || facts.has_jump { &None } else { fold };
     let cbound = compile_expr(bound, scope, t)?;
     let bound_idx = scope.fresh_anon();
 
@@ -689,15 +717,15 @@ fn compile_for(
     for p in &extra {
         hscope.fresh(p);
     }
-    hscope.bool_vars = bools_after(&extra, &[body], scope);
-    let next = |sc: &Scope, _: &mut Gen| {
-        let mut args = vec![
-            Core::Op2(BinOp::Add, Box::new(Core::Var(sc.vars[&counter])), Box::new(Core::Num(1))),
-            Core::Var(sc.vars[&bound_name]),
-        ];
-        args.extend(extra.iter().map(|p| Core::Var(sc.vars[p])));
-        Ok(Core::Call(helper_id, args))
-    };
+    let lp = std::rc::Rc::new(LoopCtx {
+        id: helper_id,
+        counter: Some((counter.clone(), bound_name.clone())),
+        params: extra.clone(),
+        mutated: mutated.clone(),
+        tagged,
+    });
+    hscope.lp = Some(lp.clone());
+    let next = move |sc: &Scope, _: &mut Gen| Ok(lp.next(sc));
     let hcond = Core::Cmp(CmpOp::Lt, Box::new(Core::Var(v_idx)), Box::new(Core::Var(bnd_idx)));
     compile_loop(helper_id, "for", hscope, hcond, body, &mutated, fold.clone(), t, g, &next)?;
 
