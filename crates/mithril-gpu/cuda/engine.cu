@@ -2392,6 +2392,7 @@ struct RangeReq {
 };
 __device__ RangeReq g_rreq[RREQ_CAP];
 __device__ u32 g_rmade, g_rdone, g_rsnap; // requests made, completed, in the current launch
+__device__ unsigned long long g_rnext; // next index a warp claims in the range phase
 __device__ u64 g_rpre[RREQ_CAP + 1];      // index prefix of the launch's requests
 
 __device__ u32 range_launch(u32 fid, u16 join, i64 lo, i64 hi, const u64 *ports, int n, u32 acc, u32 kind) {
@@ -2431,11 +2432,23 @@ __device__ void range_run() {
   s_mode[threadIdx.x] = 0;
   s_work[threadIdx.x] = 0;
   const u32 nq = g_rsnap - g_rdone;
-  const u64 total = g_rpre[nq], nl = (u64)gridDim.x * blockDim.x;
+  const u64 total = g_rpre[nq];
   u32 q = 0, held = ~0u; // held: the sum request `part` belongs to
   unsigned long long part = 0;
-  for (u64 t = (u64)blockIdx.x * blockDim.x + threadIdx.x; t < total; t += nl) {
-    if (*(volatile u32 *)G.abortf) break;
+  // warps claim 32 consecutive indices at a time from one counter, so a warp
+  // that finishes early takes more work (leaf costs vary: a pixel can cost
+  // 1,000x another) and the lanes of a warp stay on neighbouring indices.
+  // The next claim is issued before the current chunk runs, so its round
+  // trip overlaps the work instead of stalling the warp.
+  const u32 wl = threadIdx.x & 31;
+  unsigned long long next = 0;
+  if (wl == 0) next = atomicAdd(&g_rnext, 32ull);
+  for (;;) {
+    const unsigned long long base = __shfl_sync(0xffffffffu, next, 0);
+    if (base >= total || __any_sync(0xffffffffu, *(volatile u32 *)G.abortf != 0)) break;
+    if (wl == 0) next = atomicAdd(&g_rnext, 32ull);
+    const u64 t = base + wl;
+    if (t >= total) continue;
     while (t >= g_rpre[q + 1]) q++;
     const RangeReq &r = g_rreq[(g_rdone + q) & (RREQ_CAP - 1)];
     i64 v = prog_range_leaf(r.fid, r.lo + (i64)(t - g_rpre[q]), r.ports);
@@ -2559,6 +2572,7 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         }
         g_rpre[made - g_rdone] = at;
         g_rsnap = made;
+        g_rnext = 0;
         g_phase = 4;
       }
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;

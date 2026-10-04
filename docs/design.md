@@ -824,9 +824,13 @@ instead of chunk tasks (`fold::range_snippet`, engine.cu "range
 launches"). The bridge records a request (its argument ports, each
 owned by the request: a borrowed one is shared, an owned one moves) and
 suspends to a record of the fill's join rule. At the next round boundary
-the driver runs a range phase inside `k_run`: every lane of the grid takes
-indices, thread `t` running the fill's own native loop over `[lo + t,
-lo + t + 1)`, so a warp's loads and stores are contiguous; after one grid
+the driver runs a range phase inside `k_run`: warps claim 32 consecutive
+indices at a time from one counter, each lane running the fill's own native
+loop over `[lo + t, lo + t + 1)`, so a warp's loads and stores are
+contiguous and a warp that finishes early takes more work (leaf costs can
+differ by 1,000x, as Whitted's pixels do). A warp issues its next claim
+before running the current chunk, so the claim's round trip overlaps the
+work; after one grid
 barrier, lane 0 releases each request's ports and delivers its buffer to
 both slots of the join. It is `fill_chunks` with chunks of one index, and
 the leaf is the same native code the CPU runs. A sum's leaf starts each
