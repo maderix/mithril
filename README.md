@@ -76,17 +76,18 @@ def main():
 Run it:
 
 ```
-target/release/mithril run first.py              # every core
-target/release/mithril run first.py --threads 1  # one thread: the same answer
-target/release/mithril oracle first.py           # the reference interpreter
+target/release/mithril run first.py --threads 16  # sixteen threads
+target/release/mithril run first.py --threads 1   # one thread (the default)
 ```
 
-All three print `428343355`, the value CPython's `main()` returns. Nothing in the
+Both print `428343355`, the value CPython's `main()` returns. Nothing in the
 program names a thread: the loop's iterations are independent and the sum
-is associative, so Mithril splits the loop across the cores (0.28 s on one
-thread, 0.02 s on sixteen). `mithril build first.py -o first` writes an
-executable; `mithril --help` lists the commands. With an NVIDIA GPU, build
-the CLI with `--features gpu` (see [Build](#build)) and add `--gpu`.
+is associative, so Mithril splits the loop across the threads (0.28 s on one,
+0.02 s on sixteen). `mithril build first.py -o first` writes an executable
+(`./first --threads 16`); `mithril oracle first.py` runs the slow reference
+interpreter that every backend is checked against, best kept to small
+inputs; `mithril --help` lists the commands. With an NVIDIA GPU, build the
+CLI with `--features gpu` (see [Build](#build)) and add `--gpu`.
 
 The language is a subset of Python: integers (64-bit), floats, `f32`,
 tuples, arrays (`array_new`, `array_get`, `array_set`, `array_len`), `@data`
@@ -102,6 +103,13 @@ nodes and their wires, so two rule firings can happen in either order and the
 result is the same.
 The runtime can therefore run them in parallel, and the compiler can run them
 early.
+
+<img src="docs/img/net-any-order.svg" width="960" alt="The net for (2+3)*(4+5) rewritten three ways: the left sum first, the right sum first, and both at once; each ends at 45">
+
+The rules that need only what the source says fire while compiling; the ones
+that need the program's input fire when it runs, many at once:
+
+<img src="docs/img/net-two-times.svg" width="960" alt="At compile time 2+3 becomes 5 and is copied to four multiplies; at run time four inputs arrive and the four multiplies fire at once on four cores">
 
 <img src="docs/img/mithril-map.svg" width="960" alt="Mithril end to end: source to Core, parallel structure, compile-time reduction with the rule table, lowering, the Rust and CUDA printers, the CPU and GPU runtimes sharing one rule table, and one value; beside the path the reference interpreter, the Lean proofs, model checking and the gates">
 
@@ -167,6 +175,26 @@ tiny work budgets that force pausing, and on the GPU (see Tests).
   owner), `array_len(a)`.
 - Values only: updating an array or a tuple produces a new one, and the
   parallelism comes from the program's dependencies.
+- Also: `break`, `continue`, `return` inside loops, chained comparisons,
+  `x += e`, `**`, `range(a, b, step)`, `min`/`max`/`abs`, module-level
+  constants. `main()` takes no arguments; booleans print as 1 and 0.
+
+Not in the language yet, with what to write instead:
+
+| Python | Mithril today |
+|---|---|
+| `print`, strings, f-strings | return the value from `main()` |
+| lists, `append`, comprehensions, dicts, sets | arrays: `array_new`, `array_set`, `array_get`; `@data` lists |
+| `for x in xs`, `enumerate`, `zip`, `len`, `sum` | `for i in range(array_len(a))` |
+| `float(n)`, `round`, mixing ints and floats, `/` on ints | keep a computation in floats or in `f32`; `//` for integers |
+| default and keyword arguments, `*args`, nested `def`, classes | top-level functions, lambdas, `@data` |
+| `None`, `is`, `in`, `case _`, type hints, `import`, `try` | `@data` variants and `match` with every case listed |
+
+Known issues in this release: after `for i in range(n)`, `i` keeps its value
+from before the loop (write `range(0, n)` when you read `i` afterwards); an f32 returned from `main()` prints as its
+bit pattern; mixing an int and an f64 in one operation stops with an internal
+error instead of a type error; errors after parsing report the line of the
+enclosing `def`.
 
 ## Build
 

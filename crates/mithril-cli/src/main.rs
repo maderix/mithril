@@ -77,11 +77,11 @@ fn main() {
 
 const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
 
-const HELP: &str = "Mithril: compile a Python-subset program and run it on every core or the GPU.
+const HELP: &str = "Mithril: compile a Python-subset program and run it on any number of threads or the GPU.
 
-  mithril run f.py [--threads N] [--gpu]   compile and run; prints the value main() returns
+  mithril run f.py [--threads N] [--gpu]   compile and run (1 thread unless --threads); prints main()'s value
   mithril run f.py --image out.ppm         main() returns (width, height, pixels): write the image
-  mithril oracle f.py                      run on the reference interpreter
+  mithril oracle f.py                      run on the reference interpreter (slow: small inputs)
   mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
   mithril exec prog                        run a program built with --gpu
   mithril net f.py                         what compile-time reduction did to each function
@@ -495,9 +495,10 @@ fn cmd_oracle(args: &[String]) -> Result<i32, CliErr> {
     let path = parse_opts(args)?.file;
     let src = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let cm = to_core(&mithril_front::parse(&src)?)?;
-    // eval_core recurses once per loop iteration; give it a deep stack
+    // eval_core recurses once per loop iteration (about 1 KiB each): a stack
+    // reserved for millions of iterations, committed only as it is used
     let t = std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(1 << 33)
         .spawn(move || mithril_codegen::fmt_val(&mithril_front::eval_core(&cm, cm.main, &[])))?;
     println!("{}", t.join().map_err(|_| "oracle: evaluation panicked")?);
     Ok(0)
