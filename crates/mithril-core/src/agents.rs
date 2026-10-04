@@ -35,6 +35,18 @@ pub trait Cells {
     fn fresh_label(&mut self) -> u32;
     /// A boxed float (each side has its own cell layout for it).
     fn alloc_flo(&mut self, f: f64) -> Port;
+    /// Link `p` into the unfilled end of wire `w`: `None` when `p` is now
+    /// stored there, or the port the other end stored first. Both ends of a
+    /// wire may link at once on a parallel runtime, so exactly one of them
+    /// may find it empty.
+    fn link_wire(&mut self, w: u32, p: Port) -> Option<Port> {
+        let stored = self.cell(w)[0];
+        if stored == EMPTY.0 {
+            self.set(w, 0, p);
+            return None;
+        }
+        Some(Port(stored))
+    }
 }
 
 impl Cells for Net {

@@ -90,13 +90,9 @@ pub fn link<C: Cells>(c: &mut C, a: Port, b: Port) {
             std::mem::swap(&mut a, &mut b);
         }
         let w = a.payload() as u32;
-        let cell = c.cell(w);
-        if cell[0] == EMPTY.0 {
-            c.set(w, 0, b);
-            return;
-        }
+        let Some(stored) = c.link_wire(w, b) else { return };
         c.free_cell(w);
-        a = Port(cell[0]);
+        a = stored;
         // retry linking the stored port against b
         std::mem::swap(&mut a, &mut b);
     }

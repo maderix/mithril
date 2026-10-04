@@ -947,9 +947,11 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         if !typed || dtoh::<u32>(d.abortf,1,"read abort")?[0]!=0 { break; }
         let rule=dtoh::<i32>(launch_ptr,1,"native launch")?[0];
         if rule<0 { break; }
+        // a range phase past its budget continues in its own kernel (engine.cu RANGE_LAUNCH)
+        let range=rule==i32::MAX;
         let (kernel,nblocks,bytes,words)=if let Some(plan)=kernels.get(&rule) { *plan } else {
             let mut kernel=std::ptr::null_mut();
-            let name=std::ffi::CString::new(format!("k_native_{rule}")).unwrap();
+            let name=std::ffi::CString::new(if range { "k_range".to_string() } else { format!("k_native_{rule}") }).unwrap();
             cu(cuModuleGetFunction(&mut kernel,module,name.as_ptr()),"native kernel")?;
             shared_opt_in(kernel,dev)?;
             let mut active=0;
@@ -961,7 +963,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
             if stats {
                 let mut registers=0;
                 let _=cuFuncGetAttribute(&mut registers,4,kernel);
-                eprintln!("mithril-gpu: native rule {rule}, {} lanes, {words} cache words/lane, {registers} registers",nblocks*TPB);
+                let what=if range { "range phase".to_string() } else { format!("native rule {rule}") };
+                eprintln!("mithril-gpu: {what}, {} lanes, {words} cache words/lane, {registers} registers",nblocks*TPB);
             }
             plan
         };
@@ -971,14 +974,21 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
         cu(cuLaunchKernel(kernel,nblocks,1,1,TPB,1,1,bytes as u32,std::ptr::null_mut(),std::ptr::null_mut(),std::ptr::null_mut()),"launch native entry")?;
         if stats { cu(cuEventRecord(mem.events[5],std::ptr::null_mut()),"native end")?; }
         let mut done=std::ptr::null_mut();
-        cu(cuModuleGetFunction(&mut done,module,c"k_native_done".as_ptr()),"native completion")?;
-        let mut rule=rule as u32;
-        let mut args=[(&mut rule as *mut u32).cast::<c_void>()];
-        cu(cuLaunchKernel(done,1,1,1,1,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()),"complete native entry")?;
+        if range {
+            cu(cuModuleGetFunction(&mut done,module,c"k_range_done".as_ptr()),"range completion")?;
+            cu(cuLaunchKernel(done,1,1,1,1,1,1,0,std::ptr::null_mut(),std::ptr::null_mut(),std::ptr::null_mut()),"complete range phase")?;
+        } else {
+            cu(cuModuleGetFunction(&mut done,module,c"k_native_done".as_ptr()),"native completion")?;
+            let mut rule=rule as u32;
+            let mut args=[(&mut rule as *mut u32).cast::<c_void>()];
+            cu(cuLaunchKernel(done,1,1,1,1,1,1,0,std::ptr::null_mut(),args.as_mut_ptr(),std::ptr::null_mut()),"complete native entry")?;
+        }
         wait_stream(&mut mem,d.abortf,concurrent!=0,t_run,deadline,&mut stop_sent)?;
         if stats {
             let mut elapsed=0f32;
-            if cuEventElapsedTime(&mut elapsed,mem.events[4],mem.events[5])==0 { eprintln!("mithril-gpu: native rule {rule} search {elapsed:.3} ms"); }
+            if cuEventElapsedTime(&mut elapsed,mem.events[4],mem.events[5])==0 {
+                if range { eprintln!("mithril-gpu: range phase {elapsed:.3} ms"); } else { eprintln!("mithril-gpu: native rule {rule} search {elapsed:.3} ms"); }
+            }
         }
         if dtoh::<u32>(d.abortf,1,"read abort")?[0]!=0 { break; }
         let words=(shared/(TPB as usize*8)) as u32;

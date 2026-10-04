@@ -678,7 +678,7 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         }).collect();
         range_arms.push_str(&format!("            {} => s_{}({}&mut fuel, lo, hi{args}) as i64,\n", r.fid, r.fid, if ctx { "ctx, " } else { "" }));
     }
-    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms), ("range_arms", range_arms)];
+    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("fill_rule", prog.fill_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms), ("range_arms", range_arms)];
     out.push_str(&fill(mithril_rt::template::PROGRAM, &vars));
     out.push_str(mithril_rt::template::MAIN);
     out

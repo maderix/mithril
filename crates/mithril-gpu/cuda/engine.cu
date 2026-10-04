@@ -293,6 +293,7 @@ __device__ inline i64 f32_to_u32(i64 a) {
 
 #include <cstdio>
 #include <cooperative_groups.h>
+#include <cuda/atomic>
 namespace cg = cooperative_groups;
 __device__ inline void expect_con(u64 p, const char *site) {
   if (tag(p) != T_CON) { if (atomicCAS(G.abortf, 0u, 9u) == 0) printf("mithril-gpu: %s on a non-constructor port %llx\n", site, p); }
@@ -403,10 +404,15 @@ __device__ __forceinline__ u32 alloc_rec(u16 rule, u32 pend, u32 d, u32 s, u64 p
 }
 
 __device__ inline u32 rclamp(u32 i) { return i < G.rcap ? i : G.rcap - 1; }
-__device__ inline u64 rec_parent(u32 rec) { return G.recs[rclamp(rec)].parent; }
+// A record's parent is attached by the lane that made it and may be read by
+// the lane that completes it: both sides go past L1.
+__device__ inline u64 rec_parent(u32 rec) { return *(volatile u64 *)&G.recs[rclamp(rec)].parent; }
 __device__ inline u32 rec_d(u32 rec) { return G.recs[rclamp(rec)].d; }
 __device__ inline u32 rec_s(u32 rec) { return G.recs[rclamp(rec)].s; }
-__device__ inline void set_parent(u32 rec, u64 parent) { G.recs[rclamp(rec)].parent = parent; }
+__device__ inline void set_parent(u32 rec, u64 parent) {
+  __threadfence();
+  *(volatile u64 *)&G.recs[rclamp(rec)].parent = parent;
+}
 __device__ inline i64 fuel_of() { return (i64)s_fuel; } // the phase's budget (fold estimates)
 
 // Buckets are rings: `blen` and `bdone` grow without bound (bcap is a
@@ -1360,6 +1366,8 @@ __device__ inline u32 fresh_label() {
 __device__ inline u64 wire() { return mkport(T_VAR, alloc_node(EMPTY, EMPTY)); }
 __device__ inline u64 alloc_flo(double f) { return mkport(T_FLO, alloc2(__double_as_longlong(f), 0)); }
 
+__device__ void publish(u64 p);
+__device__ inline bool shared_val(u64 p);
 // the lane's worklist of generic redexes; overflow spills to the net rule
 __device__ inline void push_redex(u64 a, u64 b) {
   u32 L = lane();
@@ -1369,6 +1377,8 @@ __device__ inline void push_redex(u64 a, u64 b) {
     G.nw[(L * NWCAP + n) * 2 + 1] = b;
     G.nwn[L] = n + 1;
   } else {
+    publish(a);
+    publish(b);
     spawn3(NET_RULE, a, b, 0);
   }
 }
@@ -1441,6 +1451,35 @@ __device__ __noinline__ int con_collect(u64 p, u64 *buf, bool copy = false) {
 
 // Connect two ports. Wire cells hold the first arrival in slot 0; the
 // second arrival takes it (freeing the cell) and the two ports meet.
+// A wire is private to the lane that made it until a port to it can reach
+// another lane. Then it is published: its word carries SHARED_BIT (unfilled:
+// SHARED_EMPTY; filled: the stored port with the bit set) and its two ends
+// may be linked by two lanes at once, so the first arrival installs its port
+// with one compare-and-swap and the second takes the stored port. A private
+// wire is linked with plain loads and stores. Publication marks everything
+// the published port reaches (`publish`), so a lane only ever reaches
+// another lane's structure through published wires. Port tags fit in 4
+// bits, so bit 63 is free in a stored port.
+#define SHARED_BIT (1ull << 63)
+#define SHARED_EMPTY (EMPTY | SHARED_BIT)
+__device__ inline cuda::atomic_ref<u64, cuda::thread_scope_device> wire_word(u32 w) {
+  return cuda::atomic_ref<u64, cuda::thread_scope_device>(G.nodes[2 * (u64)nclamp(w)]);
+}
+// A published wire's port, or EMPTY while unfilled.
+__device__ __noinline__ u64 shared_load(u32 w) {
+  u64 c = wire_word(w).load(cuda::memory_order_acquire);
+  return c == SHARED_EMPTY ? EMPTY : c & ~SHARED_BIT;
+}
+// Install p at published wire w: EMPTY when p was the first arrival, else
+// the stored port.
+__device__ __noinline__ u64 shared_install(u32 w, u64 p) {
+  publish(p);
+  u64 stored = SHARED_EMPTY;
+  if (wire_word(w).compare_exchange_strong(stored, p | SHARED_BIT, cuda::memory_order_acq_rel,
+                                           cuda::memory_order_acquire))
+    return EMPTY;
+  return stored & ~SHARED_BIT;
+}
 __device__ __noinline__ void link(u64 a, u64 b) {
   u32 g = 0;
   for (;;) {
@@ -1452,6 +1491,10 @@ __device__ __noinline__ void link(u64 a, u64 b) {
     u32 w = (u32)payload(a);
     u64 c0 = cell0(w);
     if (c0 == EMPTY) { cell_set(w, 0, b); return; }
+    if (c0 & SHARED_BIT) {
+      c0 = shared_install(w, b);
+      if (c0 == EMPTY) return;
+    }
     free_node(w);
     a = b;
     b = c0;
@@ -1465,6 +1508,7 @@ __device__ __noinline__ u64 resolve(u64 p) {
     GUARDV(g, p);
     u32 w = (u32)payload(p);
     u64 c0 = cell0(w);
+    if (c0 & SHARED_BIT) c0 = shared_load(w);
     if (c0 == EMPTY) return p;
     free_node(w);
     p = c0;
@@ -1472,12 +1516,79 @@ __device__ __noinline__ u64 resolve(u64 p) {
   return p;
 }
 
+// Mark every wire port p reaches through agent slots, filled wires and
+// unshared constructor fields as published. What p reaches is private to
+// this lane until now (a lane reaches another's structure only through
+// published wires), so the walk reads and writes it plainly.
+#define PUBLISH_STACK 64
+__device__ __noinline__ void publish(u64 p) {
+  u64 st[PUBLISH_STACK];
+  int n = 0;
+  u32 spill = 0; // past the stack: a chain of cells [port, next index + 1]
+  auto push = [&](u64 q) {
+    if (n < PUBLISH_STACK) st[n++] = q;
+    else spill = alloc_node(q, spill) + 1;
+    return true;
+  };
+  push(p);
+  while (n || spill) {
+    u64 q;
+    if (n) {
+      q = st[--n];
+    } else {
+      u32 c = spill - 1;
+      q = cell0(c);
+      spill = (u32)cell1(c);
+      free_node(c);
+    }
+    u64 t = tag(q);
+    bool ok = true;
+    if (t == T_VAR) {
+      u32 w = (u32)payload(q);
+      u64 c0 = cell0(w);
+      if (c0 & SHARED_BIT) continue;
+      cell_set(w, 0, c0 == EMPTY ? SHARED_EMPTY : c0 | SHARED_BIT);
+      if (c0 != EMPTY) ok = push(c0);
+    } else if (t == T_DUP || t == T_LAM || t == T_APP || t == T_OP) {
+      u32 a = t == T_DUP ? dup_addr(q) : t == T_OP ? op_addr(q) : (u32)payload(q);
+      ok = push(cell0(a)) && push(cell1(a));
+    } else if (t == T_SWI) {
+      u32 s = (u32)payload(q);
+      u32 arms = (u32)payload(cell1(s));
+      ok = push(cell0(s)) && push(cell0(arms)) && push(cell1(arms));
+    } else if (t == T_MAT || t == T_REF) {
+      u64 h = t == T_REF ? ref_head(q) : cell1(mat_addr(q));
+      if (t == T_MAT) ok = push(cell0(mat_addr(q)));
+      for (u32 g = 0; ok && h != EMPTY; h = cell1((u32)payload(h))) {
+        GUARD(g);
+        ok = push(cell0((u32)payload(h)));
+      }
+    } else if (t == T_CON && con_ar(q) > 0 && !shared_val(q)) {
+      // a value other lanes share holds values only; an unshared one is
+      // handed over with the port
+      for (u32 g = 0; ok; ) {
+        GUARD(g);
+        u32 a = con_addr(q);
+        u8 ar = con_ar(q);
+        ok = push(cell0(a));
+        if (ar == 1) break;
+        if (ar == 2) { ok = ok && push(cell1(a)); break; }
+        q = cell1(a);
+      }
+    }
+    if (!ok) return;
+  }
+}
+
 // Wire p already holds ERA, through filled wires
 __device__ __noinline__ bool erased(u64 p) {
   u32 g = 0;
-  while (tag(p) == T_VAR && cell0((u32)payload(p)) != EMPTY) {
+  while (tag(p) == T_VAR) {
     GUARDV(g, false);
-    p = cell0((u32)payload(p));
+    u64 c0 = cell0((u32)payload(p));
+    if (c0 & SHARED_BIT) c0 = shared_load((u32)payload(p));
+    if (c0 == EMPTY) break;
+    p = c0;
   }
   return tag(p) == T_ERA;
 }
@@ -1515,7 +1626,12 @@ __device__ __noinline__ void unfold(u64 r, u64 other) {
       u64 a = cell0((u32)payload(h));
       if (settle_await(a, RELINK_RULE, (u32)r, (u32)(r >> 32), other, &j) < 0) return;
     }
-    if (j != NOREC && !settle_release(j)) return;
+    if (j != NOREC) {
+      // the call meets `other` again on the lane that completes the record
+      publish(r);
+      publish(other);
+      if (!settle_release(j)) return;
+    }
   }
   u64 args[LISTCAP];
   int n = list_collect(ref_head(r), args);
@@ -1523,6 +1639,8 @@ __device__ __noinline__ void unfold(u64 r, u64 other) {
   bool produced = true;
   for (int i = 0; i < n; i++) if (tag(args[i]) == T_VAR) produced = false;
   if (entry < NFNS && produced) {
+    // the result is linked into `other` by whichever lane runs the call
+    publish(other);
     u32 ri = alloc_rec(FILL_RULE, 1, (u32)other, (u32)(other >> 32), NONE);
     spawn_call((u16)(1 + entry), args, n, rec_addr(ri));
   } else {
@@ -2023,7 +2141,9 @@ __device__ __noinline__ int process(u64 a, u64 b) {
   if (ta == T_KONT || tb == T_KONT) {
     u64 k = ta == T_KONT ? a : b, v = ta == T_KONT ? b : a;
     if (!is_value(v)) { g_abort(AB_UNREACHABLE); return 1; }
-    // compiled code reads the value whole: delivered once settled
+    // compiled code reads the value whole: delivered once settled, to a
+    // record that may continue on any lane
+    publish(v);
     u32 j;
     if (settled(v, WHOLE_RULE, (u32)v, (u32)(v >> 32), payload(k), &j)) deliver(payload(k), v);
     return 1;
@@ -2059,7 +2179,12 @@ __device__ __noinline__ void reduce_net() {
     if (!pop_redex(&a, &b)) return;
     done += process(a, b);
   }
-  while (pop_redex(&a, &b)) spawn3(NET_RULE, a, b, 0);
+  while (pop_redex(&a, &b)) {
+    // a spilled redex may fire on any lane
+    publish(a);
+    publish(b);
+    spawn3(NET_RULE, a, b, 0);
+  }
 }
 __device__ inline void net_push(u64 a, u64 b) { push_redex(a, b); }
 
@@ -2157,14 +2282,69 @@ __device__ __noinline__ void relink_fire(u64 aux) {
 
 // ---- the bridge compiled code uses ----
 
+// A closure compiled code holds may sit in a structure other lanes share
+// and copy from. A copy rewrites the closure cell and the structure behind
+// it with plain stores (that structure is private, see `publish`), so a
+// lane copies a closure cell only while it holds the cell's lock (striped
+// over the cell index). A lane keeps the locks it took until its task ends
+// (`release_closures`), so a loop copying the same closures pays for them
+// once; a lane that must wait for a lock first releases every lock it
+// holds, so no lane waits while holding one.
+#define CELL_LOCKS 4096u
+#define HELD_MAX 8
+__device__ u32 g_cell_locks[CELL_LOCKS];
+__device__ u16 g_held[MAXLANES * HELD_MAX];
+__device__ u8 g_nheld[MAXLANES];
+__device__ u8 g_copying[MAXLANES]; // inside a copy: a drop now must not wait
+__device__ __noinline__ void release_closures() {
+  u32 L = lane();
+  u32 n = g_nheld[L];
+  __threadfence();
+  for (u32 i = 0; i < n; i++) atomicExch(&g_cell_locks[g_held[L * HELD_MAX + i]], 0u);
+  g_nheld[L] = 0;
+}
+__device__ inline void release_held() {
+  if (g_nheld[lane()]) release_closures();
+}
+// Hold closure cell l's lock; false when another lane holds it and this lane
+// may not wait (inside a copy).
+__device__ __noinline__ bool hold_closure(u32 l, bool may_wait) {
+  u32 L = lane(), s = l % CELL_LOCKS;
+  u32 n = g_nheld[L];
+  for (u32 i = 0; i < n; i++)
+    if (g_held[L * HELD_MAX + i] == s) return true;
+  if (atomicCAS(&g_cell_locks[s], 0u, L + 1) != 0u) {
+    if (!may_wait) return false;
+    release_closures();
+    while (atomicCAS(&g_cell_locks[s], 0u, L + 1) != 0u) __nanosleep(32);
+  } else if (n == HELD_MAX) {
+    // full: let the older locks go (this one is taken already)
+    release_closures();
+  }
+  __threadfence();
+  n = g_nheld[L];
+  g_held[L * HELD_MAX + n] = (u16)s;
+  g_nheld[L] = n + 1;
+  return true;
+}
 __device__ __noinline__ u64 dup_closure(u64 p) {
   u32 label = fresh_label();
   u64 l1, l2;
-  copy_lam((u32)(p & M56), label, &l1, &l2);
+  u32 l = (u32)(p & M56);
+  hold_closure(l, true);
+  g_copying[lane()] = 1;
+  copy_lam(l, label, &l1, &l2);
   reduce_net();
+  g_copying[lane()] = 0;
   return l2;
 }
 __device__ __noinline__ void drop_closure(u64 p) {
+  // the last reference: after the copies other lanes made of it. Inside a
+  // copy this lane may not wait for the lock, so the drop runs as its own task.
+  if (!hold_closure((u32)(p & M56), !g_copying[lane()])) {
+    spawn3(ERA_RULE, p, 0, 0);
+    return;
+  }
   link(era(), p);
   reduce_net();
 }
@@ -2207,9 +2387,17 @@ __device__ __noinline__ void apply_spawn(u64 f, u64 a, u64 parent) {
 __device__ inline void fire(u32 rule, u64 e0, u64 e1, u64 e2) {
   if (rule == ERA_RULE) {
     if (e1) arr_erase(e0, e1 - 1); else free_val(e0);
+    release_held();
+    return;
+  }
+  // another lane's net reduction completed this record before the compiled
+  // code that made it attached its parent: fire it once the parent is set
+  if (prog_rec_rule(rule) && rule != FILL_RULE && rec_parent((u32)e2) == NONE) {
+    spawn3(rule, e0, e1, e2);
     return;
   }
   prog_fire(rule, e0, e1, e2);
+  release_held();
   if (prog_rec_rule(rule)) rec_free((u32)e2);
 }
 
@@ -2237,6 +2425,7 @@ extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
   s_mode[threadIdx.x] = 0;
   s_fuel = fuel;
   prog_fire(0, a, b, c);
+  release_held();
   drain_local();
 }
 
@@ -2393,6 +2582,21 @@ struct RangeReq {
 __device__ RangeReq g_rreq[RREQ_CAP];
 __device__ u32 g_rmade, g_rdone, g_rsnap; // requests made, completed, in the current launch
 __device__ unsigned long long g_rnext; // next index a warp claims in the range phase
+// A range phase starts inside k_run. Past RANGE_BUDGET_NS it stops claiming
+// and the host continues it in k_range (same claim counter), where the
+// leaves get their own registers and as many blocks as fit. The budget is
+// ten launch costs (~90 us measured: k_run's exit and relaunch plus two
+// launches), so the switch costs at most a tenth of the phase it speeds up,
+// and a short phase never pays it.
+#define RANGE_BUDGET_NS 1000000ull
+#define RANGE_LAUNCH 0x7fffffff // g_native_launch: continue the range phase in k_range
+__device__ unsigned long long g_rstart; // when the current range phase began (globaltimer)
+__device__ u32 g_rswitch;               // the phase ran past its budget inside k_run
+__device__ inline unsigned long long globaltimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
 __device__ u64 g_rpre[RREQ_CAP + 1];      // index prefix of the launch's requests
 
 __device__ u32 range_launch(u32 fid, u16 join, i64 lo, i64 hi, const u64 *ports, int n, u32 acc, u32 kind) {
@@ -2428,7 +2632,8 @@ __device__ inline void range_add(u32 q, unsigned long long part) {
 
 // The range phase: this lane's indices of every request in the launch.
 // Every lane of a warp runs the loop's end together (the warp reduction).
-__device__ void range_run() {
+// `timed`: inside k_run, where the phase stops at its budget.
+__device__ void range_run(bool timed) {
   s_mode[threadIdx.x] = 0;
   s_work[threadIdx.x] = 0;
   const u32 nq = g_rsnap - g_rdone;
@@ -2446,19 +2651,29 @@ __device__ void range_run() {
   for (;;) {
     const unsigned long long base = __shfl_sync(0xffffffffu, next, 0);
     if (base >= total || __any_sync(0xffffffffu, *(volatile u32 *)G.abortf != 0)) break;
-    if (wl == 0) next = atomicAdd(&g_rnext, 32ull);
+    // past the budget the warp runs the chunk it holds and claims no more
+    bool stop = false;
+    if (timed && wl == 0) stop = globaltimer() - g_rstart > RANGE_BUDGET_NS;
+    stop = __shfl_sync(0xffffffffu, stop, 0);
+    if (!stop && wl == 0) next = atomicAdd(&g_rnext, 32ull);
     const u64 t = base + wl;
-    if (t >= total) continue;
-    while (t >= g_rpre[q + 1]) q++;
-    const RangeReq &r = g_rreq[(g_rdone + q) & (RREQ_CAP - 1)];
-    i64 v = prog_range_leaf(r.fid, r.lo + (i64)(t - g_rpre[q]), r.ports);
-    if (r.kind == RANGE_FILL) continue;
-    if (held != q && held != ~0u) {
-      atomicAdd(&g_rreq[(g_rdone + held) & (RREQ_CAP - 1)].sum, part);
-      part = 0;
+    if (t < total) {
+      while (t >= g_rpre[q + 1]) q++;
+      const RangeReq &r = g_rreq[(g_rdone + q) & (RREQ_CAP - 1)];
+      i64 v = prog_range_leaf(r.fid, r.lo + (i64)(t - g_rpre[q]), r.ports);
+      if (r.kind != RANGE_FILL) {
+        if (held != q && held != ~0u) {
+          atomicAdd(&g_rreq[(g_rdone + held) & (RREQ_CAP - 1)].sum, part);
+          part = 0;
+        }
+        held = q;
+        part += (unsigned long long)v;
+      }
     }
-    held = q;
-    part += (unsigned long long)v;
+    if (stop) {
+      if (wl == 0) g_rswitch = 1;
+      break;
+    }
   }
   range_add(held, part);
 }
@@ -2573,6 +2788,8 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         g_rpre[made - g_rdone] = at;
         g_rsnap = made;
         g_rnext = 0;
+        g_rswitch = 0;
+        g_rstart = globaltimer();
         g_phase = 4;
       }
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
@@ -2588,8 +2805,13 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
     int ph = *(volatile int *)&g_phase;
     if (ph == 0 || ph == 3) return;
     if (ph == 4) {
-      range_run();
+      range_run(true);
       grid.sync();
+      // a long phase continues in k_range; the host relaunches k_run after it
+      if (*(volatile u32 *)&g_rswitch && *(volatile unsigned long long *)&g_rnext < g_rpre[g_rsnap - g_rdone]) {
+        if (gid == 0) g_native_launch = RANGE_LAUNCH;
+        return;
+      }
       if (gid == 0) range_done();
       grid.sync();
       continue;
@@ -2645,6 +2867,19 @@ __device__ bool native_ready(const u64 *rules, int n) {
   for (int i = 0; i < n; ++i) pending += g_snap[rules[i]] - G.bdone[rules[i]];
   return pending >= g_native_width;
 }
+
+// The rest of a range phase that ran past its budget in k_run: the leaves
+// compile with the registers they need, not with the engine kernel's, and
+// as many blocks run as fit. k_range_done then delivers the requests on one
+// lane.
+extern "C" __global__ void k_range() {
+  stack_mark();
+#if NATIVE_FRAMES
+  s_native_top[threadIdx.x] = 0;
+#endif
+  range_run(false);
+}
+extern "C" __global__ void k_range_done() { range_done(); }
 
 extern "C" __global__ void k_native_done(u32 rule) {
  g_native_next=0;

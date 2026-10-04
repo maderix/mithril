@@ -105,6 +105,7 @@ const FIXTURES: &[&str] = &[
     "fold_borrowed_extra.py",
     "fill_loops.py",
     "grid_fill.py",
+    "closure_split.py",
     "loop_split_bounded.py",
     "fork_reach.py",
     "fork_chain.py",
@@ -309,6 +310,47 @@ fn gpu_chain_costs_a_round_per_budget_not_per_step() {
     let r = got.expect("device run");
     assert_eq!(r.text, want, "chain_boxed on the device");
     assert!(r.rounds < 2000, "the chain took {} rounds", r.rounds);
+}
+
+/// The black hole demo at a few pixels: its ray march recurses through a
+/// join point (march -> __join -> march, an if with code after it). In the
+/// device's frame machine those are tail calls: no frame or record is
+/// pushed for them, where each step used to push one to global memory.
+fn black_hole_small() -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demos/black_hole.py");
+    let mut src = std::fs::read_to_string(&p).unwrap();
+    for (f, v) in [("width", "8"), ("height", "6"), ("frames", "1"), ("first_frame", "300")] {
+        let head = format!("def {f}():\n    return ");
+        let at = src.find(&head).unwrap_or_else(|| panic!("{f}() not in the demo")) + head.len();
+        let end = at + src[at..].find('\n').unwrap();
+        src.replace_range(at..end, v);
+    }
+    src
+}
+
+#[test]
+fn march_through_a_join_point_reserves_no_frames() {
+    let (cm, cu) = pipeline_src(&black_hole_small());
+    let cu = cu.expect("not a constant");
+    let march = cm.fns.iter().position(|f| f.name == "march").expect("march");
+    let head = format!("native_s_{march}(i64* fuel, u64 pc");
+    let def = cu.match_indices(&head).map(|(i, _)| i).find(|&i| cu[i..].split('\n').next().unwrap().ends_with('{')).unwrap_or_else(|| panic!("march has no frame machine"));
+    // generated code is not indented: the machine ends where the next definition starts
+    let end = ["\n__device__", "\nextern"].iter().filter_map(|h| cu[def..].find(h)).min().unwrap();
+    let body = &cu[def..def + end];
+    for push in ["native_reserve(", "native_record_push("] {
+        assert!(!body.contains(push), "march's machine pushes a frame per step ({push})");
+    }
+}
+
+/// The same small black hole on the device equals the oracle.
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_black_hole_small_matches_the_oracle() {
+    if !gpu_on() { return; }
+    let (cm, cu) = pipeline_src(&black_hole_small());
+    let got = compile_and_run(&cu.expect("not a constant"), BOOT, &cache_dir());
+    assert_eq!(got.map(|r| r.text), Ok(oracle(&cm)));
 }
 
 /// Defunctionalized native recursion spills into the cell arena while the

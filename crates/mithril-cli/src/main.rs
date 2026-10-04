@@ -158,7 +158,13 @@ fn to_core(m: &Module) -> Result<CoreModule, CliErr> {
 /// The front stages and the net specialization, with its reports.
 fn specialized(o: &Opts) -> Result<(CoreModule, Vec<mithril_net::SpecReport>), CliErr> {
     let (m, _) = front(&o.file)?;
-    Ok(mithril_net::specialize(&to_core(&m)?, REDUCE_FUEL))
+    let core = to_core(&m)?;
+    // MITHRIL_NO_NET: compile the program as written, with no compile-time
+    // rule firings (the A/B for what early reduction buys)
+    if std::env::var_os("MITHRIL_NO_NET").is_some() {
+        return Ok((core, Vec::new()));
+    }
+    Ok(mithril_net::specialize(&core, REDUCE_FUEL))
 }
 
 // -------------------------------------------------------- paths and cache

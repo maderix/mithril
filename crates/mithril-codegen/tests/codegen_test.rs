@@ -1196,6 +1196,43 @@ fn row_major_nested_fills_run_as_one_fill() {
     }
 }
 
+/// Split leaves that copy closures out of a shared list and apply them on
+/// different workers: the closure copies share their bodies until applied,
+/// so workers link wires of shared net structure, copy the same closure
+/// cell, and complete each other's records concurrently. Every thread count
+/// and budget, repeated (the failures were races), equals the oracle.
+#[test]
+fn closures_shared_by_split_leaves_match_the_oracle() {
+    let mut m = mithril_front::parse(&fixture("closure_split.py")).unwrap();
+    mithril_reassoc::analyze(&mut m);
+    assert!(m.fns.iter().any(|f| f.name.starts_with("__gen")), "the loop no longer splits: the test lost its point");
+    let (cm, rs) = pipeline(&fixture("closure_split.py"), 1 << 20);
+    let want = oracle(&cm);
+    assert_eq!(want, "335896");
+    let bin = compile(&rs, "closure_split");
+    for t in ["1", "4", "16"] {
+        for fuel in ["", "1", "7", "64"] {
+            for _ in 0..3 {
+                let args: Vec<&str> = [t, fuel].into_iter().filter(|a| !a.is_empty()).collect();
+                assert_eq!(run(&bin, &args), want, "--threads {t} fuel {fuel:?}");
+            }
+        }
+    }
+}
+
+/// A tuple argument written as a call, a branch or a let (`closer(best, k)`
+/// in a search loop) keeps the loop native; each was rejected before and the
+/// whole call chain fell back to boxed tasks. Values equal the oracle.
+#[test]
+fn tuple_arguments_from_calls_branches_and_lets_stay_native() {
+    let (cm, rs) = pipeline(&fixture("tuple_arg_forms.py"), 0);
+    for f in ["best_call", "best_branch", "best_let"] {
+        let id = cm.fns.iter().position(|g| g.name == f).unwrap();
+        assert!(rs.contains(&format!("fn s_{id}(")), "{f} has no native form");
+    }
+    golden("tuple_arg_forms.py", 0, &["1", "4", "16"]);
+}
+
 /// A match on constructor values in native code (consumed and lent) equals the oracle.
 #[test]
 fn constructor_matches_in_native_code_match_oracle() {

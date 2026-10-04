@@ -460,6 +460,12 @@ impl<'m> Chk<'m> {
                     }
                 }
             }
+            // a tuple chosen by a branch, bound by a let or returned by a
+            // call (`tval` emits a join, a binding or the call)
+            Core::If(..) | Core::Let(..) | Core::Call(..) => {
+                let d = self.check(a, Expected::Tuple(sh));
+                self.settle(a, d);
+            }
             _ => self.fail(a),
         }
     }

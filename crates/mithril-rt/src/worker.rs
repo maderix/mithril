@@ -90,6 +90,10 @@ impl<'e> Cells for Wctx<'e> {
         let a = Wctx::alloc(self, f.to_bits(), 0);
         Port::new(Tag::Flo, a as u64)
     }
+    #[inline]
+    fn link_wire(&mut self, w: u32, p: Port) -> Option<Port> {
+        self.ar.install(w, mithril_core::agents::EMPTY.0, p.0).map(Port)
+    }
 }
 
 impl<'e> Wctx<'e> {
@@ -278,6 +282,15 @@ impl<'e> Wctx<'e> {
         self.ar.set(i, slot, v)
     }
 
+    /// Hold cell `i` against other workers' `lock_cell` until `unlock_cell`.
+    pub fn lock_cell(&self, i: u32) {
+        self.ar.lock(i)
+    }
+
+    pub fn unlock_cell(&self, i: u32) {
+        self.ar.unlock(i)
+    }
+
     // ---- records ----
 
     /// Allocate a waiting record that fires `rule` after `pend` deliveries.
@@ -318,7 +331,7 @@ impl<'e> Wctx<'e> {
     /// its continuation as records whose destination is only known higher
     /// up the call chain). Must happen before any delivery can fire `i`.
     pub fn set_parent(&self, i: u32, parent: u64) {
-        self.ar.recs[i as usize].parent.store(parent, Ordering::Relaxed);
+        self.ar.recs[i as usize].parent.store(parent, Ordering::Release);
     }
 
     /// Fill slot `parent & 7` of record `parent >> 3`; the delivery that
@@ -333,6 +346,14 @@ impl<'e> Wctx<'e> {
         let r = &self.ar.recs[ri as usize];
         if crate::sync::join_arrive(&r.pend, &r.args[(parent & 7) as usize], val) {
             let rule = r.rule.load(Ordering::Relaxed) as u16;
+            // A suspended dive attaches its record's parent after it returns;
+            // completed meanwhile on another worker, the record fires in the
+            // next wave, after the attach (the FILL records have no parent)
+            if r.parent.load(Ordering::Acquire) == crate::prelude::NONE && rule != self.prog.fill_rule() {
+                self.mark(rule);
+                self.out_recs[rule as usize].push(ri);
+                return;
+            }
             // The last child fires the record right here: a chain of
             // nested joins then completes in one wave instead of one hop
             // per wave. Depth-bounded so a long chain cannot overrun the

@@ -86,6 +86,10 @@ pub trait Program: Sync {
     fn net_rule(&self) -> u16 {
         u16::MAX
     }
+    /// The FILL bucket (its records link into the net, never into a parent).
+    fn fill_rule(&self) -> u16 {
+        u16::MAX
+    }
     /// Work estimate per bucket entry (used for scheduling; 0 is treated as 1).
     fn rule_cost(&self, rule: u16) -> u32;
     fn fire(&self, rule: u16, e: Redex, ctx: &mut Wctx);

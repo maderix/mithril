@@ -244,6 +244,58 @@ impl<'a> Machine<'a> {
         }
         Some(at)
     }
+    /// A call whose continuation only copies its results to a return is a
+    /// tail call: the callee's parameters take the arguments and control
+    /// jumps to its entry, reusing the frame. Recursion through tail calls
+    /// (a loop written as a function, or a join point calling back into its
+    /// function) then pushes no frames.
+    fn tail_calls(&mut self) {
+        for i in 0..self.blocks.len() {
+            let End::Call(f, args, outs, next) = self.blocks[i].end.clone() else { continue };
+            if !self.forwards(next, &outs) {
+                continue;
+            }
+            // the arguments may read the callee's parameters: evaluate them all first
+            let params = self.params[&f].clone();
+            let temps: Vec<String> = params.iter().map(|p| self.local(self.locals[p])).collect();
+            for (t, a) in temps.iter().zip(&args) {
+                self.blocks[i].body.push(set(t, a.clone()));
+            }
+            for (p, t) in params.iter().zip(&temps) {
+                self.blocks[i].body.push(set(p, v(t)));
+            }
+            self.blocks[i].end = End::Jump(self.entries[&f]);
+        }
+    }
+    /// From block `at`, control reaches a return of exactly `outs` (in order)
+    /// through copies and jumps only.
+    fn forwards(&self, mut at: usize, outs: &[String]) -> bool {
+        // holds[k]: the names holding result k so far
+        let mut holds: Vec<BTreeSet<String>> = outs.iter().map(|o| BTreeSet::from([o.clone()])).collect();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(at) {
+                return false;
+            }
+            let b = &self.blocks[at];
+            for s in &b.body {
+                let S::Set(n, E::V(m)) = s else { return false };
+                for h in holds.iter_mut() {
+                    h.remove(n);
+                }
+                if let Some(k) = holds.iter().position(|h| h.contains(m)) {
+                    holds[k].insert(n.clone());
+                }
+            }
+            match &b.end {
+                End::Jump(j) => at = *j,
+                End::Return(es) => {
+                    return es.len() == outs.len() && es.iter().zip(&holds).all(|(e, h)| matches!(e, E::V(n) if h.contains(n)));
+                }
+                _ => return false,
+            }
+        }
+    }
     fn hoist_captures(&mut self) {
         for i in 0..self.blocks.len() {
             let End::Call(_, args, outs, next) = self.blocks[i].end.clone() else { continue };
@@ -483,6 +535,7 @@ pub(crate) fn lower(module: &mithril_front::core::CoreModule, fns: &mut Vec<FnDe
         if !FRAMES.with(|f| f.get()) {
             continue;
         }
+        m.tail_calls();
         m.hoist_captures();
         if coalesced { exits::complete(&mut m); }
         joins::share(&mut m);

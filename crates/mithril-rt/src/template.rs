@@ -249,10 +249,14 @@ fn fill_fire(ctx: &mut Wctx, e: Redex) {
 /// Sharing a closure value from compiled code is the net's DUP–LAM rule
 /// (`copy_lam`): the original cell stays the first copy, so the caller's
 /// port is still that closure; the second copy is returned. The bodies
-/// are copied lazily by the rules as each copy is used.
+/// are copied lazily by the rules as each copy is used. The closure may sit
+/// in a structure other workers share and copy from: one copy at a time.
 fn dup_closure(ctx: &mut Wctx, p: u64) -> u64 {
     let label = mithril_rt::mithril_core::agents::Cells::fresh_label(ctx);
-    let (_, copy) = mithril_rt::mithril_core::rules::copy_lam(ctx, (p & M56) as u32, label);
+    let l = (p & M56) as u32;
+    ctx.lock_cell(l);
+    let (_, copy) = mithril_rt::mithril_core::rules::copy_lam(ctx, l, label);
+    ctx.unlock_cell(l);
     let budget = ctx.fuel();
     ctx.reduce_net(pg_ref(), budget);
     copy.0
@@ -314,6 +318,7 @@ pub const PROGRAM: &str = r#"struct Pg { fuel: u32, entries: Vec<Entry>, metas: 
 impl Program for Pg {
     fn n_rules(&self) -> usize { {n_rules} }
     fn net_rule(&self) -> u16 { {net_rule} }
+    fn fill_rule(&self) -> u16 { {fill_rule} }
     fn rule_cost(&self, rule: u16) -> u32 {
         // An entry that may dive can burn a whole budget; pure joins are tiny.
         const DIVING: &[usize] = &[{diving}];

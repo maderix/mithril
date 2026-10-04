@@ -284,6 +284,29 @@ The runtime runs the same table. A compiled program has a net region:
   copy so the caller's port stays valid), and erasure of a dropped
   closure by `ERA`.
 
+Compiled code shares a closure by reference (a `Lam` port inside a shared
+constructor or array), so workers copy and apply the same closure at
+once, and the copies share net structure until they are applied. Three
+points of the net region are atomic on both devices:
+
+* a wire's two ends can be linked by two workers at once: the first
+  arrival installs its port with one compare-and-swap (acquire/release),
+  the second takes the stored port and frees the wire. On the GPU only a
+  *published* wire pays for this: a wire is private to the lane that made
+  it until a port to it can reach another lane (a spill, a fill target,
+  a delivered result), and publication marks everything that port
+  reaches (bit 63 of the wire word, free because port tags fit in four
+  bits). Private wires link with plain loads and stores;
+* `DUP-LAM` rewrites the original closure cell in place, so a copy holds
+  a lock on that cell (striped over the cell index). On the GPU a lane
+  keeps the locks it took until its task ends, so a loop copying the
+  same closures pays once, and a lane that must wait first releases
+  every lock it holds;
+* another worker's net reduction can complete a record before the
+  compiled code that made it attaches its parent: the completed record
+  is queued again and fires once the parent is set (FILL records, which
+  never get a parent, fire at once).
+
 Value forms cross the boundary unchanged. Closures in compiled code are
 opaque `Lam` ports until applied. On the device, entries are printed as
 straight-line net builders (`inst_<e>`) from the same `NExpr` bodies
@@ -847,6 +870,20 @@ one scheduler round (about 68 us) per level. heat2d on the device
 (1024 x 1024, 500 steps): timeout at 150 s with the fill on one lane, 2.78 s
 with width-sized chunks on idle lanes, 63 ms with range launches (C 0.53 s;
 the generated `cell` code alone as a standalone kernel: 4.2 ms).
+
+A range phase that runs long continues outside `k_run`. `k_run` is one
+cooperative kernel compiled for the engine's own register needs (231 per
+lane), so heavy leaves run at its occupancy. Past a budget of 1 ms the
+warps stop claiming; `k_run` returns with `RANGE_LAUNCH`, and the host
+launches `k_range`, which runs the same `range_run` from the same claim
+counter with the registers the leaves need and as many blocks as fit,
+then `k_range_done` delivers the requests. The budget is ten times the
+measured cost of the detour (about 90 us: `k_run`'s exit and relaunch and
+two launches), so a phase that switches spends at most a tenth of its time
+on it and a short phase never pays it. Always switching cost heat2d
+(500 short phases) 44 to 88 ms and knapsack 354 to 1135 ms; never
+switching cost the black hole demo 1.2 to 2.9 s per 40 frames. With the
+budget: heat2d 45 ms, knapsack 372 ms, black hole 1.2 s.
 
 A fresh int array whose one use is the buffer of a proven fill that starts
 at 0, is bounded by the array's length (the same pure expression) and

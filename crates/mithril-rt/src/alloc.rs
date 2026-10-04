@@ -116,13 +116,20 @@ pub(crate) struct Arena {
     rbump: AtomicU64,
     result: AtomicU64,
     has_result: AtomicBool,
+    /// Striped locks over cells: copying a closure rewrites its cell, and the
+    /// closure may sit in a structure several workers share.
+    locks: Box<[AtomicBool]>,
 }
+
+/// Stripes of `Arena::locks`.
+const LOCK_STRIPES: usize = 4096;
 
 impl Arena {
     pub fn new(ncells: usize, nrecs: usize) -> Arena {
         assert!(ncells <= MAX_SLOTS && nrecs <= MAX_SLOTS, "capacity exceeds the u32 index range (2^32 slots)");
         Arena {
             labels: std::sync::atomic::AtomicU32::new(1),
+            locks: (0..LOCK_STRIPES).map(|_| AtomicBool::new(false)).collect(),
             cells: zeroed_slice(2 * ncells),
             rc: zeroed_slice(ncells),
             // record 0 is the reserved ROOT sink, so keep at least one slot
@@ -212,6 +219,30 @@ impl Arena {
     #[inline(always)]
     pub fn rc_unique(&self, i: u32) -> bool {
         crate::sync::rc_unique(self.rcs(i))
+    }
+
+    /// Hold cell `i`'s stripe until `unlock`.
+    pub fn lock(&self, i: u32) {
+        let l = &self.locks[i as usize % LOCK_STRIPES];
+        while l.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+    }
+
+    pub fn unlock(&self, i: u32) {
+        self.locks[i as usize % LOCK_STRIPES].store(false, Ordering::Release);
+    }
+
+    /// Store `v` in slot 0 of cell `i` if it holds `empty`, or return what
+    /// it holds. Release on the store, acquire on the read: the cells behind
+    /// the port are visible to the end that takes it.
+    #[inline(always)]
+    pub fn install(&self, i: u32, empty: u64, v: u64) -> Option<u64> {
+        let k = 2 * i as usize;
+        debug_assert!(k < self.cells.len());
+        // SAFETY: allocator-issued index.
+        let slot = unsafe { self.cells.get_unchecked(k) };
+        slot.compare_exchange(empty, v, Ordering::AcqRel, Ordering::Acquire).err()
     }
 
     #[inline(always)]
