@@ -109,6 +109,11 @@ figcaption{margin-top:14px}
 .lineage li::before{content:"";position:absolute;left:-6px;top:10px;width:10px;height:10px;border-radius:50%;background:var(--bg,#0b0b0e);border:2px solid var(--accent)}
 .lineage li:last-child::before{background:var(--accent)}
 .lineage b{font-family:var(--mono);font-size:.78rem;color:var(--accent);font-weight:600;margin-right:10px}
+.compare-box{border:1px solid var(--hair-2);border-left:4px solid var(--accent);border-radius:0 12px 12px 0;background:var(--card);padding:14px 18px 8px;margin:22px 0 26px;max-width:76ch}
+.compare-box h4{font:700 .7rem var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+.compare-box .table-wrap{margin:8px 0 6px}.compare-box table{min-width:520px}
+.compare-box th:last-child,.compare-box td:last-child{color:var(--ink)}
+.compare-box p{font-size:.84rem;color:var(--ink-2);margin:6px 0 8px}
 .pull{font-family:var(--sans);font-weight:600;font-size:1.1rem;line-height:1.45;color:var(--ink);border-left:3px solid var(--accent);padding:2px 0 2px 18px;margin:26px 0;max-width:62ch}
 
 /* code */
@@ -402,6 +407,15 @@ footer p{max-width:none}
 <li><b>HVM, Bend</b>Victor Taelin and HigherOrder Co. make the theory run: <strong>HVM</strong><sup class="cite">[<a href="#ref-hvm">4</a>]</sup> evaluates interaction combinators across CPU cores and GPUs, and <strong>Bend</strong><sup class="cite">[<a href="#ref-bend1">5</a>]</sup> shows that ordinary-looking programs parallelize with no annotations. They also find the catch: rewriting a graph one pair of nodes at a time costs far more per step than plain machine code, and <strong>Bend 2</strong><sup class="cite">[<a href="#ref-bend2">6</a>]</sup> leaves nets behind to compile to C.</li>
 </ol>
 <p><strong>Mithril bets the other way: nets pay off once you change <em>when</em> the rewriting happens.</strong> While compiling, it already runs every rewrite whose inputs are written in the source, the idea behind partial evaluation<sup class="cite">[<a href="#ref-pe">8</a>]</sup>: constants computed, small functions inlined, decided <code>if</code> tests settled. These are <strong>the program's own rules applied early</strong>, not separate optimizations, so they cannot change what it means. What depends on the input, such as each pixel's colour in a ray tracer, becomes <strong>ordinary machine code</strong>, and the net stays at run time only to share computed values and hand independent work to idle cores. Mithril holds itself to the strict test: how many cores it needs to beat a good sequential C program of the same algorithm<sup class="cite">[<a href="#ref-cost">7</a>]</sup>. It is a research language: its core rules are proved confluent in Lean<sup class="cite">[<a href="#ref-lean">9</a>]</sup>, every backend is checked against a reference interpreter, and its open problems (vectorizing independent work, keeping GPU lanes busy, irregular machine-learning workloads) are the problems nets must solve to scale.</p>
+<div class="compare-box"><h4>Mithril, Bend 1 and Bend 2</h4>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Mithril compared with Bend 1 and Bend 2"><table><thead><tr><th></th><th>Bend 1<sup class="cite">[<a href="#ref-bend1">5</a>]</sup></th><th>Bend 2<sup class="cite">[<a href="#ref-bend2">6</a>]</sup></th><th>Mithril</th></tr></thead><tbody>
+<tr><td>What runs</td><td>The interaction net, rewritten on HVM<sup class="cite">[<a href="#ref-hvm">4</a>]</sup></td><td>One generated C file, no net</td><td>Native code for input-dependent work, plus a small net</td></tr>
+<tr><td>When the net is rewritten</td><td>At run time, every step</td><td>Not at all</td><td>Mostly at compile time; at run time only to share values and hand out work</td></tr>
+<tr><td>Cost of <code>a + b</code></td><td>A rewrite: allocate, match a rule, rewire</td><td>A machine instruction</td><td>A machine instruction</td></tr>
+<tr><td>Where parallelism comes from</td><td>The net's rules, no annotations</td><td>The generated C, not the net's rules</td><td>The net's rules, no annotations</td></tr>
+</tbody></table></div>
+<p>In short: <strong>Bend 1 keeps the nets and pays for every step; Bend 2 drops the nets and compiles to C; Mithril keeps the nets and moves the rewriting to compile time.</strong> Mithril's mechanisms are derived independently; Bend is the baseline it measures against.</p>
+</div>
 <div class="note-box"><h4>For the astute reader</h4>
 <p>The work described above is what a classical optimizing compiler already does: it folds constants, inlines small functions and removes branches whose outcome is known. That overlap is deliberate. It is the bet Mithril makes.</p>
 <p>A classical compiler does this work in separate passes, each written by hand and each needing its own argument that it preserves the program's meaning. The order of the passes also changes the code that comes out; compiler writers call this the phase-ordering problem.</p>
