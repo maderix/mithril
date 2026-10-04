@@ -23,8 +23,13 @@ the CPU and the device as two serialized lanes running side by side.
                device run past GPU_RUN_CAP_S is recorded as a timeout: a
                program that finished before and now times out fails
 
-Everything is compared against tests/ci/baseline.json. `--update` rewrites
-the baseline from the current toolchain, checking every program without a
+Everything is compared against tests/ci/baseline.json, recorded on the
+primary platform (Linux x86-64). Elsewhere (macOS arm64, experimental: CPU
+only) values, lowering and code size still compare against it, so every
+platform must compute the same values; times compare against a baseline of
+that platform's own (baseline-<os>-<arch>.json), and Linux-only signals
+(perf instruction counts, the address-space cap) are skipped. `--update` rewrites
+this platform's baseline from the current toolchain, checking every program without a
 fixed expected value against `mithril oracle` first (do this only from a
 verified state).
 
@@ -34,6 +39,7 @@ Exit status: number of hard failures.
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -45,6 +51,11 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PORTS = os.path.join(ROOT, "bench", "ports")
 BASELINE = os.path.join(ROOT, "tests", "ci", "baseline.json")
+LINUX = sys.platform.startswith("linux")
+PRIMARY = LINUX and platform.machine() == "x86_64"
+# another platform's own times; its values must equal the primary baseline's
+PLATFORM_BASELINE = os.path.join(ROOT, "tests", "ci", f"baseline-{sys.platform}-{platform.machine()}.json")
+TIMES = ("instr", "build_s", "gen_s", "full_t1_s", "full_t16_s", "gpu_ms", "gpu_wall_ms")
 TARGET = os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target"))
 BIN = os.environ.get("MITHRIL_BIN", os.path.join(TARGET, "release", "mithril"))
 DUMP = os.path.join(TARGET, "release", "examples", "dump_gen")
@@ -111,7 +122,19 @@ def run(cmd, cap, env=None):
 
 
 def capped(cmd):
+    # the address-space cap is Linux's; macOS refuses `ulimit -v`
+    if not LINUX:
+        return cmd
     return ["bash", "-c", f"ulimit -v {BUILD_MEM_KB}; exec \"$@\"", "--"] + cmd
+
+
+def sed(text, expr):
+    """Apply one `s/pattern/replacement/` (a basic regular expression, as the
+    substitutions here are written) without depending on GNU sed."""
+    _, pat, rep, _ = expr.split("/")
+    for c in "(){}+?|":
+        pat = pat.replace(c, "\\" + c)
+    return re.sub(pat, rep.replace("\\", "\\\\"), text, flags=re.M)
 
 
 def source(name):
@@ -120,13 +143,18 @@ def source(name):
 
 def variant(name, subs, tmp, tag):
     src = os.path.join(tmp, f"{name}_{tag}.py")
-    shutil.copy(source(name), src)
+    text = open(source(name)).read()
     for e in subs:
-        subprocess.run(["sed", "-i", e, src], check=True)
+        text = sed(text, e)
+    open(src, "w").write(text)
     return src
 
 
 def instructions(cmd, cap):
+    if not LINUX:
+        # no perf: the run still checks the value, the count is unknown
+        rc, out, err, dt = run(cmd, cap, env=RUN_ENV)
+        return None, (last(out, "") if rc == 0 else None)
     rc, out, err, dt = run(["perf", "stat", "-x,", "-e", "instructions:u"] + cmd, cap, env=RUN_ENV)
     if rc != 0:
         return None, None
@@ -222,7 +250,7 @@ def time_cpu(r):
         rc2, out2, err2, _ = run([r["_mid"], "--threads", "16"], CPU_RUN_CAP_S, env=RUN_ENV)
         r["instr"] = ins
         r["mid_agree"] = v1 is not None and v1 == last(out2, "")
-        if "arena exhausted" in err2 or ins is None:
+        if "arena exhausted" in err2 or v1 is None:
             r["mid_exhausted"] = True
 
 
@@ -289,6 +317,12 @@ def main():
             sys.exit(f"missing {p}: cargo build --release -p mithril-cli --example dump_gen && cargo build --release -p mithril-cli")
     names = a.only or sorted(SMALL) + sorted(EXTRA)
     base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
+    if not PRIMARY:
+        # values, lowering and code size from the primary baseline, times
+        # from this platform's (none yet: times are not compared)
+        own = json.load(open(PLATFORM_BASELINE)) if os.path.exists(PLATFORM_BASELINE) else {}
+        for n, b in base.items():
+            base[n] = {k: v for k, v in b.items() if k not in TIMES} | {k: v for k, v in own.get(n, {}).items() if k in TIMES}
     gpu = HAS_GPU and not a.no_gpu
     tmp = tempfile.mkdtemp(prefix="mithril-ci-")
     t0 = time.time()
@@ -323,11 +357,13 @@ def main():
         print(f"{r['name']:15} {small:5} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('gen_s', '-'):>5} {r.get('build_s', '-'):>6} {insg} {tm('full_t1'):>7} {tm('full_t16'):>7} {gms:>9} {str(r.get('gpu_wall_ms', '-')):>8}  {st} {notes}")
     print(f"total {time.time() - t0:.1f}s (builds and small checks {t1 - t0:.1f}s, timed runs {t2 - t1:.1f}s), {fails} failing")
     if a.update:
-        # merge: `--update --only X` refreshes X and keeps every other entry
-        base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
-        base.update({r["name"]: r for r in results})
-        json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
-        print(f"baseline written: {BASELINE}")
+        # merge: `--update --only X` refreshes X and keeps every other entry;
+        # off the primary platform only this platform's times are written
+        path = BASELINE if PRIMARY else PLATFORM_BASELINE
+        base = json.load(open(path)) if os.path.exists(path) else {}
+        base.update({r["name"]: r if PRIMARY else {k: v for k, v in r.items() if k in TIMES} for r in results})
+        json.dump(base, open(path, "w"), indent=1, sort_keys=True)
+        print(f"baseline written: {path}")
     sys.exit(fails)
 
 
