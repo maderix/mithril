@@ -21583,12 +21583,12 @@
     "rc": 0
    },
    "fuel1": {
-    "err": "thread '<unnamed>' panicked at /home/maderix/Mithril/target/parity-ref/src/crates/mithril-core/src/rules.rs:297:9:\nICE: Op operand has non-value tag Era\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "err": "thread '<unnamed>' panicked at target/parity-ref/src/crates/mithril-core/src/rules.rs:297:9:\nICE: Op operand has non-value tag Era\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
     "out": "",
     "rc": 101
    },
    "fuel2": {
-    "err": "thread '<unnamed>' panicked at /home/maderix/Mithril/target/parity-ref/src/crates/mithril-core/src/rules.rs:297:9:\nICE: Op operand has non-value tag Era\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "err": "thread '<unnamed>' panicked at target/parity-ref/src/crates/mithril-core/src/rules.rs:297:9:\nICE: Op operand has non-value tag Era\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
     "out": "",
     "rc": 101
    },

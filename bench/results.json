@@ -71,7 +71,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/collatz.gpu"
      ],
@@ -101,7 +101,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/heat2d.gpu"
      ],
@@ -180,7 +180,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/histogram.gpu"
      ],
@@ -261,7 +261,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/kdtree.gpu"
      ],
@@ -342,7 +342,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/knapsack.gpu"
      ],
@@ -421,7 +421,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/msort.gpu"
      ],
@@ -502,7 +502,7 @@
     "GPU": {
      "label": "GPU",
      "cmd": [
-      "/home/maderix/Mithril/target/release/mithril",
+      "target/release/mithril",
       "exec",
       "/tmp/mithril-bench-woo0_jwi/subsetsum.gpu"
      ],
