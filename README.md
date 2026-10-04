@@ -1,10 +1,20 @@
 # Mithril
 
-**A programming language for deterministic parallelism, built on interaction nets.**
+**Parallel by construction. Deterministic. One source for CPU and GPU.**
 
-Write ordinary step-by-step code: functions, loops, values. Mithril finds the
-calls that can run at the same time and runs them on every core of a CPU or
-across a GPU. The answer is the same whichever order the work runs in.
+A programming language built on interaction nets.
+
+- **Parallel by construction.** Write ordinary step-by-step code: functions,
+  loops, values. Independent calls, independent loop iterations and sums
+  proved safe to split run in parallel because of how the program is built.
+  There are no threads, locks or kernels to write.
+- **Deterministic.** The same input gives the same output, bit for bit, on 1
+  thread, 16 threads, an NVIDIA GPU, x86-64 or Apple silicon. The rewrite rules
+  are proved confluent in Lean, and every backend is checked against a
+  reference interpreter.
+- **One source for CPU and GPU.** The same file compiles to native CPU code and
+  to CUDA, with one rule table and one runtime model on both. You pick the
+  device when the program runs.
 
 **Read the introduction:
 [Mithril: a programming language for deterministic parallelism](https://maderix.github.io/articles/mithril/)**,
