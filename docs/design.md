@@ -1662,15 +1662,16 @@ stage times; the same file runs on the CPU and the device.
 
 | demo | CPU 16 threads (wall) | device (warm) |
 |---|---|---|
-| Whitted, 512 x 512 x 4 samples | 0.049 s | 0.026 s |
-| path, 256 x 256 x 64 paths | 0.181 s | 0.016 s |
+| Whitted, 512 x 512 x 4 samples | 0.029 s | 0.009 s |
+| path, 256 x 256 x 64 paths | 0.175 s | 0.011 s |
 
 The device image is byte-identical to the CPU image for both. All ray
 code is native (vectors and hit records are nested tuples held in
 registers, section 5.2). These static demo timings are medians of three
 built-artifact runs after a warmup on 5 October 2026; device times are warm
-(device run plus result readback and formatting, without the one-off CUDA
-context and memory setup of about 120 ms per process). [Raw samples](img/raytracer-static.json). Device wall includes result formatting and process setup;
+(device run plus reading back and writing the image with the output sink,
+section 10.1, without the one-off CUDA
+context and memory setup of about 120 ms per process). [Raw samples](img/raytracer-static.json). Device wall includes process setup;
 its `k_run` interval alone does not describe end-to-end rendering cost.
 A test renders the Whitted demo at 12 x 12 and checks it against the
 oracle at 1, 4 and 16 threads.

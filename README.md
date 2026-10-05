@@ -296,9 +296,9 @@ Measured on 4 October 2026. The seven benchmark ports are timed against a C
 twin of the same algorithm, compiled with `-O2`; times are minimums of five
 runs (three on the GPU). Render times are medians of three runs after a
 warmup. All times are warm: the GPU column is the device's own timer for the
-run plus reading back and formatting the result, without the one-off CUDA
+run plus reading back and writing the result, without the one-off CUDA
 context, module and memory setup (about 120 ms per process). CPU startup is
-under 1 ms.
+under 1 ms. Renders write their image with `--image` on every lane.
 
 **Linux** · Ryzen 7 7800X3D (8 cores, 16 threads), RTX 4090, `gcc`
 
@@ -311,8 +311,8 @@ under 1 ms.
 | knapsack | 0.354 s | 0.444 s | 0.186 s | 0.399 s |
 | msort | 0.386 s | 0.302 s | 0.126 s | 6.803 s |
 | subsetsum | 0.546 s | 0.782 s | 0.150 s | 0.112 s |
-| cornell_path | - | 1.704 s | 0.181 s | 0.016 s |
-| cornell_whitted | - | 0.227 s | 0.049 s | 0.026 s |
+| cornell_path | - | 1.716 s | 0.175 s | 0.011 s |
+| cornell_whitted | - | 0.202 s | 0.029 s | 0.009 s |
 
 **macOS (experimental CPU backend)** · Apple M4 (4 performance + 6
 efficiency cores), Apple `clang`
