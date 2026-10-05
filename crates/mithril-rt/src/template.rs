@@ -140,7 +140,7 @@ impl<'e> Prog<Wctx<'e>> for Pg {
 
 /// Builtins on runtime values (the compile-time `compute` folds the same
 /// codes on literals). Codes < 16 are int/float arithmetic, 16..22
-/// comparisons, 32..44 the `Prim`s, 45 the (index, value) pair of a set.
+/// comparisons, 32..45 the `Prim`s, 46 the (index, value) pair of a set.
 fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
     if code >= 32 {
         return Some(match code {
@@ -162,7 +162,8 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
                 arr_set(ctx, x, as_i(i), v)
             }
             44 => num(f32_le(as_i(x), as_i(y))),
-            45 => mk_con(ctx, 0xFFF, &[x, y]),
+            45 => num(f32_canon(as_i(x))),
+            46 => mk_con(ctx, 0xFFF, &[x, y]),
             c => unreachable!("builtin code {}", c),
         });
     }
@@ -190,7 +191,7 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
         let r = match code { 16 => a < b, 17 => a <= b, 18 => a > b, 19 => a >= b, 20 => a == b, 21 => a != b, _ => unreachable!() };
         return Some(num(r as i64));
     }
-    let r = match code { 0 => a + b, 1 => a - b, 2 => a * b, 3 => a / b, c => unreachable!("float opcode {}", c) };
+    let r = mithril_rt::mithril_core::float::f64_op(code as u8, a, b).unwrap_or_else(|| unreachable!("float opcode {}", code));
     Some(flo(ctx, r))
 }
 

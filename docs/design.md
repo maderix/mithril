@@ -25,6 +25,16 @@ depend on runtime input, and at runtime on the rest.
 
 The thesis has three claims.
 
+Two guarantees hold on every supported backend, without exception:
+
+* **Confluence.** Any order of rule firings, any schedule, any device and
+  any split of the work between devices gives the same result.
+* **Bit-exactness.** Every backend (each CPU, each GPU, the reference
+  interpreter and the compile-time reducer) produces identical bits for
+  ints, floats and NaN (section 4.5).
+
+A backend or a feature ships only with tests that prove both.
+
 ## 2. Pipeline
 
 ```
@@ -534,6 +544,41 @@ Inside native code arrays are linear, and the bridge makes an owned array
 unique once (`arr_own`), so writes skip the count check. Owned arrays in
 native code are consumed at most once on every path, never read after,
 and freed at path end.
+
+### 4.5 Floating point
+
+Float arithmetic has one definition, `mithril_core::float`, which the
+reference interpreter, the compile-time reducer and the CPU runtime call;
+the device engines mirror it, and a conformance program checks them all
+against it bit for bit.
+
+* Every operation is IEEE 754 binary32 or binary64 with round to nearest
+  even. No two operations fuse: the device printer uses the correctly
+  rounded intrinsics (`__fadd_rn` and so on), which never contract into a
+  fused multiply-add.
+* An f32 value is its bit pattern in an int, and the type system keeps it
+  apart from ints: an f32 never meets an int operation, `==` on f32 is
+  IEEE equality (built from `f32_le`), `int()` of an f32 is defined for
+  every pattern (0 for NaN), and negation flips the sign bit.
+* NaN is the one place IEEE leaves the bits open, and the hardware differs
+  (x86, arm64, NVIDIA and Apple GPUs each produce or propagate different
+  NaN bits). So the bits of a NaN are fixed wherever they can be observed:
+  the canonical quiet NaN with the sign clear. Inside the program no
+  operation tells one NaN from another, so an f32's bits are observed only
+  where they leave the program: its result.
+* The front end therefore canonicalizes the result. The program's `main`
+  becomes `__main_result`, and a new `main` applies `f32_canon` to every
+  f32 leaf of the result, found by type inference: f32 values, tuples, and
+  arrays (one index fill per array level, so the pass is parallel). Inner
+  loops run plain float operations.
+* Where inference cannot locate the f32 leaves (a result holding a
+  constructor or a closure) the program is strict: every f32 operation and
+  every negation applies `f32_canon`. `MITHRIL_STRICT_FLOAT=1` makes any
+  program strict; tests run both modes and require identical bytes, which
+  checks the default against the strict reference.
+* f64 values are boxed and leave the program only through its result, so
+  each f64 operation canonicalizes its NaN at once (the cost is small
+  beside the box).
 
 ## 5. Lowering
 

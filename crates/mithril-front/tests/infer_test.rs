@@ -44,21 +44,25 @@ fn body(m: &mithril_front::Module, f: &str) -> Vec<Stmt> {
 
 #[test]
 fn operators_become_builtins_and_literals_become_bits() {
+    // an f32 result: the program's main is `__main_result`, wrapped by a main
+    // that makes the result's NaN canonical (design.md 4.5)
     let m = parse("def main():\n    x = sqrt(9.0)\n    return x * 2.0 + 1\n").unwrap();
-    let Stmt::Return(e) = &body(&m, "main")[1] else { panic!() };
+    let Stmt::Return(e) = &body(&m, "__main_result")[1] else { panic!() };
     let two = 2.0f32.to_bits() as i64;
     let one = 1.0f32.to_bits() as i64;
     let x = Expr::Var("x".into());
     let want = Expr::Call("f32_add".into(), vec![Expr::Call("f32_mul".into(), vec![x, Expr::Int(two)]), Expr::Int(one)]);
     assert_eq!(e, &want);
     let nine = Expr::Int(9.0f32.to_bits() as i64);
-    assert_eq!(body(&m, "main")[0], Stmt::Assign("x".into(), Expr::Call("f32_sqrt".into(), vec![nine])));
+    assert_eq!(body(&m, "__main_result")[0], Stmt::Assign("x".into(), Expr::Call("f32_sqrt".into(), vec![nine])));
+    let Stmt::Return(r) = &body(&m, "main")[1] else { panic!() };
+    assert_eq!(r, &Expr::Call("f32_canon".into(), vec![Expr::Var("r".into())]));
 }
 
 #[test]
 fn negation_flips_the_sign_bit() {
     let m = parse("def main():\n    x = sqrt(9.0)\n    return -x\n").unwrap();
-    let Stmt::Return(e) = &body(&m, "main")[1] else { panic!() };
+    let Stmt::Return(e) = &body(&m, "__main_result")[1] else { panic!() };
     assert_eq!(e, &Expr::Bin(BinOp::BitXor, Box::new(Expr::Var("x".into())), Box::new(Expr::Int(1 << 31))));
 }
 

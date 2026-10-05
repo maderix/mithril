@@ -134,15 +134,8 @@ pub const ARR_RAW: u64 = 1 << 62;
 #[inline(always)] pub fn f32b(x: i64) -> f32 { f32::from_bits(x as u32) }
 
 #[inline(always)] pub fn f32i(x: f32) -> i64 { x.to_bits() as i64 }
-#[inline(always)] pub fn f32_add(a: i64, b: i64) -> i64 { f32i(f32b(a) + f32b(b)) }
-#[inline(always)] pub fn f32_sub(a: i64, b: i64) -> i64 { f32i(f32b(a) - f32b(b)) }
-#[inline(always)] pub fn f32_mul(a: i64, b: i64) -> i64 { f32i(f32b(a) * f32b(b)) }
-#[inline(always)] pub fn f32_div(a: i64, b: i64) -> i64 { f32i(f32b(a) / f32b(b)) }
-#[inline(always)] pub fn f32_sqrt(a: i64) -> i64 { f32i(f32b(a).sqrt()) }
-#[inline(always)] pub fn f32_lt(a: i64, b: i64) -> i64 { (f32b(a) < f32b(b)) as i64 }
-#[inline(always)] pub fn f32_le(a: i64, b: i64) -> i64 { (f32b(a) <= f32b(b)) as i64 }
-#[inline(always)] pub fn f32_from_u32(a: i64) -> i64 { f32i((a as u32) as f32) }
-#[inline(always)] pub fn f32_to_u32(a: i64) -> i64 { let x = f32b(a); if x.is_nan() || x < 0.0 || x >= 4294967296.0 { 0 } else { x as u32 as i64 } }
+// binary32 arithmetic: the shared definition (canonical NaN)
+pub use mithril_core::float::{f32_add, f32_canon, f32_div, f32_from_u32, f32_le, f32_lt, f32_mul, f32_sqrt, f32_sub, f32_to_u32};
 #[inline(always)]
 pub fn arr_raw(p: u64) -> bool {
     // SAFETY: as arr_rc
@@ -964,7 +957,7 @@ pub fn bin<T: Tables>(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 {
     let (x, y) = (flo_val(ctx, a), flo_val(ctx, b));
     if own & 1 != 0 { free_val::<T>(ctx, a); }
     if own & 2 != 0 { free_val::<T>(ctx, b); }
-    let v = match op { 0 => x + y, 1 => x - y, 2 => x * y, 3 => x / y, _ => panic!("op not defined on floats") };
+    let v = mithril_core::float::f64_op(op, x, y).expect("op not defined on floats");
     flo(ctx, v)
 }
 

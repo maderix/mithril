@@ -85,11 +85,11 @@ pub use rules::link;
 /// ternary `array_set(a, i, v)` is `ARRSET(a, ARR_PAIR(i, v))`.
 
 /// Builtins by opcode (index + PRIM_BASE) and whether each is unary.
-const PRIMS: [(Prim, bool); 13] = [
+const PRIMS: [(Prim, bool); 14] = [
     (Prim::F32Add, false), (Prim::F32Sub, false), (Prim::F32Mul, false), (Prim::F32Div, false),
     (Prim::F32Sqrt, true), (Prim::F32Lt, false), (Prim::F32FromU32, true), (Prim::F32ToU32, true),
     (Prim::ArrNew, false), (Prim::ArrGet, false), (Prim::ArrLen, true), (Prim::ArrSet, false),
-    (Prim::F32Le, false),
+    (Prim::F32Le, false), (Prim::F32Canon, true),
 ];
 
 // the pairing pseudo-op sits right after the builtins; the runtime

@@ -192,7 +192,9 @@ pub enum Prim {
     /// to nearest-even; `f32_lt(a, b)` (1 when a < b, IEEE: false on NaN);
     /// `f32_le(a, b)` (1 when a <= b, IEEE: false on NaN);
     /// `f32_from_u32(n)` (nearest f32 to the unsigned n); `f32_to_u32(a)`
-    /// (truncated toward zero; NaN, negative or >= 2^32 give 0).
+    /// (truncated toward zero; NaN, negative or >= 2^32 give 0); `f32_canon(a)`
+    /// (a, with a NaN made the canonical NaN: where an f32's bits are
+    /// observed, `mithril_core::float`).
     F32Add,
     F32Sub,
     F32Mul,
@@ -202,6 +204,7 @@ pub enum Prim {
     F32Le,
     F32FromU32,
     F32ToU32,
+    F32Canon,
 }
 
 impl Prim {
@@ -214,21 +217,18 @@ impl Prim {
 /// Semantics of the binary32 primitives on bit patterns (the reference for
 /// every backend).
 pub fn f32_prim(p: Prim, a: &[i64]) -> i64 {
-    let f = |x: i64| f32::from_bits(x as u32);
-    let b = |x: f32| x.to_bits() as i64;
+    use mithril_core::float as fl;
     match p {
-        Prim::F32Add => b(f(a[0]) + f(a[1])),
-        Prim::F32Sub => b(f(a[0]) - f(a[1])),
-        Prim::F32Mul => b(f(a[0]) * f(a[1])),
-        Prim::F32Div => b(f(a[0]) / f(a[1])),
-        Prim::F32Sqrt => b(f(a[0]).sqrt()),
-        Prim::F32Lt => (f(a[0]) < f(a[1])) as i64,
-        Prim::F32Le => (f(a[0]) <= f(a[1])) as i64,
-        Prim::F32FromU32 => b((a[0] as u32) as f32),
-        Prim::F32ToU32 => {
-            let x = f(a[0]);
-            if x.is_nan() || x < 0.0 || x >= 4294967296.0 { 0 } else { x as u32 as i64 }
-        }
+        Prim::F32Add => fl::f32_add(a[0], a[1]),
+        Prim::F32Sub => fl::f32_sub(a[0], a[1]),
+        Prim::F32Mul => fl::f32_mul(a[0], a[1]),
+        Prim::F32Div => fl::f32_div(a[0], a[1]),
+        Prim::F32Sqrt => fl::f32_sqrt(a[0]),
+        Prim::F32Lt => fl::f32_lt(a[0], a[1]),
+        Prim::F32Le => fl::f32_le(a[0], a[1]),
+        Prim::F32FromU32 => fl::f32_from_u32(a[0]),
+        Prim::F32ToU32 => fl::f32_to_u32(a[0]),
+        Prim::F32Canon => fl::f32_canon(a[0]),
         _ => unreachable!("not a binary32 primitive: {:?}", p),
     }
 }
@@ -249,6 +249,7 @@ impl Prim {
             "f32_le" => (Prim::F32Le, 2),
             "f32_from_u32" => (Prim::F32FromU32, 1),
             "f32_to_u32" => (Prim::F32ToU32, 1),
+            "f32_canon" => (Prim::F32Canon, 1),
             _ => return None,
         })
     }
@@ -326,15 +327,17 @@ pub fn int_op(op: BinOp, x: i64, y: i64) -> Option<i64> {
     })
 }
 
-/// f64 semantics of a binary op; `None` where it is not defined on floats.
+/// f64 semantics of a binary op (`mithril_core::float`); `None` where it is
+/// not defined on floats.
 pub fn flo_op(op: BinOp, x: f64, y: f64) -> Option<f64> {
-    Some(match op {
-        BinOp::Add => x + y,
-        BinOp::Sub => x - y,
-        BinOp::Mul => x * y,
-        BinOp::Div => x / y,
+    let code = match op {
+        BinOp::Add => 0,
+        BinOp::Sub => 1,
+        BinOp::Mul => 2,
+        BinOp::Div => 3,
         _ => return None,
-    })
+    };
+    mithril_core::float::f64_op(code, x, y)
 }
 
 /// Evaluate `f(args)` under module `m`. This is a small, direct-style

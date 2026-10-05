@@ -600,3 +600,100 @@ fn run_coop_shares_folds_between_the_cpu_and_the_gpu() {
     assert_eq!(fs::read(&a).unwrap(), 1113931i64.to_le_bytes());
     assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
 }
+
+// ------------------------------------------------------- float conformance
+
+/// The bytes every backend writes for the float conformance program: every
+/// f32 and f64 operation over subnormal, normal, huge, zero, infinite and NaN
+/// cases (`mithril_core::float`: IEEE round to nearest, no fusing, canonical
+/// NaN). The same constant on every machine: x86 and arm64 hosts, CUDA, Metal.
+const FLOAT_CONFORMANCE_FNV: u64 = 0xc3f7_5244_9115_34d8;
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+#[test]
+fn every_lane_writes_the_same_float_bits_on_every_machine() {
+    let prog = fixture("float_conformance.py");
+    let d = fresh_dir("float-conformance");
+    let mut lanes: Vec<(&str, Vec<&str>)> = vec![("oracle", vec!["oracle"])];
+    if codegen_ready() {
+        lanes.push(("t1", vec!["run"]));
+        lanes.push(("t4", vec!["run", "--threads", "4"]));
+    }
+    if gpu_on() {
+        lanes.push(("gpu", vec!["run", "--gpu"]));
+    }
+    for (name, args) in lanes {
+        let out = d.join(format!("{name}.bin"));
+        let mut a = args.clone();
+        a.extend([prog.to_str().unwrap(), "--raw", out.to_str().unwrap()]);
+        let r = mithril(&a);
+        assert_eq!(r.status.code(), Some(0), "{name}: {}", stderr(&r));
+        let bytes = fs::read(&out).unwrap();
+        assert_eq!(bytes.len(), 6300 * 8, "{name}");
+        assert_eq!(fnv(&bytes), FLOAT_CONFORMANCE_FNV, "{name}: float bits differ from every other backend's");
+    }
+}
+
+/// NaN bits are canonical wherever they leave the program, on every lane and
+/// in both modes (the default canonicalizes the result; MITHRIL_STRICT_FLOAT
+/// every f32 operation): a negated NaN, NaNs inside tuples, arrays of tuples
+/// and nested arrays, a NaN inside a constructor (which makes the program
+/// strict by itself), and the operations that never see bits (`==`, `int()`).
+#[test]
+fn nan_bits_are_canonical_wherever_they_leave_the_program() {
+    let d = fresh_dir("nan-observed");
+    let nan = "2143289344"; // 0x7fc00000
+    let cases = [
+        (
+            "def main():\n    z = f32(array_len(array_new(0, 0)))\n    nan = z / z\n    a = array_new(3, (nan, f32(1.0)))\n    nest = array_new(2, array_new(2, -nan))\n    e = 0\n    if nan == nan:\n        e = 1\n    return (nan, -nan, a, nest, e, int(nan))\n",
+            format!("({nan}, {nan}, [({nan}, 1065353216), ({nan}, 1065353216), ({nan}, 1065353216)], [[{nan}, {nan}], [{nan}, {nan}]], 0, 0)"),
+        ),
+        ("@data\nclass Box:\n    B: (v,)\n\ndef main():\n    z = f32(array_len(array_new(0, 0)))\n    return B(-(z / z))\n", format!("C0({nan})")),
+    ];
+    for (k, (src, want)) in cases.iter().enumerate() {
+        let sub = d.join(format!("c{k}"));
+        fs::create_dir_all(&sub).unwrap();
+        let prog = write_prog(&sub, src);
+        let mut lanes: Vec<Vec<&str>> = vec![vec!["oracle"]];
+        if codegen_ready() {
+            lanes.push(vec!["run"]);
+            lanes.push(vec!["run", "--threads", "4"]);
+        }
+        if gpu_on() {
+            lanes.push(vec!["run", "--gpu"]);
+        }
+        for strict in [false, true] {
+            for lane in &lanes {
+                let mut args = lane.clone();
+                args.push(prog.to_str().unwrap());
+                let mut c = Command::new(bin());
+                c.args(&args);
+                if strict {
+                    c.env("MITHRIL_STRICT_FLOAT", "1");
+                }
+                let out = c.output().unwrap();
+                assert_eq!(out.status.code(), Some(0), "case {k} {lane:?}: {}", stderr(&out));
+                assert_eq!(stdout(&out).trim(), want, "case {k} {lane:?} strict={strict}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_float_conformance_bits_are_the_same_in_strict_mode() {
+    let prog = fixture("float_conformance.py");
+    let d = fresh_dir("float-strict");
+    let out = d.join("strict.bin");
+    let r = Command::new(bin()).args(["oracle", prog.to_str().unwrap(), "--raw", out.to_str().unwrap()]).env("MITHRIL_STRICT_FLOAT", "1").output().unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", stderr(&r));
+    assert_eq!(fnv(&fs::read(&out).unwrap()), FLOAT_CONFORMANCE_FNV);
+    if codegen_ready() {
+        let out = d.join("strict_t4.bin");
+        let r = Command::new(bin()).args(["run", prog.to_str().unwrap(), "--threads", "4", "--raw", out.to_str().unwrap()]).env("MITHRIL_STRICT_FLOAT", "1").output().unwrap();
+        assert_eq!(r.status.code(), Some(0), "{}", stderr(&r));
+        assert_eq!(fnv(&fs::read(&out).unwrap()), FLOAT_CONFORMANCE_FNV);
+    }
+}

@@ -5,3 +5,4 @@ pub mod rules;
 pub mod lower;
 pub mod sink;
 pub mod coop;
+pub mod float;

@@ -283,6 +283,10 @@ __device__ inline i64 f32_sub(i64 a, i64 b) { return f32i(__fsub_rn(f32b(a), f32
 __device__ inline i64 f32_mul(i64 a, i64 b) { return f32i(__fmul_rn(f32b(a), f32b(b))); }
 __device__ inline i64 f32_div(i64 a, i64 b) { return f32i(__fdiv_rn(f32b(a), f32b(b))); }
 __device__ inline i64 f32_sqrt(i64 a) { return f32i(__fsqrt_rn(f32b(a))); }
+// Where NaN bits are observed they are canonical (mithril_core::float):
+// NVIDIA's own NaN is 0x7fffffff.
+__device__ inline i64 f32_canon(i64 a) { float x = f32b(a); return x != x ? (i64)0x7fc00000 : a; }
+__device__ inline double canon64(double x) { return x != x ? __longlong_as_double(0x7ff8000000000000ll) : x; }
 __device__ inline i64 f32_lt(i64 a, i64 b) { return f32b(a) < f32b(b) ? 1 : 0; }
 __device__ inline i64 f32_le(i64 a, i64 b) { return f32b(a) <= f32b(b) ? 1 : 0; }
 __device__ inline i64 f32_from_u32(i64 a) { return f32i(__uint2float_rn((u32)a)); }
@@ -1259,7 +1263,7 @@ __device__ __noinline__ u64 bin(u8 op, u64 a, u64 b, u8 own) {
   case 3: r = __ddiv_rn(x, y); break;
   default: g_abort(AB_UNREACHABLE); break;
   }
-  return flo(r);
+  return flo(canon64(r));
 }
 __device__ __noinline__ u64 cmp(u8 op, u64 a, u64 b, u8 own) {
   bool r = false;
@@ -1342,7 +1346,7 @@ __device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
 #define EMPTY ((T_EXT << 56) | M56)
 #define OP_FLIP 0x100u
 #define CTAG_TUPLE 0xfffu
-#define ARR_PAIR 45u
+#define ARR_PAIR 46u
 #define LISTCAP 64
 
 __device__ inline u64 payload(u64 p) { return p & M56; }
@@ -1679,7 +1683,8 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
       return true;
     }
     case 44: *out = num(f32_le(as_i(x), as_i(y))); return true;
-    case 45: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
+    case 45: *out = num(f32_canon(as_i(x))); return true;
+    case 46: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
     default: g_abort(AB_UNREACHABLE); return false;
     }
   }
@@ -1741,7 +1746,7 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
   case 3: r = __ddiv_rn(a, b); break;
   default: g_abort(AB_UNREACHABLE); return false;
   }
-  *out = flo(r);
+  *out = flo(canon64(r));
   return true;
 }
 

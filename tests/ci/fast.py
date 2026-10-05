@@ -105,7 +105,9 @@ MID = {
     "whitted": ["s/^    return 512$/    return 48/"],
 }
 MID.setdefault("path", ["s/^    return 256$/    return 32/", "s/^    return 64$/    return 8/"])
-TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0, "cuda_s": 1.25,
+# cuda_s is timed with up to 8 device compiles at once (noise about 30%):
+# its gate catches blowups, not drift
+TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0, "cuda_s": 1.5,
        "full_t1_s": 1.3, "full_t16_s": 1.5, "gpu_ms": 1.5, "gpu_wall_ms": 1.5}
 SOFT = set()
 # below these a time is noise, never a failure

@@ -92,6 +92,67 @@ struct Infer<'m> {
     cur: &'m str,
     err: Option<Diag>,
     used: BTreeSet<&'static str>,
+    /// every f32 operation canonicalizes its NaN (see `Shape`)
+    strict: bool,
+}
+
+/// Where a value's f32 bits sit, for making its NaNs canonical where they
+/// leave the program (`mithril_core::float`). Inside the program no operation
+/// tells one NaN from another and an f32 never meets an int (a type error),
+/// so the result is the only place an f32's bits are observed. A result whose
+/// f32 leaves cannot be located (a constructor or a closure) makes the
+/// program strict: every f32 operation canonicalizes instead.
+#[derive(Clone, Debug, PartialEq)]
+enum Shape {
+    /// no f32 bits (ints, f64 values, whatever never met an f32)
+    Plain,
+    F32,
+    Tup(Vec<Shape>),
+    Arr(Box<Shape>),
+    /// f32 bits may sit anywhere inside
+    Opaque,
+}
+
+impl Shape {
+    fn has_f32(&self) -> bool {
+        match self {
+            Shape::Plain => false,
+            Shape::F32 | Shape::Opaque => true,
+            Shape::Tup(xs) => xs.iter().any(Shape::has_f32),
+            Shape::Arr(x) => x.has_f32(),
+        }
+    }
+
+    fn opaque(&self) -> bool {
+        match self {
+            Shape::Opaque => true,
+            Shape::Tup(xs) => xs.iter().any(Shape::opaque),
+            Shape::Arr(x) => x.opaque(),
+            Shape::Plain | Shape::F32 => false,
+        }
+    }
+
+    /// Source text of `e` with its f32 leaves canonical; an array's elements
+    /// go through a generated helper (pushed onto `helpers`), one index fill.
+    fn canon(&self, e: &str, helpers: &mut Vec<String>) -> String {
+        match self {
+            Shape::Plain => e.to_string(),
+            Shape::F32 => format!("f32_canon({e})"),
+            Shape::Tup(xs) => {
+                let items: Vec<String> = xs.iter().enumerate().map(|(i, x)| x.canon(&format!("{e}[{i}]"), helpers)).collect();
+                format!("({})", items.join(", "))
+            }
+            Shape::Arr(x) => {
+                let k = helpers.len();
+                let name = format!("__canon_{k}");
+                helpers.push(String::new());
+                let item = x.canon("array_get(a, i)", helpers);
+                helpers[k] = format!("def {name}(a):\n    b = a\n    for i in range(array_len(a)):\n        b = array_set(b, i, {item})\n    return b\n");
+                format!("{name}({e})")
+            }
+            Shape::Opaque => unreachable!("an opaque result makes the program strict"),
+        }
+    }
 }
 
 impl<'m> Infer<'m> {
@@ -374,6 +435,26 @@ impl<'m> Infer<'m> {
         self.flo[r]
     }
 
+    /// Where the f32 leaves of a value of class `x` sit (`Shape`).
+    fn shape(&mut self, x: usize, depth: u32) -> Shape {
+        if depth > 32 {
+            return Shape::Opaque;
+        }
+        let r = self.find(x);
+        match self.ty[r].clone() {
+            Ty::F32 => Shape::F32,
+            Ty::Tup(xs) => Shape::Tup(xs.iter().map(|&c| self.shape(c, depth + 1)).collect()),
+            Ty::Arr(e) => Shape::Arr(Box::new(self.shape(e, depth + 1))),
+            Ty::Opaque | Ty::Poison => Shape::Opaque,
+            Ty::Var | Ty::Int => Shape::Plain,
+        }
+    }
+
+    /// A strict program canonicalizes every f32 operation's NaN (`Shape`).
+    fn canonical(&self, e: Expr) -> Expr {
+        if self.strict { Expr::Call("f32_canon".into(), vec![e]) } else { e }
+    }
+
     fn f32(&mut self, e: &Expr) -> bool {
         let n = self.at[&(e as *const Expr)];
         self.is(n, &Ty::F32)
@@ -395,7 +476,7 @@ impl<'m> Infer<'m> {
                 let x = self.ex(a, env)?;
                 let r = self.find(self.at[&(e as *const Expr)]);
                 match (&self.ty[r], self.flo[r]) {
-                    (Ty::F32, _) => Expr::Bin(BinOp::BitXor, b(x), b(Expr::Int(SIGN))),
+                    (Ty::F32, _) => self.canonical(Expr::Bin(BinOp::BitXor, b(x), b(Expr::Int(SIGN)))),
                     // an f64 (a class of float literals only)
                     (Ty::Var, true) => Expr::Bin(BinOp::Mul, b(Expr::Float(-1.0)), b(x)),
                     (_, true) => return Err(Diag::new(0, format!("in '{}': negation of a value used both as an int and as an f64", self.cur))),
@@ -418,7 +499,7 @@ impl<'m> Infer<'m> {
                     BinOp::Div => "f32_div",
                     _ => return Err(Diag::new(0, format!("in '{}': operator {op:?} is not defined on f32", self.cur))),
                 };
-                Expr::Call(f.into(), vec![x, y])
+                self.canonical(Expr::Call(f.into(), vec![x, y]))
             }
             Expr::Cmp(op, x0, y0) => {
                 let on32 = self.f32(x0);
@@ -442,7 +523,7 @@ impl<'m> Infer<'m> {
                 let on32 = self.f32(a);
                 let x = self.ex(a, env)?;
                 match f.as_str() {
-                    "sqrt" => Expr::Call("f32_sqrt".into(), vec![x]),
+                    "sqrt" => self.canonical(Expr::Call("f32_sqrt".into(), vec![x])),
                     "int" if on32 => self.helper("__int_of_f32", vec![x]),
                     _ if on32 => x,
                     _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': {f}() of an f64 value (write the literal as f32, or keep the value f32)", self.cur))),
@@ -560,6 +641,7 @@ fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
         cur: "",
         err: None,
         used: BTreeSet::new(),
+        strict: false,
     };
     for (i, f) in src.fns.iter().enumerate() {
         s.fns.insert(&f.name, i);
@@ -596,6 +678,15 @@ fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
     if let Some(d) = s.err.take() {
         return Err(d);
     }
+    // the result's f32 leaves: canonical where they leave the program, or
+    // (MITHRIL_STRICT_FLOAT, or a result whose f32 leaves cannot be located)
+    // canonical after every f32 operation
+    let main = src.fns.iter().position(|f| f.name == "main");
+    let shape = match main {
+        Some(k) => s.shape(s.ret[k], 0),
+        None => Shape::Plain,
+    };
+    s.strict = std::env::var_os("MITHRIL_STRICT_FLOAT").is_some() || shape.opaque();
     for (i, f) in src.fns.iter().enumerate() {
         s.cur = &f.name;
         // the names in scope as the first pass saw them: the parameters,
@@ -608,5 +699,27 @@ fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
         let pre = crate::parse::parse_module(&crate::lex::lex(PRELUDE)?)?;
         m.fns.extend(pre.fns.into_iter().filter(|f| s.used.contains(f.name.as_str())));
     }
+    if let (Some(k), false) = (main, s.strict) {
+        if shape.has_f32() {
+            canonical_result(m, k, &shape)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename the program's `main` to `__main_result` and add a `main` that
+/// returns its value with every f32 leaf canonical.
+fn canonical_result(m: &mut Module, main: usize, shape: &Shape) -> Result<(), Diag> {
+    let mut helpers = Vec::new();
+    let ret = shape.canon("r", &mut helpers);
+    let src = format!("def main():\n    r = __main_result()\n    return {ret}\n\n{}", helpers.join("\n"));
+    let line = m.lines.get("main").copied().unwrap_or(0);
+    m.fns[main].name = "__main_result".to_string();
+    let added = crate::parse::parse_module(&crate::lex::lex(&src)?)?;
+    for f in &added.fns {
+        m.lines.insert(f.name.clone(), line);
+    }
+    m.lines.insert("__main_result".to_string(), line);
+    m.fns.extend(added.fns);
     Ok(())
 }
