@@ -1052,15 +1052,14 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let mut ub_sz = 0usize;
     cu(cuModuleGetGlobal_v2(&mut ub_ptr, &mut ub_sz, module, c"UNBOX_CID".as_ptr()), "cuModuleGetGlobal(UNBOX_CID)")?;
     let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
-    // Snapshot the cell arena only if the result walk reaches a cell.
-    // Immediate values and arrays of immediate values need none of it.
-    let mut cells = Vec::new();
+    // Immediate values and arrays of immediate values read no cells.
+    let mut cells = CellReads::new();
     let text = show(&d, &mut cells, &unbox, res[1])?;
     if stats {
-        eprintln!("mithril-gpu: detail: boot launch {:.3} ms, prepare run {:.3} ms, readback + format {:.3} ms ({} cell bytes), stack {stack}", (t_boot - t_setup).as_secs_f64() * 1e3, (t_prepare - t_boot).as_secs_f64() * 1e3, (t0.elapsed() - t_before_read).as_secs_f64() * 1e3, cells.len() * 8);
+        eprintln!("mithril-gpu: detail: boot launch {:.3} ms, prepare run {:.3} ms, readback + format {:.3} ms ({} cell bytes), stack {stack}", (t_boot - t_setup).as_secs_f64() * 1e3, (t_prepare - t_boot).as_secs_f64() * 1e3, (t0.elapsed() - t_before_read).as_secs_f64() * 1e3, cells.bytes);
     }
     mem.keep = EXITING.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(GpuResult { port: res[1], text, rounds: r[0], cell_readback_bytes: cells.len() * 8 })
+    Ok(GpuResult { port: res[1], text, rounds: r[0], cell_readback_bytes: cells.bytes })
 }
 
 // ---- readback of a result port (mirrors mithril_rt::prelude::show) ----
@@ -1074,18 +1073,52 @@ const T_ARR: u64 = 14;
 const TU: u64 = 16;
 const M56: u64 = (1u64 << 56) - 1;
 
-unsafe fn cell(d: &Dev, cells: &mut Vec<u64>, i: u32) -> Result<[u64; 2], String> {
-    if cells.is_empty() {
-        // Keep bulk transfer for aggregate results: a transfer per cell
-        // cost ~1.7 s for a 512 x 512 image. All later reads use this snapshot.
-        let used = dtoh::<u32>(d.nbump, 1, "read nbump")?[0].min(d.ncap) as usize;
-        *cells = d.nodes.read::<u64>(2*used)?;
-    }
-    let k = 2 * i as usize;
-    cells.get(k..k + 2).map(|c| [c[0], c[1]]).ok_or_else(|| format!("mithril-gpu: result cell {i} is outside the cells in use"))
+/// Cells the result walk reads back. A small result (a tuple around an
+/// array, a boxed float) reads its few cells one by one; past `limit`
+/// single reads the walk switches to one bulk snapshot of the cells in use,
+/// because a transfer per cell cost ~1.7 s for a 512 x 512 image of tuples.
+struct CellReads {
+    snap: Vec<u64>,
+    used: Option<usize>,
+    singles: usize,
+    limit: usize,
+    bytes: usize,
 }
 
-unsafe fn show(d: &Dev, cells: &mut Vec<u64>, unbox: &[u32], p: u64) -> Result<String, String> {
+impl CellReads {
+    fn new() -> Self {
+        let limit = std::env::var("MITHRIL_GPU_CELL_READS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        CellReads { snap: Vec::new(), used: None, singles: 0, limit, bytes: 0 }
+    }
+}
+
+unsafe fn cell(d: &Dev, cells: &mut CellReads, i: u32) -> Result<[u64; 2], String> {
+    let used = match cells.used {
+        Some(u) => u,
+        None => {
+            let u = dtoh::<u32>(d.nbump, 1, "read nbump")?[0].min(d.ncap) as usize;
+            cells.used = Some(u);
+            u
+        }
+    };
+    if (i as usize) >= used {
+        return Err(format!("mithril-gpu: result cell {i} is outside the cells in use"));
+    }
+    if cells.snap.is_empty() && cells.singles < cells.limit {
+        cells.singles += 1;
+        cells.bytes += 16;
+        let c = dtoh::<u64>(d.nodes.base + 16 * i as CUdeviceptr, 2, "read result cell")?;
+        return Ok([c[0], c[1]]);
+    }
+    if cells.snap.is_empty() {
+        cells.snap = d.nodes.read::<u64>(2 * used)?;
+        cells.bytes += 16 * used;
+    }
+    let k = 2 * i as usize;
+    Ok([cells.snap[k], cells.snap[k + 1]])
+}
+
+unsafe fn show(d: &Dev, cells: &mut CellReads, unbox: &[u32], p: u64) -> Result<String, String> {
     let as_i = |p: u64| ((p << 8) as i64) >> 8;
     let t = p >> 56;
     Ok(match t {

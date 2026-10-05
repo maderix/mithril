@@ -137,6 +137,8 @@ extern "C" __global__ void k_boot(u64,u64,u64,int fuel) {
 "#);
     std::env::set_var("MITHRIL_GPU_LANES", "1");
     std::env::set_var("MITHRIL_GPU_BUCKET", "256");
+    // force the bulk snapshot: this test is about its span, not about few reads
+    std::env::set_var("MITHRIL_GPU_CELL_READS", "0");
     for (nodes,records) in [("512","512"),("1024","32768")] {
         std::env::set_var("MITHRIL_GPU_NODES", nodes);
         std::env::set_var("MITHRIL_GPU_RECS", records);
@@ -148,7 +150,7 @@ extern "C" __global__ void k_boot(u64,u64,u64,int fuel) {
             assert_eq!(got.cell_readback_bytes, 16*cells, "committed and demand pages must form one logical snapshot");
         }
     }
-    for key in ["MITHRIL_GPU_LANES","MITHRIL_GPU_BUCKET","MITHRIL_GPU_NODES","MITHRIL_GPU_RECS","MITHRIL_GPU_POISON"] {
+    for key in ["MITHRIL_GPU_LANES","MITHRIL_GPU_BUCKET","MITHRIL_GPU_NODES","MITHRIL_GPU_RECS","MITHRIL_GPU_POISON","MITHRIL_GPU_CELL_READS"] {
         std::env::remove_var(key);
     }
 }

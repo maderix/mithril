@@ -583,6 +583,28 @@ fn gpu_scalar_readback_does_not_copy_dead_cells() {
     assert_eq!(r.cell_readback_bytes, 0, "the scalar result has no cell references");
 }
 
+/// A small structure around a large array (an image as `(w, h, pixels)`)
+/// reads only its own cells, not a snapshot of every cell the run allocated.
+/// A result with many cells switches to the snapshot and prints the same.
+#[test]
+#[ignore = "requires MITHRIL_GPU=1"]
+fn gpu_readback_of_a_small_structure_reads_only_its_cells() {
+    if !gpu_on() { return; }
+    let src = "@data\nclass L:\n    Nil: ()\n    Cons: (h, t)\n\n\
+def build(k, acc):\n    if k == 0:\n        return acc\n    return build(k - 1, Cons(k, acc))\n\n\
+def count(l):\n    match l:\n        case Nil():\n            return 0\n        case Cons(h, t):\n            return 1 + count(t)\n\n\
+def main():\n    n = array_len(array_new(20000, 0))\n    c = count(build(n, Nil()))\n    return (c, n, array_new(64, c))\n";
+    let (want, cubin) = cubin_of(src);
+    let r = mithril_gpu::run_cubin(&cubin, BOOT).expect("device run");
+    assert_eq!(r.text, want);
+    assert_eq!(r.cell_readback_bytes, 32, "a 3-tuple is two cells, whatever the run allocated");
+    let many = "def main():\n    n = array_len(array_new(300, 0))\n    return array_new(n, (n, n + 1))\n";
+    let (want, cubin) = cubin_of(many);
+    let r = mithril_gpu::run_cubin(&cubin, BOOT).expect("device run");
+    assert_eq!(r.text, want, "past the single-read limit the snapshot prints the same value");
+    assert!(r.cell_readback_bytes > 16 * 64, "300 tuples exceed the single-read limit");
+}
+
 #[test]
 #[ignore = "requires MITHRIL_GPU=1"]
 fn gpu_readback_follows_value_storage_including_array_elements() {
