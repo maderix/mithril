@@ -1468,6 +1468,104 @@ unprofiled runs for before/after performance comparisons.
 **Instruction counts.** fast.py measures a mid-size run with `perf stat`
 (noise-free) and compares against `tests/ci/baseline.json`.
 
+## 10. Results and communication
+
+Inside the net, values meet only at interaction rules, so they need no
+communication primitive. Two places still move data in bulk: the result
+leaving the run, and (later) work that several lanes feed into one place.
+Any mechanism for either must meet four conditions:
+
+1. **Safe:** the result cannot depend on the order in which lanes finish.
+2. **Parallel:** lanes work at the same time.
+3. **Lock-free:** no lane waits on another lane's lock.
+4. **Performant:** it runs within reach of the hand-written equivalent on
+   CPU and GPU.
+
+A pattern ships with a benchmark against its hand-written equivalent on
+both devices, and a test that every lane writes the same bits. Four
+families meet the first three conditions:
+
+| Pattern | Why the order cannot matter | Hand-written baseline |
+|---|---|---|
+| Disjoint-slot writes | each lane owns its slots | chunked copy and write |
+| Commutative accumulators | the combine is associative and commutative (ints, min, max, bitwise; no float atomics) | privatized counts, merged once |
+| Write-once cells | a second write is an error, a read waits for the first | join records |
+| Single-writer, single-reader streams | one producer, one consumer, no select | an SPSC ring buffer |
+
+Prototypes outside the repo measured each family against its baseline (a
+16-thread CPU and the RTX 4090). Disjoint slots and privatized
+accumulators matched or beat the baseline. Global atomics did not: 256
+histogram bins under contention ran slower than one thread (0.479 s vs
+0.368 s), so an accumulator privatizes per lane and merges once. The
+disjoint-slot output sink came first because it is the simplest to add.
+
+### 10.1 The output sink
+
+A run prints its result as text by default. `--image out.ppm` and
+`--raw out.bin` write the result as bytes instead, on every lane:
+
+```
+mithril run f.py --gpu --image out.ppm      # main() returns (w, h, pixels)
+mithril run f.py --threads 16 --raw out.bin # every number as 8 bytes
+mithril oracle f.py --image out.ppm
+./prog --threads 16 --image out.ppm         # a built program
+mithril exec prog.gpu --raw out.bin
+```
+
+Before the sink, a result reached an image by a long route. The run
+formatted every pixel as decimal text, the CLI parsed the text back into
+numbers, and then it wrote the PPM. The decimal text for the black hole
+strip in section 11.4 runs to hundreds of megabytes.
+
+With the sink, each lane walks its own result once and collects the
+**leaves**: the numbers of the value, depth-first, constructor names
+skipped. These are the same numbers the text would print, in the same
+order. The walk does not copy an array of ints leaf by leaf; it keeps the
+array as one run of words. On the CPU the run is borrowed from the arena.
+On the GPU it is the buffer of the one bulk read. The shared encoder
+(`mithril_core::sink`) then splits the file into pieces of about 1 MiB.
+Threads take pieces from a counter, encode them, and write each one at its
+own offset. Every piece is a disjoint byte range, so the file is the same
+whichever thread finishes first, and no thread waits for a lock.
+
+Formats:
+
+* `--raw`: every leaf as 8 little-endian bytes, an int as `i64` and a
+  float as its `f64` bits.
+* `--image`: the value is `(width, height, pixels)`. The pixels are
+  `width * height` ints `0xRRGGBB` (low 24 bits) or `3 * width * height`
+  channels clamped to 0..255. Written as binary PPM.
+
+A result the net reduced at compile time never runs on a lane. The CPU
+program for it carries the leaves as literals, floats as their bits. A
+GPU artefact stores the printed value, which is parsed back to leaves;
+floats print in round-trip form, so the parse is exact.
+
+Measured on the demos (warm GPU, and CPU at 16 threads; old output is the
+run's text alone, before the CLI's parse and PPM write):
+
+| Program | Pixels | GPU output, text | GPU output, sink | CPU t16, text | CPU t16, sink |
+|---|---|---|---|---|---|
+| cornell_path | 256 x 256 | 6.4 ms | 1.2 ms | 0.216 s | 0.216 s |
+| cornell_whitted | 512 x 512 | 16.8 ms | 1.6 ms | 0.065 s | 0.032 s |
+| sphere_field | 1280 x 720 | 62.3 ms | 2.4 ms | 14.0 s | 14.0 s |
+| black_hole (strip) | 1280 x 28800 | 2,546 ms | 295 ms | overflows (12, item 8) | overflows (12, item 8) |
+
+Every pair writes the same bytes, and the oracle, 1 thread, 16 threads
+and the GPU agree. On 36.9 M pixels the encoder alone takes 96 ms on one
+thread, against 134 ms for a hand-written pack-and-write loop, and 50 ms
+on 16 threads. Most of the black hole's remaining GPU output time is the
+bulk read: 295 MB into pageable memory takes about 120 ms. A pinned
+buffer copies it in 13 ms, but allocating that buffer takes 121 ms per
+run.
+
+The sink's threads are runtime threads working after the net is done. The
+value is fixed by then, so they cannot change meaning, but this is not the
+net's own parallelism. The net-native form of a disjoint-slot write puts
+the result array in memory the output can use directly: a file mapping on
+the CPU, mapped host memory on the GPU. Each fill lane's `array_set` is
+then the write, and no pass follows. That form is open (section 12).
+
 ## 11. Use cases and scope
 
 ### 11.1 Generality corpus
@@ -1616,7 +1714,17 @@ Device:
    cell: the same ordering bug the CPU had (section 8, loom). It needs a
    fence on the freeing path and a device test.
 
+7. Net-native output (section 10.1): place the result array in memory
+   the output reads directly (a file mapping on the CPU, mapped host
+   memory on the GPU), so each fill lane's `array_set` is the write and
+   no read or encode pass follows.
+
 CPU:
+
+8. The default black hole strip (1280 x 28800, 40 frames) overflows a
+   worker stack at 16 threads (`thread 'mithril-worker' has overflowed
+   its stack`), before and after the sink. One thread completes. The
+   demos suite runs a 16 x 20 strip and does not reach it.
 
 Semantic core:
 

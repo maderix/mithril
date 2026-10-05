@@ -6,6 +6,7 @@
 #![allow(clippy::all, clippy::missing_safety_doc)]
 
 use crate::{Engine, Redex, Wctx};
+pub use mithril_core::sink::{Leaf, Leaves, Sink};
 
 /// Dive result: Ok(value) | Err(rec) = suspended; the residue is spawned
 /// behind a record chain whose root `rec` still needs its parent set.
@@ -997,6 +998,57 @@ pub fn show<T: Tables>(eng: &Engine, p: u64) -> String {
         }
         _ => panic!("unprintable result port {:#x}", p),
     }
+}
+
+/// The leaves of the delivered root value, depth-first, for an output sink
+/// (the values `show` prints, constructor names skipped).
+pub fn leaves<T: Tables>(eng: &Engine, p: u64, out: &mut Leaves<'_>) -> Result<(), String> {
+    match tag(p) {
+        t if t >= TU => out.push(Leaf::Int(as_i(p))),
+        T_LAM => return Err("a closure cannot be written to a file".to_string()),
+        T_NUM | T_BIG => out.push(Leaf::Int(as_i(p))),
+        T_FLO => out.push(Leaf::Float(f64::from_bits(eng.cell((p & M56) as u32)[0]))),
+        T_CON => {
+            let mut q = p;
+            if con_ar(p) > 0 {
+                loop {
+                    let ar = con_ar(q) as usize;
+                    let c = eng.cell(con_addr(q));
+                    if ar > 2 {
+                        leaves::<T>(eng, c[0], out)?;
+                        q = c[1];
+                    } else {
+                        for s in c.iter().take(ar) {
+                            leaves::<T>(eng, *s, out)?;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        T_ARR => {
+            let n = arr_len_of(p);
+            if arr_raw(p) {
+                // SAFETY: the array outlives the write (the engine holds it)
+                out.extend_ints(unsafe { std::slice::from_raw_parts(arr_elems(p), n) });
+            } else {
+                for k in 0..n {
+                    leaves::<T>(eng, arr_elem(p, k), out)?;
+                }
+            }
+        }
+        _ => return Err(format!("unprintable result port {:#x}", p)),
+    }
+    Ok(())
+}
+
+/// Deliver the root value: printed, or written to the sink named by the
+/// program's `--image` / `--raw` argument by `threads` writers.
+pub fn emit_result<T: Tables>(eng: &Engine, root: u64, sink: Option<&Sink>, threads: usize) -> Result<String, String> {
+    let Some(sink) = sink else { return Ok(show::<T>(eng, root)) };
+    let mut out = Leaves::new();
+    leaves::<T>(eng, root, &mut out)?;
+    mithril_core::sink::write(sink, &out, threads)
 }
 
 

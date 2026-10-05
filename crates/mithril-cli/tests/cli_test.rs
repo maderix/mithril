@@ -329,7 +329,7 @@ fn run_stats_records_backend_timings_and_image() {
 
 #[test]
 fn image_and_stats_need_a_path() {
-    for flag in ["--image", "--stats"] {
+    for flag in ["--image", "--raw", "--stats"] {
         let out = mithril(&["run", fixture("fact_while.py").to_str().unwrap(), flag]);
         assert_eq!(out.status.code(), Some(1));
         assert!(stderr(&out).contains(&format!("{flag} needs a path")), "{}", stderr(&out));
@@ -349,4 +349,111 @@ fn stats_program_path_is_valid_json() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let j = fs::read_to_string(&st).unwrap();
     assert!(j.contains("a \\\"quoted\\\\ dir"), "{j}");
+}
+
+// ------------------------------------------------------------ output sinks
+
+/// Ints (one past i56), floats, constructors, tuples and arrays.
+const MIXED: &str = "@data\nclass P:\n    Px: (r, g, b)\n\ndef main():\n    n = 3000\n    a = array_new(n, 0)\n    for i in range(n):\n        a = array_set(a, i, i * i - 7 * i)\n    f = array_new(4, 0.0)\n    x = 0.0 - 1.0\n    for i in range(4):\n        f = array_set(f, i, x)\n        x = x + 0.25\n    return (a, f, Px(1, 0 - 2, 3), 1152921504606846976, (0 - 5, 6.5))\n";
+
+fn mixed_raw() -> Vec<u8> {
+    let mut want: Vec<u8> = Vec::new();
+    for i in 0..3000i64 {
+        want.extend((i * i - 7 * i).to_le_bytes());
+    }
+    for i in 0..4 {
+        want.extend((i as f64 * 0.25 - 1.0).to_bits().to_le_bytes());
+    }
+    for v in [1i64, -2, 3, 1 << 60, -5] {
+        want.extend(v.to_le_bytes());
+    }
+    want.extend(6.5f64.to_bits().to_le_bytes());
+    want
+}
+
+#[test]
+fn raw_sink_writes_the_same_bytes_on_every_lane() {
+    let d = fresh_dir("raw-lanes");
+    let prog = write_prog(&d, MIXED);
+    let want = mixed_raw();
+    let mut lanes: Vec<(&str, Vec<&str>)> = vec![("oracle", vec!["oracle"])];
+    if codegen_ready() {
+        lanes.push(("t1", vec!["run"]));
+        lanes.push(("t4", vec!["run", "--threads", "4"]));
+    }
+    if cfg!(feature = "gpu") {
+        lanes.push(("gpu", vec!["run", "--gpu"]));
+    }
+    for (name, args) in lanes {
+        let out_path = d.join(format!("{name}.bin"));
+        let mut a = args.clone();
+        a.extend([prog.to_str().unwrap(), "--raw", out_path.to_str().unwrap()]);
+        let out = mithril(&a);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", stderr(&out));
+        assert_eq!(stdout(&out).trim(), format!("wrote {} ({} values)", out_path.display(), want.len() / 8), "{name}");
+        assert_eq!(fs::read(&out_path).unwrap(), want, "{name}");
+    }
+}
+
+#[test]
+fn a_built_program_takes_the_sink_flags_itself() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("raw-built");
+    let prog = write_prog(&d, MIXED);
+    let exe = d.join("prog");
+    let out = mithril(&["build", prog.to_str().unwrap(), "-o", exe.to_str().unwrap()]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    for t in ["1", "8"] {
+        let raw = d.join(format!("t{t}.bin"));
+        let run = Command::new(&exe).args(["--threads", t, "--raw", raw.to_str().unwrap()]).output().unwrap();
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(fs::read(&raw).unwrap(), mixed_raw(), "t{t}");
+    }
+    // a failed write is an error with a message, not a panic
+    let run = Command::new(&exe).args(["--raw", d.join("no/such/dir.bin").to_str().unwrap()]).output().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert!(stderr(&run).contains("cannot write"), "{}", stderr(&run));
+}
+
+#[test]
+fn oracle_image_matches_the_compiled_image() {
+    let d = fresh_dir("image-oracle");
+    let src = "@data\nclass P:\n    Px: (r, g, b)\n\ndef main():\n    return (2, 1, (Px(1, 2, 3), Px(250, 300, 0 - 5)))\n";
+    let prog = write_prog(&d, src);
+    let img = d.join("o.ppm");
+    let out = mithril(&["oracle", prog.to_str().unwrap(), "--image", img.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let mut want = b"P6\n2 1\n255\n".to_vec();
+    want.extend([1, 2, 3, 250, 255, 0]);
+    assert_eq!(fs::read(&img).unwrap(), want);
+}
+
+#[test]
+fn a_closure_result_cannot_be_written() {
+    let d = fresh_dir("raw-closure");
+    let prog = write_prog(&d, "def main():\n    return lambda x: x + 1\n");
+    let out = mithril(&["oracle", prog.to_str().unwrap(), "--raw", d.join("c.bin").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("closure"), "{}", stderr(&out));
+}
+
+/// A program the compiler reduces to a constant reaches the sink as text.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_constant_gpu_artefact_writes_the_same_bytes() {
+    let d = fresh_dir("raw-const");
+    let prog = write_prog(&d, "def main():\n    return (3, 0 - 4, 2.5, 1e-300, 1152921504606846976)\n");
+    let art = d.join("prog.gpu");
+    let out = mithril(&["build", prog.to_str().unwrap(), "--gpu", "-o", art.to_str().unwrap()]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let (a, b) = (d.join("exec.bin"), d.join("oracle.bin"));
+    let out = mithril(&["exec", art.to_str().unwrap(), "--raw", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let out = mithril(&["oracle", prog.to_str().unwrap(), "--raw", b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+    let out = mithril(&["exec", art.to_str().unwrap(), "--threads", "2"]);
+    assert_eq!(out.status.code(), Some(1));
 }

@@ -4,6 +4,7 @@
 //! biggest undrained bucket, repeat until quiescent, checking the device
 //! abort flag every wave so arena exhaustion becomes a clean error.
 
+use mithril_core::sink::{Leaf, Leaves, Sink};
 use mithril_rt::Redex;
 use std::ffi::c_void;
 use std::fs;
@@ -351,11 +352,17 @@ pub fn compile_to_cubin(cu_src: &str, cache_dir: &Path) -> Result<std::path::Pat
 
 /// Run a compiled program (a prebuilt artefact: no front end).
 pub fn run_cubin(cubin_path: &Path, boot: Redex) -> Result<GpuResult, String> {
+    run_cubin_to(cubin_path, boot, None)
+}
+
+/// [`run_cubin`], with the result written to `sink` instead of formatted:
+/// `text` is then the line the run prints in its place.
+pub fn run_cubin_to(cubin_path: &Path, boot: Redex, sink: Option<&Sink>) -> Result<GpuResult, String> {
     let cubin = fs::read(cubin_path).map_err(|e| format!("mithril-gpu: read cubin: {e}"))?;
     let t0 = std::time::Instant::now();
     let hint = stack_hint(cubin_path);
     let start = fs::read_to_string(&hint).ok().and_then(|t| t.trim().parse().ok());
-    let (r, used) = GpuRunner::run_with_stack(&cubin, boot, start);
+    let (r, used) = GpuRunner::run_sink(&cubin, boot, start, sink);
     // a size the user fixed (MITHRIL_GPU_STACK) is not the program's need
     if r.is_ok() && start != Some(used) && std::env::var_os("MITHRIL_GPU_STACK").is_none() {
         let _ = fs::write(&hint, used.to_string());
@@ -434,12 +441,16 @@ impl GpuRunner {
 
     /// Run with a starting per-thread stack; returns the stack that worked.
     pub fn run_with_stack(cubin: &[u8], boot: Redex, start: Option<usize>) -> (Result<GpuResult, String>, usize) {
+        Self::run_sink(cubin, boot, start, None)
+    }
+
+    fn run_sink(cubin: &[u8], boot: Redex, start: Option<usize>, sink: Option<&Sink>) -> (Result<GpuResult, String>, usize) {
         let mut used = 0;
-        let r = unsafe { Self::run_inner(cubin, boot, start, &mut used) };
+        let r = unsafe { Self::run_inner(cubin, boot, start, sink, &mut used) };
         (r, used)
     }
 
-    unsafe fn run_inner(cubin: &[u8], boot: Redex, start: Option<usize>, used: &mut usize) -> Result<GpuResult, String> {
+    unsafe fn run_inner(cubin: &[u8], boot: Redex, start: Option<usize>, sink: Option<&Sink>, used: &mut usize) -> Result<GpuResult, String> {
         let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
         if STUCK.load(std::sync::atomic::Ordering::Relaxed) {
             // anything queued now would wait behind the abandoned kernel
@@ -468,7 +479,7 @@ impl GpuRunner {
             let r = match cu(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") {
                 Ok(()) => {
                     if std::env::var_os("MITHRIL_GPU_STATS").is_some() { eprintln!("mithril-gpu: context {:.0} ms", tc.elapsed().as_secs_f64() * 1e3); }
-                    run_in_ctx(cubin, boot, dev, stack)
+                    run_in_ctx(cubin, boot, dev, stack, sink)
                 }
                 Err(e) => Err(e),
             };
@@ -661,7 +672,7 @@ fn cannot_back(e: &str) -> bool {
     e.contains("cuCtxSetLimit") || e.contains("call alloc ") || e.contains("arena exhausted")
 }
 
-unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Result<GpuResult, String> {
+unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Option<&Sink>) -> Result<GpuResult, String> {
     let t0 = std::time::Instant::now();
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
@@ -1054,7 +1065,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize) -> Resul
     let unbox = dtoh::<u32>(ub_ptr, ub_sz / 4, "read UNBOX_CID")?;
     // Immediate values and arrays of immediate values read no cells.
     let mut cells = CellReads::new();
-    let text = show(&d, &mut cells, &unbox, res[1])?;
+    let text = match sink {
+        None => show(&d, &mut cells, &unbox, res[1])?,
+        Some(sink) => {
+            let mut out = Leaves::new();
+            leaves(&d, &mut cells, &unbox, res[1], &mut out)?;
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            mithril_core::sink::write(sink, &out, threads).map_err(|e| format!("mithril-gpu: {e}"))?
+        }
+    };
     if stats {
         eprintln!("mithril-gpu: detail: boot launch {:.3} ms, prepare run {:.3} ms, readback + format {:.3} ms ({} cell bytes), stack {stack}", (t_boot - t_setup).as_secs_f64() * 1e3, (t_prepare - t_boot).as_secs_f64() * 1e3, (t0.elapsed() - t_before_read).as_secs_f64() * 1e3, cells.bytes);
     }
@@ -1162,6 +1181,52 @@ unsafe fn show(d: &Dev, cells: &mut CellReads, unbox: &[u32], p: u64) -> Result<
         }
         _ => return Err(format!("mithril-gpu: unprintable result port {p:#x}")),
     })
+}
+
+/// The leaves of a result port, depth-first (mirrors
+/// `mithril_rt::prelude::leaves`); an array is one bulk read.
+unsafe fn leaves(d: &Dev, cells: &mut CellReads, unbox: &[u32], p: u64, out: &mut Leaves<'static>) -> Result<(), String> {
+    let as_i = |p: u64| ((p << 8) as i64) >> 8;
+    match p >> 56 {
+        t if t >= TU => out.push(Leaf::Int(as_i(p))),
+        T_LAM => return Err("mithril-gpu: a closure cannot be written to a file".to_string()),
+        T_NUM => out.push(Leaf::Int(as_i(p))),
+        T_BIG => out.push(Leaf::Int(dtoh::<i64>(d.heap + 8 * ((p & M56) + 2), 1, "read boxed int")?[0])),
+        T_FLO => out.push(Leaf::Float(f64::from_bits(cell(d, cells, (p & M56) as u32)?[0]))),
+        T_CON => {
+            let mut q = p;
+            if p & 0xF != 0 {
+                loop {
+                    let ar = (q & 0xF) as usize;
+                    let c = cell(d, cells, ((q >> 16) & ((1u64 << 40) - 1)) as u32)?;
+                    if ar > 2 {
+                        leaves(d, cells, unbox, c[0], out)?;
+                        q = c[1];
+                    } else {
+                        for s in c.iter().take(ar) {
+                            leaves(d, cells, unbox, *s, out)?;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        T_ARR => {
+            let base = p & M56;
+            let hdr = dtoh::<u64>(d.heap + 8 * base, 2, "read array header")?;
+            let n = (hdr[1] & ARR_LEN_MASK) as usize;
+            let elems = dtoh::<u64>(d.heap + 8 * (base + 2), n, "read array")?;
+            if hdr[1] & (1 << 62) != 0 {
+                out.extend_ints(elems);
+            } else {
+                for e in elems {
+                    leaves(d, cells, unbox, e, out)?;
+                }
+            }
+        }
+        _ => return Err(format!("mithril-gpu: unprintable result port {p:#x}")),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 //! `target/mithril-cache/`, keyed by `rustc -V`.
 
 use mithril_front::ast::Module;
+use mithril_core::sink::{Leaf, Leaves, Sink};
 use mithril_front::core::CoreModule;
 use mithril_front::Diag;
 use mithril_reassoc::FoldReport;
@@ -75,12 +76,13 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm] [--stats out.json] | mithril exec <artefact>";
+const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact> [--image out.ppm | --raw out.bin]";
 
 const HELP: &str = "Mithril: compile a Python-subset program and run it on any number of threads or the GPU.
 
   mithril run f.py [--threads N] [--gpu]   compile and run (1 thread unless --threads); prints main()'s value
   mithril run f.py --image out.ppm         main() returns (width, height, pixels): write the image
+  mithril run f.py --raw out.bin           write every number of main()'s value as 8 bytes
   mithril oracle f.py                      run on the reference interpreter (slow: small inputs)
   mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
   mithril exec prog                        run a program built with --gpu
@@ -113,15 +115,15 @@ struct Opts {
     threads: Option<usize>,
     gpu: bool,
     out: Option<PathBuf>,
-    /// `run`: write the result as an image (see `write_image`)
-    image: Option<PathBuf>,
+    /// `run`, `oracle`: write the result to a file (`--image`, `--raw`)
+    sink: Option<Sink>,
     /// `run`: write timings and sizes as JSON
     stats: Option<PathBuf>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
     let (mut file, mut threads, mut gpu, mut out) = (None, None, false, None);
-    let (mut image, mut stats) = (None, None);
+    let (mut sink, mut stats) = (None, None);
     let mut i = 0;
     while i < args.len() {
         let path = |i: &mut usize, what: &str| -> Result<PathBuf, CliErr> {
@@ -129,7 +131,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
             Ok(PathBuf::from(args.get(*i).ok_or(format!("{what} needs a path"))?))
         };
         match args[i].as_str() {
-            "--image" => image = Some(path(&mut i, "--image")?),
+            f @ ("--image" | "--raw") => sink = Sink::from_flag(f, &path(&mut i, f)?.to_string_lossy()),
             "--stats" => stats = Some(path(&mut i, "--stats")?),
             "--threads" => {
                 i += 1;
@@ -149,7 +151,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
         }
         i += 1;
     }
-    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, image, stats })
+    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, sink, stats })
 }
 
 // ------------------------------------------------------------ front stages
@@ -335,7 +337,7 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
         eprintln!("mithril: front end + specialization {:.0} ms", front * 1e3);
     }
     let ran = if o.gpu {
-        run_gpu(&sm, front)?
+        run_gpu(&sm, front, o.sink.as_ref())?
     } else {
         let tmp = make_temp_dir()?;
         let bin = tmp.join("prog");
@@ -346,7 +348,10 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
         if let Some(t) = o.threads {
             c.args(["--threads", &t.to_string()]);
         }
-        if o.image.is_none() && o.stats.is_none() {
+        if let Some(sink) = &o.sink {
+            c.args(sink.args());
+        }
+        if o.stats.is_none() {
             // nothing to post-process: the program prints as it runs
             let status = c.status().map_err(|e| format!("cannot run compiled program: {}", e))?;
             let _ = fs::remove_dir_all(&tmp);
@@ -363,25 +368,38 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
         }
         Ran { text, front, compile, run, rounds: None }
     };
-    let dims = match &o.image {
-        Some(path) => {
-            let (w, h) = write_image(path, &ran.text)?;
-            println!("wrote {} ({w}x{h})", path.display());
-            Some((w, h))
-        }
-        None => {
-            println!("{}", ran.text);
-            None
-        }
-    };
+    println!("{}", ran.text);
     if let Some(path) = &o.stats {
+        let dims = match &o.sink {
+            Some(Sink::Image(p)) => ppm_dims(p),
+            _ => None,
+        };
         write_stats(path, &o, &ran, dims)?;
     }
     Ok(0)
 }
 
-/// The ints of a printed value in order, constructor names skipped.
-fn ints_of(text: &str) -> Result<Vec<i64>, CliErr> {
+/// Width and height from a written PPM's header.
+fn ppm_dims(path: &Path) -> Option<(usize, usize)> {
+    let mut head = [0u8; 64];
+    let n = std::io::Read::read(&mut fs::File::open(path).ok()?, &mut head).ok()?;
+    let text = String::from_utf8_lossy(&head[..n]);
+    let mut words = text.split_ascii_whitespace().skip(1);
+    Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+}
+
+/// The value printed as `text` written to `sink`. Only a result the
+/// compiler reduced to a constant arrives as text; every run lane writes
+/// its leaves directly.
+fn write_constant(sink: &Sink, text: &str) -> Result<String, CliErr> {
+    let mut l = Leaves::new();
+    leaves_of(text)?.into_iter().for_each(|x| l.push(x));
+    Ok(mithril_core::sink::write(sink, &l, 1)?)
+}
+
+/// The numbers of a printed value in order, constructor names skipped
+/// (floats print in round-trip form, so the parse is exact).
+fn leaves_of(text: &str) -> Result<Vec<Leaf>, CliErr> {
     let b = text.as_bytes();
     let (mut out, mut i) = (Vec::new(), 0);
     while i < b.len() {
@@ -390,44 +408,30 @@ fn ints_of(text: &str) -> Result<Vec<i64>, CliErr> {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
+            // inf, NaN
+            match &text[start..i] {
+                "inf" => out.push(Leaf::Float(if start > 0 && b[start - 1] == b'-' { f64::NEG_INFINITY } else { f64::INFINITY })),
+                "NaN" => out.push(Leaf::Float(f64::NAN)),
+                _ => {}
+            }
         } else if b[i].is_ascii_digit() || (b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
             i += 1;
-            while i < b.len() && b[i].is_ascii_digit() {
+            let mut float = false;
+            while i < b.len() && (b[i].is_ascii_digit() || matches!(b[i], b'.' | b'e' | b'E') || (matches!(b[i], b'-' | b'+') && matches!(b[i - 1], b'e' | b'E'))) {
+                float |= matches!(b[i], b'.' | b'e' | b'E');
                 i += 1;
             }
-            if matches!(b.get(i), Some(b'.' | b'e' | b'E')) {
-                return Err("an image holds ints; the value has a float".into());
-            }
-            out.push(text[start..i].parse::<i64>().map_err(|e| format!("image value {}: {e}", &text[start..i]))?);
+            let w = &text[start..i];
+            out.push(if float {
+                Leaf::Float(w.parse().map_err(|e| format!("value {w}: {e}"))?)
+            } else {
+                Leaf::Int(w.parse().map_err(|e| format!("value {w}: {e}"))?)
+            });
         } else {
             i += 1;
         }
     }
     Ok(out)
-}
-
-/// `--image`: the value is `(width, height, pixels)`, pixels any nesting of
-/// tuples or constructors read depth-first, each pixel 0xRRGGBB or an
-/// `(r, g, b)` of 0..255. Written as binary PPM.
-fn write_image(path: &Path, text: &str) -> Result<(usize, usize), CliErr> {
-    let v = ints_of(text)?;
-    let (w, h) = match v[..] {
-        [w, h, ..] if w > 0 && h > 0 => (w as usize, h as usize),
-        _ => return Err("--image: the value must be (width, height, pixels)".into()),
-    };
-    let px = &v[2..];
-    let byte = |c: i64| c.clamp(0, 255) as u8;
-    let rgb: Vec<u8> = if px.len() == w * h {
-        px.iter().flat_map(|&p| [byte(p >> 16 & 255), byte(p >> 8 & 255), byte(p & 255)]).collect()
-    } else if px.len() == 3 * w * h {
-        px.iter().map(|&c| byte(c)).collect()
-    } else {
-        return Err(format!("--image: {w}x{h} needs {} pixels or {} channels; the value has {}", w * h, 3 * w * h, px.len()).into());
-    };
-    let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
-    f.extend(rgb);
-    fs::write(path, f).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok((w, h))
 }
 
 /// A JSON string literal.
@@ -479,12 +483,21 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
 /// front end (what a timed run of a built program measures).
 fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
     let path = Path::new(args.first().ok_or("exec needs the built artefact")?);
+    let sink = match &args[1..] {
+        [] => None,
+        [f, p] => Some(Sink::from_flag(f, p).ok_or_else(|| format!("unknown option '{f}'\n{USAGE}"))?),
+        _ => return Err(USAGE.into()),
+    };
     let bytes = fs::read(path)?;
     if let Some(v) = bytes.strip_prefix(b"MITHRIL-CONST ") {
-        println!("{}", String::from_utf8_lossy(v).trim());
+        let text = String::from_utf8_lossy(v).trim().to_string();
+        match &sink {
+            Some(sink) => println!("{}", write_constant(sink, &text)?),
+            None => println!("{text}"),
+        }
         return Ok(0);
     }
-    exec_gpu(path)
+    exec_gpu(path, sink.as_ref())
 }
 
 /// `mithril oracle f.py`: the reference interpreter's value of `main`
@@ -492,15 +505,27 @@ fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
 fn cmd_oracle(args: &[String]) -> Result<i32, CliErr> {
     // the oracle interprets the source as written: no fold or loop-split rewrite,
     // no compile-time reduction, so it checks those passes instead of sharing them
-    let path = parse_opts(args)?.file;
+    let o = parse_opts(args)?;
+    let path = o.file;
     let src = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let cm = to_core(&mithril_front::parse(&src)?)?;
     // eval_core recurses once per loop iteration (about 1 KiB each): a stack
     // reserved for millions of iterations, committed only as it is used
     let t = std::thread::Builder::new()
         .stack_size(1 << 33)
-        .spawn(move || mithril_codegen::fmt_val(&mithril_front::eval_core(&cm, cm.main, &[])))?;
-    println!("{}", t.join().map_err(|_| "oracle: evaluation panicked")?);
+        .spawn(move || mithril_front::eval_core(&cm, cm.main, &[]))?;
+    let v = t.join().map_err(|_| "oracle: evaluation panicked")?;
+    match &o.sink {
+        Some(sink) => {
+            let mut out = Vec::new();
+            mithril_codegen::val_leaves(&v, &mut out)?;
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let mut l = Leaves::new();
+            out.into_iter().for_each(|x| l.push(x));
+            println!("{}", mithril_core::sink::write(sink, &l, threads)?);
+        }
+        None => println!("{}", mithril_codegen::fmt_val(&v)),
+    }
     Ok(0)
 }
 
@@ -558,11 +583,17 @@ fn lean_binary() -> Option<PathBuf> {
 // -------------------------------------------------------------------- gpu
 
 #[cfg(feature = "gpu")]
-fn run_gpu(sm: &CoreModule, front: f64) -> Result<Ran, CliErr> {
+fn run_gpu(sm: &CoreModule, front: f64, sink: Option<&Sink>) -> Result<Ran, CliErr> {
     // the same lowering as the CPU program, printed for the device
     let cu = match mithril_gpu::emit_cuda(sm) {
         Ok(cu) => cu,
-        Err(constant) => return Ok(Ran { text: constant, front, compile: 0.0, run: 0.0, rounds: None }),
+        Err(constant) => {
+            let text = match sink {
+                Some(sink) => write_constant(sink, &constant)?,
+                None => constant,
+            };
+            return Ok(Ran { text, front, compile: 0.0, run: 0.0, rounds: None });
+        }
     };
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     let cache = target_dir().join("mithril-cache").join("gpu");
@@ -572,7 +603,7 @@ fn run_gpu(sm: &CoreModule, front: f64) -> Result<Ran, CliErr> {
     let compile = t0.elapsed().as_secs_f64();
     mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
     let t1 = std::time::Instant::now();
-    let r = mithril_gpu::run_cubin(&cubin, boot).map_err(CliErr::Other)?;
+    let r = mithril_gpu::run_cubin_to(&cubin, boot, sink).map_err(CliErr::Other)?;
     let run = t1.elapsed().as_secs_f64();
     if std::env::var_os("MITHRIL_TIMING").is_some() {
         eprintln!("mithril: device compile-or-load {:.0} ms, run + readback {:.0} ms", compile * 1e3, run * 1e3);
@@ -594,10 +625,10 @@ fn build_gpu(sm: &CoreModule, out: &Path) -> Result<(), CliErr> {
 }
 
 #[cfg(feature = "gpu")]
-fn exec_gpu(path: &Path) -> Result<i32, CliErr> {
+fn exec_gpu(path: &Path, sink: Option<&Sink>) -> Result<i32, CliErr> {
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let r = mithril_gpu::run_cubin(path, boot).map_err(CliErr::Other)?;
+    let r = mithril_gpu::run_cubin_to(path, boot, sink).map_err(CliErr::Other)?;
     println!("{}", r.text);
     Ok(0)
 }
@@ -608,11 +639,38 @@ fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<(), CliErr> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn exec_gpu(_path: &Path) -> Result<i32, CliErr> {
+fn exec_gpu(_path: &Path, _sink: Option<&Sink>) -> Result<i32, CliErr> {
     Err("gpu support not built; rebuild with --features gpu".into())
 }
 
 #[cfg(not(feature = "gpu"))]
-fn run_gpu(_sm: &CoreModule, _front: f64) -> Result<Ran, CliErr> {
+fn run_gpu(_sm: &CoreModule, _front: f64, _sink: Option<&Sink>) -> Result<Ran, CliErr> {
     Err("gpu support not built; rebuild with --features gpu".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printed_constants_parse_back_to_their_leaves() {
+        let parse = |t: &str| leaves_of(t).ok().expect("parses");
+        let v = parse("(C3(1, -2), [2.5, -1e-7, 3e20], C0(inf), (-inf, NaN), 1152921504606846976, x_1)");
+        let want = [Leaf::Int(1), Leaf::Int(-2), Leaf::Float(2.5), Leaf::Float(-1e-7), Leaf::Float(3e20), Leaf::Float(f64::INFINITY), Leaf::Float(f64::NEG_INFINITY)];
+        assert_eq!(v[..7], want);
+        assert!(matches!(v[7], Leaf::Float(x) if x.is_nan()));
+        assert_eq!(v[8..], [Leaf::Int(1 << 60)]);
+        // round-trip: every float prints in a form that parses to the same bits
+        for x in [0.1f64, -0.0, 1e-300, 123456.789, f64::MAX] {
+            assert_eq!(parse(&format!("{x:?}")), [Leaf::Float(x)]);
+        }
+    }
+
+    #[test]
+    fn sink_dims_come_from_the_ppm_header() {
+        let p = std::env::temp_dir().join(format!("mithril-dims-{}.ppm", std::process::id()));
+        fs::write(&p, b"P6\n640 480\n255\n\x00").unwrap();
+        assert_eq!(ppm_dims(&p), Some((640, 480)));
+        let _ = fs::remove_file(p);
+    }
 }

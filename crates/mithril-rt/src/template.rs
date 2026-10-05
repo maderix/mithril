@@ -44,7 +44,7 @@ impl Tables for Tb {
 #[inline(always)] fn bin(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 { mithril_rt::prelude::bin::<Tb>(ctx, op, a, b, own) }
 #[inline(always)] fn cmp(ctx: &mut Wctx, op: u8, a: u64, b: u64, own: u8) -> u64 { mithril_rt::prelude::cmp::<Tb>(ctx, op, a, b, own) }
 #[inline(always)] fn zeros(ctx: &mut Wctx, n: usize) -> u64 { mithril_rt::prelude::zeros::<Tb>(ctx, n) }
-fn show(eng: &Engine, p: u64) -> String { mithril_rt::prelude::show::<Tb>(eng, p) }
+fn emit_result(eng: &Engine, p: u64, sink: Option<&Sink>, threads: usize) -> Result<String, String> { mithril_rt::prelude::emit_result::<Tb>(eng, p, sink, threads) }
 
 "#;
 
@@ -370,11 +370,14 @@ fn main() {
     let mut threads: usize = 1;
     let mut fuel: i64 = -1;
     let mut pos: Vec<&str> = Vec::new();
+    // `--image out.ppm` / `--raw out.bin`: write the value to a file
+    let mut sink: Option<Sink> = None;
     let mut it = a.iter();
     while let Some(w) = it.next() {
         match w.as_str() {
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads),
             "--fuel" => fuel = it.next().and_then(|s| s.parse().ok()).unwrap_or(fuel),
+            f @ ("--image" | "--raw") => sink = it.next().and_then(|p| Sink::from_flag(f, p)),
             other => pos.push(other),
         }
     }
@@ -395,7 +398,13 @@ fn main() {
             let _ = PG.set(pg);
             let mut eng = Engine::new(threads, fuel);
             let root = eng.run(pg_ref(), Redex { a: 0, b: 0, aux: ROOT });
-            println!("{}", show(&eng, root));
+            match emit_result(&eng, root, sink.as_ref(), threads) {
+                Ok(line) => println!("{line}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
             if std::env::var_os("MITHRIL_STATS").is_some() {
                 let st = eng.stats();
                 eprintln!("peak_cells={} live_peak={} waves={} rewrites={} arrays_live={} bigs_live={}", st.peak_cells, st.live_peak, st.parallel_waves, st.rewrites, ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed), mithril_rt::mithril_core::port::BIG_LIVE.load(std::sync::atomic::Ordering::Relaxed));
