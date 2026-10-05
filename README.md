@@ -295,21 +295,24 @@ Wall-clock seconds, compilation excluded; every lane returns the same output.
 Measured on 4 October 2026. The seven benchmark ports are timed against a C
 twin of the same algorithm, compiled with `-O2`; times are minimums of five
 runs (three on the GPU). Render times are medians of three runs after a
-warmup. GPU wall includes context creation and readback.
+warmup. All times are warm: the GPU column is the device's own timer for the
+run plus reading back and formatting the result, without the one-off CUDA
+context, module and memory setup (about 120 ms per process). CPU startup is
+under 1 ms.
 
 **Linux** · Ryzen 7 7800X3D (8 cores, 16 threads), RTX 4090, `gcc`
 
-| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (wall) |
+| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads | Mithril GPU (warm) |
 |---|---:|---:|---:|---:|
-| collatz | 0.350 s | 0.283 s | 0.027 s | 0.108 s |
-| heat2d | 0.530 s | 0.706 s | 0.111 s | 0.159 s |
-| histogram | 0.387 s | 0.996 s | 0.141 s | 0.140 s |
-| kdtree | 0.369 s | 0.367 s | 0.087 s | 1.356 s |
-| knapsack | 0.351 s | 0.436 s | 0.177 s | 0.484 s |
-| msort | 0.392 s | 0.299 s | 0.125 s | 6.546 s |
-| subsetsum | 0.542 s | 0.768 s | 0.160 s | 0.245 s |
-| cornell_path | - | 1.700 s | 0.170 s | 0.171 s |
-| cornell_whitted | - | 0.223 s | 0.049 s | 0.185 s |
+| collatz | 0.355 s | 0.286 s | 0.027 s | 0.46 ms |
+| heat2d | 0.531 s | 0.707 s | 0.123 s | 0.049 s |
+| histogram | 0.385 s | 0.995 s | 0.139 s | 0.028 s |
+| kdtree | 0.372 s | 0.375 s | 0.089 s | 0.617 s |
+| knapsack | 0.354 s | 0.444 s | 0.186 s | 0.399 s |
+| msort | 0.386 s | 0.302 s | 0.126 s | 6.803 s |
+| subsetsum | 0.546 s | 0.782 s | 0.150 s | 0.112 s |
+| cornell_path | - | 1.704 s | 0.181 s | 0.016 s |
+| cornell_whitted | - | 0.227 s | 0.049 s | 0.026 s |
 
 **macOS (experimental CPU backend)** · Apple M4 (4 performance + 6
 efficiency cores), Apple `clang`
