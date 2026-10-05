@@ -74,3 +74,29 @@ fn control_that_depends_on_seed_high_bits_keeps_original_execution() {
         }
     }
 }
+
+/// Only a sum fold with no native form is offered to a co-execution
+/// channel, and only at its entry: a fold whose iterations are native runs
+/// as a range launch, and a fill or a tuple fold is never offered.
+#[test]
+fn only_irregular_sum_folds_are_offered_for_co_execution() {
+    let emit = |src: &str| {
+        let mut m = parse(src).unwrap();
+        let _ = mithril_reassoc::analyze(&mut m);
+        emit_rust(&desugar(&m).unwrap())
+    };
+    let n = "array_len(array_new(1000, 0))";
+    let forking = format!("def count(i):\n    if i < 2:\n        return 1\n    return count(i - 1) + count(i - 2)\n\ndef main():\n    s = 0\n    for j in range(0, {n}):\n        s = (s + count(j % 20)) & 4294967295\n    return s\n");
+    let native = format!("def main():\n    s = 0\n    for j in range(0, {n}):\n        s = s + j * j\n    return s\n");
+    let fill = format!("def count(i):\n    if i < 2:\n        return 1\n    return count(i - 1) + count(i - 2)\n\ndef main():\n    a = array_new({n}, 0)\n    for j in range(0, {n}):\n        a = array_set(a, j, count(j % 20))\n    return a\n");
+    let offers = |code: &str| code.matches("coop_launch(ctx").count();
+    let code = emit(&forking);
+    // the CALL rule offers on entry; the dive at its first loop head only
+    let long = "if (as_i(v1).wrapping_sub(as_i(v0)) >= 64i64) {\nlet cj: u32 = coop_launch(ctx";
+    let dive = format!("if (as_i(v0) == as_i(fold_start)) {{\n{long}");
+    assert_eq!(code.matches(&dive).count(), 1, "the dive's offer is not guarded by its entry:\n{code}");
+    assert_eq!(offers(&code), 2, "the forking fold is offered by its CALL rule and its dive");
+    assert_eq!(code.matches(long).count(), 2);
+    assert_eq!(offers(&emit(&native)), 0, "a native fold was offered");
+    assert_eq!(offers(&emit(&fill)), 0, "a fill was offered");
+}

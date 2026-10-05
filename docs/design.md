@@ -1605,6 +1605,80 @@ the result array in memory the output can use directly: a file mapping on
 the CPU, mapped host memory on the GPU. Each fill lane's `array_set` is
 then the write, and no pass follows. That form is open (section 12).
 
+### 10.2 Co-execution: the CPU and the GPU share one fold
+
+A second device helps only where the devices are comparable. A range
+launch (section 5.6.0) has native leaves, and there the GPU is 15 to 60
+times faster than 16 CPU threads, so the CPU could add a few percent at
+most. Irregular recursive work is different. Here is subsetsum (n = 36)
+split into 1,024 independent sub-searches by the take/skip choice of its
+first ten weights:
+
+```
+def main():
+    ...
+    s = 0
+    for j in range(0, 1024):
+        s = (s + walk(j, 0, 10, n, room)) & 4294967295
+    return s
+```
+
+Each `walk` forks a backtracking search whose size depends on `j`; the
+first quarter of the prefixes holds half the work. Alone, 15 CPU threads
+take 1.51 s and the GPU 1.91 s (process wall, median of five).
+
+`mithril run f.py --coop --threads 15` runs the CPU program and the GPU
+together, and they share the fold:
+
+1. **The offer.** A proven sum fold with no native form (its iterations
+   call recursive or forking code) is offered at its entry, when its range
+   has at least 64 iterations. The offer is decided by the range alone, at
+   the entry, so every engine running the program makes the same offer for
+   the same range. An earlier version decided by measured work and offered
+   at different points on different engines, whose keys then never met.
+2. **The job.** The fold becomes a job in a table every engine maps
+   (`mithril_core::coop`). Its key is the fold, its range and its
+   arguments, which must all be ints; a fold with any other argument runs
+   alone. The key fixes the result, so two engines that find the same key
+   compute the same value: no pairing can be wrong.
+3. **The chunks.** Engines claim chunks from the job's cursor. A claim is
+   one compare-and-swap; chunks are a share of what is left, so the last
+   ones are small and engines finish together. A chunk runs on its engine
+   as an ordinary call of the fold over the chunk from the identity, with
+   all of that engine's parallelism, and delivers its partial to slot 1 of
+   the ROOT record, unused before on both engines. Folds offered while a
+   job runs (the chunk's own) run alone.
+4. **The total.** The partials sit in the chunks' own slots. Once every
+   slot is filled, each engine adds them with the sum a range request
+   completes with (wrapping add, mod 2^64 or 2^32), which is associative
+   and commutative, so the total cannot depend on which engine ran which
+   chunk. A chunk an engine claimed and left open for 60 s is computed by
+   the engine waiting for it; chunks are pure, so running one twice gives
+   the same partial.
+
+Each engine computes the whole program, so `--coop` also checks the two
+devices against each other: the run fails if the CPU and the GPU disagree.
+Measured on the example: 0.917 s together against 1.513 s for the CPU
+alone (median of five), the same count on every run. The CPU took the
+heavy first chunk and the GPU most of the rest.
+
+The engines are two processes over a mapped file: the CPU program and the
+GPU runner keep their own link sets, and the table works unchanged between
+threads of one process. On the GPU the host drives the job: the bridge
+records the request and `k_run` returns `COOP_LAUNCH`; the host starts each
+chunk through `k_boot` (whose arguments `k_coop_args` builds), collects its
+partial when the engine has drained it, and `k_coop_done` delivers the
+total. A second kernel holding the program's dispatch would have been
+compiled as a second copy of it: a separate chunk kernel added 40 s of
+`ptxas` (92 to 132 s) to a 4-function program. The device's offer flag
+is set before the program boots, so the GPU's offer does not depend on when
+the host reached it.
+
+Out of scope for now: fills (renders would need the written slots
+exchanged, and the GPU already wins them), tuple accumulators, folds with
+array or tuple arguments, and more than one shared fold at a time on an
+engine.
+
 ## 11. Use cases and scope
 
 ### 11.1 Generality corpus
@@ -1765,6 +1839,20 @@ CPU:
    worker stack at 16 threads (`thread 'mithril-worker' has overflowed
    its stack`), before and after the sink. One thread completes. The
    demos suite runs a 16 x 20 strip and does not reach it.
+
+9. A compile-time specializer crash: subsetsum's split fold (section 10.2)
+   returning `(1, 1, s & 16777215)` instead of `s` panics in
+   `mithril-net` `rules.rs` ("arithmetic on mixed int/float operands
+   (Con/Num)"), before and after co-execution. Small programs of the same
+   shape compile.
+
+10. Device compile cost is the engine's: a 4-function program (20 rules)
+    takes `cicc` 151 s and `ptxas` 85 s, because every program compiles the
+    whole engine with its rule dispatch inlined into `k_run` and `k_boot`.
+    Compile times are recorded per program (`compile.txt`; `mithril build
+    --gpu` prints them) and gated by fast CI (`cuda_s`, `--cold-gpu`).
+    Compiling the engine once and linking it per program, or less
+    inlining, must first show the runtime does not lose.
 
 Semantic core:
 

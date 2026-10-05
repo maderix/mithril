@@ -32,7 +32,7 @@ def main():
     a = ap.parse_args()
     names = a.only or sorted(SMALL)
     subprocess.run(
-        ["cargo", "build", "--release", "-p", "mithril-cli", "--features", "gpu"],
+        ["cargo", "build", "--release", "-p", "mithril-cli"],
         cwd=ROOT, check=True, stdout=subprocess.DEVNULL,
     )
     tmp = tempfile.mkdtemp(prefix="mithril-gpu-")

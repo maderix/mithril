@@ -15,7 +15,12 @@ mithril-reassoc = { path = "../mithril-reassoc" }
 mithril-net = { path = "../mithril-net" }
 mithril-codegen = { path = "../mithril-codegen" }
 mithril-rt = { path = "../mithril-rt" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 mithril-gpu = { path = "../mithril-gpu", optional = true }
 
 [features]
+default = ["gpu"]
+# The GPU backend: Linux with the NVIDIA driver (libcuda). Without the
+# driver, build with --no-default-features.
 gpu = ["dep:mithril-gpu"]

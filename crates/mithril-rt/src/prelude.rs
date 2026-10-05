@@ -408,6 +408,47 @@ pub fn range_launch(ctx: &mut Wctx, fid: u32, join: u16, lo: i64, hi: i64, ports
     ctx.range_request(crate::RangeReq { fid, rec, lo, hi, ports: ports.to_vec(), acc, kind });
     rec
 }
+/// Share a proven sum fold over `[lo, hi)` with the other engines of the
+/// co-execution channel, if one is open and no shared fold is running
+/// here: the range becomes a job keyed by the fold, its range and its
+/// arguments, which must all be ints (`mithril_core::coop`). Returns the
+/// join record the caller suspends to, or 0 to run the fold alone.
+pub fn coop_launch(ctx: &mut Wctx, fid: u32, join: u16, lo: i64, hi: i64, ports: &[u64], acc: u32, kind: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    if mithril_core::coop::channel().is_none() || ports.len() + 2 > mithril_core::coop::KEY_WORDS {
+        return 0;
+    }
+    if ports.iter().enumerate().any(|(i, &p)| i >= 2 && i != acc as usize && tag(p) != T_NUM) {
+        return 0;
+    }
+    if COOP_BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return 0;
+    }
+    let rec = ctx.alloc_rec(join, 2, 0, 0, NONE);
+    ctx.range_request(crate::RangeReq { fid, rec, lo, hi, ports: ports.to_vec(), acc, kind: kind | crate::COOP_KIND });
+    rec
+}
+
+/// A shared fold runs on this engine (one at a time; the chunks' own folds
+/// run alone).
+pub static COOP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shared fold's key: function, range, kind and the int arguments.
+pub fn coop_key(r: &crate::RangeReq) -> Vec<u64> {
+    let mut key = vec![r.fid as u64, r.lo as u64, r.hi as u64, (r.kind & 3) as u64];
+    key.extend(r.ports.iter().enumerate().filter(|&(i, _)| i >= 2 && i != r.acc as usize).map(|(_, &p)| as_i(p) as u64));
+    key
+}
+
+/// The arguments of a shared fold's chunk `[lo, hi)`: the request's own,
+/// with the range replaced and the accumulator at the identity.
+pub fn coop_chunk_args(r: &crate::RangeReq, lo: i64, hi: i64) -> Vec<u64> {
+    let mut args = r.ports.clone();
+    args[0] = num(lo);
+    args[1] = num(hi);
+    args[r.acc as usize] = num(0);
+    args
+}
 #[inline] pub fn deliver_deferred(ctx: &mut Wctx, parent: u64, v: u64) { ctx.deliver_deferred(parent, v) }
 #[inline] pub fn rec_parent(ctx: &Wctx, rec: u32) -> u64 { ctx.rec(rec).parent }
 #[inline] pub fn rec_d(ctx: &Wctx, rec: u32) -> u32 { ctx.rec(rec).d }

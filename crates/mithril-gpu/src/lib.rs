@@ -22,7 +22,7 @@ mod cuda;
 mod completion;
 mod runner;
 
-pub use runner::{compile_and_run, compile_to_cubin, free_vram, hold_context, run_cubin, run_cubin_to, ContextHold, GpuResult, GpuSession, GpuRunner, EXITING};
+pub use runner::{compile_all, compile_and_run, compile_time, compile_to_cubin, CompileTime, free_vram, hold_context, run_cubin, run_cubin_to, ContextHold, GpuResult, GpuSession, GpuRunner, EXITING};
 
 /// `program.cu` for a specialized module (see `mithril_codegen::lower`).
 /// A program that reduced to a constant at compile time has nothing to

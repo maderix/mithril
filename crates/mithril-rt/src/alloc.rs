@@ -116,6 +116,9 @@ pub(crate) struct Arena {
     rbump: AtomicU64,
     result: AtomicU64,
     has_result: AtomicBool,
+    /// slot 1 of record 0: a co-execution chunk's result (see `coop`)
+    coop: AtomicU64,
+    has_coop: AtomicBool,
     /// Striped locks over cells: copying a closure rewrites its cell, and the
     /// closure may sit in a structure several workers share.
     locks: Box<[AtomicBool]>,
@@ -138,6 +141,8 @@ impl Arena {
             rbump: AtomicU64::new(1),
             result: AtomicU64::new(0),
             has_result: AtomicBool::new(false),
+            coop: AtomicU64::new(0),
+            has_coop: AtomicBool::new(false),
         }
     }
 
@@ -148,6 +153,7 @@ impl Arena {
         *self.rbump.get_mut() = 1;
         *self.result.get_mut() = 0;
         *self.has_result.get_mut() = false;
+        *self.has_coop.get_mut() = false;
     }
 
     /// Claim the next chunk `[lo, hi)`; `hi` may be 2^32, hence u64. A
@@ -258,6 +264,18 @@ impl Arena {
         if self.has_result.swap(true, Ordering::AcqRel) {
             panic!("ROOT received more than one delivery");
         }
+    }
+
+    pub fn deliver_coop(&self, v: u64) {
+        self.coop.store(v, Ordering::Relaxed);
+        if self.has_coop.swap(true, Ordering::AcqRel) {
+            panic!("a co-execution chunk delivered twice");
+        }
+    }
+
+    /// The chunk result delivered since the last take, if any.
+    pub fn take_coop(&self) -> Option<u64> {
+        self.has_coop.swap(false, Ordering::AcqRel).then(|| self.coop.load(Ordering::Relaxed))
     }
 
     pub fn result(&self) -> Option<u64> {

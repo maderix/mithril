@@ -378,6 +378,13 @@ fn main() {
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads),
             "--fuel" => fuel = it.next().and_then(|s| s.parse().ok()).unwrap_or(fuel),
             f @ ("--image" | "--raw") => sink = it.next().and_then(|p| Sink::from_flag(f, p)),
+            // `--coop PATH`: share large proven folds with the engines that map PATH
+            "--coop" => if let Some(p) = it.next() {
+                if let Err(e) = mithril_rt::mithril_core::coop::open(std::path::Path::new(p)) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
             other => pos.push(other),
         }
     }

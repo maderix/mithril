@@ -12,18 +12,14 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 gpu=0
 [[ "${1:-}" == "--gpu" ]] && gpu=1
-features=()
-((gpu)) && features=(--features gpu)
 
 step() { printf '\n== %s\n' "$*"; }
 
 step "unit and integration tests"
 cargo test --release --workspace
 
-# `cargo test --workspace` builds the CLI without features: rebuild the one
-# the gates run
 step "build the CLI"
-cargo build --release -p mithril-cli --example dump_gen "${features[@]}"
+cargo build --release -p mithril-cli --bins --example dump_gen
 
 step "port gate (tests/ci/fast.py)"
 python3 tests/ci/fast.py
@@ -41,6 +37,7 @@ if ((gpu)); then
     python3 tests/ci/gpu.py
     step "device tests"
     MITHRIL_GPU=1 cargo test --release -p mithril-gpu --test gpu_test -- --ignored --test-threads=1
+    MITHRIL_GPU=1 cargo test --release -p mithril-cli
 fi
 
 step "all gates passed"

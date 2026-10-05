@@ -165,17 +165,51 @@ fn engine_source_is_program_independent() {
 
 // ---------------- GPU-gated tests (MITHRIL_GPU=1) ----------------
 
-fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
-    eprintln!("{name}: lowering");
-    let (cm, cu) = pipeline(name);
-    eprintln!("{name}: interpreter oracle");
-    let want = oracle(&cm);
-    eprintln!("{name}: CUDA compile and execution");
-    match cu {
-        Ok(cu) => (want.clone(), compile_and_run(&cu, BOOT, &cache_dir())),
-        // nothing to run: the constant is the result
-        Err(v) => (want, Ok(mithril_gpu::GpuResult { port: 0, text: v, rounds: 0, cell_readback_bytes: 0 })),
+/// A lowered program: its device artefact, or the constant compile-time
+/// reduction left (nothing to run).
+enum Prog {
+    Cubin(PathBuf),
+    Constant(String),
+}
+
+/// Lower each source and compute its oracle value, every source on its own
+/// thread, then compile the device programs together (one compiler per
+/// CPU): what a suite of programs costs on a cold cache is the compiles.
+/// Returns (oracle value, program) in order.
+fn prepare(srcs: &[String]) -> Vec<(String, Prog)> {
+    let lowered: Vec<(String, Result<String, String>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = srcs.iter().map(|src| s.spawn(move || {
+            let (cm, cu) = pipeline_src(src);
+            (oracle(&cm), cu)
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let cus: Vec<String> = lowered.iter().filter_map(|(_, cu)| cu.as_ref().ok().cloned()).collect();
+    let mut cubins = mithril_gpu::compile_all(&cus, &cache_dir()).into_iter();
+    lowered
+        .into_iter()
+        .map(|(want, cu)| match cu {
+            Ok(_) => (want, Prog::Cubin(cubins.next().unwrap().unwrap_or_else(|e| panic!("{e}")))),
+            Err(v) => (want, Prog::Constant(v)),
+        })
+        .collect()
+}
+
+fn run_prog(p: &Prog) -> Result<mithril_gpu::GpuResult, String> {
+    match p {
+        Prog::Cubin(c) => mithril_gpu::run_cubin(c, BOOT),
+        Prog::Constant(v) => Ok(mithril_gpu::GpuResult { port: 0, text: v.clone(), rounds: 0, cell_readback_bytes: 0 }),
     }
+}
+
+/// Fixtures prepared together, then run one after another on the device.
+fn run_fixtures(names: &[&str]) -> Vec<(String, Result<mithril_gpu::GpuResult, String>)> {
+    let srcs: Vec<String> = names.iter().map(|n| fixture(n)).collect();
+    prepare(&srcs).into_iter().map(|(want, p)| (want, run_prog(&p))).collect()
+}
+
+fn run_fixture(name: &str) -> (String, Result<mithril_gpu::GpuResult, String>) {
+    run_fixtures(&[name]).pop().unwrap()
 }
 
 #[test]
@@ -185,9 +219,7 @@ fn gpu_fixtures_match_the_oracle() {
         return;
     }
     let mut failed = Vec::new();
-    for name in FIXTURES {
-        eprintln!("GPU oracle fixture: {name}");
-        let (want, got) = run_fixture(name);
+    for (name, (want, got)) in FIXTURES.iter().zip(run_fixtures(FIXTURES)) {
         match got {
             Ok(r) if r.text == want => {}
             Ok(r) => failed.push(format!("{name}: device printed {} but the oracle says {want}", r.text)),
@@ -261,25 +293,22 @@ fn gpu_closure_corpus_matches_the_cpu() {
     }
     let mut failed = Vec::new();
     // run.py's small sizes: `return run(N)` in main
-    for (name, small) in [("stage_closure.py", 50), ("pipeline_cfg.py", 20), ("interp_closure.py", 200)] {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/general").join(name);
-        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
-        let at = text.rfind("return run(").expect("main returns run(N)");
-        let end = at + text[at..].find(')').unwrap();
-        let src = format!("{}return run({small}{}", &text[..at], &text[end..]);
-        let (cm, cu) = pipeline_src(&src);
-        let want = oracle(&cm);
-        match cu {
-            Err(v) => {
-                if v != want {
-                    failed.push(format!("{name}: constant {v} differs from the oracle {want}"));
-                }
-            }
-            Ok(cu) => match compile_and_run(&cu, BOOT, &cache_dir()) {
-                Ok(r) if r.text == want => {}
-                Ok(r) => failed.push(format!("{name}: device printed {} but the oracle says {want}", r.text)),
-                Err(e) => failed.push(format!("{name}: {e}")),
-            },
+    let corpus = [("stage_closure.py", 50), ("pipeline_cfg.py", 20), ("interp_closure.py", 200)];
+    let srcs: Vec<String> = corpus
+        .iter()
+        .map(|(name, small)| {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/general").join(name);
+            let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
+            let at = text.rfind("return run(").expect("main returns run(N)");
+            let end = at + text[at..].find(')').unwrap();
+            format!("{}return run({small}{}", &text[..at], &text[end..])
+        })
+        .collect();
+    for ((name, _), (want, prog)) in corpus.iter().zip(prepare(&srcs)) {
+        match run_prog(&prog) {
+            Ok(r) if r.text == want => {}
+            Ok(r) => failed.push(format!("{name}: device printed {} but the oracle says {want}", r.text)),
+            Err(e) => failed.push(format!("{name}: {e}")),
         }
     }
     assert!(failed.is_empty(), "GPU results differ from the oracle:\n{}", failed.join("\n"));
@@ -379,8 +408,18 @@ fn gpu_deep_native_frames_spill_with_a_fixed_hardware_stack() {
 const DEEP600: &str = "@data\nclass Chain:\n    End: ()\n    Node: (tail,)\n\ndef count(n):\n    if n == 0:\n        return End()\n    return Node(count(n - 1))\n\ndef depth(x):\n    match x:\n        case End():\n            return 0\n        case Node(t):\n            return depth(t) + 1\n\ndef main():\n    return depth(count(array_len(array_new(600, 0))))\n";
 
 fn cubin_of(src: &str) -> (String, PathBuf) {
-    let (cm, cu) = pipeline_src(src);
-    (oracle(&cm), mithril_gpu::compile_to_cubin(&cu.expect("not a constant"), &cache_dir()).unwrap())
+    cubins_of(&[src.to_string()]).pop().unwrap()
+}
+
+/// Device programs of `srcs`, prepared together (see `prepare`).
+fn cubins_of(srcs: &[String]) -> Vec<(String, PathBuf)> {
+    prepare(srcs)
+        .into_iter()
+        .map(|(want, p)| match p {
+            Prog::Cubin(c) => (want, c),
+            Prog::Constant(v) => panic!("not a device program: the constant {v}"),
+        })
+        .collect()
 }
 
 #[test]
@@ -479,7 +518,7 @@ fn gpu_eager_commit_gives_the_same_results() {
         return;
     }
     std::env::set_var("MITHRIL_GPU_EAGER", "1");
-    let got: Vec<_> = ["f32_surface.py", "tree_sum.py", "arrays.py"].iter().map(|n| run_fixture(n)).collect();
+    let got = run_fixtures(&["f32_surface.py", "tree_sum.py", "arrays.py"]);
     std::env::remove_var("MITHRIL_GPU_EAGER");
     for (want, got) in got {
         assert_eq!(got.map(|r| r.text), Ok(want));
@@ -609,7 +648,7 @@ def main():\n    n = array_len(array_new(20000, 0))\n    c = count(build(n, Nil(
 #[ignore = "requires MITHRIL_GPU=1"]
 fn gpu_readback_follows_value_storage_including_array_elements() {
     if !gpu_on() { return; }
-    for (body, needs_cells) in [
+    let cases = [
         ("return n", false),
         ("return lambda x: x + n", false),
         ("if n == 3:\n        return Empty()\n    return Wrap(n)", false),
@@ -620,9 +659,9 @@ fn gpu_readback_follows_value_storage_including_array_elements() {
         ("return array_new(n, 2.5)", true),
         ("return (n, n)", true),
         ("return array_new(n, (n, n))", true),
-    ] {
-        let src = format!("@data\nclass Box:\n    Empty: ()\n    Wrap: (v,)\n\ndef main():\n    n = array_len(array_new(3, 0))\n    {body}\n");
-        let (want, cubin) = cubin_of(&src);
+    ];
+    let srcs: Vec<String> = cases.iter().map(|(body, _)| format!("@data\nclass Box:\n    Empty: ()\n    Wrap: (v,)\n\ndef main():\n    n = array_len(array_new(3, 0))\n    {body}\n")).collect();
+    for ((body, needs_cells), (want, cubin)) in cases.into_iter().zip(cubins_of(&srcs)) {
         let r = mithril_gpu::run_cubin(&cubin, BOOT).expect(body);
         assert_eq!(r.text, want, "{body}");
         assert_eq!(r.cell_readback_bytes != 0, needs_cells, "{body}: cell storage demand");
@@ -633,9 +672,8 @@ fn gpu_readback_follows_value_storage_including_array_elements() {
 #[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_BUCKET; run --test-threads=1)"]
 fn gpu_array_erasure_does_not_expand_a_suffix_into_a_frontier() {
     if !gpu_on() { return; }
-    let programs: Vec<_> = [0, 1, 255, 256, 257, 1024].into_iter().map(|n| {
-        cubin_of(&fixture("array_erase_frontier.py").replace("array_new(1024, 0)", &format!("array_new({n}, 0)")))
-    }).collect();
+    let srcs: Vec<String> = [0, 1, 255, 256, 257, 1024].into_iter().map(|n| fixture("array_erase_frontier.py").replace("array_new(1024, 0)", &format!("array_new({n}, 0)"))).collect();
+    let programs = cubins_of(&srcs);
     std::env::set_var("MITHRIL_GPU_BUCKET", "64");
     let results: Vec<_> = programs.iter().map(|(_, p)| mithril_gpu::run_cubin(p, BOOT)).collect();
     std::env::remove_var("MITHRIL_GPU_BUCKET");
@@ -666,13 +704,10 @@ fn gpu_session_runs_match_standalone_runs() {
         assert_eq!(got.map(|r| r.text), Ok(want));
         mithril_gpu::free_vram().unwrap()
     };
-    let programs: Vec<(String, PathBuf)> = ["fib_naive.py", "tree_sum.py", "array_erase_frontier.py", "readback_values.py"]
-        .iter()
-        .map(|f| cubin_of(&fixture(f)))
-        .collect();
+    let programs = cubins_of(&["fib_naive.py", "tree_sum.py", "array_erase_frontier.py", "readback_values.py"].map(fixture));
     // two programs with one layout: each takes over the other's dirty buffers
     let fib = |n: u32| format!("def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\ndef main():\n    return fib(array_len(array_new({n}, 0)))\n");
-    let twins = [cubin_of(&fib(18)), cubin_of(&fib(21))];
+    let twins = cubins_of(&[fib(18), fib(21)]);
     let session = mithril_gpu::GpuSession::open().unwrap();
     assert!(mithril_gpu::GpuSession::open().is_err(), "a second session opened");
     for k in [0, 1, 0, 1, 1, 0] {

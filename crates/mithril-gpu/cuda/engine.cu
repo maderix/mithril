@@ -180,6 +180,9 @@ __device__ inline u32 lane() {
 #define NOHOLE 0xffffffffu
 #define NOTOK 0xffffffffu
 #define ROOT 0ull
+#define COOP_SINK 1ull     // slot 1 of the ROOT record: a co-execution chunk's partial
+#define COOP_LAUNCH 0x7ffffffe // g_native_launch: a shared fold waits for the host
+__device__ u64 g_coop_out[2];      // [0] a chunk delivered, [1] its partial
 
 __device__ inline u64 tag(u64 p) { return p >> 56; }
 __device__ u64 big_box(i64 v);
@@ -484,6 +487,12 @@ __device__ inline void ready_rec(u32 rec) {
 __device__ __noinline__ void deliver(u64 parent, u64 val) {
   u32 ri = (u32)(parent >> 3);
   u32 slot = (u32)parent & 1u;
+  if (ri == 0 && parent == COOP_SINK) { // a co-execution chunk's partial
+    g_coop_out[1] = val;
+    __threadfence();
+    g_coop_out[0] = 1;
+    return;
+  }
   if (ri == 0) { // ROOT sink
     G.result[1] = val;
     __threadfence();
@@ -2417,14 +2426,23 @@ __device__ void drain_local() {
   }
 }
 
-extern "C" __global__ void k_boot(u64 a, u64 b, u64 c, int fuel) {
+// Fire `rule` with (a, b) and parent c on one lane: the program's boot
+// (rule 0), or a co-execution chunk (`from_slot`: the arguments
+// k_coop_args built). One kernel holds the program's whole dispatch; a
+// second copy would cost every program's compile as much again.
+__device__ u64 g_boot_ab[2];
+extern "C" __global__ void k_boot(u32 rule, u64 a, u64 b, u64 c, int fuel, int from_slot) {
   stack_mark();
 #if NATIVE_FRAMES
   s_native_top[threadIdx.x] = 0;
 #endif
   s_mode[threadIdx.x] = 0;
   s_fuel = fuel;
-  prog_fire(0, a, b, c);
+  if (from_slot) {
+    a = g_boot_ab[0];
+    b = g_boot_ab[1];
+  }
+  prog_fire((u16)rule, a, b, c);
   release_held();
   drain_local();
 }
@@ -2618,6 +2636,76 @@ __device__ u32 range_launch(u32 fid, u16 join, i64 lo, i64 hi, const u64 *ports,
   return r.rec;
 }
 
+// ---- co-execution: a sum fold shared with other engines (mithril_core::coop) ----
+//
+// The fold's bridge records the request and suspends to its join record
+// (coop_launch). At the next round boundary k_run returns COOP_LAUNCH; the
+// host claims chunks from the shared table and starts each one (k_coop_args,
+// then k_boot): a call of the fold over the chunk from the identity that
+// delivers its partial to COOP_SINK (slot 1 of the ROOT record). With every
+// engine's partials in, k_coop_done delivers their total as range_done
+// delivers a sum. One shared fold runs at a time; folds offered meanwhile
+// (a chunk's own) run here alone.
+struct CoopReq {
+  u32 fid, rec, n, acc, kind, pending;
+  i64 lo, hi;
+  u64 ports[RREQ_PORTS];
+};
+__device__ CoopReq g_coop;
+__device__ u32 g_coop_on, g_coop_busy; // a channel is open; a shared fold runs
+
+__device__ u32 coop_launch(u32 fid, u16 join, i64 lo, i64 hi, const u64 *ports, int n, u32 acc, u32 kind) {
+  if (!g_coop_on || n > RREQ_PORTS) return 0;
+  for (int k = 2; k < n; k++)
+    if (k != (int)acc && (ports[k] >> 56) != T_NUM) return 0;
+  if (atomicCAS(&g_coop_busy, 0u, 1u) != 0) return 0;
+  CoopReq &r = g_coop;
+  r.fid = fid;
+  r.rec = alloc_rec(join, 2u, 0u, 0u, NONE);
+  r.n = (u32)n;
+  r.acc = acc;
+  r.kind = kind;
+  r.lo = lo;
+  r.hi = hi;
+  for (int k = 0; k < n; k++) r.ports[k] = ports[k];
+  __threadfence();
+  r.pending = 1;
+  return r.rec;
+}
+
+// A chunk's arguments, for k_boot: the request's own with the range
+// replaced and the accumulator at the identity (an argument chain past two).
+extern "C" __global__ void k_coop_args(i64 lo, i64 hi) {
+  const CoopReq &r = g_coop;
+  u64 args[RREQ_PORTS];
+  for (u32 k = 0; k < r.n; k++) args[k] = r.ports[k];
+  args[0] = num(lo);
+  args[1] = num(hi);
+  args[r.acc] = num(0);
+  u64 a = args[0], b = r.n > 1 ? args[1] : 0;
+  if (r.n > 2) {
+    u64 ch = 0;
+    for (int k = (int)r.n - 1; k >= 1; k--) ch = (u64)alloc_node(args[k], ch) + 1;
+    b = ch;
+  }
+  g_coop_out[0] = 0;
+  g_boot_ab[0] = a;
+  g_boot_ab[1] = b;
+}
+
+__device__ void publish_local();
+extern "C" __global__ void k_coop_done(i64 total) {
+  s_mode[threadIdx.x] = 0;
+  s_fuel = G.fuel;
+  const CoopReq &r = g_coop;
+  for (u32 k = 0; k < r.n; k++)
+    if (k != r.acc) free_val(r.ports[k]);
+  deliver(rec_addr(r.rec), num(total));
+  deliver(rec_addr(r.rec) | 1ull, r.ports[r.acc]);
+  publish_local();
+  g_coop_busy = 0;
+}
+
 // Add a lane's partial sum into its request: once per warp when the warp's
 // lanes share the request, else per lane.
 __device__ inline void range_add(u32 q, unsigned long long part) {
@@ -2791,6 +2879,12 @@ extern "C" __global__ void k_run(u32 grow_width, u32 work_steps, int grow_fuel, 
         g_rswitch = 0;
         g_rstart = globaltimer();
         g_phase = 4;
+      }
+      // a shared fold waits for the host (it may be all that is left)
+      if (*(volatile u32 *)G.abortf == 0 && g_phase != 4 && *(volatile u32 *)&g_coop.pending) {
+        g_coop.pending = 0;
+        g_native_launch = COOP_LAUNCH;
+        g_phase = 3;
       }
       g_wmax = g_wsum = g_wcyc = g_wbusy = g_wsteps_of_max = 0;
       if (g_phase == 2) for (int k = 0; k < 40; k++) g_whist[k] = 0;

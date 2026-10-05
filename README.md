@@ -95,8 +95,8 @@ is associative, so Mithril splits the loop across the threads (0.28 s on one,
 0.02 s on sixteen). `mithril build first.py -o first` writes an executable
 (`./first --threads 16`); `mithril oracle first.py` runs the slow reference
 interpreter that every backend is checked against, best kept to small
-inputs; `mithril --help` lists the commands. With an NVIDIA GPU, build the
-CLI with `--features gpu` (see [Build](#build)) and add `--gpu`.
+inputs; `mithril --help` lists the commands. With an NVIDIA GPU, add
+`--gpu` (see [Build](#build)).
 
 The language is a subset of Python: integers (64-bit), floats, `f32`,
 tuples, arrays (`array_new`, `array_get`, `array_set`, `array_len`), `@data`
@@ -213,9 +213,11 @@ backend runs on Linux x86-64 and, experimentally, on macOS with Apple silicon
 GPU backend needs Linux and an NVIDIA GPU.
 
 ```
-cargo build --release -p mithril-cli                  # CPU only
-cargo build --release -p mithril-cli --features gpu   # CPU and GPU
+cargo build --release -p mithril-cli                          # CPU and GPU (Linux)
+cargo build --release -p mithril-cli --no-default-features    # CPU only (no NVIDIA driver)
 ```
+
+On macOS the same first command builds the CPU backend alone.
 
 The binary is `target/release/mithril`. `mithril run` compiles the generated
 program with `rustc`, so a Rust toolchain must be on the `PATH` when you run

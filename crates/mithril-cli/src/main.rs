@@ -76,13 +76,14 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact>... [--image out.ppm | --raw out.bin]";
+const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [--coop] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact>... [--image out.ppm | --raw out.bin]";
 
 const HELP: &str = "Mithril: compile a Python-subset program and run it on any number of threads or the GPU.
 
   mithril run f.py [--threads N] [--gpu]   compile and run (1 thread unless --threads); prints main()'s value
   mithril run f.py --image out.ppm         main() returns (width, height, pixels): write the image
   mithril run f.py --raw out.bin           write every number of main()'s value as 8 bytes
+  mithril run f.py --coop --threads N      the CPU and the GPU share the program's large folds
   mithril oracle f.py                      run on the reference interpreter (slow: small inputs)
   mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
   mithril exec prog                        run a program built with --gpu
@@ -120,11 +121,13 @@ struct Opts {
     sink: Option<Sink>,
     /// `run`: write timings and sizes as JSON
     stats: Option<PathBuf>,
+    /// `run`: the CPU and the GPU share the program's large folds
+    coop: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
     let (mut file, mut threads, mut gpu, mut out) = (None, None, false, None);
-    let (mut sink, mut stats) = (None, None);
+    let (mut sink, mut stats, mut coop) = (None, None, false);
     let mut i = 0;
     while i < args.len() {
         let path = |i: &mut usize, what: &str| -> Result<PathBuf, CliErr> {
@@ -141,6 +144,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
                 threads = Some(n.max(1));
             }
             "--gpu" => gpu = true,
+            "--coop" => coop = true,
             "-o" => out = Some(path(&mut i, "-o")?),
             s if s.starts_with('-') => return Err(format!("unknown option '{}'\n{}", s, USAGE).into()),
             s => {
@@ -152,7 +156,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
         }
         i += 1;
     }
-    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, sink, stats })
+    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, sink, stats, coop })
 }
 
 // ------------------------------------------------------------ front stages
@@ -201,6 +205,13 @@ fn target_dir() -> PathBuf {
     env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"))
+}
+
+/// Where compiled device programs are cached (`MITHRIL_GPU_CACHE`, else
+/// under the target directory).
+#[cfg(cuda)]
+fn gpu_cache() -> PathBuf {
+    env::var_os("MITHRIL_GPU_CACHE").map(PathBuf::from).unwrap_or_else(|| target_dir().join("mithril-cache").join("gpu"))
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
@@ -337,6 +348,9 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
     if std::env::var_os("MITHRIL_TIMING").is_some() {
         eprintln!("mithril: front end + specialization {:.0} ms", front * 1e3);
     }
+    if o.coop {
+        return run_coop(&sm, &o);
+    }
     let ran = if o.gpu {
         run_gpu(&sm, front, o.sink.as_ref())?
     } else {
@@ -472,11 +486,15 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
     let out = o.out.as_deref().ok_or("build requires -o <out>")?;
     let (sm, _) = specialized(&o)?;
     if o.gpu {
-        build_gpu(&sm, out)?;
+        // the device compile's recorded cost, whether compiled now or cached
+        match build_gpu(&sm, out)? {
+            Some((total, cicc, ptxas)) => println!("wrote {} (device compile {total:.1} s: cicc {cicc:.1} s, ptxas {ptxas:.1} s)", out.display()),
+            None => println!("wrote {}", out.display()),
+        }
     } else {
         compile_program(&sm, out)?;
+        println!("wrote {}", out.display());
     }
-    println!("wrote {}", out.display());
     Ok(0)
 }
 
@@ -490,6 +508,10 @@ fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
     while let Some(a) = it.next() {
         if a.starts_with('-') {
             let p = it.next().ok_or_else(|| format!("{a} needs a path"))?;
+            if a == "--coop" {
+                mithril_core::coop::open(Path::new(p))?;
+                continue;
+            }
             sink = Some(Sink::from_flag(a, p).ok_or_else(|| format!("unknown option '{a}'\n{USAGE}"))?);
         } else {
             paths.push(PathBuf::from(a));
@@ -602,7 +624,7 @@ fn lean_binary() -> Option<PathBuf> {
 
 // -------------------------------------------------------------------- gpu
 
-#[cfg(feature = "gpu")]
+#[cfg(cuda)]
 fn run_gpu(sm: &CoreModule, front: f64, sink: Option<&Sink>) -> Result<Ran, CliErr> {
     // the same lowering as the CPU program, printed for the device
     let cu = match mithril_gpu::emit_cuda(sm) {
@@ -616,7 +638,7 @@ fn run_gpu(sm: &CoreModule, front: f64, sink: Option<&Sink>) -> Result<Ran, CliE
         }
     };
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
-    let cache = target_dir().join("mithril-cache").join("gpu");
+    let cache = gpu_cache();
     fs::create_dir_all(&cache)?;
     let t0 = std::time::Instant::now();
     let cubin = mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?;
@@ -631,20 +653,86 @@ fn run_gpu(sm: &CoreModule, front: f64, sink: Option<&Sink>) -> Result<Ran, CliE
     Ok(Ran { text: r.text, front, compile, run, rounds: Some(r.rounds) })
 }
 
-#[cfg(feature = "gpu")]
-fn build_gpu(sm: &CoreModule, out: &Path) -> Result<(), CliErr> {
-    match mithril_gpu::emit_cuda(sm) {
-        Err(constant) => fs::write(out, format!("MITHRIL-CONST {constant}\n"))?,
-        Ok(cu) => {
-            let cache = target_dir().join("mithril-cache").join("gpu");
-            fs::create_dir_all(&cache)?;
-            fs::copy(mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?, out)?;
+/// `run --coop`: the CPU program (its own process) and the GPU (this one)
+/// run the program together, sharing its large folds through one
+/// co-execution table. Each computes the whole value, so the two must
+/// agree to the bit; the run fails if they do not.
+#[cfg(cuda)]
+fn run_coop(sm: &CoreModule, o: &Opts) -> Result<i32, CliErr> {
+    let cu = match mithril_gpu::emit_cuda(sm) {
+        Ok(cu) => cu,
+        // reduced at compile time: nothing to share
+        Err(constant) => {
+            println!("{}", match &o.sink { Some(sink) => write_constant(sink, &constant)?, None => constant });
+            return Ok(0);
         }
+    };
+    let tmp = make_temp_dir()?;
+    let bin = tmp.join("prog");
+    compile_program(sm, &bin)?;
+    let cache = gpu_cache();
+    fs::create_dir_all(&cache)?;
+    let cubin = mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?;
+    let table = tmp.join("coop.table");
+    mithril_core::coop::open(&table)?;
+    // the GPU's copy of a file result goes beside it, then is compared
+    let gpu_sink = o.sink.as_ref().map(|s| match s {
+        Sink::Image(_) => Sink::Image(tmp.join("gpu.out")),
+        Sink::Raw(_) => Sink::Raw(tmp.join("gpu.out")),
+    });
+    let mut c = Command::new(&bin);
+    c.args(["--threads", &o.threads.unwrap_or(1).to_string(), "--coop"]).arg(&table);
+    if let Some(sink) = &o.sink {
+        c.args(sink.args());
     }
-    Ok(())
+    let child = c.stdout(std::process::Stdio::piped()).spawn().map_err(|e| format!("cannot run compiled program: {e}"))?;
+    let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
+    mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let gpu = mithril_gpu::run_cubin_to(&cubin, boot, gpu_sink.as_ref());
+    let out = child.wait_with_output()?;
+    let cpu_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() {
+        println!("{cpu_text}");
+        return Ok(out.status.code().unwrap_or(1));
+    }
+    let gpu = gpu.map_err(CliErr::Other)?;
+    let agree = match (&o.sink, &gpu_sink) {
+        (Some(s), Some(g)) => fs::read(s.path())? == fs::read(g.path())?,
+        _ => gpu.text == cpu_text,
+    };
+    let _ = fs::remove_dir_all(&tmp);
+    if !agree {
+        return Err(format!("--coop: the CPU and the GPU disagree\n  cpu: {cpu_text}\n  gpu: {}", gpu.text).into());
+    }
+    println!("{cpu_text}");
+    Ok(0)
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(not(cuda))]
+fn run_coop(_sm: &CoreModule, _o: &Opts) -> Result<i32, CliErr> {
+    Err("--coop needs the GPU (Linux and the NVIDIA driver)".into())
+}
+
+/// Write the device artefact; returns its compile time (total, cicc,
+/// ptxas seconds) when one was recorded.
+#[cfg(cuda)]
+fn build_gpu(sm: &CoreModule, out: &Path) -> Result<Option<(f64, f64, f64)>, CliErr> {
+    match mithril_gpu::emit_cuda(sm) {
+        Err(constant) => {
+            fs::write(out, format!("MITHRIL-CONST {constant}\n"))?;
+            Ok(None)
+        }
+        Ok(cu) => {
+            let cache = gpu_cache();
+            fs::create_dir_all(&cache)?;
+            let cubin = mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?;
+            fs::copy(&cubin, out)?;
+            Ok(mithril_gpu::compile_time(&cubin).map(|t| (t.total, t.cicc, t.ptxas)))
+        }
+    }
+}
+
+#[cfg(cuda)]
 fn exec_gpu(path: &Path, sink: Option<&Sink>) -> Result<i32, CliErr> {
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     mithril_gpu::EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -653,7 +741,7 @@ fn exec_gpu(path: &Path, sink: Option<&Sink>) -> Result<i32, CliErr> {
     Ok(0)
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(cuda)]
 fn exec_gpu_session(paths: &[PathBuf]) -> Result<i32, CliErr> {
     let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
     let session = mithril_gpu::GpuSession::open().map_err(CliErr::Other)?;
@@ -666,24 +754,24 @@ fn exec_gpu_session(paths: &[PathBuf]) -> Result<i32, CliErr> {
     Ok(0)
 }
 
-#[cfg(not(feature = "gpu"))]
-fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<(), CliErr> {
-    Err("gpu support not built; rebuild with --features gpu".into())
+#[cfg(not(cuda))]
+fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<Option<(f64, f64, f64)>, CliErr> {
+    Err("gpu support not built (it needs Linux and the NVIDIA driver)".into())
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(cuda))]
 fn exec_gpu(_path: &Path, _sink: Option<&Sink>) -> Result<i32, CliErr> {
-    Err("gpu support not built; rebuild with --features gpu".into())
+    Err("gpu support not built (it needs Linux and the NVIDIA driver)".into())
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(cuda))]
 fn exec_gpu_session(_paths: &[PathBuf]) -> Result<i32, CliErr> {
-    Err("gpu support not built; rebuild with --features gpu".into())
+    Err("gpu support not built (it needs Linux and the NVIDIA driver)".into())
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(cuda))]
 fn run_gpu(_sm: &CoreModule, _front: f64, _sink: Option<&Sink>) -> Result<Ran, CliErr> {
-    Err("gpu support not built; rebuild with --features gpu".into())
+    Err("gpu support not built (it needs Linux and the NVIDIA driver)".into())
 }
 
 #[cfg(test)]

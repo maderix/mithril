@@ -25,6 +25,10 @@ pub(crate) struct ParFold {
     /// a split write their own index ranges of one buffer, which the right half
     /// borrows from the left without a reference; the join returns the left's.
     pub fill: bool,
+    /// Offered to the co-execution channel at its entry: a sum fold with no
+    /// native form (its iterations call recursive or forking code, so their
+    /// cost is irregular; a native fold runs as a range launch instead).
+    pub coop: bool,
 }
 
 /// Decide whether `fid` gets the chunked par_fold shape, and find its
@@ -78,12 +82,14 @@ pub(crate) fn par_fold(m: &CoreModule, fid: u32) -> Option<ParFold> {
             }
         }
     }
-    Some(ParFold { acc, mask32, tuple, fill })
+    Some(ParFold { acc, mask32, tuple, fill, coop: false })
 }
 
 /// The range-split preamble of the fold fn's CALL rule (before the dive).
 pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -> Vec<S> {
-    split_code(fid, ar, pf, join_rule, &[], v("parent"), crate::lir::ret_unit())
+    let mut code = coop_snippet(fid, ar, pf, join_rule, Some(v("parent")));
+    code.extend(split_code(fid, ar, pf, join_rule, &[], v("parent"), crate::lir::ret_unit()));
+    code
 }
 
 /// The same split inside the fold's dive, at each loop head: the remaining
@@ -92,7 +98,9 @@ pub(crate) fn split_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16) -
 /// accumulator so far rides in the left half). `bor` are the parameters the
 /// function borrows from its caller.
 pub(crate) fn split_snippet_dive(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, bor: &[bool]) -> Vec<S> {
-    split_code(fid, ar, pf, join_rule, bor, E::Const("NONE".into()), ret(crate::lir::err(crate::lir::cast(v("j"), Ty::U64))))
+    let mut code = coop_snippet(fid, ar, pf, join_rule, None);
+    code.extend(split_code(fid, ar, pf, join_rule, bor, E::Const("NONE".into()), ret(crate::lir::err(crate::lir::cast(v("j"), Ty::U64)))));
+    code
 }
 
 fn split_code(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, bor: &[bool], parent: E, exit: S) -> Vec<S> {
@@ -185,6 +193,42 @@ pub(crate) fn range_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, b
     let est = p("imax", vec![p("atomic_load", vec![E::Addr(format!("FOLD_EST_{fid}"))]), i64_(1)]);
     let work = p("sat_mul", vec![bin(Bop::Sub, hi, lo), est]);
     vec![S::Comment("range launch: the fold runs as one device-wide pass".into()), S::If(bin(Bop::Gt, work, i64_(RANGE_MIN)), launch, vec![])]
+}
+
+/// Iterations from which a fold is offered to the co-execution channel. The
+/// offer is decided by the range alone, at the fold's entry, so every engine
+/// running the program makes the same offer for the same range (a measured
+/// cost would be known at different points on different engines, and their
+/// keys would differ).
+const COOP_MIN_LEN: i64 = 64;
+
+/// A sum fold's offer to the co-execution channel (`coop_launch`), ahead of
+/// its split. Taken, the fold suspends to the returned join record: a dive
+/// returns it, a CALL rule (`parent`) attaches its parent to it. The ports
+/// are the fold's own: an offer is declined unless every argument is an
+/// int, so none needs a reference. Fills and tuple folds are not offered.
+fn coop_snippet(fid: u32, ar: usize, pf: &ParFold, join_rule: u16, parent: Option<E>) -> Vec<S> {
+    if !pf.coop || pf.fill || pf.tuple.is_some() {
+        return Vec::new();
+    }
+    let kind = if pf.mask32 { 2 } else { 1 };
+    let ports: Vec<E> = (0..ar).map(|i| v(vn(i as u32))).collect();
+    let (lo, hi) = (as_i(v("v0")), as_i(v("v1")));
+    let offer = let_("cj", Ty::U32, c("coop_launch", vec![u32_(fid as u64), u16_(join_rule as u64), lo.clone(), hi.clone(), E::Slice(ports), u32_(pf.acc as u64), u32_(kind)]));
+    // a CALL rule is an entry; a dive offers at its first loop head only
+    let (suspend, entry) = match parent {
+        Some(parent) => (vec![do_(c("set_parent", vec![v("cj"), parent])), crate::lir::ret_unit()], None),
+        None => (vec![ret(crate::lir::err(crate::lir::cast(v("cj"), Ty::U64)))], Some(bin(Bop::Eq, as_i(v("v0")), as_i(v("fold_start"))))),
+    };
+    let taken = S::If(bin(Bop::Ne, v("cj"), u32_(0)), suspend, vec![]);
+    let long = bin(Bop::Ge, bin(Bop::Sub, hi, lo), i64_(COOP_MIN_LEN));
+    let mut offer = vec![S::If(long, vec![offer, taken], vec![])];
+    if let Some(entry) = entry {
+        offer = vec![S::If(entry, offer, vec![])];
+    }
+    let mut code = vec![S::Comment("co-execution: a long irregular sum fold is offered at its entry".into())];
+    code.extend(offer);
+    code
 }
 
 /// The native bridge's first measurement. A native chunk never runs out of

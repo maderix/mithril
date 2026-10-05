@@ -331,11 +331,16 @@ impl<'e> Wctx<'e> {
 
     /// Fill slot `parent & 7` of record `parent >> 3`; the delivery that
     /// brings `pend` to zero queues the record in its rule's bucket.
-    /// `parent == ROOT` finishes the run with `val`.
+    /// `parent == ROOT` finishes the run with `val`; `parent == COOP_SINK`
+    /// is a co-execution chunk's result.
     pub fn deliver(&mut self, parent: u64, val: u64) {
         let ri = (parent >> 3) as u32;
         if ri == 0 {
-            self.ar.deliver_root(val);
+            if parent == crate::COOP_SINK {
+                self.ar.deliver_coop(val);
+            } else {
+                self.ar.deliver_root(val);
+            }
             return;
         }
         let r = &self.ar.recs[ri as usize];

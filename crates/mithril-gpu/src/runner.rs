@@ -282,7 +282,7 @@ const NVCC_IMAGE: &str = "mithril-nvcc:cu13.0";
 
 /// Compile `dir/program.cu` with nvcc inside docker (the host needs no CUDA
 /// toolkit); `dir` is mounted at /w.
-fn nvcc_compile(dir: &Path) -> Result<(), String> {
+fn nvcc_compile(dir: &Path, out: &str) -> Result<(), String> {
     let image = std::env::var("MITHRIL_NVCC_IMAGE").unwrap_or_else(|_| NVCC_IMAGE.to_string());
     let dir = dir
         .canonicalize()
@@ -302,7 +302,9 @@ fn nvcc_compile(dir: &Path) -> Result<(), String> {
             "-cubin",
             "/w/program.cu",
             "-o",
-            "/w/program.cubin",
+            &format!("/w/{out}"),
+            "-time",
+            &format!("/w/{out}.time"),
         ])
         .output()
         .map_err(|e| format!("mithril-gpu: failed to invoke docker: {e}"))?;
@@ -345,13 +347,85 @@ pub fn compile_to_cubin(cu_src: &str, cache_dir: &Path) -> Result<std::path::Pat
     fs::create_dir_all(&dir).map_err(|e| format!("mithril-gpu: mkdir {}: {e}", dir.display()))?;
     let cubin_path = dir.join("program.cubin");
     if !cubin_path.exists() {
-        fs::write(dir.join("program.cu"), cu_src)
-            .map_err(|e| format!("mithril-gpu: write program.cu: {e}"))?;
-        fs::write(dir.join("engine.cu"), ENGINE_CU)
-            .map_err(|e| format!("mithril-gpu: write engine.cu: {e}"))?;
-        nvcc_compile(&dir)?;
+        // several compilers may share the directory (`compile_all`, other
+        // processes): every file appears whole, by rename, or not at all
+        let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        for (name, text) in [("program.cu", cu_src), ("engine.cu", ENGINE_CU)] {
+            let tmp = dir.join(format!("{name}.{tag}"));
+            fs::write(&tmp, text).map_err(|e| format!("mithril-gpu: write {name}: {e}"))?;
+            fs::rename(&tmp, dir.join(name)).map_err(|e| format!("mithril-gpu: write {name}: {e}"))?;
+        }
+        let out = format!("program.cubin.{tag}");
+        nvcc_compile(&dir, &out)?;
+        let t = CompileTime::of_phases(&fs::read_to_string(dir.join(format!("{out}.time"))).unwrap_or_default());
+        let _ = fs::remove_file(dir.join(format!("{out}.time")));
+        let _ = fs::write(dir.join("compile.txt"), t.to_text());
+        fs::rename(dir.join(&out), &cubin_path).map_err(|e| format!("mithril-gpu: install cubin: {e}"))?;
+        if std::env::var_os("MITHRIL_GPU_STATS").is_some() {
+            eprintln!("mithril-gpu: compiled in {:.1} s (cicc {:.1} s, ptxas {:.1} s)", t.total, t.cicc, t.ptxas);
+        }
     }
     Ok(cubin_path)
+}
+
+/// What compiling a program cost (seconds), kept beside its cubin in
+/// `compile.txt`: the device compiler's front end (`cicc`), its back end
+/// (`ptxas`), and every phase together.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompileTime {
+    pub cicc: f64,
+    pub ptxas: f64,
+    pub total: f64,
+}
+
+impl CompileTime {
+    /// From the phase table `nvcc -time` writes (CSV; the metric in ms).
+    fn of_phases(csv: &str) -> CompileTime {
+        let mut t = CompileTime::default();
+        for row in csv.lines().skip(1) {
+            let cols: Vec<&str> = row.split(',').map(str::trim).collect();
+            let (Some(phase), Some(ms)) = (cols.get(1), cols.get(6).and_then(|m| m.parse::<f64>().ok())) else { continue };
+            let s = ms / 1000.0;
+            t.total += s;
+            if phase.starts_with("cicc") {
+                t.cicc += s;
+            } else if phase.starts_with("ptxas") {
+                t.ptxas += s;
+            }
+        }
+        t
+    }
+
+    fn to_text(self) -> String {
+        format!("cicc_s {:.3}\nptxas_s {:.3}\ntotal_s {:.3}\n", self.cicc, self.ptxas, self.total)
+    }
+}
+
+/// The compile time recorded beside a cached cubin (`compile_to_cubin`).
+pub fn compile_time(cubin: &Path) -> Option<CompileTime> {
+    let text = fs::read_to_string(cubin.with_file_name("compile.txt")).ok()?;
+    let get = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.trim().parse().ok());
+    Some(CompileTime { cicc: get("cicc_s")?, ptxas: get("ptxas_s")?, total: get("total_s")? })
+}
+
+/// Compile several programs at once, one compiler per CPU (each program's
+/// `ptxas` runs on one core); the results are in the order of `sources`.
+pub fn compile_all(sources: &[String], cache_dir: &Path) -> Vec<Result<std::path::PathBuf, String>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<std::sync::Mutex<Option<Result<std::path::PathBuf, String>>>> = sources.iter().map(|_| Default::default()).collect();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(sources.len()).max(1);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k >= sources.len() {
+                    break;
+                }
+                *done[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(compile_to_cubin(&sources[k], cache_dir));
+            });
+        }
+    });
+    done.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| Err("mithril-gpu: not compiled".into()))).collect()
 }
 
 /// Run a compiled program (a prebuilt artefact: no front end).
@@ -1009,6 +1083,11 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     cu(cuModuleGetFunction(&mut k_boot, module, c"k_boot".as_ptr()), "get k_boot")?;
 
     shared_opt_in(k_boot, dev)?;
+    // a co-execution channel is open before the program starts: an offer
+    // must not depend on when the host got to it (the engines' keys would differ)
+    if mithril_core::coop::channel().is_some() {
+        set_global(module, c"g_coop_on", &1u32)?;
+    }
     let stats = std::env::var_os("MITHRIL_GPU_STATS").is_some();
     if stats {
         for _ in 0..6 {
@@ -1023,13 +1102,15 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     // boot fires rule 0 with the redex, parent = ROOT (aux), in the
     // parallel world with the dive budget
     {
-        let (mut a, mut b, mut c) = (boot.a, boot.b, boot.aux);
-        let mut bf: i32 = fuel;
+        let (mut rule, mut a, mut b, mut c) = (0u32, boot.a, boot.b, boot.aux);
+        let (mut bf, mut from_slot): (i32, i32) = (fuel, 0);
         let mut params = [
+            (&mut rule as *mut u32).cast::<c_void>(),
             (&mut a as *mut u64).cast::<c_void>(),
             (&mut b as *mut u64).cast::<c_void>(),
             (&mut c as *mut u64).cast::<c_void>(),
             (&mut bf as *mut i32).cast::<c_void>(),
+            (&mut from_slot as *mut i32).cast::<c_void>(),
         ];
         cu(
             cuLaunchKernel(k_boot, 1, 1, 1, 1, 1, 1, (shared / TPB as usize) as u32, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()),
@@ -1082,6 +1163,8 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     let (mut launch_ptr,mut launch_size)=(0,0);
     let typed=cuModuleGetGlobal_v2(&mut launch_ptr,&mut launch_size,module,c"g_native_launch".as_ptr())==0;
     let mut kernels=std::collections::HashMap::new();
+    let channel = mithril_core::coop::channel();
+    let mut coop: Option<DeviceCoop> = None;
     loop {
         check_deadline(t_run, deadline)?;
         cu(cuLaunchCooperativeKernel(k_run,blocks,1,1,TPB,1,1,shared as u32,std::ptr::null_mut(),params.as_mut_ptr()),"launch engine")?;
@@ -1089,7 +1172,24 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
         wait_stream(&mut mem,d.abortf,concurrent!=0,t_run,deadline,&mut stop_sent)?;
         if !typed || dtoh::<u32>(d.abortf,1,"read abort")?[0]!=0 { break; }
         let rule=dtoh::<i32>(launch_ptr,1,"native launch")?[0];
-        if rule<0 { break; }
+        // a shared fold: start its first chunk, or the next one when the
+        // engine has drained a chunk (engine.cu COOP_LAUNCH)
+        if rule == COOP_LAUNCH {
+            let channel = channel.ok_or("mithril-gpu: a shared fold without a channel")?;
+            coop = Some(DeviceCoop::start(module, channel, fuel, shared)?);
+            continue;
+        }
+        if rule<0 {
+            match &mut coop {
+                Some(run) => {
+                    if run.step(module, &d)? {
+                        coop = None;
+                    }
+                    continue;
+                }
+                None => break,
+            }
+        }
         // a range phase past its budget continues in its own kernel (engine.cu RANGE_LAUNCH)
         let range=rule==i32::MAX;
         let (kernel,nblocks,bytes,words)=if let Some(plan)=kernels.get(&rule) { *plan } else {
@@ -1212,6 +1312,163 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     mem.keep = EXITING.load(std::sync::atomic::Ordering::Relaxed);
     mem.to_session = in_session;
     Ok(GpuResult { port: res[1], text, rounds: r[0], cell_readback_bytes: cells.bytes })
+}
+
+// ---- co-execution (mithril_core::coop; engine.cu "co-execution") ----
+
+/// engine.cu `COOP_LAUNCH`
+const COOP_LAUNCH: i32 = 0x7fff_fffe;
+
+/// engine.cu `CoopReq`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CoopReq {
+    fid: u32,
+    rec: u32,
+    n: u32,
+    acc: u32,
+    kind: u32,
+    pending: u32,
+    lo: i64,
+    hi: i64,
+    ports: [u64; 12],
+}
+
+/// A shared fold this device runs (the host side of `CoopRun` in
+/// mithril-rt's engine): chunks claimed from the job start one at a time
+/// through `k_boot`; once the engine has drained a chunk its partial is
+/// stored and the next one starts; the last one in, `k_coop_done` delivers
+/// the total of every engine's partials.
+struct DeviceCoop {
+    req: CoopReq,
+    job: Option<mithril_core::coop::Job<'static>>,
+    chunk: mithril_core::coop::Chunk,
+    redo: Vec<mithril_core::coop::Chunk>,
+    fuel: i32,
+    shared: usize,
+    started: std::time::Instant,
+}
+
+/// How long a partner may leave a claimed chunk open before it runs here.
+const COOP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl DeviceCoop {
+    unsafe fn start(module: *mut c_void, channel: &'static mithril_core::coop::Coop, fuel: i32, shared: usize) -> Result<DeviceCoop, String> {
+        let req = get_global::<CoopReq>(module, c"g_coop")?;
+        let as_i = |p: u64| ((p << 8) as i64) >> 8;
+        let mut key = vec![req.fid as u64, req.lo as u64, req.hi as u64, (req.kind & 3) as u64];
+        key.extend((2..req.n as usize).filter(|&k| k != req.acc as usize).map(|k| as_i(req.ports[k]) as u64));
+        let job = channel.job(&key, req.lo, req.hi);
+        let whole = mithril_core::coop::Chunk { k: 0, lo: req.lo, hi: req.hi };
+        let first = match &job {
+            Some(j) => j.claim(),
+            None => Some(whole),
+        };
+        let mut run = DeviceCoop { req, job, chunk: whole, redo: Vec::new(), fuel, shared, started: std::time::Instant::now() };
+        match first {
+            Some(c) => run.launch(module, c)?,
+            // the partners took every chunk: nothing runs here; finish at once
+            None => {
+                run.chunk.k = usize::MAX;
+                set_global(module, c"g_coop_out", &[1u64, 0])?;
+            }
+        }
+        Ok(run)
+    }
+
+    /// Start chunk `c`: `k_coop_args` builds its arguments, `k_boot` fires
+    /// the fold's CALL rule with them, delivering to `COOP_SINK`.
+    unsafe fn launch(&mut self, module: *mut c_void, c: mithril_core::coop::Chunk) -> Result<(), String> {
+        self.chunk = c;
+        self.started = std::time::Instant::now();
+        let (mut args, mut boot): (*mut c_void, *mut c_void) = (std::ptr::null_mut(), std::ptr::null_mut());
+        cu(cuModuleGetFunction(&mut args, module, c"k_coop_args".as_ptr()), "get k_coop_args")?;
+        cu(cuModuleGetFunction(&mut boot, module, c"k_boot".as_ptr()), "get k_boot")?;
+        let (mut lo, mut hi) = (c.lo, c.hi);
+        let mut p = [(&mut lo as *mut i64).cast::<c_void>(), (&mut hi as *mut i64).cast::<c_void>()];
+        cu(cuLaunchKernel(args, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), p.as_mut_ptr(), std::ptr::null_mut()), "launch k_coop_args")?;
+        let (mut rule, mut a, mut b, mut sink, mut fuel, mut from_slot) = (1 + self.req.fid, 0u64, 0u64, 1u64, self.fuel, 1i32);
+        let mut p = [
+            (&mut rule as *mut u32).cast::<c_void>(),
+            (&mut a as *mut u64).cast::<c_void>(),
+            (&mut b as *mut u64).cast::<c_void>(),
+            (&mut sink as *mut u64).cast::<c_void>(),
+            (&mut fuel as *mut i32).cast::<c_void>(),
+            (&mut from_slot as *mut i32).cast::<c_void>(),
+        ];
+        let bytes = (self.shared / TPB as usize) as u32;
+        cu(cuLaunchKernel(boot, 1, 1, 1, 1, 1, 1, bytes, std::ptr::null_mut(), p.as_mut_ptr(), std::ptr::null_mut()), "launch the chunk")
+    }
+
+    /// The engine drained the running chunk: store its partial and start
+    /// the next; true once the shared fold is complete.
+    unsafe fn step(&mut self, module: *mut c_void, d: &Dev) -> Result<bool, String> {
+        let out = get_global::<[u64; 2]>(module, c"g_coop_out")?;
+        if out[0] == 0 {
+            return Err("mithril-gpu: a co-execution chunk delivered nothing".into());
+        }
+        let Some(job) = &self.job else {
+            self.done(module, port_int(d, out[1])?)?;
+            return Ok(true);
+        };
+        if self.chunk.k != usize::MAX {
+            job.put(self.chunk.k, port_int(d, out[1])? as u64);
+            mithril_core::coop::trace("gpu", self.chunk, self.started, self.started.elapsed());
+        }
+        if let Some(c) = self.redo.pop().or_else(|| job.claim()) {
+            self.launch(module, c)?;
+            return Ok(false);
+        }
+        match job.finish(COOP_PATIENCE) {
+            Ok(parts) => {
+                self.done(module, mithril_core::coop::total(&parts, self.req.kind & 3))?;
+                Ok(true)
+            }
+            Err(open) => {
+                self.redo = open;
+                let c = self.redo.pop().ok_or("mithril-gpu: no open chunk")?;
+                self.launch(module, c)?;
+                Ok(false)
+            }
+        }
+    }
+
+    unsafe fn done(&self, module: *mut c_void, total: i64) -> Result<(), String> {
+        let mut k: *mut c_void = std::ptr::null_mut();
+        cu(cuModuleGetFunction(&mut k, module, c"k_coop_done".as_ptr()), "get k_coop_done")?;
+        let mut t = total;
+        let mut params = [(&mut t as *mut i64).cast::<c_void>()];
+        cu(cuLaunchKernel(k, 1, 1, 1, 1, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()), "launch k_coop_done")
+    }
+}
+
+/// The int an int port holds (a boxed one is read from the heap).
+unsafe fn port_int(d: &Dev, p: u64) -> Result<i64, String> {
+    match p >> 56 {
+        T_NUM => Ok(((p << 8) as i64) >> 8),
+        T_BIG => Ok(dtoh::<i64>(d.heap + 8 * ((p & M56) + 2), 1, "read boxed int")?[0]),
+        t => Err(format!("mithril-gpu: a shared fold's partial is not an int (tag {t})")),
+    }
+}
+
+unsafe fn get_global<T: Copy + Default>(module: *mut c_void, name: &std::ffi::CStr) -> Result<T, String> {
+    let (mut p, mut sz) = (0 as CUdeviceptr, 0usize);
+    cu(cuModuleGetGlobal_v2(&mut p, &mut sz, module, name.as_ptr()), "cuModuleGetGlobal")?;
+    if sz != std::mem::size_of::<T>() {
+        return Err(format!("mithril-gpu: {name:?} is {sz} bytes on the device"));
+    }
+    let mut v = T::default();
+    cu(cuMemcpyDtoH_v2((&mut v as *mut T).cast(), p, sz), "read global")?;
+    Ok(v)
+}
+
+unsafe fn set_global<T: Copy>(module: *mut c_void, name: &std::ffi::CStr, v: &T) -> Result<(), String> {
+    let (mut p, mut sz) = (0 as CUdeviceptr, 0usize);
+    cu(cuModuleGetGlobal_v2(&mut p, &mut sz, module, name.as_ptr()), "cuModuleGetGlobal")?;
+    if sz != std::mem::size_of::<T>() {
+        return Err(format!("mithril-gpu: {name:?} is {sz} bytes on the device"));
+    }
+    cu(cuMemcpyHtoD_v2(p, (v as *const T).cast(), sz), "write global")
 }
 
 // ---- readback of a result port (mirrors mithril_rt::prelude::show) ----

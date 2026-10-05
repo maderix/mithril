@@ -54,6 +54,12 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// GPU tests run where the backend is built in and `MITHRIL_GPU=1` says a
+/// device and the nvcc image are there (as the device tests in mithril-gpu).
+fn gpu_on() -> bool {
+    cfg!(cuda) && std::env::var("MITHRIL_GPU").as_deref() == Ok("1")
+}
+
 fn fresh_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mithril-cli-test-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&d);
@@ -133,14 +139,14 @@ fn oracle_reports_front_end_errors_like_run() {
     assert!(stderr(&out).contains("missing input file"), "stderr: {}", stderr(&out));
 }
 
-// a CLI built with the gpu feature runs the program instead
-#[cfg(not(feature = "gpu"))]
+// a CLI built with the GPU backend runs the program instead
+#[cfg(not(cuda))]
 #[test]
 fn run_gpu_without_feature_reports_and_exits_1() {
     let out = mithril(&["run", fixture("fact_while.py").to_str().unwrap(), "--gpu"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("gpu support not built; rebuild with --features gpu"),
+        stderr(&out).contains("gpu support not built"),
         "stderr: {}",
         stderr(&out)
     );
@@ -381,7 +387,7 @@ fn raw_sink_writes_the_same_bytes_on_every_lane() {
         lanes.push(("t1", vec!["run"]));
         lanes.push(("t4", vec!["run", "--threads", "4"]));
     }
-    if cfg!(feature = "gpu") {
+    if gpu_on() {
         lanes.push(("gpu", vec!["run", "--gpu"]));
     }
     for (name, args) in lanes {
@@ -440,9 +446,11 @@ fn a_closure_result_cannot_be_written() {
 }
 
 /// A program the compiler reduces to a constant reaches the sink as text.
-#[cfg(feature = "gpu")]
 #[test]
 fn a_constant_gpu_artefact_writes_the_same_bytes() {
+    if !gpu_on() {
+        return;
+    }
     let d = fresh_dir("raw-const");
     let prog = write_prog(&d, "def main():\n    return (3, 0 - 4, 2.5, 1e-300, 1152921504606846976)\n");
     let art = d.join("prog.gpu");
@@ -459,9 +467,11 @@ fn a_constant_gpu_artefact_writes_the_same_bytes() {
 }
 
 /// Several artefacts in one `exec` print what each prints alone.
-#[cfg(feature = "gpu")]
 #[test]
 fn exec_runs_several_artefacts_in_one_session() {
+    if !gpu_on() {
+        return;
+    }
     let d = fresh_dir("exec-session");
     let srcs = ["def main():\n    return 7\n", MIXED, "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\ndef main():\n    return fib(array_len(array_new(20, 0)))\n"];
     let mut arts = Vec::new();
@@ -488,4 +498,105 @@ fn exec_runs_several_artefacts_in_one_session() {
     let out = mithril(&["exec", &arts[1], &arts[2], "--raw", d.join("x.bin").to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("take one artefact"), "{}", stderr(&out));
+}
+
+// ------------------------------------------------------------ co-execution
+
+/// subsetsum split by the take/skip choice of its first 7 weights: a sum
+/// fold of 128 irregular, forking sub-searches (the oracle's count 1113931).
+const SUBSET: &str = "def prng(x):\n    b = x ^ ((x << 13) & 4294967295)\n    d = b ^ (b >> 17)\n    return d ^ ((d << 5) & 4294967295)\n\n\
+def weight(i):\n    return (prng((i + 1) * 2654435761 & 4294967295) & 65535) + 1\n\n\
+def total_weight(n):\n    s = 0\n    for i in range(n):\n        s = s + weight(i)\n    return s\n\n\
+def count(i, n, room):\n    if i == n:\n        return 1\n    skip = count(i + 1, n, room)\n    w = weight(i)\n    if w > room:\n        return skip\n    take = count(i + 1, n, room - w)\n    return (skip + take) & 4294967295\n\n\
+def walk(j, i, k, n, room):\n    if i == k:\n        return count(k, n, room)\n    if (j >> i) & 1 == 1:\n        w = weight(i)\n        if w > room:\n            return 0\n        return walk(j, i + 1, k, n, room - w)\n    return walk(j, i + 1, k, n, room)\n\n\
+def main():\n    n = 24\n    room = total_weight(n) // 3\n    s = 0\n    for j in range(0, 128):\n        s = (s + walk(j, 0, 7, n, room)) & 4294967295\n    return s\n";
+
+/// The chunks `MITHRIL_COOP_STATS` reports in `stderr`, as `[lo, hi)`.
+fn coop_chunks(stderr: &str) -> Vec<(i64, i64)> {
+    stderr
+        .lines()
+        .filter_map(|l| l.split_once(" [")?.1.split_once(')').map(|(r, _)| r.to_string()))
+        .map(|r| {
+            let (a, b) = r.split_once(", ").unwrap();
+            (a.parse().unwrap(), b.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn coop_cpu_processes_share_an_irregular_fold_and_agree_with_the_oracle() {
+    if !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("coop-cpu");
+    let prog = write_prog(&d, SUBSET);
+    let oracle = mithril(&["oracle", prog.to_str().unwrap()]);
+    assert_eq!(stdout(&oracle).trim(), "1113931");
+    let exe = d.join("prog");
+    assert!(mithril(&["build", prog.to_str().unwrap(), "-o", exe.to_str().unwrap()]).status.success());
+    for (round, threads) in [vec!["4"], vec!["2", "3"], vec!["1", "2", "4"]].iter().enumerate() {
+        let table = d.join(format!("t{round}"));
+        let kids: Vec<_> = threads
+            .iter()
+            .map(|t| {
+                Command::new(&exe)
+                    .args(["--threads", t, "--coop", table.to_str().unwrap()])
+                    .env("MITHRIL_COOP_STATS", "1")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let mut chunks = Vec::new();
+        for k in kids {
+            let o = k.wait_with_output().unwrap();
+            assert!(o.status.success(), "{}", stderr(&o));
+            assert_eq!(stdout(&o).trim(), "1113931", "threads {threads:?}");
+            chunks.extend(coop_chunks(&stderr(&o)));
+        }
+        // whoever ran what, the chunks are disjoint and cover the fold once
+        chunks.sort();
+        assert_eq!(chunks.first().map(|c| c.0), Some(0), "{chunks:?}");
+        assert_eq!(chunks.last().map(|c| c.1), Some(128), "{chunks:?}");
+        assert!(chunks.windows(2).all(|w| w[0].1 == w[1].0), "{chunks:?}");
+    }
+}
+
+#[test]
+fn coop_runs_a_fold_with_a_non_int_argument_alone() {
+    if !codegen_ready() {
+        return;
+    }
+    // the same search with its room passed in a tuple: not offered
+    let src = SUBSET
+        .replace("def walk(j, i, k, n, room):", "def walk(j, i, k, n, rt):\n    room = rt[0]")
+        .replace("walk(j, i + 1, k, n, room - w)", "walk(j, i + 1, k, n, (room - w, 0))")
+        .replace("walk(j, i + 1, k, n, room)", "walk(j, i + 1, k, n, (room, 0))")
+        .replace("walk(j, 0, 7, n, room)", "walk(j, 0, 7, n, (room, 0))");
+    let d = fresh_dir("coop-decline");
+    let prog = write_prog(&d, &src);
+    let exe = d.join("prog");
+    assert!(mithril(&["build", prog.to_str().unwrap(), "-o", exe.to_str().unwrap()]).status.success());
+    let o = Command::new(&exe).args(["--threads", "4", "--coop", d.join("t").to_str().unwrap()]).env("MITHRIL_COOP_STATS", "1").output().unwrap();
+    assert_eq!(stdout(&o).trim(), "1113931", "{}", stderr(&o));
+}
+
+#[test]
+fn run_coop_shares_folds_between_the_cpu_and_the_gpu() {
+    if !gpu_on() {
+        return;
+    }
+    let d = fresh_dir("coop-gpu");
+    let prog = write_prog(&d, SUBSET);
+    let out = mithril(&["run", prog.to_str().unwrap(), "--coop", "--threads", "4"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "1113931");
+    // a file result: both write it, and the files must agree
+    let (a, b) = (d.join("coop.bin"), d.join("plain.bin"));
+    let out = mithril(&["run", prog.to_str().unwrap(), "--coop", "--threads", "4", "--raw", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(mithril(&["run", prog.to_str().unwrap(), "--raw", b.to_str().unwrap()]).status.success());
+    assert_eq!(fs::read(&a).unwrap(), 1113931i64.to_le_bytes());
+    assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
 }

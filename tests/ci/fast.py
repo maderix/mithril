@@ -55,7 +55,7 @@ LINUX = sys.platform.startswith("linux")
 PRIMARY = LINUX and platform.machine() == "x86_64"
 # another platform's own times; its values must equal the primary baseline's
 PLATFORM_BASELINE = os.path.join(ROOT, "tests", "ci", f"baseline-{sys.platform}-{platform.machine()}.json")
-TIMES = ("instr", "build_s", "gen_s", "full_t1_s", "full_t16_s", "gpu_ms", "gpu_wall_ms")
+TIMES = ("instr", "build_s", "gen_s", "cuda_s", "full_t1_s", "full_t16_s", "gpu_ms", "gpu_wall_ms")
 TARGET = os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target"))
 BIN = os.environ.get("MITHRIL_BIN", os.path.join(TARGET, "release", "mithril"))
 DUMP = os.path.join(TARGET, "release", "examples", "dump_gen")
@@ -66,7 +66,9 @@ BUILD_CAP_S = 60
 RUN_CAP_S = 60
 GPU_LOCK = __import__("threading").Lock()  # one device run at a time
 GPU_BUILDS = __import__("threading").Semaphore(8)  # nvcc builds at once
-GPU_BUILD_CAP_S = 300
+# the slowest device compile measured cold is near 250 s (cicc 156 s +
+# ptxas 92 s for a 4-function program: the engine dominates)
+GPU_BUILD_CAP_S = 600
 # a full-size run past these is recorded as a timeout, not waited for
 CPU_RUN_CAP_S = 30
 GPU_RUN_CAP_S = 8
@@ -103,11 +105,11 @@ MID = {
     "whitted": ["s/^    return 512$/    return 48/"],
 }
 MID.setdefault("path", ["s/^    return 256$/    return 32/", "s/^    return 64$/    return 8/"])
-TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0,
+TOL = {"segments": 1.5, "gen_lines": 1.3, "instr": 1.15, "build_s": 2.0, "gen_s": 2.0, "cuda_s": 1.25,
        "full_t1_s": 1.3, "full_t16_s": 1.5, "gpu_ms": 1.5, "gpu_wall_ms": 1.5}
 SOFT = set()
 # below these a time is noise, never a failure
-FLOOR = {"build_s": 2.0, "gen_s": 1.0, "full_t1_s": 0.05, "full_t16_s": 0.05, "gpu_ms": 2.0, "gpu_wall_ms": 300.0}
+FLOOR = {"build_s": 2.0, "gen_s": 1.0, "cuda_s": 10.0, "full_t1_s": 0.05, "full_t16_s": 0.05, "gpu_ms": 2.0, "gpu_wall_ms": 300.0}
 HAS_GPU = shutil.which("nvidia-smi") is not None and subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode == 0
 RUN_ENV = dict(os.environ, MITHRIL_NODES=str(1 << 28), MITHRIL_RECS=str(1 << 26))
 
@@ -220,9 +222,14 @@ def measure(name, tmp, gpu, update, base):
     if gpu:
         r["_gpu"] = os.path.join(tmp, f"{name}.full.gpu")
         with GPU_BUILDS:
-            if run(capped([BIN, "build", "--gpu", source(name), "-o", r["_gpu"]]), GPU_BUILD_CAP_S)[0] != 0:
-                r["error"] = "device build failed"
+            rc, out, err, dt = run(capped([BIN, "build", "--gpu", source(name), "-o", r["_gpu"]]), GPU_BUILD_CAP_S)
+            if rc != 0:
+                r["error"] = f"device build failed ({dt:.0f} s): " + err.strip()[-160:]
                 return r
+            # the recorded compile (cicc + ptxas), cached or not: --cold-gpu recompiles
+            m = re.search(r"device compile ([0-9.]+) s", out)
+            if m:
+                r["cuda_s"] = float(m.group(1))
     if name in MID:
         msrc = variant(name, MID[name], tmp, "mid")
         mbin = os.path.join(tmp, f"{name}.mid")
@@ -311,6 +318,7 @@ def main():
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--no-gpu", action="store_true")
+    ap.add_argument("--cold-gpu", action="store_true", help="compile every device program afresh (an engine or lowering change)")
     a = ap.parse_args()
     for p in (BIN, DUMP):
         if not os.path.exists(p):
@@ -325,6 +333,8 @@ def main():
             base[n] = {k: v for k, v in b.items() if k not in TIMES} | {k: v for k, v in own.get(n, {}).items() if k in TIMES}
     gpu = HAS_GPU and not a.no_gpu
     tmp = tempfile.mkdtemp(prefix="mithril-ci-")
+    if a.cold_gpu:
+        os.environ["MITHRIL_GPU_CACHE"] = os.path.join(tmp, "gpu-cache")
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
         results = list(ex.map(lambda n: measure(n, tmp, gpu, a.update, base), names))
@@ -342,7 +352,7 @@ def main():
         for k in [k for k in r if k.startswith("_")]:
             del r[k]
     fails = 0
-    print(f"{'program':15} {'small':5} {'scalar':>6} {'segs':>5} {'lines':>6} {'gen':>5} {'build':>6} {'instr(G)':>9} {'t1 s':>7} {'t16 s':>7} {'gpu ms':>9} {'gpu wall':>8}  status")
+    print(f"{'program':15} {'small':5} {'scalar':>6} {'segs':>5} {'lines':>6} {'gen':>5} {'build':>6} {'cuda':>6} {'instr(G)':>9} {'t1 s':>7} {'t16 s':>7} {'gpu ms':>9} {'gpu wall':>8}  status")
     for r in results:
         b = base.get(r["name"], {})
         hard, soft = compare(r, b)
@@ -354,8 +364,11 @@ def main():
         small = {True: "PASS", False: "FAIL", None: "-"}[r.get("small_ok")]
         tm = lambda k: "timeout" if r.get(f"{k}_timeout") else str(r.get(f"{k}_s", "-"))
         gms = "timeout" if r.get("gpu_timeout") else (f"{r['gpu_ms']:.1f}" if r.get("gpu_ms") is not None else "-")
-        print(f"{r['name']:15} {small:5} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('gen_s', '-'):>5} {r.get('build_s', '-'):>6} {insg} {tm('full_t1'):>7} {tm('full_t16'):>7} {gms:>9} {str(r.get('gpu_wall_ms', '-')):>8}  {st} {notes}")
+        print(f"{r['name']:15} {small:5} {len(r.get('scalar', [])):6} {r.get('segments', '-'):>5} {r.get('gen_lines', '-'):>6} {r.get('gen_s', '-'):>5} {r.get('build_s', '-'):>6} {r.get('cuda_s', '-'):>6} {insg} {tm('full_t1'):>7} {tm('full_t16'):>7} {gms:>9} {str(r.get('gpu_wall_ms', '-')):>8}  {st} {notes}")
     print(f"total {time.time() - t0:.1f}s (builds and small checks {t1 - t0:.1f}s, timed runs {t2 - t1:.1f}s), {fails} failing")
+    slowest = max((r for r in results if r.get("cuda_s")), key=lambda r: r["cuda_s"], default=None)
+    if slowest:
+        print(f"slowest device compile: {slowest['name']} {slowest['cuda_s']} s (cicc + ptxas, as recorded when it compiled)")
     if a.update:
         # merge: `--update --only X` refreshes X and keeps every other entry;
         # off the primary platform only this platform's times are written

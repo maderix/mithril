@@ -105,16 +105,29 @@ impl Engine {
         let mut boost: i64 = 1;
         let mut prev_n: usize = 0;
         ctx0.spawn(0, boot);
+        let mut coop: Option<CoopRun> = None;
 
         thread::scope(|sc| {
             let _quit = QuitOnDrop(&pool);
             let mut spawned = false;
             loop {
                 ctx0.merge_into(&mut buckets, &mut recs);
+                // a shared fold's chunk finished: store it, start the next
+                if let Some(v) = coop.as_ref().and_then(|_| ar.take_coop()) {
+                    if coop.as_mut().is_some_and(|run| run.step(v, &mut ctx0, prog)) {
+                        coop = None;
+                    }
+                    continue;
+                }
                 // range requests run first, as one wave each round
                 let mut ranges = mem::take(&mut ctx0.range_reqs);
                 for w in &workers {
                     ranges.append(&mut lock(w).range_reqs);
+                }
+                if let Some(i) = ranges.iter().position(|r| r.kind & crate::COOP_KIND != 0) {
+                    coop = Some(CoopRun::start(ranges.remove(i), &mut ctx0));
+                    ctx0.range_reqs.append(&mut ranges);
+                    continue;
                 }
                 if !ranges.is_empty() {
                     let total: u64 = ranges.iter().map(|r| (r.hi - r.lo).max(0) as u64).sum();
@@ -165,7 +178,10 @@ impl Engine {
                     complete_ranges(&ranges, &sums, &mut ctx0, prog);
                     continue;
                 }
-                let Some((rule, work)) = pick(&buckets, &recs, &costs) else { break };
+                let Some((rule, work)) = pick(&buckets, &recs, &costs) else {
+                    assert!(coop.is_none(), "a co-execution chunk delivered nothing");
+                    break;
+                };
                 let k = rule as usize;
                 let n = buckets[k].len() + recs[k].len();
                 if std::env::var_os("MITHRIL_TRACE_PICK").is_some() { eprintln!("pick rule={rule} n={n} work={work} boost={boost} t={:.3}", T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()); }
@@ -306,6 +322,97 @@ fn complete_ranges(ranges: &[crate::RangeReq], sums: &[std::sync::atomic::Atomic
             ctx0.deliver(slot, crate::prelude::num(if r.kind == 2 { s & 0xffff_ffff } else { s }));
             ctx0.deliver(slot | 1, acc);
         }
+    }
+}
+
+/// A shared fold this engine runs (`prelude::coop_launch`). Its chunks run
+/// here one at a time, each a call of the fold over the chunk from the
+/// identity (spread over the workers like any call), delivering its
+/// partial to `COOP_SINK`. The last partial in, the total of every
+/// engine's partials completes the request as a range request completes.
+struct CoopRun {
+    req: crate::RangeReq,
+    /// `None` when the channel's table is full: the fold runs here alone
+    job: Option<mithril_core::coop::Job<'static>>,
+    chunk: mithril_core::coop::Chunk,
+    /// chunks a partner claimed and left open, run here
+    redo: Vec<mithril_core::coop::Chunk>,
+    started: std::time::Instant,
+}
+
+/// How long a partner may leave a claimed chunk open before it is run here.
+const COOP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl CoopRun {
+    fn start(req: crate::RangeReq, ctx0: &mut Wctx) -> CoopRun {
+        let channel = mithril_core::coop::channel().expect("a shared fold without a channel");
+        let job = channel.job(&crate::prelude::coop_key(&req), req.lo, req.hi);
+        let whole = mithril_core::coop::Chunk { k: 0, lo: req.lo, hi: req.hi };
+        let chunk = match &job {
+            Some(j) => j.claim(),
+            None => Some(whole),
+        };
+        let mut run = CoopRun { req, job, chunk: whole, redo: Vec::new(), started: std::time::Instant::now() };
+        match chunk {
+            Some(c) => run.spawn(c, ctx0),
+            // the partners took every chunk already: wait for them
+            None => {
+                run.chunk.k = usize::MAX;
+                ctx0.deliver(crate::COOP_SINK, 0);
+            }
+        }
+        run
+    }
+
+    fn spawn(&mut self, c: mithril_core::coop::Chunk, ctx0: &mut Wctx) {
+        self.chunk = c;
+        self.started = std::time::Instant::now();
+        let args = crate::prelude::coop_chunk_args(&self.req, c.lo, c.hi);
+        crate::prelude::spawn_call(ctx0, (1 + self.req.fid) as u16, &args, crate::COOP_SINK);
+    }
+
+    /// Chunk result `v` arrived; true once the request is complete.
+    fn step(&mut self, v: u64, ctx0: &mut Wctx, prog: &dyn Program) -> bool {
+        let Some(job) = &self.job else {
+            self.complete(crate::prelude::as_i(v), ctx0, prog);
+            return true;
+        };
+        if self.chunk.k != usize::MAX {
+            job.put(self.chunk.k, crate::prelude::as_i(v) as u64);
+            mithril_core::coop::trace("cpu", self.chunk, self.started, self.started.elapsed());
+        }
+        if let Some(c) = self.redo.pop().or_else(|| job.claim()) {
+            self.spawn(c, ctx0);
+            return false;
+        }
+        match job.finish(COOP_PATIENCE) {
+            Ok(parts) => {
+                let total = mithril_core::coop::total(&parts, self.req.kind & 3);
+                self.complete(total, ctx0, prog);
+                true
+            }
+            Err(open) => {
+                self.redo = open;
+                let c = self.redo.pop().expect("an open chunk");
+                self.spawn(c, ctx0);
+                false
+            }
+        }
+    }
+
+    /// Deliver the total and the incoming accumulator to the join record,
+    /// release the other arguments and let the next shared fold start.
+    fn complete(&self, total: i64, ctx0: &mut Wctx, prog: &dyn Program) {
+        let r = &self.req;
+        let slot = (r.rec as u64) << 3;
+        for (k, p) in r.ports.iter().enumerate() {
+            if k != r.acc as usize {
+                prog.release(*p, ctx0);
+            }
+        }
+        ctx0.deliver(slot, crate::prelude::num(total));
+        ctx0.deliver(slot | 1, r.ports[r.acc as usize]);
+        crate::prelude::COOP_BUSY.store(false, Ordering::Release);
     }
 }
 

@@ -53,6 +53,12 @@ pub use worker::{RecInfo, Wctx};
 
 /// Parent address of the reserved root record: deliver here to finish.
 pub const ROOT: u64 = 0;
+/// Slot 1 of the root record: where a co-execution chunk delivers its
+/// partial (`prelude::coop_launch`).
+pub const COOP_SINK: u64 = 1;
+/// `RangeReq::kind` bit of a fold shared with other engines: its chunks run
+/// as calls of the fold, not as native leaves (`prelude::coop_launch`).
+pub const COOP_KIND: u32 = 4;
 
 /// One queued rewrite: two operands plus an auxiliary word, all raw u64s
 /// whose meaning is fixed by the rule that consumes them.

@@ -365,7 +365,12 @@ pub fn lower(m: &CoreModule) -> (LirProgram, CoreModule) {
 }
 fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, native::FoldPlan>) -> (LirProgram, CoreModule) {
     let scal = analysis.configure(plans);
-    let Lowering { module: m_u, bodies, tys, unbox, bor, bsets, folds, native_sigs, calls } = analysis;
+    let Lowering { module: m_u, bodies, tys, unbox, bor, bsets, mut folds, native_sigs, calls } = analysis;
+    for (f, pf) in folds.iter_mut().enumerate() {
+        if let Some(pf) = pf {
+            pf.coop = scal[f].is_none();
+        }
+    }
     let m = &m_u;
     let nf = m.fns.len();
     let mut join_rule = vec![0; nf];
@@ -506,7 +511,7 @@ fn lower_inner(analysis: Lowering, plans: &std::collections::BTreeMap<u32, nativ
         if let Some(pf) = &folds[fid] {
             emit(vec![fold::join_fn(fid as u32, pf)]);
         } else if let Some(plan) = plans.get(&(fid as u32)) {
-            emit(vec![fold::join_fn(fid as u32, &fold::ParFold { acc: 0, mask32: true, tuple: (plan.seeds.len() > 1).then_some(plan.seeds.len()), fill: false })]);
+            emit(vec![fold::join_fn(fid as u32, &fold::ParFold { acc: 0, mask32: true, tuple: (plan.seeds.len() > 1).then_some(plan.seeds.len()), fill: false, coop: false })]);
         }
     }
     // Segments may enqueue further segments while being emitted.
