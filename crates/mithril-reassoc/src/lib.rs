@@ -171,54 +171,111 @@ fn collapse_block(stmts: Vec<Stmt>, whole: &[Stmt], fresh: &mut usize) -> Vec<St
 /// range(m): ...; a = array_set(a, y * m + x, e)` writes the indices 0 to
 /// n * m - 1 in order, exactly as `for i in range(n * m): y = i // m;
 /// x = i % m; ...; a = array_set(a, i, e)` does, and the flat loop is an index
-/// fill when its body is one (`fill_target`). `m` must be the same for every
-/// row, and `y` and `x` unread outside the loops (their values after an empty
-/// row differ). `whole` is the function body, `k` numbers the fresh names.
-fn collapse(y: &str, n: &Expr, outer: &[Stmt], whole: &[Stmt], k: usize) -> Option<Vec<Stmt>> {
-    let [Stmt::For(x, m, inner, None)] = outer else { return None };
-    // a `break` or `continue` belongs to the inner loop: merging would change it
+/// fill when its body is one (`fill_target`). Deeper perfect nests generalize
+/// the same way: `for v1 in range(n1): ... for vk in range(nk)` writing at
+/// `(...(v1 * n2 + v2) * n3 + ...) * nk + vk` is one loop over n1 * ... * nk
+/// cells with `vj = (i // (n(j+1) * ... * nk)) % nj`. Every inner length must
+/// be the same on every iteration of the loops around it, and the loop
+/// variables unread outside the nest (their values after an empty inner loop
+/// differ). `whole` is the function body, `k` numbers the fresh names.
+fn collapse(v1: &str, n1: &Expr, outer: &[Stmt], whole: &[Stmt], k: usize) -> Option<Vec<Stmt>> {
+    // the perfect nest: each level's body is exactly the next loop
+    let mut vars = vec![v1.to_string()];
+    let mut bounds = vec![n1.clone()];
+    let mut inner = outer;
+    while let [Stmt::For(v, n, b, None)] = inner {
+        vars.push(v.clone());
+        bounds.push(n.clone());
+        inner = b;
+    }
+    if vars.len() < 2 {
+        return None;
+    }
+    // a `break` or `continue` belongs to the innermost loop: merging would change it
     if mithril_front::desugar::has_jump(inner) {
         return None;
     }
     let (Stmt::Assign(a, Expr::Call(f, args)), work) = inner.split_last()? else { return None };
-    if f != "array_set" || args.len() != 3 || x == y {
+    if f != "array_set" || args.len() != 3 {
         return None;
     }
-    let is = |e: &Expr, v: &str| *e == Expr::Var(v.to_string());
-    let row = |e: &Expr| matches!(e, Expr::Bin(BinOp::Mul, p, q) if (is(p, y) && **q == *m) || (**p == *m && is(q, y)));
-    if !matches!(&args[1], Expr::Bin(BinOp::Add, p, q) if (row(p) && is(q, x)) || (is(p, x) && row(q))) {
+    let distinct: std::collections::BTreeSet<&String> = vars.iter().collect();
+    if distinct.len() != vars.len() {
         return None;
     }
+    if !row_major(&args[1], &vars, &bounds) {
+        return None;
+    }
+    // inner lengths are re-evaluated per iteration of the loops around them
     let mut assigned = assigned_names(inner);
-    assigned.extend([x.clone(), y.to_string()]);
-    if assigned.iter().any(|v| uses_var(m, v)) {
+    assigned.extend(vars.iter().cloned());
+    if bounds[1..].iter().any(|m| assigned.iter().any(|v| uses_var(m, v))) {
         return None;
     }
-    let this = [Stmt::For(y.to_string(), n.clone(), outer.to_vec(), None)];
-    if [y, x.as_str()].iter().any(|v| reads_of(whole, v) != reads_of(&this, v)) {
+    let this = [Stmt::For(v1.to_string(), n1.clone(), outer.to_vec(), None)];
+    if vars.iter().any(|v| reads_of(whole, v) != reads_of(&this, v)) {
         return None;
     }
-    let [rows, cols, cells, i] = ["rows", "cols", "cells", "cell"].map(|p| format!("__{p}{k}"));
+    let depth = vars.len();
+    let [cells, i] = ["cells", "cell"].map(|p| format!("__{p}{k}"));
+    // two levels keep their historical names; deeper nests number each length
+    let dims: Vec<String> = if depth == 2 {
+        vec![format!("__rows{k}"), format!("__cols{k}")]
+    } else {
+        (0..depth).map(|j| format!("__dim{k}_{j}")).collect()
+    };
     let var = |v: &str| Box::new(Expr::Var(v.to_string()));
-    let mut body = vec![
-        Stmt::Assign(y.to_string(), Expr::Bin(BinOp::FloorDiv, var(&i), var(&cols))),
-        Stmt::Assign(x.clone(), Expr::Bin(BinOp::Mod, var(&i), var(&cols))),
-    ];
+    let product = |from: usize| -> Expr {
+        let mut e = Expr::Var(dims[depth - 1].clone());
+        for j in (from..depth - 1).rev() {
+            e = Expr::Bin(BinOp::Mul, var(&dims[j]), Box::new(e));
+        }
+        e
+    };
+    let mut body = Vec::new();
+    for j in 0..depth {
+        let stride = (j + 1 < depth).then(|| product(j + 1));
+        let value = match (j, stride) {
+            // the outermost index needs no modulus; the innermost no division
+            (0, Some(st)) => Expr::Bin(BinOp::FloorDiv, var(&i), Box::new(st)),
+            (_, None) => Expr::Bin(BinOp::Mod, var(&i), var(&dims[j])),
+            (_, Some(st)) => Expr::Bin(BinOp::Mod, Box::new(Expr::Bin(BinOp::FloorDiv, var(&i), Box::new(st))), var(&dims[j])),
+        };
+        body.push(Stmt::Assign(vars[j].clone(), value));
+    }
     body.extend(work.iter().cloned());
     body.push(Stmt::Assign(a.clone(), Expr::Call(f.clone(), vec![args[0].clone(), Expr::Var(i.clone()), args[2].clone()])));
     fill_target(&i, &body)?;
-    // no rows: no cells (n * m is positive for two negative bounds)
-    let count = Expr::IfExp(
-        Box::new(Expr::Cmp(CmpOp::Gt, var(&rows), Box::new(Expr::Int(0)))),
-        Box::new(Expr::Bin(BinOp::Mul, var(&rows), var(&cols))),
-        Box::new(Expr::Int(0)),
-    );
-    Some(vec![
-        Stmt::Assign(rows, n.clone()),
-        Stmt::Assign(cols, m.clone()),
-        Stmt::Assign(cells.clone(), count),
-        Stmt::For(i, Expr::Var(cells), body, None),
-    ])
+    // an empty outer level writes nothing; a negative innermost length makes
+    // the product non-positive, so the flat loop is empty too
+    let mut count = product(0);
+    for j in (0..depth - 1).rev() {
+        count = Expr::IfExp(
+            Box::new(Expr::Cmp(CmpOp::Gt, var(&dims[j]), Box::new(Expr::Int(0)))),
+            Box::new(count),
+            Box::new(Expr::Int(0)),
+        );
+    }
+    let mut out: Vec<Stmt> = dims.iter().zip(&bounds).map(|(d, n)| Stmt::Assign(d.clone(), n.clone())).collect();
+    out.push(Stmt::Assign(cells.clone(), count));
+    out.push(Stmt::For(i, Expr::Var(cells), body, None));
+    Some(out)
+}
+
+/// `e` is the row-major index of `vars` over `bounds`: `vars[0]` for one
+/// level, and `prev * bounds[j] + vars[j]` (either operand order) after it.
+fn row_major(e: &Expr, vars: &[String], bounds: &[Expr]) -> bool {
+    let j = vars.len() - 1;
+    let is = |e: &Expr, v: &str| *e == Expr::Var(v.to_string());
+    if j == 0 {
+        return is(e, &vars[0]);
+    }
+    let scaled = |p: &Expr| match p {
+        Expr::Bin(BinOp::Mul, a, b) if **b == bounds[j] => row_major(a, &vars[..j], &bounds[..j]),
+        Expr::Bin(BinOp::Mul, a, b) if **a == bounds[j] => row_major(b, &vars[..j], &bounds[..j]),
+        _ => false,
+    };
+    matches!(e, Expr::Bin(BinOp::Add, p, q) if (scaled(p) && is(q, &vars[j])) || (is(p, &vars[j]) && scaled(q)))
 }
 
 /// How many times `stmts` read the variable `v`.

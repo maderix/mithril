@@ -709,3 +709,50 @@ fn collapsed_fills_preserve_sequential_semantics() {
     assert_eq!(got, format!("{:?}", eval_core(&plain, plain.main, &[])));
 }
 
+
+fn nested3(index: &str, mid: &str, inner: &str) -> String {
+    format!("def f(p, n, m):\n    a = array_new(p * n * m, 0)\n    for z in range(p):\n        for y in range({mid}):\n            for x in range({inner}):\n                a = array_set(a, {index}, x * 3 + y * 5 + z)\n    return a\n")
+}
+
+#[test]
+fn deeper_row_major_nests_collapse_to_one_fill() {
+    for index in ["(z * n + y) * m + x", "x + m * (n * z + y)", "(y + z * n) * m + x", "x + (y + n * z) * m"] {
+        assert!(collapsed(&nested3(index, "n", "m")), "{index}");
+    }
+    // four levels, with locals before the write
+    assert!(collapsed("def f(q, p, n, m):\n    a = array_new(q * p * n * m, 0)\n    for w in range(q):\n        for z in range(p):\n            for y in range(n):\n                for x in range(m):\n                    t = w * 7 + z * 5 + y * 3 + x\n                    a = array_set(a, ((w * p + z) * n + y) * m + x, t * t)\n    return a\n"));
+}
+
+#[test]
+fn near_miss_deeper_nests_are_not_collapsed_whole() {
+    // a stride that is not the inner length
+    assert!(!collapsed(&nested3("(z * m + y) * m + x", "n", "m")));
+    assert!(!collapsed(&nested3("(z * n + y) * n + x", "n", "m")));
+    // the variables in the wrong order
+    assert!(!collapsed(&nested3("(y * n + z) * m + x", "n", "m")));
+    // a middle length that depends on the outer variable
+    assert!(!collapsed(&nested3("(z * (n + z) + y) * m + x", "n + z", "m")));
+    // the middle level does more than the innermost loop
+    assert!(!collapsed("def f(p, n, m):\n    a = array_new(p * n * m, 0)\n    s = 0\n    for z in range(p):\n        for y in range(n):\n            s = s + 1\n            for x in range(m):\n                a = array_set(a, (z * n + y) * m + x, x)\n    return a\n"));
+    // the outer variable read after the nest
+    assert!(!collapsed("def f(p, n, m):\n    a = array_new(p * n * m, 0)\n    for z in range(p):\n        for y in range(n):\n            for x in range(m):\n                a = array_set(a, (z * n + y) * m + x, x)\n    return (a, z)\n"));
+}
+
+#[test]
+fn collapsed_deep_fills_preserve_sequential_semantics() {
+    // every sign of each of the three bounds: an empty or negative level writes nothing
+    let mut calls = Vec::new();
+    for p in [-2, 0, 1, 3] {
+        for n in [-1, 0, 2] {
+            for m in [-3, 0, 1, 4] {
+                calls.push(format!("sum(f({p}, {n}, {m}, 24))"));
+            }
+        }
+    }
+    let src = format!("def f(p, n, m, size):\n    a = array_new(size, 5)\n    for z in range(p):\n        for y in range(n):\n            for x in range(m):\n                t = x * 31 + y * 7 + z\n                a = array_set(a, (z * n + y) * m + x, t * t + 1)\n    return a\n\ndef sum(a):\n    s = 0\n    for i in range(array_len(a)):\n        s = s * 7 + array_get(a, i)\n    return s\n\ndef main():\n    r = ({})\n    return r\n", calls.join(", "));
+    let (m, _) = analyzed(&src);
+    assert!(top_loop(&m, "f").0.starts_with("__cell"));
+    let cm: CoreModule = desugar(&m).unwrap();
+    let plain = desugar(&mithril_front::parse(&src).unwrap()).unwrap();
+    assert_eq!(format!("{:?}", eval_core(&cm, cm.main, &[])), format!("{:?}", eval_core(&plain, plain.main, &[])));
+}
