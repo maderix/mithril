@@ -1,4 +1,4 @@
-//! The f32 surface (`infer`): elaboration shape, IEEE results against Rust's
+//! The f32 and f16 surface (`infer`): elaboration shape, IEEE results against Rust's
 //! binary32, inference through every construct, diagnostics, and programs
 //! without f32 left unchanged. Also the parser forms it relies on: unary
 //! minus, tuple destructuring and bare tuple returns.
@@ -363,4 +363,104 @@ fn tuple_destructuring_and_bare_tuples() {
     assert_eq!(int("def main():\n    a, b = 1, 2\n    a, b = b, a\n    return a * 10 + b\n"), 21);
     assert_eq!(run("def two():\n    return 3, 4\n\ndef main():\n    x, y = two()\n    return y, x\n"), Val::T(std::sync::Arc::new(vec![Val::I(4), Val::I(3)])));
     assert!(err("def main():\n    a, 1 = 1, 2\n    return a\n").contains("invalid assignment target"));
+}
+
+// ---- binary16 ----
+
+/// The bit pattern an f16 expression evaluates to.
+fn f16_bits(body: &str) -> u32 {
+    int(&format!("def main():\n    x = f16(0)\n    x = {body}\n    return x\n")) as u32
+}
+
+/// The f16 nearest `v` (the exact search, checked against hardware f32 in
+/// mithril-core).
+fn h(v: f64) -> u32 {
+    mithril_core::float::f64_to_f16(v) as u32
+}
+
+#[test]
+fn f16_arithmetic_rounds_once_as_binary16() {
+    // operands are f16 values; the exact result (f64 is exact for + and *,
+    // and rounds / and sqrt fine enough to round once more) rounded to f16
+    let third = 1.0 / 3.0;
+    let cases: [(&str, u32); 10] = [
+        ("f16(1) / f16(3)", h(third)),
+        ("f16(0.1) + f16(0.2)", h(f16v(h(0.1)) + f16v(h(0.2)))),
+        ("f16(65504.0) + f16(8.0)", 0x7bff),   // below halfway: largest finite
+        ("f16(65504.0) + f16(16.0)", 0x7c00),  // halfway to 2^16: infinity
+        ("f16(2049)", 0x6800),                 // a tie rounds to even (2048)
+        ("f16(2051)", 0x6802),                 // 2052
+        ("sqrt(f16(2.0))", h(2f64.sqrt())),
+        ("f16(6.0e-8) * f16(0.5)", 0),         // half the smallest subnormal: even
+        ("f16(1.0e-5)", h(1.0e-5)),            // a subnormal
+        ("-f16(0)", 0x8000),
+    ];
+    for (e, want) in cases {
+        assert_eq!(f16_bits(e), want, "{e}");
+    }
+}
+
+fn f16v(bits: u32) -> f64 {
+    f32::from_bits(mithril_core::float::f16_to_f32(bits as i64) as u32) as f64
+}
+
+#[test]
+fn an_f16_literal_rounds_once_from_its_decimal_value() {
+    // 1 + 2^-11 + 2^-30: just above halfway between 1 and the next f16;
+    // through f32 it would land on the halfway point and round to 1
+    let v = "1.000488282181322574615478515625";
+    assert_eq!(f16_bits(&format!("f16({v})")), 0x3c01);
+    assert_eq!(f16_bits(&format!("f16(1) * {v}")), 0x3c01, "as an operand");
+    assert_eq!(f16_bits(&format!("f16(-{v})")), 0xbc01);
+    assert_eq!(f16_bits("f16(-0)"), 0, "-0 is the int zero");
+    assert_eq!(f16_bits("f16(-0.0)"), 0x8000);
+}
+
+#[test]
+fn f16_conversions() {
+    let src = "def main():\n    a = f16(-2.75)\n    n = 70000\n    big = f16(n)\n    w = f32(f16(0.1))\n    return (int(a), int(big), w, f16(f32(1) / f32(3)), f16(n - 69999), int(f16(2049)))\n";
+    match run(src) {
+        Val::T(xs) => {
+            let got: Vec<i64> = xs.iter().map(|v| if let Val::I(i) = v { *i } else { panic!("{v:?}") }).collect();
+            assert_eq!((got[0], got[1], got[5]), (-2, 0, 2048), "int(): toward zero; infinity gives 0");
+            assert_eq!(got[2] as u32, (f16v(h(0.1)) as f32).to_bits(), "widening is exact");
+            assert_eq!(got[3] as u32, h((1.0f32 / 3.0) as f64), "narrowing an f32");
+            assert_eq!(got[4] as u32, 0x3c00, "an int variable");
+        }
+        v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn f16_nan_is_canonical_and_compares_false() {
+    let src = "def main():\n    z = f16(array_len(array_new(0, 0)))\n    n = z / z\n    m = -n\n    return (n, m, sqrt(f16(-1.0)), (n == n) + 2 * (n != n) + 4 * (n < z) + 8 * (z <= z))\n";
+    let r = run(src);
+    let want = Val::T(std::sync::Arc::new(vec![Val::I(0x7e00), Val::I(0x7e00), Val::I(0x7e00), Val::I(2 + 8)]));
+    assert_eq!(r, want);
+}
+
+#[test]
+fn f16_is_its_own_type() {
+    let e = err("def main():\n    x = f16(1)\n    y = f32(1)\n    return x + y\n");
+    assert!(e.contains("used both as f16 and as f32"), "{e}");
+    let e = err("def main():\n    x = f16(1)\n    for i in range(3):\n        x = x * i\n    return 0\n");
+    assert!(e.contains("used both as f16 and as an int"), "{e}");
+    let e = err("def main():\n    x = f16(1)\n    return x % 2.0\n");
+    assert!(e.contains("not defined on f16"), "{e}");
+    let e = err("def main():\n    x = f16(1)\n    if x:\n        return 1\n    return 0\n");
+    assert!(e.contains("a condition is an f16"), "{e}");
+}
+
+#[test]
+fn sqrt_follows_its_argument() {
+    // an f16 argument (also through a helper) stays f16; otherwise f32
+    let mut m = raw("def root(v):\n    return sqrt(v)\n\ndef main():\n    a = root(f16(4))\n    return a\n");
+    mithril_front::infer::elaborate(&mut m).unwrap();
+    let wide = Expr::Call("f16_to_f32".into(), vec![Expr::Var("v".into())]);
+    let want = Expr::Call("f32_to_f16".into(), vec![Expr::Call("f32_sqrt".into(), vec![wide])]);
+    assert_eq!(body(&m, "root")[0], Stmt::Return(want));
+    // an f16 result is canonical already: main is not wrapped
+    assert!(m.fns.iter().all(|f| f.name != "__main_result"));
+    assert_eq!(int("def main():\n    return sqrt(f16(4))\n"), 0x4000);
+    assert_eq!(f32_bits("sqrt(2.0)"), 2f32.sqrt().to_bits());
 }

@@ -607,7 +607,7 @@ fn run_coop_shares_folds_between_the_cpu_and_the_gpu() {
 /// f32 and f64 operation over subnormal, normal, huge, zero, infinite and NaN
 /// cases (`mithril_core::float`: IEEE round to nearest, no fusing, canonical
 /// NaN). The same constant on every machine: x86 and arm64 hosts, CUDA, Metal.
-const FLOAT_CONFORMANCE_FNV: u64 = 0xc3f7_5244_9115_34d8;
+const FLOAT_CONFORMANCE_FNV: u64 = 0x634d_cadc_1878_89af;
 
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
@@ -632,7 +632,7 @@ fn every_lane_writes_the_same_float_bits_on_every_machine() {
         let r = mithril(&a);
         assert_eq!(r.status.code(), Some(0), "{name}: {}", stderr(&r));
         let bytes = fs::read(&out).unwrap();
-        assert_eq!(bytes.len(), 6300 * 8, "{name}");
+        assert_eq!(bytes.len(), 9660 * 8, "{name}");
         assert_eq!(fnv(&bytes), FLOAT_CONFORMANCE_FNV, "{name}: float bits differ from every other backend's");
     }
 }

@@ -287,6 +287,25 @@ __device__ inline i64 f32_sqrt(i64 a) { return f32i(__fsqrt_rn(f32b(a))); }
 // NVIDIA's own NaN is 0x7fffffff.
 __device__ inline i64 f32_canon(i64 a) { float x = f32b(a); return x != x ? (i64)0x7fc00000 : a; }
 __device__ inline double canon64(double x) { return x != x ? __longlong_as_double(0x7ff8000000000000ll) : x; }
+// binary16 conversions in integer arithmetic (mithril_core::float)
+__device__ inline i64 f16_to_f32(i64 x) {
+  u32 h = (u32)x & 0xffff, sign = (h & 0x8000) << 16, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+  if (exp == 0x1f) return (i64)(sign | 0x7f800000u | (man << 13));
+  if (exp != 0) return (i64)(sign | ((exp + 112) << 23) | (man << 13));
+  if (man == 0) return (i64)sign;
+  u32 p = 31 - __clz(man);
+  return (i64)(sign | ((p + 103) << 23) | ((man << (23 - p)) & 0x7fffffu));
+}
+__device__ inline i64 f32_to_f16(i64 x) {
+  u32 f = (u32)x, sign = (f >> 16) & 0x8000, a = f & 0x7fffffffu;
+  if (a > 0x7f800000u) return 0x7e00;
+  if (a >= 0x477ff000u) return sign | 0x7c00;
+  if (a >= 0x38800000u) return sign | ((a + 0xfff + ((a >> 13) & 1) - 0x38000000u) >> 13);
+  if (a <= 0x33000000u) return sign;
+  u32 m = (a & 0x7fffffu) | 0x800000u, shift = 126 - (a >> 23);
+  u32 q = m >> shift, rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+  return sign | (q + ((rem > half || (rem == half && (q & 1))) ? 1 : 0));
+}
 __device__ inline i64 f32_lt(i64 a, i64 b) { return f32b(a) < f32b(b) ? 1 : 0; }
 __device__ inline i64 f32_le(i64 a, i64 b) { return f32b(a) <= f32b(b) ? 1 : 0; }
 __device__ inline i64 f32_from_u32(i64 a) { return f32i(__uint2float_rn((u32)a)); }
@@ -1346,7 +1365,7 @@ __device__ __noinline__ u64 tup_add(u64 a, u64 b, bool mask32) {
 #define EMPTY ((T_EXT << 56) | M56)
 #define OP_FLIP 0x100u
 #define CTAG_TUPLE 0xfffu
-#define ARR_PAIR 46u
+#define ARR_PAIR 48u
 #define LISTCAP 64
 
 __device__ inline u64 payload(u64 p) { return p & M56; }
@@ -1684,7 +1703,9 @@ __device__ __noinline__ bool net_compute(u16 code, u64 x, u64 y, u64 *out) {
     }
     case 44: *out = num(f32_le(as_i(x), as_i(y))); return true;
     case 45: *out = num(f32_canon(as_i(x))); return true;
-    case 46: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
+    case 46: *out = num(f16_to_f32(as_i(x))); return true;
+    case 47: *out = num(f32_to_f16(as_i(x))); return true;
+    case 48: { u64 fs[2] = {x, y}; *out = mk_con(0xfff, fs, 2); return true; }
     default: g_abort(AB_UNREACHABLE); return false;
     }
   }

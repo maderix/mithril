@@ -194,7 +194,9 @@ pub enum Prim {
     /// `f32_from_u32(n)` (nearest f32 to the unsigned n); `f32_to_u32(a)`
     /// (truncated toward zero; NaN, negative or >= 2^32 give 0); `f32_canon(a)`
     /// (a, with a NaN made the canonical NaN: where an f32's bits are
-    /// observed, `mithril_core::float`).
+    /// observed, `mithril_core::float`); `f16_to_f32(h)` (the f32 holding
+    /// binary16 h exactly); `f32_to_f16(a)` (the nearest binary16, ties to
+    /// even, a NaN the canonical NaN).
     F32Add,
     F32Sub,
     F32Mul,
@@ -205,6 +207,8 @@ pub enum Prim {
     F32FromU32,
     F32ToU32,
     F32Canon,
+    F16ToF32,
+    F32ToF16,
 }
 
 impl Prim {
@@ -229,6 +233,8 @@ pub fn f32_prim(p: Prim, a: &[i64]) -> i64 {
         Prim::F32FromU32 => fl::f32_from_u32(a[0]),
         Prim::F32ToU32 => fl::f32_to_u32(a[0]),
         Prim::F32Canon => fl::f32_canon(a[0]),
+        Prim::F16ToF32 => fl::f16_to_f32(a[0]),
+        Prim::F32ToF16 => fl::f32_to_f16(a[0]),
         _ => unreachable!("not a binary32 primitive: {:?}", p),
     }
 }
@@ -250,6 +256,8 @@ impl Prim {
             "f32_from_u32" => (Prim::F32FromU32, 1),
             "f32_to_u32" => (Prim::F32ToU32, 1),
             "f32_canon" => (Prim::F32Canon, 1),
+            "f16_to_f32" => (Prim::F16ToF32, 1),
+            "f32_to_f16" => (Prim::F32ToF16, 1),
             _ => return None,
         })
     }

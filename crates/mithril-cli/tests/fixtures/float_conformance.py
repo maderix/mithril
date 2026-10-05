@@ -1,4 +1,4 @@
-# Float conformance: every f32 and f64 operation over operands from
+# Float conformance: every f32, f16 and f64 operation over operands from
 # subnormal to overflow, zeros, infinities and NaN producers. Every backend
 # must write the same bytes.
 
@@ -43,6 +43,41 @@ def op32(x, y, j):
     return x - y * y
 
 
+def mag16(k):
+    m = k % 7
+    if m == 0:
+        return f16(1.0e-7)
+    if m == 1:
+        return f16(0.001)
+    if m == 2:
+        return f16(1.0)
+    if m == 3:
+        return f16(30.0)
+    if m == 4:
+        return f16(65.0)
+    if m == 5:
+        return f16(1.0e-4)
+    return f16(0.0)
+
+
+def op16(p, q, j):
+    if j == 0:
+        return p + q
+    if j == 1:
+        return p - q
+    if j == 2:
+        return p * q
+    if j == 3:
+        return p / q
+    if j == 4:
+        return sqrt(p)
+    if j == 5:
+        return p * q + p
+    if j == 6:
+        return (p * q) / (p - q)
+    return -(p / q)
+
+
 def mag64(k):
     m = k % 7
     if m == 0:
@@ -84,6 +119,12 @@ def main():
         x = f32(hash(k) % 2001 - 1000) * mag32(k)
         y = f32(hash(k + 7) % 2001 - 1000) * mag32(k // 7)
         a = array_set(a, c, op32(x, y, c % 8))
+    h = array_new(8 * n, f16(0.0))
+    for c in range(8 * n):
+        k = c // 8
+        p = f16(hash(k + 3) % 2001 - 1000) * mag16(k)
+        q = f16(hash(k + 11) % 2001 - 1000) * mag16(k // 7)
+        h = array_set(h, c, op16(p, q, c % 8))
     # f64 operands: a logistic-map sequence from a run-time seed (pure f64)
     v = array_get(array_new(n, 0.3141592653589793), 0)
     seq = array_new(n + 8, v)
@@ -96,4 +137,4 @@ def main():
         u = (array_get(seq, m) - 0.5) * mag64(m)
         w = (array_get(seq, m + 7) - 0.5) * mag64(m // 7)
         b = array_set(b, d, op64(u, w, d % 7))
-    return (a, b)
+    return (a, h, b)

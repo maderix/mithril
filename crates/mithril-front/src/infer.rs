@@ -12,6 +12,14 @@
 //! `!=` true), `sqrt(x)`, `f32(n)` (int to nearest f32, exact below 2^24)
 //! and `int(x)` (toward zero; NaN or |x| >= 2^32 gives 0). Mixing f32 with
 //! an int variable is an error: convert with `f32(n)` or `int(x)`.
+//!
+//! binary16 is the same with `f16(x)` as its source (from an int, an f32 or
+//! a literal, rounded once to nearest even). An f16 travels as its 16-bit
+//! pattern; each operation widens its operands to f32 (`f16_to_f32`),
+//! applies the f32 operation and rounds the result back (`f32_to_f16`), which
+//! gives the correctly rounded binary16 result (`mithril_core::float`).
+//! `f32(h)` widens, `int(h)` truncates. `sqrt` of a value that never meets an
+//! f16 is f32.
 
 use crate::ast::*;
 use crate::Diag;
@@ -21,6 +29,7 @@ use std::collections::{BTreeSet, HashMap};
 enum Ty {
     Var,
     F32,
+    F16,
     Int,
     Tup(Vec<usize>),
     Arr(usize),
@@ -73,6 +82,30 @@ fn int_bits(n: i64) -> i64 {
     (n as f32).to_bits() as i64
 }
 
+use mithril_core::float::f64_to_f16;
+
+fn widen(x: Expr) -> Expr {
+    Expr::Call("f16_to_f32".into(), vec![x])
+}
+
+fn narrow(x: Expr) -> Expr {
+    Expr::Call("f32_to_f16".into(), vec![x])
+}
+
+/// The value of a numeric literal argument, `-` included.
+fn literal(args: &[Expr]) -> Option<f64> {
+    match args {
+        [Expr::Float(v)] => Some(*v),
+        [Expr::Int(v)] => Some(*v as f64),
+        // an int negates as an int (`-0` is zero, not negative zero)
+        [Expr::Neg(a)] => match &**a {
+            Expr::Int(v) => Some(-(*v as f64) + 0.0),
+            a => literal(std::slice::from_ref(a)).map(|v| -v),
+        },
+        _ => None,
+    }
+}
+
 struct Infer<'m> {
     ty: Vec<Ty>,
     up: Vec<usize>,
@@ -94,6 +127,18 @@ struct Infer<'m> {
     used: BTreeSet<&'static str>,
     /// every f32 operation canonicalizes its NaN (see `Shape`)
     strict: bool,
+    /// arguments of `sqrt`: f32 unless they are f16
+    sqrts: Vec<usize>,
+}
+
+/// The class of a value at a float builtin.
+#[derive(Clone, Copy, PartialEq)]
+enum Num {
+    F32,
+    F16,
+    /// a class of float literals only
+    F64,
+    Int,
 }
 
 /// Where a value's f32 bits sit, for making its NaNs canonical where they
@@ -102,9 +147,11 @@ struct Infer<'m> {
 /// so the result is the only place an f32's bits are observed. A result whose
 /// f32 leaves cannot be located (a constructor or a closure) makes the
 /// program strict: every f32 operation canonicalizes instead.
+/// An f16 needs nothing here: every f16 result is rounded by `f32_to_f16`,
+/// whose NaN is canonical.
 #[derive(Clone, Debug, PartialEq)]
 enum Shape {
-    /// no f32 bits (ints, f64 values, whatever never met an f32)
+    /// no f32 bits (ints, f16 and f64 values, whatever never met an f32)
     Plain,
     F32,
     Tup(Vec<Shape>),
@@ -186,18 +233,20 @@ impl<'m> Infer<'m> {
         self.up[gone] = keep;
         self.flo[keep] |= self.flo[gone];
         match (ta, tb) {
-            (Ty::Var, _) | (_, Ty::Var) | (Ty::F32, Ty::F32) | (Ty::Int, Ty::Int) | (Ty::Opaque, Ty::Opaque) => {}
+            (Ty::Var, _) | (_, Ty::Var) | (Ty::F32, Ty::F32) | (Ty::F16, Ty::F16) | (Ty::Int, Ty::Int) | (Ty::Opaque, Ty::Opaque) => {}
             (Ty::Tup(xs), Ty::Tup(ys)) if xs.len() == ys.len() => xs.into_iter().zip(ys).for_each(|(x, y)| self.unify(x, y)),
             (Ty::Arr(x), Ty::Arr(y)) => self.unify(x, y),
-            (Ty::F32, t) | (t, Ty::F32) => {
+            (f @ (Ty::F32 | Ty::F16), t) | (t, f @ (Ty::F32 | Ty::F16)) => {
                 let what = match t {
+                    Ty::F32 => "f32",
                     Ty::Int => "an int",
                     Ty::Tup(_) => "a tuple",
                     Ty::Arr(_) => "an array",
                     Ty::Poison => "a value of mixed shape",
                     _ => "a constructor or closure",
                 };
-                self.err.get_or_insert(Diag::new(0, format!("in '{}': a value is used both as f32 and as {what} (convert with f32(n) or int(x))", self.cur)));
+                let (name, conv) = if f == Ty::F16 { ("f16", "f16(x)") } else { ("f32", "f32(n)") };
+                self.err.get_or_insert(Diag::new(0, format!("in '{}': a value is used both as {name} and as {what} (convert with {conv} or int(x))", self.cur)));
                 self.ty[keep] = Ty::Poison;
             }
             _ => self.ty[keep] = Ty::Poison,
@@ -276,7 +325,7 @@ impl<'m> Infer<'m> {
                 let xs: Vec<usize> = args.iter().map(|a| self.expr(a, env)).collect();
                 // a float literal written as the argument of f32() or int()
                 // is f32 (a float variable keeps its own type)
-                if matches!((args.as_slice(), f.as_str()), ([Expr::Float(_)], "f32" | "int")) && self.builtin(f, env) {
+                if matches!((args.as_slice(), f.as_str()), ([Expr::Float(_)], "f32" | "f16" | "int")) && self.builtin(f, env) {
                     self.conv.push(xs[0]);
                 }
                 self.call(f, &xs, env)
@@ -313,10 +362,11 @@ impl<'m> Infer<'m> {
         let int = |s: &mut Self, x: Option<&usize>| x.iter().for_each(|&&x| s.fresh_is(x, Ty::Int));
         match (f, xs.len()) {
             ("sqrt", 1) => {
-                self.fresh_is(xs[0], Ty::F32);
+                self.sqrts.push(xs[0]);
                 xs[0]
             }
             ("f32", 1) => self.node(Ty::F32),
+            ("f16", 1) => self.node(Ty::F16),
             ("int", 1) => self.node(Ty::Int),
             ("array_len", 1) => self.node(Ty::Int),
             ("array_new", 2) => {
@@ -446,7 +496,7 @@ impl<'m> Infer<'m> {
             Ty::Tup(xs) => Shape::Tup(xs.iter().map(|&c| self.shape(c, depth + 1)).collect()),
             Ty::Arr(e) => Shape::Arr(Box::new(self.shape(e, depth + 1))),
             Ty::Opaque | Ty::Poison => Shape::Opaque,
-            Ty::Var | Ty::Int => Shape::Plain,
+            Ty::Var | Ty::Int | Ty::F16 => Shape::Plain,
         }
     }
 
@@ -460,6 +510,29 @@ impl<'m> Infer<'m> {
         self.is(n, &Ty::F32)
     }
 
+    fn f16(&mut self, e: &Expr) -> bool {
+        let n = self.at[&(e as *const Expr)];
+        self.is(n, &Ty::F16)
+    }
+
+    fn num(&mut self, e: &Expr) -> Num {
+        if self.f32(e) {
+            Num::F32
+        } else if self.f16(e) {
+            Num::F16
+        } else if self.flo_of(e) {
+            Num::F64
+        } else {
+            Num::Int
+        }
+    }
+
+    /// `f(widened xs)` rounded back to f16.
+    fn via_f32(&mut self, f: &str, xs: Vec<Expr>) -> Expr {
+        let wide = xs.into_iter().map(widen).collect();
+        narrow(Expr::Call(f.into(), wide))
+    }
+
     fn helper(&mut self, f: &'static str, args: Vec<Expr>) -> Expr {
         self.used.insert(f);
         Expr::Call(f.into(), args)
@@ -468,15 +541,20 @@ impl<'m> Infer<'m> {
     fn ex(&mut self, e: &Expr, env: &HashMap<String, usize>) -> Result<Expr, Diag> {
         let b = |x: Expr| Box::new(x);
         let is32 = self.f32(e);
+        let is16 = self.f16(e);
         Ok(match e {
             Expr::Int(v) if is32 => Expr::Int(int_bits(*v)),
             Expr::Float(v) if is32 => Expr::Int(bits(*v)),
+            Expr::Int(v) if is16 => Expr::Int(f64_to_f16(*v as f64)),
+            Expr::Float(v) if is16 => Expr::Int(f64_to_f16(*v)),
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => e.clone(),
             Expr::Neg(a) => {
                 let x = self.ex(a, env)?;
                 let r = self.find(self.at[&(e as *const Expr)]);
                 match (&self.ty[r], self.flo[r]) {
                     (Ty::F32, _) => self.canonical(Expr::Bin(BinOp::BitXor, b(x), b(Expr::Int(SIGN)))),
+                    // through f32 like every f16 operation: a NaN stays canonical
+                    (Ty::F16, _) => narrow(Expr::Bin(BinOp::BitXor, b(widen(x)), b(Expr::Int(SIGN)))),
                     // an f64 (a class of float literals only)
                     (Ty::Var, true) => Expr::Bin(BinOp::Mul, b(Expr::Float(-1.0)), b(x)),
                     (_, true) => return Err(Diag::new(0, format!("in '{}': negation of a value used both as an int and as an f64", self.cur))),
@@ -486,10 +564,11 @@ impl<'m> Infer<'m> {
             Expr::Bin(op, x, y) => {
                 let (x, y) = (self.ex(x, env)?, self.ex(y, env)?);
                 let r = self.find(self.at[&(e as *const Expr)]);
-                if !is32 && *op == BinOp::Div && self.ty[r] == Ty::Int {
+                let float = is32 || is16;
+                if !float && *op == BinOp::Div && self.ty[r] == Ty::Int {
                     return Err(Diag::new(0, format!("in '{}': `/` on integers is a float division in Python, which Mithril does not support on ints yet; write `//` for integer division", self.cur)));
                 }
-                if !is32 {
+                if !float {
                     return Ok(Expr::Bin(*op, b(x), b(y)));
                 }
                 let f = match op {
@@ -497,14 +576,19 @@ impl<'m> Infer<'m> {
                     BinOp::Sub => "f32_sub",
                     BinOp::Mul => "f32_mul",
                     BinOp::Div => "f32_div",
-                    _ => return Err(Diag::new(0, format!("in '{}': operator {op:?} is not defined on f32", self.cur))),
+                    _ => return Err(Diag::new(0, format!("in '{}': operator {op:?} is not defined on {}", self.cur, if is16 { "f16" } else { "f32" }))),
                 };
+                if is16 {
+                    return Ok(self.via_f32(f, vec![x, y]));
+                }
                 self.canonical(Expr::Call(f.into(), vec![x, y]))
             }
             Expr::Cmp(op, x0, y0) => {
-                let on32 = self.f32(x0);
-                let (x, y) = (self.ex(x0, env)?, self.ex(y0, env)?);
-                if !on32 {
+                let (on32, on16) = (self.f32(x0), self.f16(x0));
+                let (mut x, mut y) = (self.ex(x0, env)?, self.ex(y0, env)?);
+                if on16 {
+                    (x, y) = (widen(x), widen(y));
+                } else if !on32 {
                     return Ok(Expr::Cmp(*op, b(x), b(y)));
                 }
                 let (f, args, want) = match op {
@@ -518,17 +602,29 @@ impl<'m> Infer<'m> {
                 let call = if f.starts_with("__") { self.helper("__f32_eq", args) } else { Expr::Call(f.into(), args) };
                 Expr::Cmp(want, b(call), b(Expr::Int(0)))
             }
-            Expr::Call(f, args) if args.len() == 1 && self.builtin(f, env) && ["sqrt", "f32", "int"].contains(&f.as_str()) => {
+            // an f16 literal is rounded once, from its own value
+            Expr::Call(f, args) if f == "f16" && self.builtin(f, env) && literal(&args[..]).is_some() => Expr::Int(f64_to_f16(literal(&args[..]).unwrap())),
+            Expr::Call(f, args) if args.len() == 1 && self.builtin(f, env) && ["sqrt", "f32", "f16", "int"].contains(&f.as_str()) => {
                 let a = &args[0];
-                let on32 = self.f32(a);
+                let from = self.num(a);
                 let x = self.ex(a, env)?;
-                match f.as_str() {
-                    "sqrt" => self.canonical(Expr::Call("f32_sqrt".into(), vec![x])),
-                    "int" if on32 => self.helper("__int_of_f32", vec![x]),
-                    _ if on32 => x,
-                    _ if self.flo_of(a) => return Err(Diag::new(0, format!("in '{}': {f}() of an f64 value (write the literal as f32, or keep the value f32)", self.cur))),
-                    "int" => x,
-                    _ => self.helper("__f32_of_int", vec![x]),
+                match (f.as_str(), from) {
+                    ("sqrt", Num::F16) => self.via_f32("f32_sqrt", vec![x]),
+                    ("sqrt", _) => self.canonical(Expr::Call("f32_sqrt".into(), vec![x])),
+                    (_, Num::F64) => return Err(Diag::new(0, format!("in '{}': {f}() of an f64 value (write the literal as f32, or keep the value f32)", self.cur))),
+                    ("int", Num::F32) => self.helper("__int_of_f32", vec![x]),
+                    ("int", Num::F16) => self.helper("__int_of_f32", vec![widen(x)]),
+                    ("int", Num::Int) | ("f32", Num::F32) | ("f16", Num::F16) => x,
+                    ("f32", Num::F16) => widen(x),
+                    ("f32", Num::Int) => self.helper("__f32_of_int", vec![x]),
+                    ("f16", Num::F32) => narrow(x),
+                    // an int that rounds in f32 (above 2^24) is past the f16 range
+                    // either way, so rounding through f32 is rounding once
+                    ("f16", Num::Int) => {
+                        let w = self.helper("__f32_of_int", vec![x]);
+                        narrow(w)
+                    }
+                    _ => unreachable!(),
                 }
             }
             Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| self.ex(a, env)).collect::<Result<_, _>>()?),
@@ -552,6 +648,7 @@ impl<'m> Infer<'m> {
         let r = self.find(self.at[&(e as *const Expr)]);
         let what = match &self.ty[r] {
             Ty::F32 => Some("an f32"),
+            Ty::F16 => Some("an f16"),
             Ty::Tup(_) => Some("a tuple"),
             Ty::Arr(_) => Some("an array"),
             Ty::Opaque => Some("a constructor or closure"),
@@ -642,6 +739,7 @@ fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
         err: None,
         used: BTreeSet::new(),
         strict: false,
+        sqrts: Vec::new(),
     };
     for (i, f) in src.fns.iter().enumerate() {
         s.fns.insert(&f.name, i);
@@ -662,6 +760,12 @@ fn elaborate_in(m: &mut Module) -> Result<(), Diag> {
         s.stmts(&f.body, &mut env);
     }
     s.settle();
+    for x in std::mem::take(&mut s.sqrts) {
+        let r = s.find(x);
+        if s.ty[r] != Ty::F16 {
+            s.fresh_is(x, Ty::F32);
+        }
+    }
     for x in std::mem::take(&mut s.conv) {
         let r = s.find(x);
         if s.flo[r] && s.ty[r] == Ty::Var {

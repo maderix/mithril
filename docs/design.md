@@ -579,6 +579,17 @@ against it bit for bit.
 * f64 values are boxed and leave the program only through its result, so
   each f64 operation canonicalizes its NaN at once (the cost is small
   beside the box).
+* binary16 is defined by binary32. An f16 value is its 16-bit pattern; an
+  operation widens its operands exactly (`f16_to_f32`), applies the f32
+  operation and rounds the result once to f16 (`f32_to_f16`, ties to even).
+  binary32 carries more than twice binary16's precision plus two bits, so
+  for add, sub, mul, div and sqrt that one rounding gives the correctly
+  rounded binary16 result. A backend adds two conversions for f16, written
+  in integer arithmetic so every device computes them alike, and no f16
+  arithmetic of its own. `f32_to_f16` maps every NaN to the canonical f16
+  NaN, and every f16 result passes through it, so f16 values are always
+  canonical and the result needs no pass for them. A literal written as an
+  f16 is rounded once from its decimal value, not through f32.
 
 ## 5. Lowering
 

@@ -140,7 +140,7 @@ impl<'e> Prog<Wctx<'e>> for Pg {
 
 /// Builtins on runtime values (the compile-time `compute` folds the same
 /// codes on literals). Codes < 16 are int/float arithmetic, 16..22
-/// comparisons, 32..45 the `Prim`s, 46 the (index, value) pair of a set.
+/// comparisons, 32..47 the `Prim`s, 48 the (index, value) pair of a set.
 fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
     if code >= 32 {
         return Some(match code {
@@ -163,7 +163,9 @@ fn net_compute(ctx: &mut Wctx, code: u16, x: u64, y: u64) -> Option<u64> {
             }
             44 => num(f32_le(as_i(x), as_i(y))),
             45 => num(f32_canon(as_i(x))),
-            46 => mk_con(ctx, 0xFFF, &[x, y]),
+            46 => num(f16_to_f32(as_i(x))),
+            47 => num(f32_to_f16(as_i(x))),
+            48 => mk_con(ctx, 0xFFF, &[x, y]),
             c => unreachable!("builtin code {}", c),
         });
     }

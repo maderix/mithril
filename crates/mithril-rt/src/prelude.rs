@@ -135,7 +135,10 @@ pub const ARR_RAW: u64 = 1 << 62;
 
 #[inline(always)] pub fn f32i(x: f32) -> i64 { x.to_bits() as i64 }
 // binary32 arithmetic: the shared definition (canonical NaN)
-pub use mithril_core::float::{f32_add, f32_canon, f32_div, f32_from_u32, f32_le, f32_lt, f32_mul, f32_sqrt, f32_sub, f32_to_u32};
+pub use mithril_core::float::{
+    f16_to_f32, f32_add, f32_canon, f32_div, f32_from_u32, f32_le, f32_lt, f32_mul, f32_sqrt, f32_sub,
+    f32_to_f16, f32_to_u32,
+};
 #[inline(always)]
 pub fn arr_raw(p: u64) -> bool {
     // SAFETY: as arr_rc
