@@ -590,6 +590,15 @@ against it bit for bit.
   NaN, and every f16 result passes through it, so f16 values are always
   canonical and the result needs no pass for them. A literal written as an
   f16 is rounded once from its decimal value, not through f32.
+* A device without binary64 (Metal) runs f64 in software:
+  `mithril-core/device/soft64.h`, integer arithmetic only, correctly
+  rounded, canonical NaN. The same header serves a device whose f32
+  flushes subnormals: an f32 operation on a subnormal operand or result
+  runs in software f64 and rounds once to f32, which by the same precision
+  argument as f16 is the correctly rounded f32 result. The header is one
+  text that compiles as C++ and as MSL; the host test compiles it as C++
+  and checks it against hardware binary64 and binary32, so the tested code
+  is the code the device runs.
 
 ## 5. Lowering
 
