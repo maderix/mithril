@@ -7,7 +7,7 @@
 //! `P2` structs, nested capture functions are lambdas, slice arguments
 //! are hoisted to local arrays.
 
-use mithril_codegen::lir::{Bop, FnDef, Pat, Ty, E, S};
+use mithril_codegen::lir::{Bop, FnDef, Inline, Pat, Ty, E, S};
 use mithril_codegen::{LirProgram, Rule};
 use mithril_net::{count_uses, ClosureSpec, Entry, MatchMeta, NExpr, ARR_PAIR};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -537,9 +537,15 @@ fn tuple_widths(body: &[S], out: &mut Vec<usize>) {
     }
 }
 
+/// A dive form (it returns a dive result) is compiled once, out of line.
+/// The dispatch (`prog_dive`) reaches every dive form and dives call each
+/// other: inlined, the program is copied into every function that calls
+/// the dispatch or another dive, and the device compiler compiles each
+/// copy (design.md 5.1).
 fn signature(d: &FnDef) -> String {
     let params: Vec<String> = d.params.iter().map(|(x, t)| format!("{} {x}", ty(*t))).collect();
-    format!("__device__ {} {}({})", ty(d.ret), d.name, params.join(", "))
+    let once = if d.ret == Ty::Res && d.inline != Inline::Always { "__noinline__ " } else { "" };
+    format!("__device__ {once}{} {}({})", ty(d.ret), d.name, params.join(", "))
 }
 
 /// Print `program.cu` for a lowered program.
@@ -606,7 +612,7 @@ pub fn print(prog: &LirProgram) -> String {
         out.push('\n');
     }
     // prog_dive: args[0] is the destination, the rest the arguments
-    let _ = writeln!(out, "__device__ R prog_dive(u32 f, const u64 *args, i64 *fuel) {{\n  switch (f) {{");
+    let _ = writeln!(out, "__device__ __noinline__ R prog_dive(u32 f, const u64 *args, i64 *fuel) {{\n  switch (f) {{");
     for (fid, (ar, bor)) in prog.dives.iter().enumerate() {
         let args: String = (0..*ar).map(|i| format!(", args[{}]", i + 1)).collect();
         let lent: String = (0..*ar).filter(|&i| bor[i]).map(|i| format!(" free_val(args[{}]);", i + 1)).collect();

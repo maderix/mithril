@@ -132,7 +132,19 @@ fn every_fixture_prints_as_cuda_with_the_rule_table() {
             }
         };
         assert!(cu.contains("#include \"engine.cu\""), "{name}: no engine include");
-        assert!(cu.contains("__device__ R prog_dive("), "{name}: no dive dispatcher");
+        assert!(cu.contains("__device__ __noinline__ R prog_dive("), "{name}: no out-of-line dive dispatcher");
+        // a dive form is compiled once, out of line (design.md 5.1); one left
+        // inlinable (a call-free leaf) must not reach other dives, or each
+        // copy would carry the program
+        for def in cu.split("\n__device__ R ").skip(1).filter(|d| d.starts_with('d') && d.contains(") {\n")) {
+            let (head, body) = def.split_once(") {\n").unwrap();
+            let body = body.split("\n}\n").next().unwrap_or("");
+            let own = head.split('(').next().unwrap();
+            let calls = ["d_", "dd_", "q_", "prog_dive(", "dive_to(", "dive_res"]
+                .iter()
+                .any(|c| body.match_indices(c).any(|(i, _)| !body[..i].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_') && !body[i..].starts_with(own)));
+            assert!(!calls, "{name}: inlinable dive form {own} calls other dives");
+        }
         assert!(cu.contains("__device__ void prog_fire("), "{name}: no fire dispatcher");
         assert!(cu.contains("case 0u: fc_"), "{name}: no boot rule");
         for tok in ["let ", "&mut", "match ", "Ok(", "Err(", "::<", "u16_(", "wrapping_"] {

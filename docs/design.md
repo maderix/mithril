@@ -561,14 +561,25 @@ lambdas, slice arguments are hoisted to local arrays, and C operand
 widths come from the IR's declared local types. Device code is compiled
 by nvcc in a container and cached by source hash.
 
-Device inlining follows two measured rules. Non-trivial runtime functions
-are `__noinline__`: inlining the rule table into every caller produced
-437K lines of PTX and a 5-minute ptxas for a 3-function program, against
-29K lines and 4 s. Small helpers are inlined: a `__noinline__` call out of
-a 200-register function spills through local memory, 1.7M cycles per
-tree-node visit (clock64 profile). Float arithmetic on the device uses
-the `_rn` intrinsics, so it never contracts into fma; with contraction
-nbody printed a different checksum.
+Device inlining follows three rules, all about how often the device
+compiler sees the same code:
+
+* Non-trivial runtime functions are `__noinline__`. Inlined, the rule
+  table would be copied into every caller.
+* Every dive form, and the dive dispatch (`prog_dive`), is `__noinline__`.
+  The dispatch reaches every dive, and dives call each other, so inlining
+  copies the whole program into each function that calls the dispatch
+  and into each dive that calls another. The device compiler would then
+  compile the program once per copy, and compile time would follow the
+  shape of the call graph instead of the program's size. Out of line,
+  each dive is compiled once. The cost is a real call per dive on the
+  device, felt where a hot path makes a dive call per element (section
+  12).
+* Small helpers are inlined: a `__noinline__` call out of a
+  register-heavy function saves its registers through local memory.
+
+Float arithmetic on the device uses the `_rn` intrinsics, so it never
+contracts into fma; contraction changes results.
 
 ### 5.2 Forms
 
@@ -1389,8 +1400,7 @@ reduction runs before spilling to the net rule;
 
 A standalone run pays its setup every time. It creates the CUDA context,
 loads the program's module, allocates the arenas, and frees all of them
-at the end. For the path tracer that is about 145 ms around a 10 ms
-render.
+at the end. For a short program the setup costs more than the run.
 
 A **session** (`GpuSession`) keeps three things between runs:
 
@@ -1418,11 +1428,9 @@ then programs with other layouts, a failed run and a stack doubling, and
 checks every answer against the oracle. It also checks that closing the
 session returns the device memory.
 
-`mithril exec a.gpu b.gpu ...` runs several artefacts in one session. On
-the 4090, 16 runs of the path tracer took 2.52 s as 16 processes and
-0.56 s in one session: 157 ms per job against 35 ms, with identical
-output. The first job still pays the context; module load and allocation
-are paid once per program.
+`mithril exec a.gpu b.gpu ...` runs several artefacts in one session. The
+first job pays the context; module load and allocation are paid once per
+program.
 
 ## 8. Verification
 
@@ -1531,12 +1539,10 @@ families meet the first three conditions:
 | Write-once cells | a second write is an error, a read waits for the first | join records |
 | Single-writer, single-reader streams | one producer, one consumer, no select | an SPSC ring buffer |
 
-Prototypes outside the repo measured each family against its baseline (a
-16-thread CPU and the RTX 4090). Disjoint slots and privatized
-accumulators matched or beat the baseline. Global atomics did not: 256
-histogram bins under contention ran slower than one thread (0.479 s vs
-0.368 s), so an accumulator privatizes per lane and merges once. The
-disjoint-slot output sink came first because it is the simplest to add.
+Contended global atomics lose to a single thread on a small accumulator,
+so an accumulator privatizes per lane and merges once. Disjoint slots need
+no coordination at all, which made the output sink the first pattern to
+build.
 
 ### 10.1 The output sink
 
@@ -1553,8 +1559,8 @@ mithril exec prog.gpu --raw out.bin
 
 Before the sink, a result reached an image by a long route. The run
 formatted every pixel as decimal text, the CLI parsed the text back into
-numbers, and then it wrote the PPM. The decimal text for the black hole
-strip in section 11.4 runs to hundreds of megabytes.
+numbers, and then it wrote the PPM. For a large image the text dwarfed the
+image it encoded.
 
 With the sink, each lane walks its own result once and collects the
 **leaves**: the numbers of the value, depth-first, constructor names
@@ -1580,23 +1586,11 @@ program for it carries the leaves as literals, floats as their bits. A
 GPU artefact stores the printed value, which is parsed back to leaves;
 floats print in round-trip form, so the parse is exact.
 
-Measured on the demos (warm GPU, and CPU at 16 threads; old output is the
-run's text alone, before the CLI's parse and PPM write):
-
-| Program | Pixels | GPU output, text | GPU output, sink | CPU t16, text | CPU t16, sink |
-|---|---|---|---|---|---|
-| cornell_path | 256 x 256 | 6.4 ms | 1.2 ms | 0.216 s | 0.216 s |
-| cornell_whitted | 512 x 512 | 16.8 ms | 1.6 ms | 0.065 s | 0.032 s |
-| sphere_field | 1280 x 720 | 62.3 ms | 2.4 ms | 14.0 s | 14.0 s |
-| black_hole (strip) | 1280 x 28800 | 2,546 ms | 295 ms | overflows (12, item 8) | overflows (12, item 8) |
-
-Every pair writes the same bytes, and the oracle, 1 thread, 16 threads
-and the GPU agree. On 36.9 M pixels the encoder alone takes 96 ms on one
-thread, against 134 ms for a hand-written pack-and-write loop, and 50 ms
-on 16 threads. Most of the black hole's remaining GPU output time is the
-bulk read: 295 MB into pageable memory takes about 120 ms. A pinned
-buffer copies it in 13 ms, but allocating that buffer takes 121 ms per
-run.
+The oracle, every thread count and the GPU write the same bytes, the
+same bytes the text route produced. On the GPU the remaining output cost
+of a large image is the one bulk read into pageable memory: a pinned
+buffer copies faster, but allocating one per run costs as much as it
+saves.
 
 The sink's threads are runtime threads working after the net is done. The
 value is fixed by then, so they cannot change meaning, but this is not the
@@ -1608,11 +1602,10 @@ then the write, and no pass follows. That form is open (section 12).
 ### 10.2 Co-execution: the CPU and the GPU share one fold
 
 A second device helps only where the devices are comparable. A range
-launch (section 5.6.0) has native leaves, and there the GPU is 15 to 60
-times faster than 16 CPU threads, so the CPU could add a few percent at
-most. Irregular recursive work is different. Here is subsetsum (n = 36)
-split into 1,024 independent sub-searches by the take/skip choice of its
-first ten weights:
+launch (section 5.6.0) has native leaves, and there the GPU is so much
+faster than the CPU that the CPU would add little. Irregular recursive
+work is different. Here is subsetsum split into 1,024 independent
+sub-searches by the take/skip choice of its first ten weights:
 
 ```
 def main():
@@ -1624,8 +1617,8 @@ def main():
 ```
 
 Each `walk` forks a backtracking search whose size depends on `j`; the
-first quarter of the prefixes holds half the work. Alone, 15 CPU threads
-take 1.51 s and the GPU 1.91 s (process wall, median of five).
+early prefixes hold much of the work. On this search the CPU and the GPU
+are about equally fast.
 
 `mithril run f.py --coop --threads 15` runs the CPU program and the GPU
 together, and they share the fold:
@@ -1634,8 +1627,8 @@ together, and they share the fold:
    call recursive or forking code) is offered at its entry, when its range
    has at least 64 iterations. The offer is decided by the range alone, at
    the entry, so every engine running the program makes the same offer for
-   the same range. An earlier version decided by measured work and offered
-   at different points on different engines, whose keys then never met.
+   the same range. A measured cost would be known at different points on
+   different engines, and their keys would never meet.
 2. **The job.** The fold becomes a job in a table every engine maps
    (`mithril_core::coop`). Its key is the fold, its range and its
    arguments, which must all be ints; a fold with any other argument runs
@@ -1658,9 +1651,9 @@ together, and they share the fold:
 
 Each engine computes the whole program, so `--coop` also checks the two
 devices against each other: the run fails if the CPU and the GPU disagree.
-Measured on the example: 0.917 s together against 1.513 s for the CPU
-alone (median of five), the same count on every run. The CPU took the
-heavy first chunk and the GPU most of the rest.
+On the example the two finish well ahead of either alone, with the same
+count on every run, though which engine runs which chunk changes from run
+to run.
 
 The engines are two processes over a mapped file: the CPU program and the
 GPU runner keep their own link sets, and the table works unchanged between
@@ -1668,9 +1661,9 @@ threads of one process. On the GPU the host drives the job: the bridge
 records the request and `k_run` returns `COOP_LAUNCH`; the host starts each
 chunk through `k_boot` (whose arguments `k_coop_args` builds), collects its
 partial when the engine has drained it, and `k_coop_done` delivers the
-total. A second kernel holding the program's dispatch would have been
-compiled as a second copy of it: a separate chunk kernel added 40 s of
-`ptxas` (92 to 132 s) to a 4-function program. The device's offer flag
+total. Chunks start through `k_boot` rather than a kernel of their own:
+every kernel that holds the program's dispatch is a copy the device
+compiler compiles again (section 5.1). The device's offer flag
 is set before the program boots, so the GPU's offer does not depend on when
 the host reached it.
 
@@ -1846,13 +1839,11 @@ CPU:
    (Con/Num)"), before and after co-execution. Small programs of the same
    shape compile.
 
-10. Device compile cost is the engine's: a 4-function program (20 rules)
-    takes `cicc` 151 s and `ptxas` 85 s, because every program compiles the
-    whole engine with its rule dispatch inlined into `k_run` and `k_boot`.
-    Compile times are recorded per program (`compile.txt`; `mithril build
-    --gpu` prints them) and gated by fast CI (`cuda_s`, `--cold-gpu`).
-    Compiling the engine once and linking it per program, or less
-    inlining, must first show the runtime does not lose.
+10. Out-of-line dives (section 5.1) cost a real device call per dive.
+    Most programs do not notice; graph_dfs, whose hot path makes a dive
+    call per visited node, runs measurably slower than with dives
+    inlined. To profile and fix where the call sits, without bringing back
+    copies of the program.
 
 Semantic core:
 
