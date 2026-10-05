@@ -76,7 +76,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact> [--image out.ppm | --raw out.bin]";
+const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact>... [--image out.ppm | --raw out.bin]";
 
 const HELP: &str = "Mithril: compile a Python-subset program and run it on any number of threads or the GPU.
 
@@ -86,6 +86,7 @@ const HELP: &str = "Mithril: compile a Python-subset program and run it on any n
   mithril oracle f.py                      run on the reference interpreter (slow: small inputs)
   mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
   mithril exec prog                        run a program built with --gpu
+  mithril exec a b c                       run several, paying the device setup once
   mithril net f.py                         what compile-time reduction did to each function
   mithril prove f.py                       prove the program's parallel folds (Lean obligations)
 
@@ -481,23 +482,42 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
 
 /// `mithril exec <artefact>`: run a program `build --gpu` compiled, with no
 /// front end (what a timed run of a built program measures).
+/// Several artefacts run one after another in one device session, so only
+/// the first pays the device setup.
 fn cmd_exec(args: &[String]) -> Result<i32, CliErr> {
-    let path = Path::new(args.first().ok_or("exec needs the built artefact")?);
-    let sink = match &args[1..] {
-        [] => None,
-        [f, p] => Some(Sink::from_flag(f, p).ok_or_else(|| format!("unknown option '{f}'\n{USAGE}"))?),
-        _ => return Err(USAGE.into()),
-    };
-    let bytes = fs::read(path)?;
-    if let Some(v) = bytes.strip_prefix(b"MITHRIL-CONST ") {
-        let text = String::from_utf8_lossy(v).trim().to_string();
-        match &sink {
-            Some(sink) => println!("{}", write_constant(sink, &text)?),
-            None => println!("{text}"),
+    let (mut paths, mut sink) = (Vec::new(), None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a.starts_with('-') {
+            let p = it.next().ok_or_else(|| format!("{a} needs a path"))?;
+            sink = Some(Sink::from_flag(a, p).ok_or_else(|| format!("unknown option '{a}'\n{USAGE}"))?);
+        } else {
+            paths.push(PathBuf::from(a));
         }
-        return Ok(0);
     }
-    exec_gpu(path, sink.as_ref())
+    if paths.is_empty() {
+        return Err("exec needs the built artefact".into());
+    }
+    if paths.len() > 1 && sink.is_some() {
+        return Err("--image and --raw take one artefact".into());
+    }
+    if let [path] = &paths[..] {
+        if let Some(text) = constant_of(path)? {
+            match &sink {
+                Some(sink) => println!("{}", write_constant(sink, &text)?),
+                None => println!("{text}"),
+            }
+            return Ok(0);
+        }
+        return exec_gpu(path, sink.as_ref());
+    }
+    exec_gpu_session(&paths)
+}
+
+/// The value a `build --gpu` artefact of a compile-time constant holds.
+fn constant_of(path: &Path) -> Result<Option<String>, CliErr> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(bytes.strip_prefix(b"MITHRIL-CONST ").map(|v| String::from_utf8_lossy(v).trim().to_string()))
 }
 
 /// `mithril oracle f.py`: the reference interpreter's value of `main`
@@ -633,6 +653,19 @@ fn exec_gpu(path: &Path, sink: Option<&Sink>) -> Result<i32, CliErr> {
     Ok(0)
 }
 
+#[cfg(feature = "gpu")]
+fn exec_gpu_session(paths: &[PathBuf]) -> Result<i32, CliErr> {
+    let boot = mithril_rt::Redex { a: 0, b: 0, aux: mithril_rt::ROOT };
+    let session = mithril_gpu::GpuSession::open().map_err(CliErr::Other)?;
+    for path in paths {
+        match constant_of(path)? {
+            Some(text) => println!("{text}"),
+            None => println!("{}", session.run(path, boot, None).map_err(CliErr::Other)?.text),
+        }
+    }
+    Ok(0)
+}
+
 #[cfg(not(feature = "gpu"))]
 fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<(), CliErr> {
     Err("gpu support not built; rebuild with --features gpu".into())
@@ -640,6 +673,11 @@ fn build_gpu(_sm: &CoreModule, _out: &Path) -> Result<(), CliErr> {
 
 #[cfg(not(feature = "gpu"))]
 fn exec_gpu(_path: &Path, _sink: Option<&Sink>) -> Result<i32, CliErr> {
+    Err("gpu support not built; rebuild with --features gpu".into())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn exec_gpu_session(_paths: &[PathBuf]) -> Result<i32, CliErr> {
     Err("gpu support not built; rebuild with --features gpu".into())
 }
 

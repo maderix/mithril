@@ -653,3 +653,71 @@ fn gpu_deep_array_erasure_resumes_after_the_depth_bound() {
     assert_eq!(r.text, want);
     assert!(r.rounds > 1, "the remaining suffix must resume as scheduled work");
 }
+
+#[test]
+#[ignore = "requires MITHRIL_GPU=1 (sets MITHRIL_GPU_NODES and _FUEL; run --test-threads=1)"]
+fn gpu_session_runs_match_standalone_runs() {
+    if !gpu_on() {
+        return;
+    }
+    let before = {
+        let _hold = mithril_gpu::hold_context().unwrap();
+        let (want, got) = run_fixture("fib_naive.py");
+        assert_eq!(got.map(|r| r.text), Ok(want));
+        mithril_gpu::free_vram().unwrap()
+    };
+    let programs: Vec<(String, PathBuf)> = ["fib_naive.py", "tree_sum.py", "array_erase_frontier.py", "readback_values.py"]
+        .iter()
+        .map(|f| cubin_of(&fixture(f)))
+        .collect();
+    // two programs with one layout: each takes over the other's dirty buffers
+    let fib = |n: u32| format!("def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\ndef main():\n    return fib(array_len(array_new({n}, 0)))\n");
+    let twins = [cubin_of(&fib(18)), cubin_of(&fib(21))];
+    let session = mithril_gpu::GpuSession::open().unwrap();
+    assert!(mithril_gpu::GpuSession::open().is_err(), "a second session opened");
+    for k in [0, 1, 0, 1, 1, 0] {
+        let (want, cubin) = &twins[k];
+        assert_eq!(session.run(cubin, BOOT, None).map(|r| r.text).as_ref(), Ok(want), "twin {k}");
+    }
+    // the same program again (buffers and module reused), other programs
+    // (another layout frees and resizes), a failed run, and a run whose
+    // stack doubles: each gives the standalone answer
+    for k in [0, 0, 1, 0, 2, 2, 3, 1, 0] {
+        let (want, cubin) = &programs[k];
+        assert_eq!(session.run(cubin, BOOT, None).map(|r| r.text).as_ref(), Ok(want), "program {k}");
+    }
+    std::env::set_var("MITHRIL_GPU_NODES", "1024");
+    assert!(session.run(&programs[1].1, BOOT, None).is_err(), "the tree cannot fit in 1024 cells");
+    std::env::remove_var("MITHRIL_GPU_NODES");
+    for k in [1, 0] {
+        let (want, cubin) = &programs[k];
+        assert_eq!(session.run(cubin, BOOT, None).map(|r| r.text).as_ref(), Ok(want), "program {k} after a failure");
+    }
+    std::env::set_var("MITHRIL_GPU_FUEL", "1000");
+    let (want, deep) = cubin_of(DEEP600);
+    let dir = std::env::temp_dir().join(format!("mithril-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fresh = dir.join("deep.cubin");
+    std::fs::copy(&deep, &fresh).unwrap(); // no stack hint yet: it doubles
+    assert_eq!(session.run(&fresh, BOOT, None).map(|r| r.text), Ok(want));
+    std::env::remove_var("MITHRIL_GPU_FUEL");
+    let (want, cubin) = &programs[2];
+    assert_eq!(session.run(cubin, BOOT, None).map(|r| r.text).as_ref(), Ok(want), "after the doubling");
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+    // closing the session returns what it kept, and another can open
+    let _hold = mithril_gpu::hold_context().unwrap();
+    let mut lost = usize::MAX;
+    for _ in 0..10 {
+        lost = lost.min(before.saturating_sub(mithril_gpu::free_vram().unwrap()));
+        if lost < 64 << 20 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(lost < 64 << 20, "{} MiB of device memory not returned by the session", lost >> 20);
+    let again = mithril_gpu::GpuSession::open().unwrap();
+    let (want, cubin) = &programs[0];
+    assert_eq!(again.run(cubin, BOOT, None).map(|r| r.text).as_ref(), Ok(want));
+}

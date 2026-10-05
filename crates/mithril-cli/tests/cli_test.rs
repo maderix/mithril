@@ -457,3 +457,35 @@ fn a_constant_gpu_artefact_writes_the_same_bytes() {
     let out = mithril(&["exec", art.to_str().unwrap(), "--threads", "2"]);
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// Several artefacts in one `exec` print what each prints alone.
+#[cfg(feature = "gpu")]
+#[test]
+fn exec_runs_several_artefacts_in_one_session() {
+    let d = fresh_dir("exec-session");
+    let srcs = ["def main():\n    return 7\n", MIXED, "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\ndef main():\n    return fib(array_len(array_new(20, 0)))\n"];
+    let mut arts = Vec::new();
+    for (i, src) in srcs.iter().enumerate() {
+        let sub = d.join(format!("p{i}"));
+        fs::create_dir_all(&sub).unwrap();
+        let prog = write_prog(&sub, src);
+        let art = sub.join("prog.gpu");
+        let out = mithril(&["build", prog.to_str().unwrap(), "--gpu", "-o", art.to_str().unwrap()]);
+        assert!(out.status.success(), "build failed: {}", stderr(&out));
+        arts.push(art.to_str().unwrap().to_string());
+    }
+    let alone: String = arts.iter().map(|a| stdout(&mithril(&["exec", a]))).collect();
+    let mut args = vec!["exec"];
+    // repeats reuse the session's buffers and modules
+    let order = [0, 1, 2, 1, 2, 0];
+    order.iter().for_each(|&k| args.push(&arts[k]));
+    let together = mithril(&args);
+    assert_eq!(together.status.code(), Some(0), "stderr: {}", stderr(&together));
+    let lines: Vec<String> = alone.lines().map(String::from).collect();
+    let want: String = order.iter().map(|&k| format!("{}\n", lines[k])).collect();
+    assert_eq!(stdout(&together), want);
+    assert_eq!(lines[2], "6765");
+    let out = mithril(&["exec", &arts[1], &arts[2], "--raw", d.join("x.bin").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("take one artefact"), "{}", stderr(&out));
+}

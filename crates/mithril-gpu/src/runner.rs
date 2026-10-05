@@ -263,8 +263,12 @@ unsafe fn native_cache(kernel: *mut c_void, residency: i32) -> Result<(usize, u3
 }
 
 fn fnv1a(s: &str) -> u64 {
+    fnv1a_bytes(s.as_bytes())
+}
+
+fn fnv1a_bytes(s: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
+    for &b in s {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -495,6 +499,7 @@ impl GpuRunner {
                 // clean abort (a stop at the deadline too) leaves it usable.
                 if r.is_err() && cuCtxSynchronize() != 0 {
                     let _ = cuDevicePrimaryCtxReset_v2(dev);
+                    forget_session();
                 }
                 let td = std::time::Instant::now();
                 let _ = cuDevicePrimaryCtxRelease_v2(dev);
@@ -519,15 +524,29 @@ impl GpuRunner {
 
 /// What one run allocated on the device: freed (and the module unloaded)
 /// when the run ends, so the primary context holds nothing between runs.
-/// A successful run of an exiting process leaves it to the driver.
+/// A successful run of an exiting process leaves it to the driver; a
+/// successful run inside a [`GpuSession`] hands its buffers to the session.
 struct Mem {
     bufs: Vec<CUdeviceptr>,
+    /// the size and commit of each of `bufs`
+    shapes: Vec<(usize, Commit)>,
     events: Vec<*mut c_void>,
+    /// the module this run loaded and unloads (null when a session owns it)
     module: *mut c_void,
     /// a successful run of an exiting process: the driver reclaims it
     keep: bool,
     /// the kernel still runs (a timeout): the process's exit reclaims it
     abandon: bool,
+    /// buffers a session kept from its last run, taken in allocation order
+    reuse: std::collections::VecDeque<(usize, Commit, CUdeviceptr)>,
+    /// a successful run inside a session: its buffers go back to the session
+    to_session: bool,
+}
+
+impl Mem {
+    fn new() -> Mem {
+        Mem { bufs: Vec::new(), shapes: Vec::new(), events: Vec::new(), module: std::ptr::null_mut(), keep: false, abandon: false, reuse: Default::default(), to_session: false }
+    }
 }
 
 impl Drop for Mem {
@@ -537,8 +556,16 @@ impl Drop for Mem {
         }
         unsafe {
             for &e in &self.events { let _ = cuEventDestroy_v2(e); }
-            for &b in &self.bufs {
-                let _ = cuMemFree_v2(b);
+            let mut bufs: Vec<(usize, Commit, CUdeviceptr)> = self.shapes.iter().zip(&self.bufs).map(|(&(n, c), &b)| (n, c, b)).collect();
+            bufs.extend(self.reuse.drain(..));
+            let mut kept = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            match kept.as_mut() {
+                Some(k) if self.to_session => k.bufs = bufs,
+                _ => {
+                    for (_, _, b) in bufs {
+                        let _ = cuMemFree_v2(b);
+                    }
+                }
             }
             if !self.module.is_null() {
                 let _ = cuModuleUnload(self.module);
@@ -547,9 +574,74 @@ impl Drop for Mem {
     }
 }
 
+/// What a [`GpuSession`] keeps between runs: the loaded modules and the
+/// buffers of the last run, reused by the next run with the same layout
+/// (rule count and stack), so a run pays no module load, allocation or free.
+struct Kept {
+    layout: (usize, usize),
+    /// free VRAM when the layout's buffers were sized; later runs size by it,
+    /// since the kept buffers themselves are no longer free
+    vfree: usize,
+    bufs: Vec<(usize, Commit, CUdeviceptr)>,
+    modules: std::collections::HashMap<u64, usize>,
+}
+
+static SESSION: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+
+/// A persistent device session: the context, the loaded programs and the
+/// buffers stay between runs, so only the first run pays setup. Runs inside
+/// a session behave exactly as standalone runs (each starts from freshly
+/// initialized state); one session per process.
+pub struct GpuSession {
+    _hold: ContextHold,
+}
+
+impl GpuSession {
+    pub fn open() -> Result<GpuSession, String> {
+        let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        if s.is_some() {
+            return Err("mithril-gpu: a session is already open in this process".to_string());
+        }
+        let hold = hold_context()?;
+        *s = Some(Kept { layout: (0, 0), vfree: 0, bufs: Vec::new(), modules: Default::default() });
+        Ok(GpuSession { _hold: hold })
+    }
+
+    /// Run a compiled program in the session (see [`run_cubin_to`]).
+    pub fn run(&self, cubin_path: &Path, boot: Redex, sink: Option<&Sink>) -> Result<GpuResult, String> {
+        run_cubin_to(cubin_path, boot, sink)
+    }
+}
+
+impl Drop for GpuSession {
+    fn drop(&mut self) {
+        let _one = ONE_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = SESSION.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            unsafe {
+                for (_, _, b) in k.bufs {
+                    let _ = cuMemFree_v2(b);
+                }
+                for (_, m) in k.modules {
+                    let _ = cuModuleUnload(m as *mut c_void);
+                }
+            }
+        }
+    }
+}
+
+/// A device fault reset the context: everything a session kept is gone.
+fn forget_session() {
+    if let Some(k) = SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        k.bufs.clear();
+        k.modules.clear();
+        k.layout = (0, 0);
+    }
+}
+
 /// How a buffer's pages are committed.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Commit {
+    #[default]
     /// now: a per-lane table every lane writes as the kernel starts
     /// (demand paging would only move the faults into the kernel)
     Now,
@@ -567,14 +659,22 @@ enum Commit {
 /// teardown on every run). `MITHRIL_GPU_EAGER=1` commits everything now (a
 /// diagnostic: it separates demand-paging cost from the rest).
 unsafe fn alloc(mem: &mut Mem, dev: i32, n: usize, commit: Commit, what: &str) -> Result<CUdeviceptr, String> {
+    if mem.reuse.front().is_some_and(|&(m, c, _)| m == n && c == commit) {
+        let (_, _, p) = mem.reuse.pop_front().unwrap_or_default();
+        mem.bufs.push(p);
+        mem.shapes.push((n, commit));
+        return Ok(p);
+    }
     let mut p: CUdeviceptr = 0;
     if commit == Commit::Now || (commit != Commit::Shared && std::env::var_os("MITHRIL_GPU_EAGER").is_some()) {
         cu(cuMemAlloc_v2(&mut p, n.max(1)), what)?;
         mem.bufs.push(p);
+        mem.shapes.push((n, commit));
         return Ok(p);
     }
     cu(cuMemAllocManaged(&mut p, n.max(1), CU_MEM_ATTACH_GLOBAL), what)?;
     mem.bufs.push(p);
+    mem.shapes.push((n, commit));
     if commit == Commit::Shared {
         return Ok(p);
     }
@@ -676,9 +776,24 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     let t0 = std::time::Instant::now();
     cu(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack), "cuCtxSetLimit(stack)")?;
 
-    let mut mem = Mem { bufs: Vec::new(), events: Vec::new(), module: std::ptr::null_mut(), keep: false, abandon: false };
-    cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
-    let module = mem.module;
+    let mut mem = Mem::new();
+    let in_session = SESSION.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let key = fnv1a_bytes(cubin);
+    let cached = SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|k| k.modules.get(&key).copied());
+    let module = match cached {
+        Some(m) => m as *mut c_void,
+        None => {
+            let mut m: *mut c_void = std::ptr::null_mut();
+            cu(cuModuleLoadData(&mut m, cubin.as_ptr() as *const c_void), "cuModuleLoadData")?;
+            match SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                Some(k) => {
+                    k.modules.insert(key, m as usize);
+                }
+                None => mem.module = m,
+            }
+            m
+        }
+    };
     let t_load = t0.elapsed();
 
     // number of rules, published by the generated program
@@ -715,6 +830,23 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
     // all resident threads, and slack for the context/module.
     let (mut vfree, mut vtotal) = (0usize, 0usize);
     cu(cuMemGetInfo_v2(&mut vfree, &mut vtotal), "cuMemGetInfo")?;
+    if in_session {
+        // the same layout reuses the kept buffers, sized as before; another
+        // layout frees them first and sizes from what is then free
+        let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        let k = s.as_mut().ok_or("mithril-gpu: the session closed during a run")?;
+        if k.layout == (nrules, stack) {
+            vfree = k.vfree;
+            mem.reuse = std::mem::take(&mut k.bufs).into();
+        } else {
+            for (_, _, b) in k.bufs.drain(..) {
+                let _ = cuMemFree_v2(b);
+            }
+            cu(cuMemGetInfo_v2(&mut vfree, &mut vtotal), "cuMemGetInfo")?;
+            k.layout = (nrules, stack);
+            k.vfree = vfree;
+        }
+    }
     let (mut mp, mut tpm) = (0i32, 0i32);
     cu(cuDeviceGetAttribute(&mut mp, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev), "attr(mp)")?;
     cu(
@@ -1078,6 +1210,7 @@ unsafe fn run_in_ctx(cubin: &[u8], boot: Redex, dev: i32, stack: usize, sink: Op
         eprintln!("mithril-gpu: detail: boot launch {:.3} ms, prepare run {:.3} ms, readback + format {:.3} ms ({} cell bytes), stack {stack}", (t_boot - t_setup).as_secs_f64() * 1e3, (t_prepare - t_boot).as_secs_f64() * 1e3, (t0.elapsed() - t_before_read).as_secs_f64() * 1e3, cells.bytes);
     }
     mem.keep = EXITING.load(std::sync::atomic::Ordering::Relaxed);
+    mem.to_session = in_session;
     Ok(GpuResult { port: res[1], text, rounds: r[0], cell_readback_bytes: cells.bytes })
 }
 
@@ -1282,7 +1415,7 @@ mod tests {
             let (mut before, mut total) = (0, 0);
             cu(cuMemGetInfo_v2(&mut before, &mut total), "free before").unwrap();
             {
-                let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                let mut mem = Mem::new();
                 let result = Arena::allocate(2<<18, 1<<18, 8,
                     |bytes| alloc(&mut mem, dev, bytes, Commit::Now, "test arena"),
                     |_,_| Err("injected commit error".into()));
@@ -1293,7 +1426,7 @@ mod tests {
             cu(cuMemGetInfo_v2(&mut after, &mut total), "free after").unwrap();
             assert_eq!(after, before, "failed commitment leaked memory");
             for count in [1, 17, 257] { for prefix in [0, 1, 16, 257] { for width in [4, 8, REC_SIZE] {
-                let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                let mut mem = Mem::new();
                 let buffer = arena(&mut mem, dev, count, prefix, width, "test arena").unwrap();
                 buffer.poison(count, width).unwrap();
                 assert_eq!(buffer.read::<u8>(count*width).unwrap(), vec![0xCD; count*width]);
@@ -1343,7 +1476,7 @@ extern "C" __global__ void probe_{words}(unsigned* output) {{
             cu(cuDevicePrimaryCtxRetain(&mut ctx, dev), "retain").unwrap();
             let _hold = ContextHold(dev);
             cu(cuCtxSetCurrent(ctx), "current").unwrap();
-            let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+            let mut mem = Mem::new();
             cu(cuModuleLoadData(&mut mem.module, cubin.as_ptr().cast()), "load probes").unwrap();
             for words in [256, 512, 768, 1024, 1536, 2048] {
                 let name = std::ffi::CString::new(format!("probe_{words}")).unwrap();
@@ -1396,7 +1529,7 @@ extern "C" __global__ void probe_{words}(unsigned* output) {{
             cu(cuCtxSynchronize(), "complete").unwrap();
             for concurrent in [false, true] {
                 for mut stop_sent in [false, true] {
-                    let mut mem = Mem { bufs: vec![], events: vec![], module: std::ptr::null_mut(), keep: false, abandon: false };
+                    let mut mem = Mem::new();
                     let start = std::time::Instant::now() - std::time::Duration::from_secs(3);
                     let result = wait_stream(&mut mem, 0, concurrent, start, std::time::Duration::from_secs(2), &mut stop_sent);
                     assert!(matches!(result, Err(e) if e.starts_with(TIMEOUT) && e.ends_with("stopped")));

@@ -1385,6 +1385,45 @@ work phase. `MITHRIL_GPU_CU` runs a hand-edited `program.cu`;
 reduction runs before spilling to the net rule;
 `MITHRIL_GPU_POISON` and `MITHRIL_GPU_DEBUG` are probes.
 
+### 7.7 Sessions: setup once, many jobs
+
+A standalone run pays its setup every time. It creates the CUDA context,
+loads the program's module, allocates the arenas, and frees all of them
+at the end. For the path tracer that is about 145 ms around a 10 ms
+render.
+
+A **session** (`GpuSession`) keeps three things between runs:
+
+* the context, which stays retained while the session is open;
+* each program's module, loaded once and cached by the bytes of its
+  cubin;
+* the buffers of the last run. The next run with the same layout (rule
+  count and stack size) takes them back in allocation order, instead of
+  allocating new ones.
+
+Arena sizes depend on free device memory, and the kept buffers are not
+free. The session therefore records the free memory it measured when it
+sized a layout, and later runs of that layout size by the recorded value.
+They ask for the same sizes and get the kept buffers back. A run with
+another layout frees the kept buffers, measures again and becomes the
+kept layout. A device fault resets the context and invalidates everything
+kept, so the session forgets it.
+
+A run in a session initializes the same state as a standalone run: every
+counter, bump pointer and list head is written before launch. Only the
+contents of the arenas differ, and those carry nothing a run can rely on,
+because a fresh allocation is not zeroed either. A test runs two programs
+with one layout back to back (each takes over the other's used buffers),
+then programs with other layouts, a failed run and a stack doubling, and
+checks every answer against the oracle. It also checks that closing the
+session returns the device memory.
+
+`mithril exec a.gpu b.gpu ...` runs several artefacts in one session. On
+the 4090, 16 runs of the path tracer took 2.52 s as 16 processes and
+0.56 s in one session: 157 ms per job against 35 ms, with identical
+output. The first job still pays the context; module load and allocation
+are paid once per program.
+
 ## 8. Verification
 
 Correctness is by construction and checked by oracle. What is proved,
