@@ -187,7 +187,7 @@ fn every_scalar_operation_is_bit_equal_to_the_cpu() {
     let mut input = dev.buffer(recs.len() * 24);
     input.words_mut().copy_from_slice(&recs.concat());
     let out = dev.buffer(recs.len() * 8);
-    dev.run(&[Dispatch { pipeline: &pso, buffers: vec![&input, &out], threads: recs.len(), group: 256 }]).unwrap();
+    dev.run(&[Dispatch { pipeline: &pso, buffers: vec![&input, &out], reached: vec![], threads: recs.len(), group: 256 }]).unwrap();
     let mut bad = Vec::new();
     let mut per_op = std::collections::BTreeMap::<u64, usize>::new();
     for (r, &z) in recs.iter().zip(out.words()) {

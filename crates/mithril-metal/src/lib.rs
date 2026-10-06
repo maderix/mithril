@@ -14,6 +14,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(target_os = "macos")]
+pub mod range;
 
 /// The device's scalar operations with the software float header in front:
 /// the start of every program this backend compiles.

@@ -697,3 +697,37 @@ fn the_float_conformance_bits_are_the_same_in_strict_mode() {
         assert_eq!(fnv(&fs::read(&out).unwrap()), FLOAT_CONFORMANCE_FNV);
     }
 }
+
+// ------------------------------------------------------------------ metal
+
+/// The Metal lane (macOS): range launches on the GPU write the CPU's bytes.
+/// The fixture's folds cover int sums (wrapping and 32-bit), a fill reading
+/// a borrowed array, binary32 subnormals and guarded recursion, and one
+/// fold whose recursion outgrows the device's stack (it falls back to the
+/// CPU).
+#[test]
+fn the_metal_lane_writes_the_cpu_bytes() {
+    if !cfg!(target_os = "macos") || !codegen_ready() {
+        return;
+    }
+    let d = fresh_dir("metal");
+    for name in ["metal_ranges.py"] {
+        let prog = fixture(name);
+        let mut bytes = Vec::new();
+        for (lane, extra) in [("t1", vec![]), ("t4", vec!["--threads", "4"]), ("metal", vec!["--threads", "4", "--metal"])] {
+            let out = d.join(format!("{name}.{lane}.bin"));
+            let mut args = vec!["run", prog.to_str().unwrap(), "--raw", out.to_str().unwrap()];
+            args.extend(extra);
+            let r = Command::new(bin()).args(&args).env("MITHRIL_METAL_TRACE", "1").output().unwrap();
+            assert_eq!(r.status.code(), Some(0), "{name} {lane}: {}", stderr(&r));
+            if lane == "metal" {
+                // the GPU ran at least one fold (a request it completed)
+                assert!(stderr(&r).lines().any(|l| l.starts_with("metal: fold") && l.contains("Some(")), "{name}: no fold ran on the GPU:\n{}", stderr(&r));
+            }
+            bytes.push((lane, fs::read(&out).unwrap()));
+        }
+        for (lane, b) in &bytes[1..] {
+            assert!(*b == bytes[0].1, "{name}: {lane} differs from t1");
+        }
+    }
+}

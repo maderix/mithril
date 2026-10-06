@@ -315,7 +315,7 @@ fn apply_spawn(ctx: &mut Wctx, f: u64, a: u64, parent: u64) {
 "#;
 
 /// The `Program` impl (`{n_rules}`, `{net_rule}`, `{diving}`,
-/// `{fire_arms}`, `{dive_arms}`, `{range_arms}`).
+/// `{fire_arms}`, `{dive_arms}`, `{range_arms}`, `{range_shapes}`).
 pub const PROGRAM: &str = r#"struct Pg { fuel: u32, entries: Vec<Entry>, metas: Vec<MatchMeta> }
 
 impl Program for Pg {
@@ -358,6 +358,14 @@ impl Program for Pg {
 {range_arms}            _ => unreachable!("range fold {}", fid),
         }
     }
+    fn range_shape(&self, fid: u32) -> &'static [u8] {
+        match fid {
+{range_shapes}            _ => &[],
+        }
+    }
+    fn metal_leaves(&self) -> &'static str {
+        METAL_LEAVES
+    }
     fn release(&self, p: u64, ctx: &mut Wctx) {
         free_val(ctx, p)
     }
@@ -388,6 +396,11 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+            // range launches on the Metal GPU (macOS)
+            "--metal" => {
+                #[cfg(target_os = "macos")]
+                mithril_rt::metal::enable();
+            }
             other => pos.push(other),
         }
     }

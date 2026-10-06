@@ -166,6 +166,10 @@ impl Device {
                 for (i, b) in d.buffers.iter().enumerate() {
                     msg!((); enc, "setBuffer:offset:atIndex:", b.id => Id, 0usize => usize, i => usize);
                 }
+                // MTLResourceUsageRead | MTLResourceUsageWrite
+                for b in &d.reached {
+                    msg!((); enc, "useResource:usage:", b.id => Id, 3usize => usize);
+                }
                 let threads = Size { w: d.threads, h: 1, d: 1 };
                 let group = Size { w: d.group, h: 1, d: 1 };
                 msg!((); enc, "dispatchThreads:threadsPerThreadgroup:", threads => Size, group => Size);
@@ -188,6 +192,11 @@ impl Drop for Device {
 
 pub struct Library(Id);
 
+// Libraries and pipeline states are immutable once made, and Metal allows
+// them on any thread.
+unsafe impl Send for Library {}
+unsafe impl Sync for Library {}
+
 impl Drop for Library {
     fn drop(&mut self) {
         release(self.0);
@@ -195,6 +204,9 @@ impl Drop for Library {
 }
 
 pub struct Pipeline(Id);
+
+unsafe impl Send for Pipeline {}
+unsafe impl Sync for Pipeline {}
 
 impl Pipeline {
     /// The most threads one threadgroup of this pipeline may have.
@@ -227,6 +239,12 @@ impl Buffer {
         unsafe { std::slice::from_raw_parts(self.ptr as *const u64, self.len / 8) }
     }
 
+    /// The buffer's address in the GPU's address space (a kernel may turn
+    /// it into a pointer; the buffer must be bound to the dispatch).
+    pub fn gpu_address(&self) -> u64 {
+        msg!(u64; self.id, "gpuAddress")
+    }
+
     pub fn words_mut(&mut self) -> &mut [u64] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u64, self.len / 8) }
     }
@@ -239,10 +257,12 @@ impl Drop for Buffer {
 }
 
 /// One kernel launch: `threads` threads in groups of `group`, with the
-/// buffers bound at indices 0, 1, ...
+/// buffers bound at indices 0, 1, ...; `reached` are buffers the kernel
+/// reads and writes through device addresses only (made resident).
 pub struct Dispatch<'a> {
     pub pipeline: &'a Pipeline,
     pub buffers: Vec<&'a Buffer>,
+    pub reached: Vec<&'a Buffer>,
     pub threads: usize,
     pub group: usize,
 }

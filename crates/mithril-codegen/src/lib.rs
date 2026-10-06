@@ -44,6 +44,7 @@ mod fast;
 mod fold;
 mod native;
 mod bounds;
+pub mod cprint;
 pub mod lir;
 mod range;
 mod rewrite;
@@ -181,6 +182,12 @@ pub(crate) fn ints_of(tys: &ty::Types, fid: usize) -> std::collections::HashSet<
 /// Emit the Rust program of a module that has been specialized by the
 /// interaction rules (`mithril_net::specialize`): the residual program.
 pub fn emit_rust(m: &CoreModule) -> String {
+    emit_rust_for(m, false)
+}
+
+/// `emit_rust`, carrying the range folds' leaves in MSL when `metal` (the
+/// program then runs them on the Metal GPU when asked to, `--metal`).
+pub fn emit_rust_for(m: &CoreModule, metal: bool) -> String {
     // the passes recurse along let chains, which compile-time unfolding
     // makes long: run on a stack sized for that, not the caller's
     std::thread::scope(|s| {
@@ -189,7 +196,7 @@ pub fn emit_rust(m: &CoreModule) -> String {
             .spawn_scoped(s, move || {
                 // the CPU's stacks hold native recursion (see native::FRAMES)
                 native::FRAMES.with(|f| f.set(false));
-                emit_rust_inner(m)
+                emit_rust_inner(m, metal)
             })
             .expect("spawn codegen thread")
             .join()
@@ -664,7 +671,7 @@ fn fill(t: &str, vars: &[(&str, String)]) -> String {
 /// The CPU program: `lower` printed by `lir::rust`, plus the Rust glue
 /// (`mithril_rt::template`: prelude wrappers, net region, the `Program`
 /// impl, `main`) around the program's tables.
-fn emit_rust_inner(m: &CoreModule) -> String {
+fn emit_rust_inner(m: &CoreModule, metal: bool) -> String {
     let (prog, _m) = lower(m);
     if let Some(v) = &prog.constant {
         return constant_program(v);
@@ -731,7 +738,25 @@ fn emit_rust_inner(m: &CoreModule) -> String {
         }).collect();
         range_arms.push_str(&format!("            {} => s_{}({}&mut fuel, lo, hi{args}) as i64,\n", r.fid, r.fid, if ctx { "ctx, " } else { "" }));
     }
-    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("fill_rule", prog.fill_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms), ("range_arms", range_arms)];
+    // what a device needs to run a range request (see `Program::range_shape`)
+    let mut range_shapes = String::new();
+    for r in &prog.range_fills {
+        let shape: Vec<String> = (0..r.ints.len())
+            .map(|k| match k {
+                0 | 1 => "0",
+                _ if k == r.acc && r.kind != 0 => "3",
+                _ if k == r.acc => "4",
+                _ if r.ints[k] => "1",
+                _ => "2",
+            })
+            .map(String::from)
+            .collect();
+        range_shapes.push_str(&format!("            {} => &[{}],\n", r.fid, shape.join(", ")));
+    }
+    let leaves = if metal { cprint::msl_leaves(&prog.fns, &prog.range_fills) } else { String::new() };
+    assert!(!leaves.contains("\"##"), "MSL leaves would end the raw string");
+    out.push_str(&format!("const METAL_LEAVES: &str = r##\"{leaves}\"##;\n"));
+    let vars = [("n_rules", n_rules.to_string()), ("net_rule", net_rule.to_string()), ("fill_rule", prog.fill_rule.to_string()), ("diving", diving), ("fire_arms", fire_arms), ("dive_arms", dive_arms), ("range_arms", range_arms), ("range_shapes", range_shapes)];
     out.push_str(&fill(mithril_rt::template::PROGRAM, &vars));
     out.push_str(mithril_rt::template::MAIN);
     out

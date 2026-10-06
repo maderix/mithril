@@ -129,6 +129,26 @@ impl Engine {
                     ctx0.range_reqs.append(&mut ranges);
                     continue;
                 }
+                // requests the GPU runs complete now; the rest run here
+                #[cfg(target_os = "macos")]
+                if crate::metal::on() && !ranges.is_empty() {
+                    let (mut done, mut sums, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+                    for r in mem::take(&mut ranges) {
+                        match crate::metal::run(prog, &r) {
+                            Some(s) => {
+                                done.push(r);
+                                sums.push(std::sync::atomic::AtomicU64::new(s));
+                            }
+                            None => rest.push(r),
+                        }
+                    }
+                    complete_ranges(&done, &sums, &mut ctx0, prog);
+                    ranges = rest;
+                    if ranges.is_empty() {
+                        // the deliveries are picked up at the top of the round
+                        continue;
+                    }
+                }
                 if !ranges.is_empty() {
                     let total: u64 = ranges.iter().map(|r| (r.hi - r.lo).max(0) as u64).sum();
                     let sums: Vec<std::sync::atomic::AtomicU64> = ranges.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();

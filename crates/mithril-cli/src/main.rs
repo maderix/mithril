@@ -76,7 +76,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [--coop] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact>... [--image out.ppm | --raw out.bin]";
+const USAGE: &str = "usage: mithril <run|build|net|prove|oracle> f.py [--threads N] [--gpu] [--coop] [--metal] [-o out] [--image out.ppm | --raw out.bin] [--stats out.json] | mithril exec <artefact>... [--image out.ppm | --raw out.bin]";
 
 const HELP: &str = "Mithril: compile a Python-subset program and run it on any number of threads or the GPU.
 
@@ -84,6 +84,8 @@ const HELP: &str = "Mithril: compile a Python-subset program and run it on any n
   mithril run f.py --image out.ppm         main() returns (width, height, pixels): write the image
   mithril run f.py --raw out.bin           write every number of main()'s value as 8 bytes
   mithril run f.py --coop --threads N      the CPU and the GPU share the program's large folds
+  mithril run f.py --metal                 large proven folds run on the Metal GPU (macOS;
+                                           also build --metal, then ./prog --metal)
   mithril oracle f.py                      run on the reference interpreter (slow: small inputs)
   mithril build f.py -o prog [--gpu]       compile to an executable (run it: ./prog --threads N)
   mithril exec prog                        run a program built with --gpu
@@ -123,11 +125,13 @@ struct Opts {
     stats: Option<PathBuf>,
     /// `run`: the CPU and the GPU share the program's large folds
     coop: bool,
+    /// `run` (macOS): range launches on the Metal GPU
+    metal: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
     let (mut file, mut threads, mut gpu, mut out) = (None, None, false, None);
-    let (mut sink, mut stats, mut coop) = (None, None, false);
+    let (mut sink, mut stats, mut coop, mut metal) = (None, None, false, false);
     let mut i = 0;
     while i < args.len() {
         let path = |i: &mut usize, what: &str| -> Result<PathBuf, CliErr> {
@@ -145,6 +149,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
             }
             "--gpu" => gpu = true,
             "--coop" => coop = true,
+            "--metal" => metal = true,
             "-o" => out = Some(path(&mut i, "-o")?),
             s if s.starts_with('-') => return Err(format!("unknown option '{}'\n{}", s, USAGE).into()),
             s => {
@@ -156,7 +161,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, CliErr> {
         }
         i += 1;
     }
-    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, sink, stats, coop })
+    Ok(Opts { file: file.ok_or("missing input file")?, threads, gpu, out, sink, stats, coop, metal })
 }
 
 // ------------------------------------------------------------ front stages
@@ -251,9 +256,11 @@ fn rustc_rlib(out_dir: &Path, name: &str, src: &Path) -> Result<(), CliErr> {
         .arg(out_dir)
         .arg("-L")
         .arg(out_dir);
-    let core = out_dir.join("libmithril_core.rlib");
-    if name != "mithril_core" && core.exists() {
-        c.arg("--extern").arg(format!("mithril_core={}", core.display()));
+    for dep in ["mithril_core", "mithril_metal"] {
+        let lib = out_dir.join(format!("lib{dep}.rlib"));
+        if name != dep && lib.exists() {
+            c.arg("--extern").arg(format!("{dep}={}", lib.display()));
+        }
     }
     run_tool(c, &format!("rustc ({})", name))
 }
@@ -272,8 +279,8 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
     // runtime never serve a stale rlib
     let crates_root = workspace_root().join("crates");
     let mut key: Vec<u8> = ver.stdout.clone();
-    for c in ["mithril-core", "mithril-rt"] {
-        let src = crates_root.join(c).join("src");
+    for c in ["mithril-core/src", "mithril-core/device", "mithril-metal/src", "mithril-metal/msl", "mithril-rt/src"] {
+        let src = crates_root.join(c);
         if let Ok(rd) = fs::read_dir(&src) {
             let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
             names.sort();
@@ -294,6 +301,9 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     rustc_rlib(&tmp, "mithril_core", &crates_root.join("mithril-core/src/lib.rs"))?;
+    if cfg!(target_os = "macos") {
+        rustc_rlib(&tmp, "mithril_metal", &crates_root.join("mithril-metal/src/lib.rs"))?;
+    }
     rustc_rlib(&tmp, "mithril_rt", &crates_root.join("mithril-rt/src/lib.rs"))?;
     match fs::rename(&tmp, &dir) {
         Ok(()) => {}
@@ -309,8 +319,9 @@ fn rt_cache_dir() -> Result<PathBuf, CliErr> {
 // ----------------------------------------------------------- compile step
 
 /// Emit Rust for the specialized module and `rustc -O` it to `out_bin`.
-fn compile_program(cm: &CoreModule, out_bin: &Path) -> Result<(), CliErr> {
-    let src = mithril_codegen::emit_rust(cm);
+/// `metal`: the program carries its range leaves for the Metal GPU.
+fn compile_program(cm: &CoreModule, out_bin: &Path, metal: bool) -> Result<(), CliErr> {
+    let src = mithril_codegen::emit_rust_for(cm, metal);
     let cache = rt_cache_dir()?;
     let tmp = make_temp_dir()?;
     fs::write(tmp.join("main.rs"), src)?;
@@ -357,11 +368,14 @@ fn cmd_run(args: &[String]) -> Result<i32, CliErr> {
         let tmp = make_temp_dir()?;
         let bin = tmp.join("prog");
         let tc = std::time::Instant::now();
-        compile_program(&sm, &bin)?;
+        compile_program(&sm, &bin, o.metal)?;
         let compile = tc.elapsed().as_secs_f64();
         let mut c = Command::new(&bin);
         if let Some(t) = o.threads {
             c.args(["--threads", &t.to_string()]);
+        }
+        if o.metal {
+            c.arg("--metal");
         }
         if let Some(sink) = &o.sink {
             c.args(sink.args());
@@ -492,7 +506,7 @@ fn cmd_build(args: &[String]) -> Result<i32, CliErr> {
             None => println!("wrote {}", out.display()),
         }
     } else {
-        compile_program(&sm, out)?;
+        compile_program(&sm, out, o.metal)?;
         println!("wrote {}", out.display());
     }
     Ok(0)
@@ -669,7 +683,7 @@ fn run_coop(sm: &CoreModule, o: &Opts) -> Result<i32, CliErr> {
     };
     let tmp = make_temp_dir()?;
     let bin = tmp.join("prog");
-    compile_program(sm, &bin)?;
+    compile_program(sm, &bin, false)?;
     let cache = gpu_cache();
     fs::create_dir_all(&cache)?;
     let cubin = mithril_gpu::compile_to_cubin(&cu, &cache).map_err(CliErr::Other)?;

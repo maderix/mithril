@@ -621,9 +621,13 @@ over a `Tables` trait the program implements; the device implements it
 in `engine.cu`. The program templates (net region, `Program` impl,
 `main`) live in `mithril_rt::template`.
 
-The CUDA printer: tuples are `T<k>`/`P2` structs, capture functions are
-lambdas, slice arguments are hoisted to local arrays, and C operand
-widths come from the IR's declared local types. Device code is compiled
+The C-family printer (`mithril-codegen::cprint`) prints the same LIR in
+two dialects, CUDA and the Metal Shading Language. Tuples are
+`T<k>`/`P2` structs, capture functions are lambdas, slice arguments are
+hoisted to local arrays, and C operand widths come from the IR's
+declared local types. MSL has no `goto` and no stack pointer, so in that
+dialect a loop is left by `break` (through a flag from inside a switch),
+and the stack guard is a wrapper that counts nested guarded calls. Device code is compiled
 by nvcc in a container and cached by source hash.
 
 Device inlining follows three rules, all about how often the device
@@ -1497,6 +1501,46 @@ session returns the device memory.
 first job pays the context; module load and allocation are paid once per
 program.
 
+### 7.8 Metal: range launches on the Apple GPU
+
+The Metal backend starts with the work that dominates renders: the
+range launches of section 5.6.0. The CPU engine runs the program. When
+a round collects its range requests, each one whose fold has leaves the
+GPU can run goes to the GPU, one index per thread. The rest run on the
+CPU wave as before. A fill writes its array; a sum returns a wrapping
+total, reduced per threadgroup and then on the host.
+
+The leaves are the CPU program's own native forms. The program is lowered
+once, as for the CPU, and the C-family printer prints each range fold's
+native loop and the functions it reaches in MSL. The device's scalar
+operations (`mithril-metal/msl/ops.metal`) give the CPU's bits: ints
+wrap through unsigned arithmetic, f32 runs in hardware on normal values
+and through the software f64 of section 4.5 when a subnormal is involved,
+and f16 converts in integer arithmetic. So a request gives the same
+result on either device, and choosing the device is scheduling.
+
+A request's arrays are copied into one shared buffer and reach the leaves
+as device addresses in the CPU's block layout; after the dispatch a
+fill's array is copied back. The buffer is declared resident for reading
+and writing, because the kernel reaches it only through those addresses.
+
+Recursion in a leaf runs on the GPU's call stack, which a pipeline
+declares and the GPU reserves for every thread in flight. The printer
+bounds the frames one level of guarded recursion can take; the host
+picks the depth. A leaf that nests deeper than the stack holds faults.
+After a fault every guarded call returns at once and every loop stops
+(each MSL loop checks the fault), so the leaf ends even though its values
+no longer mean anything. The host then makes the stack deeper and runs
+the request again. If the GPU runs out of memory, it makes the stack
+shallower, and it remembers the shallowest depth that failed. A request
+that no stack holds, or that indexes an array out of bounds (the leaf
+marks the block), runs on the CPU, whose result is the same and which
+reports the fault.
+
+Leaves that MSL cannot express stay on the CPU: recursion that no guard
+bounds, boxed f64 values, and frame machines. A program carries its MSL
+leaves only when built for the GPU (`run --metal`, `build --metal`).
+
 ## 8. Verification
 
 Correctness is by construction and checked by oracle. What is proved,
@@ -1946,6 +1990,12 @@ Constraint and proofs:
     160 s. terrain's native fold reaches 1,024 chunks against 16,384 for
     the dive form (1.34 s against 0.29 s). One rule for both, tied to idle
     capacity rather than to the budget, is the next step.
+19. Metal range launches (section 7.8) are correct and slower than the
+    CPU: the cause is not yet measured (a suspect is the declared call
+    stack, which makes every leaf call a real call). Leaves that recurse
+    deeply with large frames (the black hole's `pow2`) need more stack
+    than the GPU holds and run on the CPU. A leaf that indexes out of
+    bounds keeps running on garbage until its loops end.
 
 Measurement:
 

@@ -42,6 +42,8 @@
 mod alloc;
 mod engine;
 mod worker;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod prelude;
 pub mod sync;
 pub mod template;
@@ -104,6 +106,18 @@ pub trait Program: Sync {
     /// ports (see `RangeReq`); a sum returns its partial from the identity.
     fn range_leaf(&self, _fid: u32, _lo: i64, _hi: i64, _ports: &[u64], _ctx: &mut Wctx) -> i64 {
         unreachable!("the program has no range folds")
+    }
+    /// How fold `fid`'s range request passes each port to its leaf, for a
+    /// device that runs it: 0 not an argument (the index and the bound), 1
+    /// an int, 2 an array it reads, 3 a sum's accumulator (0: a term starts
+    /// from the identity), 4 a fill's array (written).
+    fn range_shape(&self, _fid: u32) -> &'static [u8] {
+        &[]
+    }
+    /// The range folds' leaves in the Metal Shading Language
+    /// (`mithril_codegen::cprint::msl_leaves`).
+    fn metal_leaves(&self) -> &'static str {
+        ""
     }
     /// Release a value the program owns (a completed range request's ports).
     fn release(&self, _p: u64, _ctx: &mut Wctx) {}
