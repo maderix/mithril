@@ -1053,6 +1053,9 @@ against 5.3 s).
 
 ## 6. CPU runtime
 
+The three runtimes (CPU, CUDA, Metal) side by side, with what they share
+and the order for unifying them: `docs/runtime.md`.
+
 One model on CPU and device: redexes are pending rule applications;
 records are continuations waiting for `pend` values; dives run functions
 natively under a budget and split on suspension (section 5.3).
