@@ -243,13 +243,15 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 - `demos/cornell_whitted.py`, `demos/cornell_path.py`: a Whitted ray tracer and
   a path tracer of the Cornell box. Write the image with
   `mithril run --image cornell.ppm demos/cornell_path.py`.
-- `docs/examples/`: the merge sort, N-queens, Collatz and specialization
+- `examples/`: the merge sort, N-queens, Collatz and specialization
   programs used in the introduction.
 - `bench/ports/kdtree.py`: nearest-neighbour queries over a shared spatial tree,
   with an independent C implementation and a recorded checksum.
 - `bench/general/*.py`: interpreters, persistent maps, pipelines and closures.
 - `bench/lockless/`: five programs that use locks or atomics in C and Rust,
   written in Mithril with plain values, each next to its C and Rust versions.
+- `bench/metal/uniform_f32.py`: a uniform binary32 fill the CPU and the Apple
+  GPU share (`mithril run bench/metal/uniform_f32.py --threads 10 --metal`).
 
 Inspect what the compiler did with a program:
 
@@ -379,15 +381,21 @@ Bend's example set; their sources live outside this repository.
 | path | contents |
 |---|---|
 | `crates/mithril-front` | lexer, parser, type elaboration, desugaring to Core, the reference interpreter |
-| `crates/mithril-core` | ports, agents and the interaction rule table |
+| `crates/mithril-core` | ports, agents and the interaction rule table; the float definitions, software f64 (`device/soft64.h`), the output sink, the co-execution table |
 | `crates/mithril-net` | compile-time net reduction and specialization |
 | `crates/mithril-reassoc` | detection and proof of associative folds |
-| `crates/mithril-codegen` | lowering to the IR and the Rust printer |
+| `crates/mithril-codegen` | lowering to the IR, the Rust printer and the C-family printer (CUDA and Metal dialects) |
 | `crates/mithril-rt` | the CPU runtime (scheduler, workers, allocator) |
-| `crates/mithril-gpu` | the CUDA printer, the device engine (`cuda/engine.cu`) and its host runner |
+| `crates/mithril-gpu` | the CUDA program, the device engine (`cuda/engine.cu`) and its host runner |
+| `crates/mithril-metal` | the Metal backend: host layer, device scalar operations, range launches |
 | `crates/mithril-cli` | the `mithril` command |
 | `proofs/confluence` | Lean 4 proof that the core rule table is confluent |
-| `bench`, `demos`, `docs`, `tests` | programs, benchmarks, documentation and gates |
+| `examples` | the small programs of the introduction and the guide |
+| `demos` | the renders (black hole, Cornell box, sphere field), their render scripts, the compiler planning demo |
+| `bench` | benchmark programs: ports with C references, the generality corpus, the lockless set, the Metal split |
+| `docs` | the design (`design.md`), the runtimes (`runtime.md`), the guide |
+| `tests` | CI gates, end-to-end checks, the parity corpus, the starter programs |
+| `docker` | the nvcc image for device builds |
 
 ## License
 

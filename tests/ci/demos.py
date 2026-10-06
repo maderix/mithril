@@ -28,10 +28,10 @@ PROGRAMS = {
     "sphere_field": ("demos/sphere_field.py", {"width": 24, "height": 16, "spp": 2, "depth": 3, "rows": 3}, {}),
     "cornell_whitted": ("demos/cornell_whitted.py", {"size": 12}, {}),
     "cornell_path": ("demos/cornell_path.py", {"size": 8, "spp": 4}, {}),
-    "collatz": ("docs/examples/collatz.py", {}, {"array_new(300000, 0)": "array_new(3000, 0)"}),
-    "msort": ("docs/examples/msort.py", {}, {"array_new(65536, 0)": "array_new(2000, 0)"}),
-    "queens": ("docs/examples/queens.py", {}, {"array_new(10, 0)": "array_new(7, 0)"}),
-    "specialize": ("docs/examples/specialize.py", {}, {}),
+    "collatz": ("examples/collatz.py", {}, {"array_new(300000, 0)": "array_new(3000, 0)"}),
+    "msort": ("examples/msort.py", {}, {"array_new(65536, 0)": "array_new(2000, 0)"}),
+    "queens": ("examples/queens.py", {}, {"array_new(10, 0)": "array_new(7, 0)"}),
+    "specialize": ("examples/specialize.py", {}, {}),
 }
 
 
