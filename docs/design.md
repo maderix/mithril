@@ -1893,14 +1893,16 @@ oracle at 1, 4 and 16 threads.
 
 ## 12. Open items
 
+Each item is tracked as a GitHub issue (number in parentheses).
+
 Device:
 
-1. Scheduling after rule populations stop growing: per-rule high-water
+1. (#3) Scheduling after rule populations stop growing: per-rule high-water
    accounting fixes replacement and oscillation barriers (section 7.2).
    A same-rule handoff can still hide future forks. A further general policy
    needs evidence about useful exposed work and lane imbalance; changing a
    width or budget to rescue one port is not a solution.
-2. Work efficiency and divergence: baseline Nsight profiles measure 3.10 active threads
+2. (#4) Work efficiency and divergence: baseline Nsight profiles measure 3.10 active threads
    per warp instruction for symreg, 2.01 for queens, 4.71 for kdtree and
    17.86 for tree-bitonic, with about eight active warps per SM. Their
    profiled kernels use 255, 210, 224 and 226 registers respectively. These are
@@ -1908,47 +1910,47 @@ Device:
    removing native work accounting cuts queens' stream interval from
    1,192 to 771 ms but does not help symreg (1,955 to 1,966 ms). Any
    region-level accounting lowering must retain budget and stop behavior.
-3. Startup and result costs: context creation is typically about 42 ms (34--56 ms
+3. (#5) Startup and result costs: context creation is typically about 42 ms (34--56 ms
    across selected warm runs). Root-driven readback avoids cell copies for scalar
    results; aggregates referencing cells still copy the allocation
    high-water range. Kdtree's 531 ms boot interval is sequential program
    work, not context creation. Eager allocation leaves it at 523 ms, so
    managed-memory faults do not explain that cost.
-4. Global snapshots and barriers still serialize rounds. The initial
+4. (#6) Global snapshots and barriers still serialize rounds. The initial
    phase structure has the provenance in section 14; subsequent scheduling
    changes must follow Mithril's measured work and communication costs.
 
-5. Array teardown on the device is one continuation chain per array: a
+5. (#7) Array teardown on the device is one continuation chain per array: a
    single boxed array of 2^20 elements is erased over about 4,096 rounds in
    sequence. Splitting the unvisited suffix in two at each resume keeps the
    frontier bounded with logarithmic depth. The device erasure tests check
    results, not free-list balance; a double free or a leaked block would
    pass them.
 
-6. The device refcount decrement (`rc_dec` in `engine.cu`) is a bare
+6. (#8) The device refcount decrement (`rc_dec` in `engine.cu`) is a bare
    `atomicSub` with no fence before the last owner frees and reuses the
    cell: the same ordering bug the CPU had (section 8, loom). It needs a
    fence on the freeing path and a device test.
 
-7. Net-native output (section 10.1): place the result array in memory
+7. (#9) Net-native output (section 10.1): place the result array in memory
    the output reads directly (a file mapping on the CPU, mapped host
    memory on the GPU), so each fill lane's `array_set` is the write and
    no read or encode pass follows.
 
 CPU:
 
-8. The default black hole strip (1280 x 28800, 40 frames) overflows a
+8. (#10) The default black hole strip (1280 x 28800, 40 frames) overflows a
    worker stack at 16 threads (`thread 'mithril-worker' has overflowed
    its stack`), before and after the sink. One thread completes. The
    demos suite runs a 16 x 20 strip and does not reach it.
 
-9. A compile-time specializer crash: subsetsum's split fold (section 10.2)
+9. (#11) A compile-time specializer crash: subsetsum's split fold (section 10.2)
    returning `(1, 1, s & 16777215)` instead of `s` panics in
    `mithril-net` `rules.rs` ("arithmetic on mixed int/float operands
    (Con/Num)"), before and after co-execution. Small programs of the same
    shape compile.
 
-10. Out-of-line dives (section 5.1) cost a real device call per dive.
+10. (#12) Out-of-line dives (section 5.1) cost a real device call per dive.
     Most programs do not notice; graph_dfs, whose hot path makes a dive
     call per visited node, runs measurably slower than with dives
     inlined. To profile and fix where the call sits, without bringing back
@@ -1956,30 +1958,30 @@ CPU:
 
 Semantic core:
 
-12. Readback: a closure created in an arm, capturing a pattern binder and
+12. (#13) Readback: a closure created in an arm, capturing a pattern binder and
     applied twice, is an ICE in the reader (the ignored test
     `a_closure_capturing_an_arm_binder_applied_twice` in
     `specialize_test.rs`). Two specializer crashes on nested closures with
     conditionals (in `mithril-core` `net.rs` and `rules.rs`).
-13. The Dup cache is keyed by the whole selection, so a captured shared
+13. (#14) The Dup cache is keyed by the whole selection, so a captured shared
     value read under three selections is bound three times (duplicated
     work, not a wrong answer). Keying by the selections a read consults
     fixes it.
-14. The clone discipline (section 3.4) is not enforced: the compiler does
+14. (#15) The clone discipline (section 3.4) is not enforced: the compiler does
     not call `check_clone_discipline`, so a closure applied to itself
     (`f = lambda g: 3; f(f)`) compiles and runs. Undecided: run it in the
     pipeline, or state what self-application does.
 
 Constraint and proofs:
 
-15. `tail_inline` remains a Core-level rewrite in codegen with an
+15. (#16) `tail_inline` remains a Core-level rewrite in codegen with an
     unmarked threshold (64), and the inline decision uses a
     threshold (192) and a name prefix (`__while`/`__for`). Undecided:
     move into the rules, justify by a stated cost model, or mark as
     tunables with their evidence.
-16. Lean proof of confluence: the pure core is proved (section 8); the extensions (section 8, `proofs/confluence/README.md`) and the conformance link from `mithril_core::rules` to the Lean model are not.
-17. One rule-table source for the CPU and the device: not started.
-18. Split granularity across backends. A fold or fill splits while its
+16. (#17) Lean proof of confluence: the pure core is proved (section 8); the extensions (section 8, `proofs/confluence/README.md`) and the conformance link from `mithril_core::rules` to the Lean model are not.
+17. (#18) One rule-table source for the CPU and the device: not started.
+18. (#19) Split granularity across backends. A fold or fill splits while its
     estimated work exceeds the budget, and neither backend tells the split
     whether workers are idle. On the CPU every split level and join is a
     wave (about 16 us), so short parallel regions repeated in a sequential
@@ -1990,7 +1992,7 @@ Constraint and proofs:
     160 s. terrain's native fold reaches 1,024 chunks against 16,384 for
     the dive form (1.34 s against 0.29 s). One rule for both, tied to idle
     capacity rather than to the budget, is the next step.
-19. Metal range launches (section 7.8) are correct and slower than the
+19. (#20, #21) Metal range launches (section 7.8) are correct and slower than the
     CPU: the cause is not yet measured (a suspect is the declared call
     stack, which makes every leaf call a real call). Leaves that recurse
     deeply with large frames (the black hole's `pow2`) need more stack
@@ -1999,7 +2001,7 @@ Constraint and proofs:
 
 Measurement:
 
-Unconfirmed findings from source review (argued from the code, no
+Unconfirmed findings from source review (#22; argued from the code, no
 failing probe yet): an array leaking through an if-arm tuple mask; a
 thread-local read before it is set on the device path; the borrow
 inference's round cap.
