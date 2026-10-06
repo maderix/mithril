@@ -11,7 +11,10 @@ typedef uchar u8;
 // elements...]) at a device address; a handle is (T_ARR << 56) | address ----
 
 #define M56 ((u64)0xffffffffffffff)
-#define ARR_FLAGS ((u64)3 << 62)
+// a fill's staged copy has a write map after its elements: one byte per
+// element, set where the GPU writes (the host copies those back)
+#define ARR_MAP ((u64)1 << 61)
+#define ARR_FLAGS ((u64)7 << 61)
 // written over a block's refcount word when a leaf indexes out of bounds:
 // the host then runs the request on the CPU, which reports the fault
 #define ARR_FAULT ((u64)1)
@@ -31,7 +34,9 @@ inline u64 arr_set_n(u64 a, usize n, i64 i, u64 v) {
     arr_fault(a);
     return a;
   }
-  arr_block(a)[2 + i] = v;
+  device u64 *b = arr_block(a);
+  b[2 + i] = v;
+  if (b[1] & ARR_MAP) reinterpret_cast<device uchar *>(b + 2 + n)[i] = 1;
   return a;
 }
 inline u64 arr_get_r(u64 a, i64 i) { return arr_get_n(a, arr_len_of(a), i); }

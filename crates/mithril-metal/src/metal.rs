@@ -157,9 +157,17 @@ impl Device {
 
     /// Run the dispatches in order, in one command buffer, and wait. A
     /// dispatch boundary is a full barrier for device memory.
-    pub fn run(&self, dispatches: &[Dispatch]) -> Result<(), String> {
+    pub fn run(&self, dispatches: &[Dispatch]) -> Result<Timing, String> {
+        self.submit(dispatches).wait()
+    }
+
+    /// Start the dispatches (one command buffer) without waiting.
+    pub fn submit(&self, dispatches: &[Dispatch]) -> Submitted {
         pooled(|| {
+            let t0 = std::time::Instant::now();
             let cb = msg!(Id; self.queue, "commandBuffer");
+            // kept past this pool: released when the Submitted drops
+            msg!(Id; cb, "retain");
             let enc = msg!(Id; cb, "computeCommandEncoder");
             for d in dispatches {
                 msg!((); enc, "setComputePipelineState:", d.pipeline.0 => Id);
@@ -176,10 +184,50 @@ impl Device {
             }
             msg!((); enc, "endEncoding");
             msg!((); cb, "commit");
-            msg!((); cb, "waitUntilCompleted");
-            let err = msg!(Id; cb, "error");
-            if err.is_null() { Ok(()) } else { Err(error_text(err)) }
+            Submitted { cb, t0 }
         })
+    }
+}
+
+/// What a command buffer cost: from submission to completion, and on the
+/// GPU (nanoseconds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timing {
+    pub wall_ns: f64,
+    pub gpu_ns: f64,
+}
+
+/// A command buffer on its way through the GPU.
+pub struct Submitted {
+    cb: Id,
+    t0: std::time::Instant,
+}
+
+unsafe impl Send for Submitted {}
+
+impl Submitted {
+    /// The GPU has finished it (completed or failed).
+    pub fn done(&self) -> bool {
+        // MTLCommandBufferStatusCompleted = 4, MTLCommandBufferStatusError = 5
+        msg!(usize; self.cb, "status") >= 4
+    }
+
+    pub fn wait(self) -> Result<Timing, String> {
+        pooled(|| {
+            msg!((); self.cb, "waitUntilCompleted");
+            let err = msg!(Id; self.cb, "error");
+            if !err.is_null() {
+                return Err(error_text(err));
+            }
+            let gpu = msg!(f64; self.cb, "GPUEndTime") - msg!(f64; self.cb, "GPUStartTime");
+            Ok(Timing { wall_ns: self.t0.elapsed().as_nanos() as f64, gpu_ns: gpu * 1e9 })
+        })
+    }
+}
+
+impl Drop for Submitted {
+    fn drop(&mut self) {
+        release(self.cb);
     }
 }
 

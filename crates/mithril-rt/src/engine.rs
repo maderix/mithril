@@ -86,6 +86,9 @@ impl Engine {
     /// delivered to `ROOT`. Panics on arena exhaustion ("arena exhausted"),
     /// if no value reached `ROOT`, or if any rule panicked.
     pub fn run(&mut self, prog: &dyn Program, boot: Redex) -> u64 {
+        // the GPU's leaves compile while the program starts on the CPU
+        #[cfg(target_os = "macos")]
+        crate::metal::prepare(prog);
         let n_rules = prog.n_rules();
         assert!((1..=1 << 16).contains(&n_rules), "n_rules must be in 1..=65536");
         self.arena.reset();
@@ -129,30 +132,15 @@ impl Engine {
                     ctx0.range_reqs.append(&mut ranges);
                     continue;
                 }
-                // requests the GPU runs complete now; the rest run here
-                #[cfg(target_os = "macos")]
-                if crate::metal::on() && !ranges.is_empty() {
-                    let (mut done, mut sums, mut rest) = (Vec::new(), Vec::new(), Vec::new());
-                    for r in mem::take(&mut ranges) {
-                        match crate::metal::run(prog, &r) {
-                            Some(s) => {
-                                done.push(r);
-                                sums.push(std::sync::atomic::AtomicU64::new(s));
-                            }
-                            None => rest.push(r),
-                        }
-                    }
-                    complete_ranges(&done, &sums, &mut ctx0, prog);
-                    ranges = rest;
-                    if ranges.is_empty() {
-                        // the deliveries are picked up at the top of the round
-                        continue;
-                    }
-                }
                 if !ranges.is_empty() {
+                    // the GPU takes part in a wave of requests it can run
+                    #[cfg(target_os = "macos")]
+                    let gpu = ranges.iter().any(|r| crate::metal::ready(prog, r.fid));
+                    #[cfg(not(target_os = "macos"))]
+                    let gpu = false;
                     let total: u64 = ranges.iter().map(|r| (r.hi - r.lo).max(0) as u64).sum();
                     let sums: Vec<std::sync::atomic::AtomicU64> = ranges.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-                    if threads == 1 || total < RANGE_PAR {
+                    if !gpu && (threads == 1 || total < RANGE_PAR) {
                         for (q, r) in ranges.iter().enumerate() {
                             let v = prog.range_leaf(r.fid, r.lo, r.hi, &r.ports, &mut ctx0);
                             ctx0.hand_off_net();
@@ -185,7 +173,7 @@ impl Engine {
                             wv.block = (total as usize / (threads * 8)).clamp(64, 1 << 16);
                             wv.next.store(0, Ordering::Relaxed);
                         }
-                        run_wave(&pool, threads, &mut ctx0);
+                        run_wave(&pool, threads, &mut ctx0, gpu);
                         if let Some(p) = lock(&pool.panic).take() {
                             panic::resume_unwind(p);
                         }
@@ -261,7 +249,7 @@ impl Engine {
                         w.set_fuel(f);
                     }
                 }
-                run_wave(&pool, threads, &mut ctx0);
+                run_wave(&pool, threads, &mut ctx0, false);
                 if let Some(p) = lock(&pool.panic).take() {
                     panic::resume_unwind(p);
                 }
@@ -296,7 +284,7 @@ const RANGE_PAR: u64 = 1 << 12;
 /// Start the prepared wave on the pool, drain it here too, and wait for
 /// its end: spin, then park until the last worker (which sees `waiting`)
 /// notifies under the lock.
-fn run_wave(pool: &Pool, threads: usize, ctx0: &mut Wctx) {
+fn run_wave(pool: &Pool, threads: usize, ctx0: &mut Wctx, gpu: bool) {
     {
         let mut c = lock(&pool.ctrl);
         c.epoch += 1;
@@ -306,7 +294,18 @@ fn run_wave(pool: &Pool, threads: usize, ctx0: &mut Wctx) {
     if pool.parked.load(Ordering::SeqCst) > 0 {
         pool.start.notify_all();
     }
-    drain(&read(&pool.wave), ctx0);
+    // (the coordinator feeds the GPU in a range wave it takes part in)
+    #[cfg(target_os = "macos")]
+    if gpu {
+        drain_ranges_gpu(&read(&pool.wave), ctx0, threads);
+    } else {
+        drain(&read(&pool.wave), ctx0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = gpu;
+        drain(&read(&pool.wave), ctx0);
+    }
     if !spin_until(pool.spins, || pool.running.load(Ordering::Acquire) == 0) {
         let mut c = lock(&pool.ctrl);
         pool.waiting.store(true, Ordering::SeqCst);
@@ -578,6 +577,85 @@ fn drain_ranges(wv: &Wave, ctx: &mut Wctx) {
             }
             t = stop;
             q += 1;
+        }
+    }
+}
+
+/// The coordinator's part of a range wave the GPU takes part in: it keeps
+/// one block on the GPU (its size from `metal::gpu_share`) and runs CPU
+/// blocks while it is in flight, measuring the CPU's rate; a block the
+/// GPU declines runs here. The GPU's blocks come from the same counter as
+/// the CPU's, so every index runs once.
+#[cfg(target_os = "macos")]
+fn drain_ranges_gpu(wv: &Wave, ctx: &mut Wctx, threads: usize) {
+    use crate::metal;
+    let total = *wv.pre.last().unwrap_or(&0);
+    let prog = ctx.program();
+    // indices [t, end) of the wave, request by request: on the CPU, timed
+    let cpu = |ctx: &mut Wctx, t: u64, end: u64| {
+        let (mut t, mut q) = (t, wv.pre.partition_point(|&p| p <= t) - 1);
+        while t < end {
+            let r = &wv.ranges[q];
+            let stop = end.min(wv.pre[q + 1]);
+            let (lo, hi) = (r.lo + (t - wv.pre[q]) as i64, r.lo + (stop - wv.pre[q]) as i64);
+            let t0 = std::time::Instant::now();
+            let v = prog.range_leaf(r.fid, lo, hi, &r.ports, ctx);
+            metal::cpu_ran(r.fid, stop - t, t0.elapsed().as_nanos() as f64);
+            ctx.hand_off_net();
+            if r.kind != 0 {
+                wv.sums[q].fetch_add(v as u64, Ordering::Relaxed);
+            }
+            t = stop;
+            q += 1;
+        }
+    };
+    // a GPU block: (the block, its request, its wave indices)
+    let settle = |ctx: &mut Wctx, (chunk, q, t, end): (metal::Chunk, usize, u64, u64)| match chunk.finish() {
+        Some(v) => {
+            if wv.ranges[q].kind != 0 {
+                wv.sums[q].fetch_add(v, Ordering::Relaxed);
+            }
+        }
+        None => cpu(ctx, t, end),
+    };
+    let mut flight: Option<(metal::Chunk, usize, u64, u64)> = None;
+    loop {
+        if flight.as_ref().is_some_and(|f| f.0.done()) {
+            settle(ctx, flight.take().unwrap());
+        }
+        if flight.is_none() {
+            let at = (wv.next.load(Ordering::Relaxed) as u64).min(total);
+            if at < total {
+                let q = wv.pre.partition_point(|&p| p <= at) - 1;
+                let r = &wv.ranges[q];
+                let want = if metal::ready(prog, r.fid) { metal::gpu_share(r.fid, wv.pre[q + 1] - at, threads, wv.block as u64) } else { 0 };
+                if want > 0 {
+                    let t = wv.next.fetch_add(want as usize, Ordering::Relaxed) as u64;
+                    let end = (t + want).min(total);
+                    if t < end {
+                        // the GPU takes the claim's part in one request; any
+                        // part past it runs here
+                        let q = wv.pre.partition_point(|&p| p <= t) - 1;
+                        let stop = end.min(wv.pre[q + 1]);
+                        let r = &wv.ranges[q];
+                        let (lo, hi) = (r.lo + (t - wv.pre[q]) as i64, r.lo + (stop - wv.pre[q]) as i64);
+                        match metal::start(prog, r, lo, hi) {
+                            Some(c) => flight = Some((c, q, t, stop)),
+                            None => cpu(ctx, t, stop),
+                        }
+                        cpu(ctx, stop, end);
+                    }
+                }
+            }
+        }
+        match crate::sync::claim_block(&wv.next, wv.block, total as usize) {
+            Some(b) => cpu(ctx, b.start as u64, b.end as u64),
+            None => {
+                if let Some(f) = flight.take() {
+                    settle(ctx, f);
+                }
+                return;
+            }
         }
     }
 }

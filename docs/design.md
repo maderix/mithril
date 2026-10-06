@@ -1504,11 +1504,27 @@ program.
 ### 7.8 Metal: range launches on the Apple GPU
 
 The Metal backend starts with the work that dominates renders: the
-range launches of section 5.6.0. The CPU engine runs the program. When
-a round collects its range requests, each one whose fold has leaves the
-GPU can run goes to the GPU, one index per thread. The rest run on the
-CPU wave as before. A fill writes its array; a sum returns a wrapping
-total, reduced per threadgroup and then on the host.
+range launches of section 5.6.0. The CPU engine runs the program, and the
+GPU joins its range waves as one more worker. The coordinator claims
+blocks from the same counter the CPU workers claim from, so every index
+runs once: it keeps one block in flight on the GPU, runs CPU blocks while
+the GPU works, and accounts for the GPU's block when it completes. A
+sum's GPU block adds its total (wrapping add does not depend on order);
+a fill's GPU block writes its elements (a fill's indices are disjoint, so
+CPU workers write the other elements of the same array meanwhile). A
+block the GPU declines runs on the CPU.
+
+How much the GPU takes is a cost model from measurements: a GPU block
+costs a fixed latency (submission and completion) plus a time per index,
+a CPU thread a time per index, each measured per fold as the waves run.
+The GPU takes a block only when it would finish no later than the CPU
+threads finish the rest, and as large as that allows; before its rates
+are known it takes a small probe. So a request too small to repay a
+launch runs on the CPU alone, and the GPU never becomes the wave's
+straggler. The leaves compile on their own thread while the program
+starts; until they are ready the CPU runs every request.
+(`MITHRIL_METAL_TEST=1` waits for the compile and gives the GPU a share
+of every wave whatever it costs, so tests run the GPU's code.)
 
 The leaves are the CPU program's own native forms. The program is lowered
 once, as for the CPU, and the C-family printer prints each range fold's
@@ -1519,10 +1535,13 @@ and through the software f64 of section 4.5 when a subnormal is involved,
 and f16 converts in integer arithmetic. So a request gives the same
 result on either device, and choosing the device is scheduling.
 
-A request's arrays are copied into one shared buffer and reach the leaves
-as device addresses in the CPU's block layout; after the dispatch a
-fill's array is copied back. The buffer is declared resident for reading
-and writing, because the kernel reaches it only through those addresses.
+The arrays a block reads are copied into one shared buffer and reach the
+leaves as device addresses in the CPU's block layout. A fill never reads
+its array, so its copy carries no elements, only a write map: each
+element the GPU writes marks a byte, and those elements alone are copied
+back, which leaves the elements CPU workers wrote untouched. The buffers
+are kept between launches. They are declared resident for reading and
+writing, because the kernel reaches them only through those addresses.
 
 Binary32 in a leaf runs in two passes. The fast pass runs every f32
 operation in hardware and marks the index wherever the GPU's flushing may

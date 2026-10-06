@@ -718,11 +718,12 @@ fn the_metal_lane_writes_the_cpu_bytes() {
             let out = d.join(format!("{name}.{lane}.bin"));
             let mut args = vec!["run", prog.to_str().unwrap(), "--raw", out.to_str().unwrap()];
             args.extend(extra);
-            let r = Command::new(bin()).args(&args).env("MITHRIL_METAL_TRACE", "1").output().unwrap();
+            // (MITHRIL_METAL_TEST: the GPU takes part whatever it costs)
+            let r = Command::new(bin()).args(&args).env("MITHRIL_METAL_TRACE", "1").env("MITHRIL_METAL_TEST", "1").output().unwrap();
             assert_eq!(r.status.code(), Some(0), "{name} {lane}: {}", stderr(&r));
             if lane == "metal" {
                 // the GPU ran at least one fold (a request it completed)
-                assert!(stderr(&r).lines().any(|l| l.starts_with("metal: fold") && l.contains("Some(")), "{name}: no fold ran on the GPU:\n{}", stderr(&r));
+                assert!(stderr(&r).lines().any(|l| l.starts_with("metal: fold") && l.ends_with("to the GPU")), "{name}: no fold ran on the GPU:\n{}", stderr(&r));
             }
             bytes.push((lane, fs::read(&out).unwrap()));
         }
