@@ -1,0 +1,11 @@
+[package]
+name = "mithril-metal"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+mithril-core = { path = "../mithril-core" }
+
+[dev-dependencies]
+mithril-front = { path = "../mithril-front" }
