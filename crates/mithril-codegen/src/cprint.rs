@@ -9,7 +9,8 @@
 //! are hoisted to local arrays. MSL differs in four places: pointers name
 //! their address space, 64-bit literals use `l` / `ul`, a loop is left by
 //! `break` (through a flag from inside a switch) since MSL has no `goto`,
-//! and the stack guard counts depth in a wrapper (`function`).
+//! and the stack guard compares a nesting depth passed by value
+//! (`msl_leaves`).
 
 use crate::lir::{Bop, FnDef, Inline, Pat, Ty, E, S};
 use std::collections::{HashMap, HashSet};
@@ -350,8 +351,11 @@ impl<'a> P<'a> {
                 self.line(format!("(*{x}) = {v};"));
             }
             // the stack guard leaves the frame (value-initialized return)
-            // (MSL guards with a wrapper function, see `function`)
-            S::Do(E::Call { f, .. }) if f == "stack_guard" && self.dialect == Dialect::Msl => {}
+            // MSL counts nesting in `dl` (see `msl_leaves`)
+            S::Do(E::Call { f, .. }) if f == "stack_guard" && self.dialect == Dialect::Msl => {
+                let z = self.zero_ret();
+                self.line(format!("if (dl >= DEEP_LIMIT) {{ fuel[1] |= DEEP_FAULT; {z} }}"));
+            }
             S::Do(E::Call { f, .. }) if f == "stack_guard" => self.line(format!("if (stack_deep()) return{};", if self.ret == Ty::Unit { "" } else { " {}" })),
             S::Do(e) => {
                 let v = self.ex(e);
@@ -611,15 +615,8 @@ pub fn signature(d: &FnDef, dialect: Dialect) -> String {
     }
 }
 
-/// The definition of `d`. In MSL a function that guards the stack is
-/// split: `NAME_body` holds the body and `NAME` counts the depth around it
-/// (`deep_enter` / `deep_leave`), because MSL has no stack pointer to read.
+/// The definition of `d`.
 pub fn function(d: &FnDef, fnret: &HashMap<String, Ty>, dialect: Dialect) -> String {
-    let guarded = dialect == Dialect::Msl && matches!(d.body.first(), Some(S::Do(E::Call { f, .. })) if f == "stack_guard");
-    let mut def = d.clone();
-    if guarded {
-        def.name = format!("{}_body", d.name);
-    }
     let mut p = P {
         fnret,
         locals: d.params.iter().cloned().collect(),
@@ -634,18 +631,9 @@ pub fn function(d: &FnDef, fnret: &HashMap<String, Ty>, dialect: Dialect) -> Str
         breakable: Vec::new(),
         flagged: HashSet::new(),
     };
-    p.out.push_str(&signature(&def, dialect));
+    p.out.push_str(&signature(d, dialect));
     p.out.push(' ');
-    p.block_with(&def.body, d.params.iter().map(|(x, _)| x.clone()).collect());
-    if guarded {
-        let args: Vec<&str> = d.params.iter().map(|(x, _)| x.as_str()).collect();
-        let call = format!("{}({})", def.name, args.join(", "));
-        let (zero, run) = match d.ret {
-            Ty::Unit => (String::new(), format!("{call};\ndeep_leave(fuel);")),
-            t => (format!(" {}{{}}", ty(t, dialect)), format!("{} r = {call};\ndeep_leave(fuel);\nreturn r;", ty(t, dialect))),
-        };
-        let _ = writeln!(p.out, "{} {{\nif (deep_enter(fuel)) return{zero};\n{run}\n}}", signature(d, dialect));
-    }
+    p.block_with(&d.body, d.params.iter().map(|(x, _)| x.clone()).collect());
     p.out
 }
 
@@ -704,29 +692,86 @@ pub fn msl_leaves(fns: &[FnDef], fills: &[crate::RangeFill]) -> String {
     if !printable {
         return String::new();
     }
-    // the device's call stack is declared when the pipeline is made, from
-    // the frames one level of guarded recursion takes (the host picks the
-    // depth; a leaf nesting deeper faults, see range.metal deep_enter)
+    // recursion runs to a depth the host picks (DEEP_LIMIT): a function
+    // that can reach a guarded call takes its nesting depth `dl` by value,
+    // a guarded call passes dl + 1, and a guarded function past the limit
+    // faults (range.metal deep_faulted). The count stays in a register.
     let Some(frames) = leaf_frames(&reached) else {
         // recursion no guard bounds: such leaves stay on the CPU
         return String::new();
     };
-    let fnret: HashMap<String, Ty> = reached.iter().map(|d| (d.name.clone(), d.ret)).collect();
+    let is_guarded = |f: &FnDef| matches!(f.body.first(), Some(S::Do(E::Call { f, .. })) if f == "stack_guard");
+    let guarded: HashSet<&str> = reached.iter().filter(|f| is_guarded(f)).map(|f| f.name.as_str()).collect();
+    let leveled = reaching(&reached, &guarded);
+    let mut fnret: HashMap<String, Ty> = LEAF_F32.iter().map(|f| (format!("m_{f}"), Ty::I64)).collect();
+    for d in &reached {
+        fnret.insert(d.name.clone(), d.ret);
+    }
+    let mut defs: Vec<FnDef> = Vec::new();
+    for d in &reached {
+        let mut d = (*d).clone();
+        let level = leveled.contains(d.name.as_str());
+        if level {
+            d.params.insert(1, ("dl".into(), Ty::I64));
+        }
+        crate::lir::mutate_stmts(&mut d.body, &mut |s| {
+            if let (Some(e), _) = s.parts_mut() {
+                e.rewrite(&mut |e| {
+                    if let E::Call { f, args, .. } = e {
+                        if level && leveled.contains(f.as_str()) {
+                            let dl = if guarded.contains(f.as_str()) { E::Bin(Bop::Add, Box::new(E::V("dl".into())), Box::new(E::Int(1, Ty::I64))) } else { E::V("dl".into()) };
+                            args.insert(1, dl);
+                        } else if LEAF_F32.contains(&f.as_str()) {
+                            // binary32 in a leaf marks its index for the exact
+                            // pass where the GPU's flushing may have changed it
+                            *f = format!("m_{f}");
+                            args.insert(0, E::V("fuel".into()));
+                        }
+                    }
+                });
+            }
+            true
+        });
+        defs.push(d);
+    }
     let mut out = format!("// mithril: frames {frames}\n");
     out.push_str(&tuple_structs(&reached));
-    for d in &reached {
+    for d in &defs {
         let _ = writeln!(out, "{};", signature(d, Dialect::Msl));
     }
-    for d in &reached {
+    for d in &defs {
         out.push_str(&function(d, &fnret, Dialect::Msl));
     }
     let _ = writeln!(out, "i64 prog_range_leaf(uint fid, i64 i, device const ulong *args, thread i64 *fuel) {{\nswitch (fid) {{");
     for r in fills {
         let args: String = (2..r.ints.len()).map(|k| if k == r.acc && r.kind != 0 { ", 0l".to_string() } else { format!(", (i64)args[{k}]") }).collect();
-        let _ = writeln!(out, "case {}: return s_{}(fuel, i, i + 1{args});", r.fid, r.fid);
+        let dl = if leveled.contains(format!("s_{}", r.fid).as_str()) { ", 0l" } else { "" };
+        let _ = writeln!(out, "case {}: return s_{}(fuel{dl}, i, i + 1{args});", r.fid, r.fid);
     }
     let _ = writeln!(out, "default: return 0;\n}}\n}}");
     out
+}
+
+/// The binary32 operations a leaf runs through `m_*` (range.metal): fast
+/// in hardware, exact on the indices they mark.
+const LEAF_F32: [&str; 7] = ["f32_add", "f32_sub", "f32_mul", "f32_div", "f32_sqrt", "f32_lt", "f32_le"];
+
+/// The functions that can reach a guarded one (the guarded ones included).
+fn reaching<'a>(fns: &[&'a FnDef], guarded: &HashSet<&str>) -> HashSet<&'a str> {
+    let mut out: HashSet<&str> = fns.iter().filter(|f| guarded.contains(f.name.as_str())).map(|f| f.name.as_str()).collect();
+    loop {
+        let before = out.len();
+        for f in fns {
+            let mut calls = false;
+            crate::lir::walk_exprs(&f.body, &mut |e| calls |= matches!(e, E::Call { f, .. } if out.contains(f.as_str())));
+            if calls {
+                out.insert(f.name.as_str());
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
 }
 
 /// Frames from a guarded function's entry to the next guarded call, at
@@ -814,10 +859,10 @@ mod tests {
     fn msl_spells_pointers_literals_and_the_guard() {
         let msl = print(&sample(), Dialect::Msl);
         // pointers name their address space; 64-bit literals have no `ll`
-        assert!(msl.contains("i64 s_7_body(thread i64* fuel, i64 v0)"), "{msl}");
         assert!(msl.contains("((i64)9223372036854775808ul)") && !msl.contains("ll)"), "{msl}");
-        // the guard is a wrapper that counts depth around the body
-        assert!(msl.contains("i64 s_7(thread i64* fuel, i64 v0) {\nif (deep_enter(fuel)) return i64{};\ni64 r = s_7_body(fuel, v0);\ndeep_leave(fuel);\nreturn r;\n}"), "{msl}");
+        // the guard compares the nesting depth passed by value
+        assert!(msl.contains("i64 s_7(thread i64* fuel, i64 v0) {"), "{msl}");
+        assert!(msl.contains("if (dl >= DEEP_LIMIT) { fuel[1] |= DEEP_FAULT; return (i64)0; }"), "{msl}");
         assert!(!msl.contains("stack_deep"), "{msl}");
         let cuda = print(&sample(), Dialect::Cuda);
         assert!(cuda.contains("__device__ i64 s_7(i64* fuel, i64 v0)") && cuda.contains("if (stack_deep()) return {};") && cuda.contains("(-9223372036854775808ll)"), "{cuda}");
@@ -825,16 +870,21 @@ mod tests {
 
     #[test]
     fn msl_leaves_reach_the_fold_and_bound_the_stack() {
-        let leaf = def("s_3", vec![let_("x", Ty::I64, E::Call { f: "s_4".into(), args: vec![v("fuel"), v("v0")], ctx: false }), S::Ret(v("x"))]);
+        let leaf = def("s_3", vec![let_("x", Ty::I64, E::Call { f: "s_4".into(), args: vec![v("fuel"), v("v0")], ctx: false }), let_("y", Ty::I64, p("f32_mul", vec![v("x"), v("x")])), S::Ret(v("y"))]);
         let callee = def("s_4", vec![do_(p("stack_guard", vec![])), S::Ret(E::Call { f: "s_4".into(), args: vec![v("fuel"), v("v0")], ctx: false })]);
         let unrelated = def("s_9", vec![S::Ret(v("v0"))]);
         let fill = crate::RangeFill { fid: 3, ints: vec![true, true, true, false], acc: 3, kind: 1 };
         let out = msl_leaves(&[leaf.clone(), callee.clone(), unrelated], &[fill]);
-        // one level: s_3 above the guarded s_4 (wrapper and body)
+        // one level: s_3 above the guarded s_4
         assert!(out.starts_with("// mithril: frames 3\n"), "{out}");
-        assert!(out.contains("s_4_body") && !out.contains("s_9"), "{out}");
-        // a sum's accumulator starts from the identity
-        assert!(out.contains("case 3: return s_3(fuel, i, i + 1, (i64)args[2], 0l);"), "{out}");
+        assert!(!out.contains("s_9"), "{out}");
+        // both take the nesting depth; a guarded call passes one more
+        assert!(out.contains("i64 s_3(thread i64* fuel, i64 dl, i64 v0)") && out.contains("s_4(fuel, ((i64)((u64)(dl) + (u64)(((i64)1ul)))), v0)"), "{out}");
+        assert!(out.contains("if (dl >= DEEP_LIMIT)"), "{out}");
+        // binary32 goes through the marking operations
+        assert!(out.contains("m_f32_mul(fuel, x, x)"), "{out}");
+        // a sum's accumulator starts from the identity; the depth from 0
+        assert!(out.contains("case 3: return s_3(fuel, 0l, i, i + 1, (i64)args[2], 0l);"), "{out}");
         // recursion no guard bounds stays on the CPU
         let loose = def("s_4", vec![S::Ret(E::Call { f: "s_4".into(), args: vec![v("fuel"), v("v0")], ctx: false })]);
         assert_eq!(msl_leaves(&[leaf, loose], &[crate::RangeFill { fid: 3, ints: vec![true, true, true], acc: 2, kind: 0 }]), "");

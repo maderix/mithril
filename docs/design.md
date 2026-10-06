@@ -1524,18 +1524,30 @@ as device addresses in the CPU's block layout; after the dispatch a
 fill's array is copied back. The buffer is declared resident for reading
 and writing, because the kernel reaches it only through those addresses.
 
+Binary32 in a leaf runs in two passes. The fast pass runs every f32
+operation in hardware and marks the index wherever the GPU's flushing may
+have changed a result: a subnormal operand, or a zero result the exact
+operation need not give (operands of different magnitudes that sum to
+zero, nonzero factors, a nonzero numerator over a finite divisor). A
+marked index contributes nothing to a sum. The exact pass then runs the
+marked indices again with the exact operations, writing their elements
+again and giving their terms. An index the fast pass leaves unmarked saw
+only normal operands and normal or exactly zero results, where the
+hardware rounds as IEEE does; so the result is exact, and the hot path
+carries no software float code.
+
 Recursion in a leaf runs on the GPU's call stack, which a pipeline
-declares and the GPU reserves for every thread in flight. The printer
-bounds the frames one level of guarded recursion can take; the host
-picks the depth. A leaf that nests deeper than the stack holds faults.
-After a fault every guarded call returns at once and every loop stops
-(each MSL loop checks the fault), so the leaf ends even though its values
-no longer mean anything. The host then makes the stack deeper and runs
-the request again. If the GPU runs out of memory, it makes the stack
-shallower, and it remembers the shallowest depth that failed. A request
-that no stack holds, or that indexes an array out of bounds (the leaf
-marks the block), runs on the CPU, whose result is the same and which
-reports the fault.
+declares and the GPU reserves for every thread in flight. A function
+that can reach a guarded call takes its nesting depth by value, a guarded
+call passes one more, and a guarded function past the limit faults.
+The count lives in a register, not in memory. The limit is fixed when the leaves compile, and the
+declared stack is the printer's bound on the frames one level takes,
+times the limit. After a fault every loop stops (each MSL loop checks
+the fault), so the leaf ends even though its values no longer mean
+anything; the host compiles the leaves with twice the limit and runs the
+request again. A request no limit holds, or that indexes an array out of
+bounds (the leaf marks the block), runs on the CPU, whose result is the
+same and which reports the fault.
 
 Leaves that MSL cannot express stay on the CPU: recursion that no guard
 bounds, boxed f64 values, and frame machines. A program carries its MSL
@@ -1992,12 +2004,13 @@ Constraint and proofs:
     160 s. terrain's native fold reaches 1,024 chunks against 16,384 for
     the dive form (1.34 s against 0.29 s). One rule for both, tied to idle
     capacity rather than to the budget, is the next step.
-19. (#20, #21) Metal range launches (section 7.8) are correct and slower than the
-    CPU: the cause is not yet measured (a suspect is the declared call
-    stack, which makes every leaf call a real call). Leaves that recurse
-    deeply with large frames (the black hole's `pow2`) need more stack
-    than the GPU holds and run on the CPU. A leaf that indexes out of
-    bounds keeps running on garbage until its loops end.
+19. (#20, #21) Metal range launches (section 7.8) are correct and still
+    slower than the CPU on the renders. Measured causes: hardware
+    recursion saves every live value at each call, and the rays diverge.
+    Leaves that recurse deeply with large frames (the black hole's
+    `pow2`) need more stack than the GPU holds and run on the CPU. A leaf
+    that indexes out of bounds keeps running on garbage until its loops
+    end.
 
 Measurement:
 

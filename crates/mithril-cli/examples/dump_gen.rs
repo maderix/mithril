@@ -7,7 +7,8 @@ fn main() {
     let _ = mithril_reassoc::analyze(&mut m);
     let cm = mithril_front::desugar(&m).unwrap();
     let (sm, _) = mithril_net::specialize(&cm, 1 << 20);
-    let code = mithril_codegen::emit_rust(&sm);
+    // `--metal`: also print the range leaves in MSL (METAL_LEAVES)
+    let code = mithril_codegen::emit_rust_for(&sm, std::env::args().any(|a| a == "--metal"));
     std::fs::write(&out, &code).unwrap();
     for (i, f) in cm.fns.iter().enumerate() {
         let s = if code.contains(&format!("fn s_{i}(")) { "SCALAR" } else { "dive" };

@@ -4,14 +4,14 @@
 //!
 //! The arrays a request passes are copied into one shared buffer and reach
 //! the leaves as device addresses; after the dispatch a fill's array is
-//! copied back. The call stack a pipeline declares is reserved for every
-//! thread in flight, so its depth adapts: halved when the GPU runs out of
-//! memory, doubled when a leaf nests deeper. A leaf that faults past that
-//! (an index out of bounds, recursion past the most the stack holds) makes
+//! copied back. Recursion in the leaves runs to a nesting limit fixed when
+//! the leaves compile (`DEEP_LIMIT`): a leaf that reaches it faults, and the
+//! leaves compile again with twice the limit. A leaf that faults past the
+//! deepest limit, or indexes an array out of bounds, makes
 //! [`RangeExec::run`] return `None`: the caller runs the request on the
 //! CPU, whose result is the same by construction and which reports a fault.
 
-use crate::metal::{Device, Dispatch, Library, Pipeline};
+use crate::metal::{Device, Dispatch, Pipeline};
 use std::sync::Mutex;
 
 /// One argument of a request, in port order from index 2 (the fold's index
@@ -25,17 +25,33 @@ pub enum Arg<'a> {
 
 const KERNEL: &str = r#"
 kernel void range_launch(device const ulong *req [[buffer(0)]], device ulong *parts [[buffer(1)]],
-                         device metal::atomic_uint *fault [[buffer(2)]],
+                         device metal::atomic_uint *flags [[buffer(2)]], device uint *marked [[buffer(3)]],
                          uint t [[thread_position_in_grid]], uint lt [[thread_position_in_threadgroup]],
                          uint g [[threadgroup_position_in_grid]], uint size [[threads_per_threadgroup]]) {
   threadgroup ulong part[1024];
-  // req: fid, lo, n, the guarded depth the stack holds, then the fold's
-  // ports from index 1 (args[k] = req[3 + k]; ports 0 and 1 are the range)
+  // req: fid, lo, n, then the fold's ports from index 1 (args[k] =
+  // req[3 + k]; ports 0 and 1 are the range); flags[0]: a depth fault,
+  // flags[1]: how many indices the fast pass marked for the exact pass
   ulong v = 0;
-  if (t < req[2]) {
-    i64 fuel[3] = {(i64)1 << 60, 0, (i64)req[3]};
-    v = (ulong)prog_range_leaf((uint)req[0], (i64)req[1] + (i64)t, req + 3, fuel);
-    if (fuel[1] != 0) atomic_store_explicit(fault, 1u, metal::memory_order_relaxed);
+#ifdef F32_EXACT
+  bool active = t < metal::atomic_load_explicit(&flags[1], metal::memory_order_relaxed);
+  uint k = active ? marked[t] : 0;
+#else
+  bool active = t < req[2];
+  uint k = t;
+#endif
+  if (active) {
+    i64 fuel[2] = {(i64)1 << 60, 0};
+    v = (ulong)prog_range_leaf((uint)req[0], (i64)req[1] + (i64)k, req + 3, fuel);
+    if (fuel[1] & DEEP_FAULT) {
+      atomic_store_explicit(&flags[0], 1u, metal::memory_order_relaxed);
+#ifndef F32_EXACT
+    } else if (fuel[1] & F32_SUSPECT) {
+      // the exact pass gives this index's term (and writes its element again)
+      v = 0;
+      marked[atomic_fetch_add_explicit(&flags[1], 1u, metal::memory_order_relaxed)] = k;
+#endif
+    }
   }
   part[lt] = v;
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -48,33 +64,34 @@ kernel void range_launch(device const ulong *req [[buffer(0)]], device ulong *pa
 "#;
 
 const T_ARR: u64 = 14;
+/// The nesting limit the leaves first compile with, and the deepest.
+const START_DEEP: usize = 32;
+const MAX_DEEP: usize = 256;
 /// The most call frames a Metal pipeline may declare.
 const MAX_STACK: usize = 4096;
-/// Frames below the leaves' own: the kernel, prog_range_leaf, and the
-/// deepest chain of the scalar operations (the software float path:
-/// sf_f32_op, sf_f64_op, sf_div, sf_round_pack, ...), with a margin.
-const BELOW: usize = 32;
-/// The guarded depth a program starts with.
-const START_DEEP: usize = 16;
 
 /// The GPU and the pipeline of one program's range leaves.
 pub struct RangeExec {
     dev: Device,
-    lib: Library,
-    /// call frames per level of guarded recursion
+    /// the leaves' source without its nesting limit
+    src: String,
+    /// call frames per nesting level (for calls the compiler keeps)
     frames: usize,
-    /// the guarded depth the current pipeline's stack holds, the pipeline,
-    /// and its threadgroup size
-    current: Mutex<(usize, Pipeline, usize)>,
-    /// the least depth whose stack the GPU could not hold
-    ceiling: std::sync::atomic::AtomicUsize,
+    /// the nesting limit compiled now and its passes
+    current: Mutex<Passes>,
+}
+
+/// The leaves at one nesting limit: the fast pass, and the exact pass
+/// (compiled when first needed), each with its threadgroup size.
+struct Passes {
+    deep: usize,
+    fast: (Pipeline, usize),
+    exact: Option<(Pipeline, usize)>,
 }
 
 enum Outcome {
     Done(u64),
-    /// out of memory: the stack must shrink
-    Memory,
-    /// a leaf nested deeper than the stack holds
+    /// a leaf nested deeper than the limit
     Deep,
     /// out of bounds, or the GPU failed
     Fault,
@@ -94,23 +111,23 @@ impl RangeExec {
         let dev = Device::new().ok_or("no Metal device")?;
         let quiet = "#pragma clang diagnostic ignored \"-Wunused-variable\"".to_string();
         let src = [crate::ops_source(), quiet, include_str!("../msl/range.metal").to_string(), leaves.to_string(), KERNEL.to_string()].join("\n");
-        // the compiler's report: its errors (generated code leaves unused locals)
+        let fast = Self::build(&dev, &src, frames, START_DEEP, false)?;
+        Ok(RangeExec { dev, src, frames, current: Mutex::new(Passes { deep: START_DEEP, fast, exact: None }) })
+    }
+
+    /// The pipeline of the leaves at nesting limit `deep`, fast or exact.
+    fn build(dev: &Device, src: &str, frames: usize, deep: usize, exact: bool) -> Result<(Pipeline, usize), String> {
         let t0 = std::time::Instant::now();
-        let lib = dev.compile(&src).map_err(|e| e.lines().filter(|l| l.contains("error")).collect::<Vec<_>>().join("\n"))?;
-        trace(&format!("compiled the leaves in {} ms", t0.elapsed().as_millis()));
-        let deep = START_DEEP.min(Self::most(frames));
-        let (pso, group) = Self::pipeline(&dev, &lib, frames, deep)?;
-        let ceiling = std::sync::atomic::AtomicUsize::new(usize::MAX);
-        Ok(RangeExec { dev, lib, frames, current: Mutex::new((deep, pso, group)), ceiling })
-    }
-
-    /// The deepest guarded nesting a full stack holds.
-    fn most(frames: usize) -> usize {
-        ((MAX_STACK - BELOW) / frames).saturating_sub(1)
-    }
-
-    fn pipeline(dev: &Device, lib: &Library, frames: usize, deep: usize) -> Result<(Pipeline, usize), String> {
-        let pso = dev.pipeline(lib, "range_launch", (deep + 1) * frames + BELOW)?;
+        let mode = if exact { "#define F32_EXACT\n" } else { "" };
+        let lib = dev.compile(&format!("{mode}#define DEEP_LIMIT {deep}\n{src}"))
+            // the compiler's report: its errors (generated code leaves unused locals)
+            .map_err(|e| e.lines().filter(|l| l.contains("error")).collect::<Vec<_>>().join("\n"))?;
+        trace(&format!("compiled the leaves at nesting {deep} in {} ms", t0.elapsed().as_millis()));
+        // a level of guarded recursion is `frames` calls at most (+ the
+        // kernel, prog_range_leaf and the scalar operations' fallbacks)
+        let t1 = std::time::Instant::now();
+        let pso = dev.pipeline(&lib, "range_launch", ((deep + 1) * frames + 32).min(MAX_STACK))?;
+        trace(&format!("built the pipeline in {} ms", t1.elapsed().as_millis()));
         // the reduction halves the group: a power of two
         let group = 1 << pso.max_group().min(1024).ilog2();
         Ok((pso, group))
@@ -123,34 +140,29 @@ impl RangeExec {
         if n == 0 || n > u32::MAX as usize {
             return None;
         }
-        use std::sync::atomic::Ordering::Relaxed;
         let mut cur = self.current.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            let deeper = (cur.0 * 2).min(Self::most(self.frames));
-            let deep = match self.attempt(&cur, fid, lo, n, args) {
+            match self.attempt(&mut cur, fid, lo, n, args) {
                 Outcome::Done(s) => return Some(s),
-                Outcome::Fault => return None,
-                Outcome::Memory if cur.0 > 2 => {
-                    self.ceiling.fetch_min(cur.0, Relaxed);
-                    cur.0 / 2
+                Outcome::Deep if cur.deep < MAX_DEEP => {
+                    let deep = cur.deep * 2;
+                    let fast = Self::build(&self.dev, &self.src, self.frames, deep, false).ok()?;
+                    *cur = Passes { deep, fast, exact: None };
                 }
-                Outcome::Deep if deeper > cur.0 && deeper < self.ceiling.load(Relaxed) => deeper,
-                Outcome::Memory | Outcome::Deep => return None,
-            };
-            trace(&format!("call stack for {deep} nested guarded calls"));
-            let (pso, group) = Self::pipeline(&self.dev, &self.lib, self.frames, deep).ok()?;
-            *cur = (deep, pso, group);
+                Outcome::Deep | Outcome::Fault => return None,
+            }
         }
     }
 
-    fn attempt(&self, cur: &(usize, Pipeline, usize), fid: u32, lo: i64, n: usize, args: &mut [Arg]) -> Outcome {
-        let (deep, pso, group) = (cur.0, &cur.1, cur.2);
+    fn attempt(&self, cur: &mut Passes, fid: u32, lo: i64, n: usize, args: &mut [Arg]) -> Outcome {
+        let deep = cur.deep;
+        let (pso, group) = (&cur.fast.0, cur.fast.1);
         let words: usize = args.iter().map(|a| if let Arg::Array { block, .. } = a { block.len() } else { 0 }).sum();
         let mut arrays = self.dev.buffer(words * 8);
         let base = arrays.gpu_address();
         let mut req = self.dev.buffer((5 + args.len()) * 8);
         let r = req.words_mut();
-        r[..5].copy_from_slice(&[fid as u64, lo as u64, n as u64, deep as u64, 0]);
+        r[..5].copy_from_slice(&[fid as u64, lo as u64, n as u64, 0, 0]);
         let mut at = 0;
         let staged = arrays.words_mut();
         for (k, a) in args.iter().enumerate() {
@@ -168,18 +180,49 @@ impl RangeExec {
         }
         let groups = n.div_ceil(group);
         let parts = self.dev.buffer(groups * 8);
-        let fault = self.dev.buffer(8);
-        let d = Dispatch { pipeline: pso, buffers: vec![&req, &parts, &fault], reached: vec![&arrays], threads: groups * group, group };
+        let flags = self.dev.buffer(8);
+        let marked = self.dev.buffer(n * 4);
+        let d = Dispatch { pipeline: pso, buffers: vec![&req, &parts, &flags, &marked], reached: vec![&arrays], threads: groups * group, group };
         let t0 = std::time::Instant::now();
         let ran = self.dev.run(&[d]);
-        trace(&format!("{n} indices at depth {deep}: {} ms", t0.elapsed().as_millis()));
+        trace(&format!("{n} indices at nesting {deep}: {} ms", t0.elapsed().as_millis()));
         if let Err(e) = ran {
             trace(&e);
-            return if e.contains("Memory") { Outcome::Memory } else { Outcome::Fault };
+            return Outcome::Fault;
         }
-        if fault.words()[0] != 0 {
-            trace(&format!("a leaf nested deeper than {deep} guarded calls"));
+        // flags: the depth fault in the low word, the marked count in the high
+        let deep_fault = |flags: &crate::metal::Buffer| flags.words()[0] as u32 != 0;
+        if deep_fault(&flags) {
+            trace(&format!("a leaf nested deeper than {deep}"));
             return Outcome::Deep;
+        }
+        let mut sum = parts.words().iter().fold(0u64, |s, &p| s.wrapping_add(p));
+        // the marked indices again, with exact binary32
+        let count = (flags.words()[0] >> 32) as usize;
+        if count > 0 {
+            if cur.exact.is_none() {
+                match Self::build(&self.dev, &self.src, self.frames, deep, true) {
+                    Ok(p) => cur.exact = Some(p),
+                    Err(e) => {
+                        trace(&e);
+                        return Outcome::Fault;
+                    }
+                }
+            }
+            let (pso, group) = cur.exact.as_ref().map(|(p, g)| (p, *g)).unwrap();
+            let groups = count.div_ceil(group);
+            let again = self.dev.buffer(groups * 8);
+            let d = Dispatch { pipeline: pso, buffers: vec![&req, &again, &flags, &marked], reached: vec![&arrays], threads: groups * group, group };
+            let t0 = std::time::Instant::now();
+            if let Err(e) = self.dev.run(&[d]) {
+                trace(&e);
+                return Outcome::Fault;
+            }
+            trace(&format!("{count} indices again, exact: {} ms", t0.elapsed().as_millis()));
+            if deep_fault(&flags) {
+                return Outcome::Deep;
+            }
+            sum = again.words().iter().fold(sum, |s, &p| s.wrapping_add(p));
         }
         let staged = arrays.words();
         let mut at = 0;
@@ -202,6 +245,6 @@ impl RangeExec {
                 at += len;
             }
         }
-        Outcome::Done(parts.words().iter().fold(0u64, |s, &p| s.wrapping_add(p)))
+        Outcome::Done(sum)
     }
 }
