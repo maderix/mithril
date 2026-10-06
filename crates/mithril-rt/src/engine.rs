@@ -135,7 +135,7 @@ impl Engine {
                 if !ranges.is_empty() {
                     // the GPU takes part in a wave of requests it can run
                     #[cfg(target_os = "macos")]
-                    let gpu = ranges.iter().any(|r| crate::metal::ready(prog, r.fid));
+                    let gpu = ranges.iter().any(|r| crate::metal::wanted(prog, r.fid));
                     #[cfg(not(target_os = "macos"))]
                     let gpu = false;
                     let total: u64 = ranges.iter().map(|r| (r.hi - r.lo).max(0) as u64).sum();

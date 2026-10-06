@@ -26,8 +26,9 @@ static EXEC: OnceLock<Option<RangeExec>> = OnceLock::new();
 static COMPILING: std::sync::Once = std::sync::Once::new();
 
 /// `MITHRIL_METAL_TEST=1`: the GPU takes part whatever it costs (the compile
-/// is waited for, and every wave gives the GPU a share), so that tests run
-/// the GPU's code.
+/// is waited for, and the GPU takes all of a wave the CPU workers have not
+/// claimed: at one thread, the whole of it), so that tests run the GPU's
+/// code and the GPU alone can be timed.
 fn testing() -> bool {
     static T: OnceLock<bool> = OnceLock::new();
     *T.get_or_init(|| std::env::var("MITHRIL_METAL_TEST").as_deref() == Ok("1"))
@@ -62,6 +63,12 @@ fn exec(prog: &dyn Program) -> Option<&'static RangeExec> {
 /// The GPU can run fold `fid`'s requests now.
 pub fn ready(prog: &dyn Program, fid: u32) -> bool {
     on() && !prog.range_shape(fid).is_empty() && exec(prog).is_some()
+}
+
+/// The GPU may run fold `fid`'s requests: now, or once its leaves compile
+/// (a wave it may join checks `ready` as it goes).
+pub fn wanted(prog: &dyn Program, fid: u32) -> bool {
+    on() && !prog.range_shape(fid).is_empty() && !matches!(EXEC.get(), Some(None))
 }
 
 /// Start compiling the leaves for the GPU, so they are ready by the first
@@ -114,7 +121,7 @@ pub fn cpu_ran(fid: u32, n: u64, ns: f64) {
 /// Before the GPU's rates are known it takes a probe of two CPU blocks.
 pub fn gpu_share(fid: u32, rest: u64, threads: usize, block: u64) -> u64 {
     if testing() {
-        return block.max(rest / 2).min(rest);
+        return rest;
     }
     let r = rates(fid);
     if r.cpu == 0.0 {
