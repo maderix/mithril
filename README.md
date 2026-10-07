@@ -209,15 +209,16 @@ enclosing `def`.
 
 Requirements: Rust 1.86 or newer and Python 3 (for the test scripts). The CPU
 backend runs on Linux x86-64 and, experimentally, on macOS with Apple silicon
-(fast CI and the demo suite pass there with the same values as on Linux); the
-GPU backend needs Linux and an NVIDIA GPU.
+(fast CI and the demo suite pass there with the same values as on Linux). The
+CUDA backend needs Linux and an NVIDIA GPU. On macOS, `--metal` lets the Apple
+GPU take blocks of large proven loops beside the CPU threads.
 
 ```
 cargo build --release -p mithril-cli                          # CPU and GPU (Linux)
 cargo build --release -p mithril-cli --no-default-features    # CPU only (no NVIDIA driver)
 ```
 
-On macOS the same first command builds the CPU backend alone.
+On macOS the same first command builds the CPU backend and the Metal lane.
 
 The binary is `target/release/mithril`. `mithril run` compiles the generated
 program with `rustc`, so a Rust toolchain must be on the `PATH` when you run
@@ -296,7 +297,7 @@ Wall-clock seconds, compilation excluded; every lane returns the same output.
 
 <br>
 
-Measured on 4 October 2026. The seven benchmark ports are timed against a C
+Linux measured on 4 October 2026. The seven benchmark ports are timed against a C
 twin of the same algorithm, compiled with `-O2`; times are minimums of five
 runs (three on the GPU). Render times are medians of three runs after a
 warmup. All times are warm: the GPU column is the device's own timer for the
@@ -318,20 +319,31 @@ under 1 ms. Renders write their image with `--image` on every lane.
 | cornell_path | - | 1.716 s | 0.175 s | 0.011 s |
 | cornell_whitted | - | 0.202 s | 0.029 s | 0.009 s |
 
-**macOS (experimental CPU backend)** · Apple M4 (4 performance + 6
-efficiency cores), Apple `clang`
+**macOS** · Mac mini, Apple M4 (4 performance + 6 efficiency cores, 10-core
+GPU), Apple `clang`, measured on 7 October 2026. The CPU+GPU column runs
+`--threads 10 --metal`: the GPU takes blocks of a large proven loop when the
+cost model says it finishes them no later than the CPU threads would. The GPU
+column gives the GPU every loop it can take (`MITHRIL_METAL_TEST=1`). On
+programs with no such loop both run on the CPU alone. Times are wall clock for
+the whole process, Metal setup included, and every lane writes its result with
+`--raw` for the byte comparison.
 
-| program | C (1 thread) | Mithril 1 thread | Mithril 16 threads |
-|---|---:|---:|---:|
-| collatz | 0.300 s | 0.305 s | 0.050 s |
-| heat2d | 0.391 s | 0.529 s | 0.123 s |
-| histogram | 0.307 s | 0.506 s | 0.093 s |
-| kdtree | 0.150 s | 0.382 s | 0.127 s |
-| knapsack | 0.293 s | 0.402 s | 0.417 s |
-| msort | 0.113 s | 0.230 s | 0.131 s |
-| subsetsum | 0.561 s | 0.546 s | 0.119 s |
-| cornell_path | - | 1.088 s | 0.161 s |
-| cornell_whitted | - | 0.111 s | 0.029 s |
+| program | C (1 thread) | Mithril 1 thread | Mithril 10 threads | CPU+GPU (Metal) | GPU alone |
+|---|---:|---:|---:|---:|---:|
+| collatz | 0.330 s | 0.336 s | 0.051 s | 0.052 s | 0.223 s |
+| heat2d | 0.400 s | 0.531 s | 0.103 s | 0.124 s | 10.07 s |
+| histogram | 0.316 s | 0.554 s | 0.094 s | 0.094 s | - |
+| kdtree | 0.158 s | 0.394 s | 0.131 s | 0.131 s | - |
+| knapsack | 0.300 s | 0.403 s | 0.132 s | 0.152 s | 64.03 s |
+| msort | 0.119 s | 0.236 s | 0.139 s | 0.137 s | - |
+| subsetsum | 0.563 s | 0.546 s | 0.110 s | 0.134 s | - |
+| cornell_path | - | 1.115 s | 0.161 s | 0.212 s | 2.303 s |
+| cornell_whitted | - | 0.106 s | 0.021 s | 0.022 s | 0.157 s |
+| uniform_f32 | - | 5.471 s | 0.763 s | 0.576 s | 0.846 s |
+
+A dash in the GPU column marks a program with no loop the GPU can take.
+heat2d and knapsack launch the GPU 502 and 8,000 times, and each launch waits
+several milliseconds for the GPU to start.
 
 Every program returns the same output on every lane and on both machines.
 
