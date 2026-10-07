@@ -15,6 +15,13 @@ A programming language built on interaction nets.
 - **One source for CPU and GPU.** The same file compiles to native CPU code and
   to CUDA, with one rule table and one runtime model on both. You pick the
   device when the program runs.
+- **CPU and GPU together.** The CPU and the GPU can share one computation. A
+  sum or loop that the compiler has proved can be split is cut into chunks,
+  and each device takes the next chunk when it becomes free, so the answer is
+  the same whichever device computed which chunk. On a subset-sum search a
+  Ryzen 7800X3D and an RTX 4090 together finish 1.45 times faster than the
+  CPU alone, and an Apple M4's CPU and GPU together run a floating-point fill
+  1.32 times faster.
 
 **Read the field guide: [maderix.github.io/articles/mithril](https://maderix.github.io/articles/mithril/)**,
 an illustrated walk through where the language comes from, how it works,
@@ -251,8 +258,10 @@ docker build -f docker/nvcc.Dockerfile -t mithril-nvcc:cu13.0 docker/
 - `bench/general/*.py`: interpreters, persistent maps, pipelines and closures.
 - `bench/lockless/`: five programs that use locks or atomics in C and Rust,
   written in Mithril with plain values, each next to its C and Rust versions.
-- `bench/metal/uniform_f32.py`: a uniform binary32 fill the CPU and the Apple
-  GPU share (`mithril run bench/metal/uniform_f32.py --threads 10 --metal`).
+- `bench/coexec`: computations the CPU and the GPU share: a subset-sum search split
+  into 1,024 sub-searches (`mithril run bench/coexec/subsetsum_split.py --coop
+  --threads 15`) and a uniform binary32 fill on the Apple GPU
+  (`mithril run bench/coexec/uniform_f32.py --threads 10 --metal`).
 
 Inspect what the compiler did with a program:
 
@@ -404,7 +413,7 @@ Bend's example set; their sources live outside this repository.
 | `proofs/confluence` | Lean 4 proof that the core rule table is confluent |
 | `examples` | the small programs of the introduction and the guide |
 | `demos` | the renders (black hole, Cornell box, sphere field), their render scripts, the compiler planning demo |
-| `bench` | benchmark programs: ports with C references, the generality corpus, the lockless set, the Metal split |
+| `bench` | benchmark programs: ports with C references, the generality corpus, the lockless set, CPU+GPU co-execution |
 | `docs` | the design (`design.md`), the runtimes (`runtime.md`), the guide |
 | `tests` | CI gates, end-to-end checks, the parity corpus, the starter programs |
 | `docker` | the nvcc image for device builds |
