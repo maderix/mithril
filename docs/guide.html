@@ -415,6 +415,30 @@ footer p{max-width:none}
 <li><b>Parallel</b>Pairs that are ready at the same moment are independent, so separate cores can rewrite them at the same time. No locks are needed, because the cores never update a shared variable.</li>
 <li><b>Deterministic</b>Every order of rewriting that finishes produces the same final graph, a property called <strong>confluence</strong> (chapter 3). The order in which the cores do their work cannot change the answer.</li>
 </ul>
+<details class="in-deep"><summary>A closer look at interaction nets: ports, rules and a worked example</summary>
+<p>An agent has one <em>principal port</em> and a fixed number of <em>auxiliary ports</em>, and every wire connects exactly two ports. Most of Mithril's agents have two auxiliary ports. An addition agent, for example, receives its first operand on its principal port and uses its auxiliary ports for the second operand and the result.</p>
+<p>Because a wire has exactly two ends, a value in a net has exactly one consumer. A program that uses a variable twice therefore needs a copy agent, written <code>δ</code>, whose two auxiliary ports lead to the two uses, and a variable that is never used is connected to an erasure agent, written <code>ε</code>. Copying and deleting a value are rewrite steps, carried out by rules in the same way as arithmetic.</p>
+<p>Two agents form an active pair only when they are connected principal port to principal port. Mithril's rules fall into a few families:</p>
+<ul>
+<li><b>Compute.</b> An arithmetic or comparison agent that meets a number stores it, and when it meets the second number it is replaced by the result.</li>
+<li><b>Unfold.</b> A call agent is replaced by the body of the function it names, with the arguments connected to the parameters.</li>
+<li><b>Branch.</b> An <code>if</code> or <code>match</code> agent that meets a value keeps the branch that the value selects and discards the others, which were never built.</li>
+<li><b>Copy.</b> A <code>δ</code> agent that meets a number, a tuple or a function produces two copies of it. Two <code>δ</code> agents that are the two halves of the same copy cancel each other, and their wires are joined directly.</li>
+<li><b>Erase.</b> An <code>ε</code> agent that meets another agent deletes it and places an <code>ε</code> on each wire that led to it, so an unused structure is removed one agent at a time.</li>
+<li><b>Apply.</b> A function value meeting an application connects the argument to the parameter and the body to the result.</li>
+</ul>
+<p>These rules are the reason the order of rewriting does not matter. Each agent has only one principal port, so it belongs to at most one active pair at a time, and the two agents of a pair determine which rule fires. Firing a rule changes only its own pair and the wires attached to it, so every other active pair is still present afterwards and still fires the same rule. Lafont showed that this property implies more than confluence: every order of rewriting that reaches the end takes the same number of steps<sup class="cite">[<a href="#ref-lafont90">1</a>]</sup>.</p>
+<p>A short example shows the rules working together. The program <code>y = 2 + 3; return y * y</code> becomes a net with an addition agent, a <code>δ</code> agent and a multiplication agent, and it reduces in five steps:</p>
+<ol>
+<li>The addition agent meets <code>2</code> and stores it.</li>
+<li>It meets <code>3</code> and is replaced by <code>5</code>.</li>
+<li>The <code>5</code> now faces the principal port of the <code>δ</code> agent, and the pair is replaced by two copies of <code>5</code>.</li>
+<li>The multiplication agent meets the first copy and stores it.</li>
+<li>It meets the second copy and is replaced by <code>25</code>.</li>
+</ol>
+<p>In this small net the steps must happen in sequence, because each one produces the value the next one needs. A larger program contains many such chains that do not depend on each other, and the runtime spreads them across cores. Because every input of this example is written in the source, Mithril's compiler performs all five steps before the program runs (chapter 4).</p>
+<p>No step needs information from outside its own pair, which is why the same rules can run on one core, on many cores, on a GPU, or inside the compiler. Lafont's papers on interaction nets<sup class="cite">[<a href="#ref-lafont90">1</a>]</sup> and interaction combinators<sup class="cite">[<a href="#ref-lafont97">3</a>]</sup> give the original definitions, and the HVM repository<sup class="cite">[<a href="#ref-hvm">4</a>]</sup> describes a large implementation.</p>
+</details>
 <p>The idea developed over several decades:</p>
 <ol class="lineage">
 <li><b>1987</b>Jean-Yves Girard's <strong>linear logic</strong><sup class="cite">[<a href="#ref-girard87">2</a>]</sup> treats every value as used exactly once.</li>
